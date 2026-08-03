@@ -2,7 +2,6 @@ package config
 
 import (
 	"encoding/json"
-	"strings"
 
 	"github.com/MumuTW/looper/internal/labels"
 )
@@ -48,7 +47,7 @@ func ProjectClassificationLabels(cfg *Config, projectID string) bool {
 		return false
 	}
 	for _, project := range cfg.Projects {
-		if strings.TrimSpace(project.ID) == strings.TrimSpace(projectID) {
+		if project.ID == projectID {
 			return project.ClassificationLabels
 		}
 	}
@@ -58,7 +57,7 @@ func ProjectClassificationLabels(cfg *Config, projectID string) bool {
 func configuredProjectLabelNamespace(cfg *Config, projectID string) (labels.Namespace, bool) {
 	if cfg != nil {
 		for _, project := range cfg.Projects {
-			if strings.TrimSpace(project.ID) == strings.TrimSpace(projectID) {
+			if project.ID == projectID {
 				return labels.NewNamespace(project.LabelNamespace), true
 			}
 		}

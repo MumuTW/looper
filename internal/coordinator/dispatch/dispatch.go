@@ -245,32 +245,21 @@ func isAllowedUser(comment Comment, allowedUsers []string) bool {
 }
 
 func singleDispatchLabelForNamespace(issueLabels []string, namespace labels.Namespace) (string, bool) {
-	allowLegacy := acceptsLegacyDispatchLabels(namespace)
 	configured := ""
-	legacy := ""
 	for _, label := range issueLabels {
-		if !namespace.IsDispatch(label) {
+		if !namespace.IsConfiguredDispatch(label) {
 			continue
 		}
-		if namespace.IsConfiguredDispatch(label) {
-			if configured != "" {
-				return "", false
-			}
-			configured = label
-			continue
-		}
-		if !allowLegacy {
-			continue
-		}
-		if legacy != "" {
+		if configured != "" {
 			return "", false
 		}
-		legacy = label
+		if namespace.IsConfiguredDispatchPlan(label) {
+			configured = namespace.DispatchPlan()
+		} else {
+			configured = namespace.DispatchImplement()
+		}
 	}
-	if configured != "" {
-		return configured, true
-	}
-	return legacy, legacy != ""
+	return configured, configured != ""
 }
 
 func triggerLabelsForDispatch(dispatchLabel string, cfg Config) []string {
@@ -279,18 +268,13 @@ func triggerLabelsForDispatch(dispatchLabel string, cfg Config) []string {
 		namespace = labels.DefaultNamespace()
 	}
 	switch {
-	case namespace.IsConfiguredDispatchPlan(dispatchLabel) || (acceptsLegacyDispatchLabels(namespace) && namespace.IsDispatchPlan(dispatchLabel)):
+	case namespace.IsConfiguredDispatchPlan(dispatchLabel):
 		return compactLabels(cfg.PlannerTriggerLabels)
-	case namespace.IsConfiguredDispatchImplement(dispatchLabel) || (acceptsLegacyDispatchLabels(namespace) && namespace.IsDispatchImplement(dispatchLabel)):
+	case namespace.IsConfiguredDispatchImplement(dispatchLabel):
 		return compactLabels(cfg.WorkerTriggerLabels)
 	default:
 		return nil
 	}
-}
-
-func acceptsLegacyDispatchLabels(namespace labels.Namespace) bool {
-	prefix := strings.ToLower(strings.TrimSpace(namespace.Prefix))
-	return prefix == "" || prefix == labels.Prefix
 }
 
 func compactLabels(labels []string) []string {

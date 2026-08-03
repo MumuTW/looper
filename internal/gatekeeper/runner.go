@@ -228,6 +228,8 @@ type Options struct {
 	// TrustForProject reports a project's merge-authority level. Nil means every
 	// project stays at observe, which is also the configured default.
 	TrustForProject func(projectID string) config.GatekeeperTrustLevel
+	// MergeStrategyForProject selects the strategy used at the auto trust level.
+	MergeStrategyForProject func(projectID string) config.ReviewerAutoMergeStrategy
 	// DiffBudgetForProject returns the effective boolean change-size limits. Zero
 	// bounds are unlimited; nil means every project has no configured limit.
 	DiffBudgetForProject func(projectID string) config.GatekeeperDiffBudget

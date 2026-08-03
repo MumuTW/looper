@@ -3413,7 +3413,8 @@ func (r *Runner) publishCriteriaFailureReview(ctx context.Context, input stepInp
 	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, freshIssue.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 		return nil, &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", issueRef.Repo, issueRef.Number)}
 	}
-	if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: issueRef.Repo, IssueNumber: issueRef.Number, Labels: criteriaFailureLabels(freshIssue.Labels), CWD: input.Project.RepoPath}); err != nil {
+	namespace := r.reviewerLabelNamespaceForProject(input.Project.ID, input.Project.MetadataJSON)
+	if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: issueRef.Repo, IssueNumber: issueRef.Number, Labels: criteriaFailureLabels(freshIssue.Labels, namespace), CWD: input.Project.RepoPath}); err != nil {
 		return nil, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if err := r.github.RemovePullRequestReaction(ctx, PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}); err != nil {
@@ -3434,7 +3435,7 @@ func (r *Runner) resolveLinkedIssueForCriteria(ctx context.Context, input stepIn
 		if issue.IsPullRequest {
 			return linkedIssueReference{}, githubinfra.IssueDetail{}, false, nil
 		}
-		ref.Tracked = issueHasCoordinatorTracking(issue.Labels)
+		ref.Tracked = issueHasCoordinatorTracking(issue.Labels, r.reviewerLabelNamespaceForProject(input.Project.ID, input.Project.MetadataJSON))
 		return ref, issue, true, nil
 	}
 	return linkedIssueReference{}, githubinfra.IssueDetail{}, false, nil
@@ -3655,21 +3656,37 @@ func parseInt64(raw string) (int64, error) {
 	return strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 }
 
-func criteriaFailureLabels(issueLabels []string) []string {
+func criteriaFailureLabels(issueLabels []string, configured ...labels.Namespace) []string {
+	namespace := labels.DefaultNamespace()
+	if len(configured) > 0 {
+		namespace = configured[0]
+	}
+	triaged := "triaged"
+	if labels.Normalize(namespace.Prefix) != labels.Prefix {
+		triaged = namespace.Label(triaged)
+	}
 	toRemove := []string{}
 	for _, label := range issueLabels {
 		normalized := strings.ToLower(strings.TrimSpace(label))
-		if normalized == "triaged" || labels.IsDispatch(label) {
+		if normalized == strings.ToLower(triaged) || namespace.IsConfiguredDispatch(label) {
 			toRemove = append(toRemove, label)
 		}
 	}
 	return toRemove
 }
 
-func issueHasCoordinatorTracking(issueLabels []string) bool {
+func issueHasCoordinatorTracking(issueLabels []string, configured ...labels.Namespace) bool {
+	namespace := labels.DefaultNamespace()
+	if len(configured) > 0 {
+		namespace = configured[0]
+	}
+	triaged := "triaged"
+	if labels.Normalize(namespace.Prefix) != labels.Prefix {
+		triaged = namespace.Label(triaged)
+	}
 	for _, label := range issueLabels {
 		normalized := strings.ToLower(strings.TrimSpace(label))
-		if normalized == "triaged" || labels.IsDispatch(label) {
+		if normalized == strings.ToLower(triaged) || namespace.IsConfiguredDispatch(label) {
 			return true
 		}
 	}

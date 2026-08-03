@@ -19,6 +19,17 @@ func TestLabelPresentationUsesCustomNamespaceDefaults(t *testing.T) {
 	}
 }
 
+func TestLabelPresentationForNamespaceScopesBuiltIns(t *testing.T) {
+	t.Parallel()
+	namespace := labels.NewNamespace("team.looper:")
+	if got := labelPresentationForNamespace("team.looper:hold:worker", namespace); got.Color != "b60205" {
+		t.Fatalf("custom namespace presentation = %#v, want hold presentation", got)
+	}
+	if got := labelPresentationForNamespace("other:hold:worker", namespace); got.Color == "b60205" {
+		t.Fatalf("foreign namespace presentation = %#v, want neutral fallback", got)
+	}
+}
+
 // Applying a label used to create it with `gh label create --force`, which
 // updates an existing label in place. Every time Looper applied looper:hold to
 // an issue it therefore rewrote that label's color and description in the

@@ -63,6 +63,7 @@ type trustedReviewProxyResponse struct {
 // in-process submitter after proxy validation. No agent-provided config path,
 // policy, expected head, manual identity, or CWD survives into this value.
 type TrustedReviewSubmission struct {
+	ProjectID           string
 	PRRef               string
 	Event               string
 	CommitID            string
@@ -96,6 +97,7 @@ func FormatTrustedReviewPRRef(repo string, prNumber int64) string {
 // expected-head, and manual-run identity flags are stripped and replaced with
 // these values before the daemon-internal submitter runs.
 type TrustedReviewProxyPolicy struct {
+	ProjectID        string
 	Clean            string // COMMENT or APPROVE
 	Blocking         string // COMMENT or REQUEST_CHANGES
 	ExpectedCommitID string
@@ -266,6 +268,7 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, submitter 
 	stderr := newTrustedReviewBoundedBuffer(maxTrustedReviewProxyOutputBytes)
 	err := submitter(requestCtx, TrustedReviewSubmission{
 		PRRef:               allowedPRRef,
+		ProjectID:           policy.ProjectID,
 		Event:               trustedReviewProxyEvent(req.Argv),
 		CommitID:            policy.ExpectedCommitID,
 		CleanReviewEvent:    policy.Clean,
@@ -494,7 +497,7 @@ func normalizeTrustedReviewProxyPolicy(policy TrustedReviewProxyPolicy) (Trusted
 		return TrustedReviewProxyPolicy{}, fmt.Errorf("manual reviewer run id is required")
 	}
 	return TrustedReviewProxyPolicy{
-		Clean: clean, Blocking: blocking, ExpectedCommitID: expectedCommitID,
+		ProjectID: strings.TrimSpace(policy.ProjectID), Clean: clean, Blocking: blocking, ExpectedCommitID: expectedCommitID,
 		ReviewerManual: policy.ReviewerManual, ReviewerRunID: reviewerRunID,
 	}, nil
 }

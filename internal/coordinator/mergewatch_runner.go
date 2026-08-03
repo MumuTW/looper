@@ -41,9 +41,10 @@ func (r *Runner) applyMergeWatch(ctx context.Context, projectID, repo, cwd strin
 	if err != nil {
 		return nil, err
 	}
+	triagedLabel := triageCompletionLabel(roles.Coordinator.Triage.TriagedLabel, namespace)
 	markReadyDrafts := r.markReadyCandidates(ctx, repo, cwd, roles)
 	for _, issue := range loaded {
-		if !issueHasCoordinatorTracking(issue.detail.Labels, roles.Coordinator.Triage.TriagedLabel, namespace) {
+		if !issueHasCoordinatorTracking(issue.detail.Labels, triagedLabel, namespace) {
 			continue
 		}
 		removed, applyErr := func() (bool, error) {
@@ -51,7 +52,7 @@ func (r *Runner) applyMergeWatch(ctx context.Context, projectID, repo, cwd strin
 			lock.Lock()
 			defer lock.Unlock()
 			r.applyMarkReady(ctx, repo, cwd, issue, currentLogin, markReadyDrafts, roles.Coordinator.Triage.TriagedLabel, namespace)
-			return r.applyMergeWatchLocked(ctx, projectID, repo, cwd, issue, roles, namespace, currentLogin, budget)
+			return r.applyMergeWatchLocked(ctx, projectID, repo, cwd, issue, roles, namespace, triagedLabel, currentLogin, budget)
 		}()
 		if applyErr != nil {
 			return nil, applyErr
@@ -63,7 +64,7 @@ func (r *Runner) applyMergeWatch(ctx context.Context, projectID, repo, cwd strin
 	return result, nil
 }
 
-func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd string, issue loadedIssue, roles config.RoleConfigs, namespace labels.Namespace, currentLogin string, maxIndeterminateDuration time.Duration) (bool, error) {
+func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd string, issue loadedIssue, roles config.RoleConfigs, namespace labels.Namespace, triagedLabel, currentLogin string, maxIndeterminateDuration time.Duration) (bool, error) {
 	marker := findMergeWatchComment(issue.detail.Comments, currentLogin)
 	watchedPR, ok, err := r.resolveWatchedPR(ctx, repo, cwd, issue, marker, namespace, currentLogin)
 	if err != nil || !ok {
@@ -111,7 +112,7 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 		fixer := config.EffectiveCodingRoles(roles)[config.CodingRoleFixer]
 		fixerLabels := namespace.RemapAll(requiredDiscoveryLabels(fixer.Discovery.Labels, fixer.Discovery.LabelMode))
 		if len(fixerLabels) > 0 {
-			if err := r.github.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: snapshot.PRNumber, Labels: fixerLabels, CWD: cwd}); err != nil {
+			if err := r.github.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: snapshot.PRNumber, Labels: fixerLabels, LabelNamespace: namespace, CWD: cwd}); err != nil {
 				return false, err
 			}
 		}
@@ -122,7 +123,7 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 		return false, r.upsertMergeWatchComment(ctx, repo, cwd, issue.detail.Number, marker, baseMarker, summary)
 	case mergewatch.ActionTransientError:
 		if action.Exhausted {
-			if err := r.removeIssueLabels(ctx, repo, cwd, issue.detail.Number, issue.detail.Labels, retriageCleanupPatterns(roles, roles.Coordinator.Triage.TriagedLabel, namespace)); err != nil {
+			if err := r.removeIssueLabels(ctx, repo, cwd, issue.detail.Number, issue.detail.Labels, retriageCleanupPatterns(roles, triagedLabel, namespace)); err != nil {
 				return false, err
 			}
 			return true, r.deleteMergeWatchComment(ctx, repo, cwd, marker)
@@ -135,7 +136,7 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 		baseMarker.Retries = action.RetriesLeft
 		return false, r.upsertMergeWatchComment(ctx, repo, cwd, issue.detail.Number, marker, baseMarker, "")
 	case mergewatch.ActionBranchProtectionChanged:
-		if err := r.removeIssueLabels(ctx, repo, cwd, issue.detail.Number, issue.detail.Labels, retriageCleanupPatterns(roles, roles.Coordinator.Triage.TriagedLabel, namespace)); err != nil {
+		if err := r.removeIssueLabels(ctx, repo, cwd, issue.detail.Number, issue.detail.Labels, retriageCleanupPatterns(roles, triagedLabel, namespace)); err != nil {
 			return false, err
 		}
 		return true, r.deleteMergeWatchComment(ctx, repo, cwd, marker)

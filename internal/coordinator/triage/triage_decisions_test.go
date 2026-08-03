@@ -67,6 +67,31 @@ func TestDecideCustomNamespaceDoesNotProjectClassificationByDefault(t *testing.T
 	}
 }
 
+func TestDecideCustomNamespaceProjectsClassificationIntoNamespace(t *testing.T) {
+	t.Parallel()
+	cfg := testConfig()
+	cfg.Namespace = labels.NewNamespace("team.looper:")
+	cfg.ProjectClassificationLabels = true
+	decision := Decide(context.Background(), fixtureLLM{raw: `{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["team.looper:dispatch:plan"]}}`}, Input{Issue: Issue{Title: "Coordinator bug", CreatedAt: time.Now().UTC().Format(time.RFC3339)}, Config: cfg, Now: time.Now().UTC()})
+	if decision.NoOp {
+		t.Fatalf("Decide() = %#v, want a valid decision", decision)
+	}
+	want := []string{"team.looper:kind/bug", "team.looper:area/coordinator", "team.looper:complexity/m", "team.looper:dispatch:plan", "triaged"}
+	if len(decision.ApplyLabels) != len(want) {
+		t.Fatalf("ApplyLabels = %v, want %v", decision.ApplyLabels, want)
+	}
+	for i := range want {
+		if decision.ApplyLabels[i] != want[i] {
+			t.Fatalf("ApplyLabels = %v, want %v", decision.ApplyLabels, want)
+		}
+	}
+	for _, pattern := range decision.ClearLabelPatterns {
+		if pattern == "kind/*" || pattern == "area/*" || pattern == "complexity/*" {
+			t.Fatalf("classification cleanup pattern %q leaked into custom namespace decision", pattern)
+		}
+	}
+}
+
 func TestBuildPromptCustomNamespaceUsesNamespacedDispatchSchema(t *testing.T) {
 	cfg := testConfig()
 	cfg.Namespace = labels.NewNamespace("team.looper:")

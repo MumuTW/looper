@@ -567,7 +567,7 @@ The historic gate remains configurable under `roles.triager.legacy`: `autoRouteC
 
 ## Coordinator config reference
 
-Coordinator is the proactive, stateless issue-intake role. It owns both Triage and Dispatch. Triage writes the project-scoped completion marker (`triaged` in the default namespace, `<namespace>triaged` for a custom namespace) plus the coordinator-owned label namespace. Dispatch consumes that same completion marker and `dispatch/*` and derives the actual trigger label from Planner or Worker config instead of redeclaring those labels.
+Coordinator is the proactive, stateless issue-intake role. It owns both Triage and Dispatch. Triage writes the project-scoped completion marker (`triaged` in the default namespace, `<namespace>triaged` for a custom namespace) plus the coordinator-owned label namespace. Dispatch consumes that same completion marker and the namespaced `<namespace>dispatch:plan` / `<namespace>dispatch:implement` labels and derives the actual trigger label from Planner or Worker config instead of redeclaring those labels. Bare `dispatch/*` labels are foreign host state: they are read-only compatibility leftovers and are never triggers or cleanup targets.
 
 Triage LLM calls use the **global** `agent.vendor` / `agent.model` only (not coding-role profiles or `roles.*.agent` overlays). See [Multi-role agent vendor and model](#multi-role-agent-vendor-and-model).
 
@@ -586,7 +586,7 @@ Coordinator triage lives under `roles.coordinator.triage.*`:
 | `roles.coordinator.triage.disposition.unclearLabel` | Label used for `unclear` | `"needs-info"` |
 | `roles.coordinator.triage.disposition.reTriageOnAuthorReply` | Re-opens the triage loop when the original author clarifies a `needs-info` issue | `true` |
 
-Coordinator clears and rewrites its own label namespace on each successful triage pass: `kind/*`, `area/*`, `complexity/*`, `dispatch/*`, `wontfix`, and `needs-info`. It then posts or edits the marker comment and writes the project-scoped completion marker last.
+Coordinator clears and rewrites its own label namespace on each successful triage pass: `kind/*`, `area/*`, `complexity/*`, `<namespace>dispatch:*`, `wontfix`, and `needs-info`. Bare `dispatch/*` labels are foreign host state and are never removed. It then posts or edits the marker comment and writes the project-scoped completion marker last.
 
 ### Dispatch settings
 
@@ -634,7 +634,7 @@ Behavior notes:
 
 - `/plan` maps to the first planner trigger label at `roles.planner.triggers.labels[0]`
 - `/implement` maps to the first worker trigger label at `roles.worker.triggers.labels[0]`
-- autonomous mode uses the existing `dispatch/*` label to choose the same derived trigger labels
+- autonomous mode uses the existing namespaced dispatch label to choose the same derived trigger labels
 - Coordinator never stores its own dispatch state; the authority chain stays on GitHub labels, comments, and timeline events
 - `roles.coordinator.dispatch.autonomous.holdLabel` is compatibility-only for coordinator autonomous dispatch; the official global hold contract is `looper:hold`
 

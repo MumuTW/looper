@@ -38,8 +38,9 @@ const maxNamespacePrefixLength = 32
 // Namespace is the project-scoped label authority. The default namespace is
 // Prefix; a project may opt into another validated prefix so two Looper
 // instances can coexist on one host repository without sharing control labels.
-// Legacy bare dispatch labels are readable through IsDispatch* for one release,
-// but are never emitted by the namespace.
+// Bare dispatch labels are never Looper authority. They may remain visible in
+// a repository as host-owned state, but the namespace never reads or emits
+// them.
 type Namespace struct {
 	Prefix string
 }
@@ -156,7 +157,7 @@ func (n Namespace) AnyOwned(labels []string) bool {
 }
 
 func (n Namespace) IsDispatch(label string) bool {
-	return n.IsConfiguredDispatch(label) || (n.acceptsLegacyDispatch() && (Normalize(label) == "dispatch/plan" || Normalize(label) == "dispatch/implement"))
+	return n.IsConfiguredDispatch(label)
 }
 
 func (n Namespace) IsConfiguredDispatch(label string) bool {
@@ -169,7 +170,7 @@ func (n Namespace) IsConfiguredDispatch(label string) bool {
 }
 
 func (n Namespace) IsDispatchPlan(label string) bool {
-	return n.IsConfiguredDispatchPlan(label) || (n.acceptsLegacyDispatch() && Normalize(label) == "dispatch/plan")
+	return n.IsConfiguredDispatchPlan(label)
 }
 
 func (n Namespace) IsConfiguredDispatchPlan(label string) bool {
@@ -186,11 +187,7 @@ func (n Namespace) IsDispatchPlanForLabels(values []string) bool {
 }
 
 func (n Namespace) IsDispatchImplement(label string) bool {
-	return n.IsConfiguredDispatchImplement(label) || (n.acceptsLegacyDispatch() && Normalize(label) == "dispatch/implement")
-}
-
-func (n Namespace) acceptsLegacyDispatch() bool {
-	return n.normalized().Prefix == Prefix
+	return n.IsConfiguredDispatchImplement(label)
 }
 
 func (n Namespace) IsConfiguredDispatchImplement(label string) bool {
@@ -214,11 +211,32 @@ func (n Namespace) Standard() []Definition {
 	}
 }
 
-// DefinitionFor returns the standard presentation for a namespaced built-in
-// label. It recognizes both the default and a validated custom prefix so the
-// GitHub gateway can provision the same presentation without knowing the
-// project's configuration type.
-func DefinitionFor(label string) (Definition, bool) {
+// DefinitionForNamespace returns the standard presentation for a built-in
+// label in the resolved project namespace. The default namespace is also
+// accepted because it is the only compatibility presentation that is safe to
+// recognize without treating arbitrary host labels as Looper authority.
+func DefinitionForNamespace(label string, namespace Namespace) (Definition, bool) {
+	normalized := Normalize(label)
+	namespace = namespace.normalized()
+	candidates := []Namespace{namespace}
+	if namespace.Prefix != Prefix {
+		candidates = append(candidates, DefaultNamespace())
+	}
+	for _, candidateNamespace := range candidates {
+		for _, definition := range candidateNamespace.Standard() {
+			if Normalize(definition.Name) == normalized {
+				return definition, true
+			}
+		}
+	}
+	return Definition{}, false
+}
+
+// NamespaceForLabel returns the validated namespace encoded by a standard
+// label. A caller that is about to provision labels can use this as the
+// resolved project namespace, so presentation lookup cannot accidentally use
+// a similarly suffixed label from an unrelated namespace.
+func NamespaceForLabel(label string) (Namespace, bool) {
 	normalized := Normalize(label)
 	definitions := DefaultNamespace().Standard()
 	sort.SliceStable(definitions, func(i, j int) bool {
@@ -236,11 +254,20 @@ func DefinitionFor(label string) (Definition, bool) {
 			continue
 		}
 		namespace := NewNamespace(prefix)
-		for _, candidate := range namespace.Standard() {
-			if Normalize(candidate.Name) == normalized {
-				return candidate, true
-			}
+		if _, ok := DefinitionForNamespace(label, namespace); ok {
+			return namespace, true
 		}
+	}
+	return Namespace{}, false
+}
+
+// DefinitionFor returns the standard presentation for a namespaced built-in
+// label. It preserves the package-level convenience API by resolving the
+// namespace encoded in the label, while callers that have project authority
+// should use DefinitionForNamespace.
+func DefinitionFor(label string) (Definition, bool) {
+	if namespace, ok := NamespaceForLabel(label); ok {
+		return DefinitionForNamespace(label, namespace)
 	}
 	return Definition{}, false
 }

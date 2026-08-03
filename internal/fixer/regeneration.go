@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/domain"
 	"github.com/MumuTW/looper/internal/eventlog"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
@@ -114,6 +115,7 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 	if !ok {
 		return regenerationNone, nil
 	}
+	namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)
 
 	current := loop
 	if r.repos != nil && r.repos.Loops != nil {
@@ -219,7 +221,7 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 				reason = "originating issue is already closed"
 			}
 		}
-		if err := r.persistRegenerationEscalation(ctx, current, state, pr.Number, derefString(queueItem.Repo), project.RepoPath, reason); err != nil {
+		if err := r.persistRegenerationEscalation(ctx, current, state, pr.Number, derefString(queueItem.Repo), project.RepoPath, namespace, reason); err != nil {
 			return regenerationNone, err
 		}
 		return regenerationEscalated, nil
@@ -229,7 +231,7 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 	}
 	if r.regenerationAvailability != nil {
 		if reason := strings.TrimSpace(r.regenerationAvailability(project.ID)); reason != "" {
-			if err := r.persistRegenerationEscalation(ctx, current, state, pr.Number, derefString(queueItem.Repo), project.RepoPath, reason); err != nil {
+			if err := r.persistRegenerationEscalation(ctx, current, state, pr.Number, derefString(queueItem.Repo), project.RepoPath, namespace, reason); err != nil {
 				return regenerationNone, err
 			}
 			return regenerationEscalated, nil
@@ -349,9 +351,9 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 			if reason == "" {
 				reason = "planner routing was permanently rejected"
 			}
-			// PR is already closed at this point. Add looper:needs-human to the originating issue
-			// so humans are aware the regeneration failed permanently.
-			if err := bridge.AddIssueLabels(ctx, IssueLabelsInput{Repo: originRepo, IssueNumber: originNumber, Labels: []string{labels.NeedsHuman}, CWD: project.RepoPath}); err != nil {
+			// PR is already closed at this point. Add the project's needs-human
+			// label to the originating issue so humans see the permanent failure.
+			if err := bridge.AddIssueLabels(ctx, IssueLabelsInput{Repo: originRepo, IssueNumber: originNumber, Labels: []string{namespace.NeedsHuman()}, CWD: project.RepoPath}); err != nil {
 				return regenerationNone, fmt.Errorf("label originating issue for permanent rejection: %w", err)
 			}
 			state.Escalated = true
@@ -363,10 +365,10 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 		}
 		return regenerationNone, fmt.Errorf("route originating issue back to planner: %w", err)
 	}
-	if err := bridge.AddIssueLabels(ctx, IssueLabelsInput{Repo: originRepo, IssueNumber: originNumber, Labels: []string{labels.DefaultPlanTrigger}, CWD: project.RepoPath}); err != nil {
+	if err := bridge.AddIssueLabels(ctx, IssueLabelsInput{Repo: originRepo, IssueNumber: originNumber, Labels: []string{namespace.PlanTrigger()}, CWD: project.RepoPath}); err != nil {
 		return regenerationNone, fmt.Errorf("mark originating issue for planner: %w", err)
 	}
-	if err := bridge.RemoveIssueLabels(ctx, IssueLabelsInput{Repo: originRepo, IssueNumber: originNumber, Labels: []string{labels.DefaultWorkerReadyTrigger}, CWD: project.RepoPath}); err != nil {
+	if err := bridge.RemoveIssueLabels(ctx, IssueLabelsInput{Repo: originRepo, IssueNumber: originNumber, Labels: []string{namespace.WorkerReadyTrigger()}, CWD: project.RepoPath}); err != nil {
 		return regenerationNone, fmt.Errorf("clear worker-ready label from originating issue: %w", err)
 	}
 	state.Routed = true
@@ -409,7 +411,7 @@ func (r *Runner) regenerationHumanCommitGuard(ctx context.Context, project stora
 	return "", nil
 }
 
-func (r *Runner) persistRegenerationEscalation(ctx context.Context, loop storage.LoopRecord, state fixerRegenerationState, prNumber int64, repo, cwd, reason string) error {
+func (r *Runner) persistRegenerationEscalation(ctx context.Context, loop storage.LoopRecord, state fixerRegenerationState, prNumber int64, repo, cwd string, namespace labels.Namespace, reason string) error {
 	state.EscalationWhy = reason
 	body := fmt.Sprintf("%s\n\nFixer stopped automatic close-and-regenerate because: %s\nThe PR remains open for human review.\n\nFailure context: %s", regenerationCommentMarker+" authority="+state.Authority+" outcome=escalated -->", reason, state.FailureContext)
 	bridge, ok := r.github.(RegenerationGateway)
@@ -468,7 +470,7 @@ func (r *Runner) persistRegenerationEscalation(ctx context.Context, loop storage
 	if _, err := r.mergeLoopMetadata(ctx, loop, map[string]any{"fixerRegeneration": state}); err != nil {
 		return err
 	}
-	if err := bridge.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: repo, PRNumber: prNumber, Labels: []string{labels.NeedsHuman}, CWD: cwd}); err != nil {
+	if err := bridge.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: repo, PRNumber: prNumber, Labels: []string{namespace.NeedsHuman()}, CWD: cwd}); err != nil {
 		return fmt.Errorf("label human escalation: %w", err)
 	}
 	state.Escalated = true

@@ -2,7 +2,7 @@ package labels
 
 import "testing"
 
-func TestNamespaceDerivesOwnedLabelsAndReadsLegacyDispatch(t *testing.T) {
+func TestNamespaceDerivesOwnedLabelsAndRejectsForeignDispatch(t *testing.T) {
 	ns := NewNamespace("Team.Looper:")
 	if ns.Prefix != "team.looper:" {
 		t.Fatalf("Prefix = %q, want team.looper:", ns.Prefix)

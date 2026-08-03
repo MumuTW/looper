@@ -392,8 +392,8 @@ func (r *Runner) listCoordinatorBacklog(ctx context.Context, projectID, repo, cw
 	}
 	issues := make([]githubinfra.IssueSummary, 0, limit)
 	backlogLanes := []backlogLane{
-		{dispatchLabel: dispatch.DispatchPlan, triggerLabels: dispatchCfg.PlannerTriggerLabels},
-		{dispatchLabel: dispatch.DispatchImplement, triggerLabels: dispatchCfg.WorkerTriggerLabels},
+		{dispatchLabel: dispatchCfg.Namespace.DispatchPlan(), triggerLabels: dispatchCfg.PlannerTriggerLabels},
+		{dispatchLabel: dispatchCfg.Namespace.DispatchImplement(), triggerLabels: dispatchCfg.WorkerTriggerLabels},
 	}
 	targets := backlogScanTargets(backlogLanes, r.projectNetworkMode(projectID) == config.ProjectNetworkModeRouted)
 	if len(targets) == 0 {
@@ -671,7 +671,7 @@ func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, iss
 	remainingLabels = removeMatchingLabels(remainingLabels, removeNow)
 	applyNow := removeExactLabels(decision.ApplyLabels, cfg.TriagedLabel)
 	if len(applyNow) > 0 {
-		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: applyNow, CWD: cwd}); err != nil {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: applyNow, LabelNamespace: cfg.Namespace, CWD: cwd}); err != nil {
 			return err
 		}
 	}
@@ -687,7 +687,7 @@ func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, iss
 	}
 	shouldMarkTriaged := decision.MarkTriaged && (!hadTriaged || commentPosted)
 	if shouldMarkTriaged && !hasExactLabel(remainingLabels, cfg.TriagedLabel) {
-		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: []string{cfg.TriagedLabel}, CWD: cwd}); err != nil {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: []string{cfg.TriagedLabel}, LabelNamespace: cfg.Namespace, CWD: cwd}); err != nil {
 			return err
 		}
 	}
@@ -716,15 +716,15 @@ func (r *Runner) applyDispatchAction(ctx context.Context, projectID string, repo
 	}
 	if intent := r.workerAdmissionIntent(issue, action, dispatchCfg); intent.Active {
 		if r.projectNetworkMode(projectID) == config.ProjectNetworkModeRouted {
-			return r.applyRoutedWorkerAdmission(ctx, repo, cwd, issue, action, intent)
+			return r.applyRoutedWorkerAdmission(ctx, repo, cwd, issue, action, intent, dispatchCfg.Namespace)
 		}
-		return r.applyLocalWorkerAdmission(ctx, repo, cwd, issue, action, intent.TriggerLabels)
+		return r.applyLocalWorkerAdmission(ctx, repo, cwd, issue, action, intent.TriggerLabels, dispatchCfg.Namespace)
 	}
-	return r.applyGenericDispatchAction(ctx, repo, cwd, issue, action)
+	return r.applyGenericDispatchAction(ctx, repo, cwd, issue, action, dispatchCfg.Namespace)
 
 }
 
-func (r *Runner) applyGenericDispatchAction(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action) (bool, error) {
+func (r *Runner) applyGenericDispatchAction(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, namespace labels.Namespace) (bool, error) {
 	mutated := false
 	if strings.TrimSpace(action.AssignTo) != "" {
 		if err := r.github.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: repo, IssueNumber: issue.Number, Assignees: []string{action.AssignTo}, CWD: cwd}); err != nil {
@@ -734,7 +734,7 @@ func (r *Runner) applyGenericDispatchAction(ctx context.Context, repo string, cw
 	}
 	labelsToAdd := removeExistingLabels(action.TriggerLabels, issue.Labels)
 	if len(labelsToAdd) > 0 {
-		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToAdd, CWD: cwd}); err != nil {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToAdd, LabelNamespace: namespace, CWD: cwd}); err != nil {
 			return false, err
 		}
 		mutated = true
@@ -770,13 +770,13 @@ func (r *Runner) workerAdmissionIntent(issue triage.Issue, action dispatch.Actio
 	return workerAdmissionIntent{}
 }
 
-func (r *Runner) applyLocalWorkerAdmission(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, triggerLabels []string) (bool, error) {
+func (r *Runner) applyLocalWorkerAdmission(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, triggerLabels []string, namespace labels.Namespace) (bool, error) {
 	localAction := action
 	localAction.TriggerLabels = triggerLabels
-	return r.applyGenericDispatchAction(ctx, repo, cwd, issue, localAction)
+	return r.applyGenericDispatchAction(ctx, repo, cwd, issue, localAction, namespace)
 }
 
-func (r *Runner) applyRoutedWorkerAdmission(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, intent workerAdmissionIntent) (bool, error) {
+func (r *Runner) applyRoutedWorkerAdmission(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, intent workerAdmissionIntent, namespace labels.Namespace) (bool, error) {
 	mutated := false
 	if r.network == nil {
 		return false, fmt.Errorf("coordinator network admission is not configured")
@@ -815,7 +815,7 @@ func (r *Runner) applyRoutedWorkerAdmission(ctx context.Context, repo string, cw
 	}
 	labelsToAdd := removeExistingLabels(intent.TriggerLabels, issue.Labels)
 	if len(labelsToAdd) > 0 {
-		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToAdd, CWD: cwd}); err != nil {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToAdd, LabelNamespace: namespace, CWD: cwd}); err != nil {
 			return false, err
 		}
 		mutated = true
@@ -837,7 +837,7 @@ func (r *Runner) applyRoutedWorkerAdmission(ctx context.Context, repo string, cw
 		mutated = true
 	}
 	if len(targetPlan.Add) > 0 {
-		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: targetPlan.Add, CWD: cwd}); err != nil {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: targetPlan.Add, LabelNamespace: namespace, CWD: cwd}); err != nil {
 			return false, err
 		}
 		mutated = true
@@ -1326,9 +1326,6 @@ func isWorkerDispatch(issue triage.Issue, namespace labels.Namespace) bool {
 		if namespace.IsConfiguredDispatchImplement(label) {
 			return true
 		}
-		if (strings.EqualFold(strings.TrimSpace(namespace.Prefix), labels.Prefix)) && namespace.IsDispatchImplement(label) {
-			return true
-		}
 	}
 	return false
 }
@@ -1490,7 +1487,7 @@ func (r *Runner) applyRoutedReviewAssignment(ctx context.Context, projectID, rep
 	if err := r.revalidatePullRequestLease(ctx, repo, detail.Number, status.Lease.FencingToken); err != nil {
 		return err
 	}
-	return r.github.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: detail.Number, Labels: []string{wantLabel}, CWD: cwd})
+	return r.github.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: detail.Number, Labels: []string{wantLabel}, LabelNamespace: namespace, CWD: cwd})
 }
 
 func (r *Runner) revalidatePullRequestLease(ctx context.Context, repo string, prNumber int64, fencingToken int64) error {
@@ -1766,34 +1763,27 @@ func dependencyTrackedIssue(issue triage.Issue, triagedLabel string, dispatchCfg
 
 func issueDispatchLabelForNamespace(issueLabels []string, namespace labels.Namespace) (string, bool) {
 	configured := ""
-	legacy := ""
 	for _, label := range issueLabels {
-		if !namespace.IsDispatch(label) {
+		if !namespace.IsConfiguredDispatch(label) {
 			continue
 		}
-		if namespace.IsConfiguredDispatch(label) {
-			if configured != "" {
-				return "", false
-			}
-			configured = label
-			continue
-		}
-		if legacy != "" {
+		if configured != "" {
 			return "", false
 		}
-		legacy = label
+		if namespace.IsConfiguredDispatchPlan(label) {
+			configured = namespace.DispatchPlan()
+		} else {
+			configured = namespace.DispatchImplement()
+		}
 	}
-	if configured != "" {
-		return configured, true
-	}
-	return legacy, legacy != ""
+	return configured, configured != ""
 }
 
 func configuredTriggerLabels(dispatchLabel string, cfg dispatch.Config) []string {
 	switch {
-	case cfg.Namespace.IsDispatchPlan(dispatchLabel):
+	case cfg.Namespace.IsConfiguredDispatchPlan(dispatchLabel):
 		return append([]string(nil), cfg.PlannerTriggerLabels...)
-	case cfg.Namespace.IsDispatchImplement(dispatchLabel):
+	case cfg.Namespace.IsConfiguredDispatchImplement(dispatchLabel):
 		return append([]string(nil), cfg.WorkerTriggerLabels...)
 	default:
 		return nil

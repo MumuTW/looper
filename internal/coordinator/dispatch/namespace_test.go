@@ -36,3 +36,19 @@ func TestCustomNamespaceAutonomousDispatchRejectsBareLegacyLabel(t *testing.T) {
 		t.Fatalf("bare custom dispatch action = %#v, want no-op", action)
 	}
 }
+
+func TestDefaultNamespaceAutonomousDispatchRejectsBareForeignLabel(t *testing.T) {
+	now := time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)
+	namespace := labels.DefaultNamespace()
+	cfg := Config{
+		Mode:                 ModeAutonomous,
+		TriagedLabel:         "triaged",
+		Namespace:            namespace,
+		AutonomousDelay:      time.Minute,
+		PlannerTriggerLabels: []string{namespace.PlanTrigger()},
+	}
+	action := Decide(Issue{Number: 4, Labels: []string{cfg.TriagedLabel, "dispatch/plan"}, TriagedAt: now.Add(-2 * time.Minute)}, cfg, now, nil)
+	if !action.NoOp || len(action.TriggerLabels) != 0 {
+		t.Fatalf("bare default dispatch action = %#v, want no-op", action)
+	}
+}

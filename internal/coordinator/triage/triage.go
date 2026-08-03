@@ -264,7 +264,11 @@ func parseDecision(raw string, cfg Config) (Decision, error) {
 	classificationProjection := classificationProjectionEnabled(cfg, namespace)
 	clear := []string{cfg.OutOfScopeLabel, cfg.UnclearLabel}
 	if classificationProjection {
-		clear = append([]string{"kind/*", "area/*", "complexity/*"}, clear...)
+		classificationPatterns := []string{"kind/*", "area/*", "complexity/*"}
+		if labels.Normalize(namespace.Prefix) != labels.Prefix {
+			classificationPatterns = []string{namespace.Label("kind/*"), namespace.Label("area/*"), namespace.Label("complexity/*")}
+		}
+		clear = append(classificationPatterns, clear...)
 	}
 	clear = append(clear, namespace.DispatchLabels()...)
 	switch Disposition(strings.TrimSpace(output.Disposition)) {
@@ -287,6 +291,11 @@ func parseDecision(raw string, cfg Config) (Decision, error) {
 		}
 		apply := []string{dispatch, cfg.TriagedLabel}
 		if classificationProjection {
+			if labels.Normalize(namespace.Prefix) != labels.Prefix {
+				kind = namespace.Label(kind)
+				area = namespace.Label(area)
+				complexity = namespace.Label(complexity)
+			}
 			apply = []string{kind, area, complexity, dispatch, cfg.TriagedLabel}
 		}
 		return Decision{Disposition: DispositionValid, ClearLabelPatterns: clear, ApplyLabels: apply, CommentBody: comment, MarkTriaged: true}, nil
