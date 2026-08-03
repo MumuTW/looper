@@ -2335,14 +2335,16 @@ func TestGatewayListIssueTimelineScopesAPIToHostname(t *testing.T) {
 // TestGatewayListIssueTimelineDecodesProjectedPages covers the decode side of
 // the capture-cap contract: gh emits the projected events as a stream of
 // objects across pages, and the gateway must hand the coordinator and triager
-// exactly the consumed fields — event kind, timestamp, id, and label name.
+// exactly the consumed fields — event kind, timestamp, id, label name, and the
+// minimal linked-PR identity retained on cross-referenced events so
+// linkedPullRequestNumbers can still discover the PR a cross-reference points at.
 func TestGatewayListIssueTimelineDecodesProjectedPages(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
-		return shell.Result{Stdout: `{"id":1,"event":"labeled","created_at":"2026-05-14T12:00:00Z","label":{"name":"looper:triaged"}}
-{"id":2,"event":"reopened","created_at":"2026-05-15T09:30:00Z","label":null}
-{"id":3,"event":"cross-referenced","created_at":"2026-05-16T10:00:00Z","label":null}`}, nil
+		return shell.Result{Stdout: `{"id":1,"event":"labeled","created_at":"2026-05-14T12:00:00Z","label":{"name":"looper:triaged"},"source":null,"pull_request":null,"issue":null}
+{"id":2,"event":"reopened","created_at":"2026-05-15T09:30:00Z","label":null,"source":null,"pull_request":null,"issue":null}
+{"id":3,"event":"cross-referenced","created_at":"2026-05-16T10:00:00Z","label":null,"source":{"issue":{"number":42,"html_url":"https://github.com/acme/looper/pull/42","url":"https://api.github.com/repos/acme/looper/pulls/42","pull_request":{"number":42,"html_url":"https://github.com/acme/looper/pull/42","url":"https://api.github.com/repos/acme/looper/pulls/42"}}},"pull_request":null,"issue":null}`}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
 	rows, err := gateway.ListIssueTimeline(context.Background(), IssueTimelineInput{Repo: "acme/looper", IssueNumber: 8})
@@ -2361,6 +2363,25 @@ func TestGatewayListIssueTimelineDecodesProjectedPages(t *testing.T) {
 	}
 	if asInt64(rows[2]["id"]) != 3 || asString(rows[2]["event"]) != "cross-referenced" || asString(rows[2]["created_at"]) != "2026-05-16T10:00:00Z" {
 		t.Fatalf("ListIssueTimeline()[2] = %#v, want the projected cross-reference event", rows[2])
+	}
+	// The cross-referenced event must retain enough of its source for
+	// linkedPullRequestNumbers to discover the linked PR: the nested issue's
+	// number, URL, and pull_request marker. The full source body is dropped by
+	// the projection, which is what keeps the wire shape under the capture cap.
+	source, _ := rows[2]["source"].(map[string]any)
+	if source == nil {
+		t.Fatalf("ListIssueTimeline()[2].source = %#v, want the retained cross-reference source", rows[2]["source"])
+	}
+	sourceIssue, _ := source["issue"].(map[string]any)
+	if sourceIssue == nil || asInt64(sourceIssue["number"]) != 42 {
+		t.Fatalf("ListIssueTimeline()[2].source.issue = %#v, want the linked PR number 42", source["issue"])
+	}
+	if asString(sourceIssue["html_url"]) != "https://github.com/acme/looper/pull/42" {
+		t.Fatalf("ListIssueTimeline()[2].source.issue.html_url = %#v, want the linked PR URL", sourceIssue["html_url"])
+	}
+	prMarker, _ := sourceIssue["pull_request"].(map[string]any)
+	if prMarker == nil || asInt64(prMarker["number"]) != 42 {
+		t.Fatalf("ListIssueTimeline()[2].source.issue.pull_request = %#v, want the PR marker that distinguishes a PR from a plain issue", sourceIssue["pull_request"])
 	}
 }
 

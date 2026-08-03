@@ -1365,7 +1365,14 @@ func (g *Gateway) ListIssueCommentsContaining(ctx context.Context, input ViewIss
 // the whole timeline. gh applies this projection to each page before anything
 // crosses that boundary, keeping only the fields the coordinator and triager
 // consume: event kind, timestamp, event id, and the label for label events.
-const issueTimelineProjection = `.[] | {id, event, created_at, label: (.label | if . then {name} else null end)}`
+//
+// The projection also retains the minimal identifying fields of a cross-
+// referenced source, a top-level pull_request, and a top-level issue — number,
+// html_url, url, and the nested pull_request marker — so linkedPullRequestNumbers
+// can still discover the PR a cross-referenced event points at and drive
+// merge-watch and mark-ready. The full bodies those objects carry are dropped,
+// which is what keeps the wire shape under the capture cap.
+const issueTimelineProjection = `.[] | {id, event, created_at, label: (.label | if . then {name} else null end), source: (.source | if . then {issue: (.issue | if . then {number, html_url, url, pull_request: (if .pull_request then {number, html_url, url} else null end)} else null end)} else null end), pull_request: (.pull_request | if . then {number, html_url, url} else null end), issue: (.issue | if . then {number, html_url, url, pull_request: (if .pull_request then {number, html_url, url} else null end)} else null end)}`
 
 func (g *Gateway) ListIssueTimeline(ctx context.Context, input IssueTimelineInput) ([]map[string]any, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
