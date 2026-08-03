@@ -3954,7 +3954,7 @@ func (r *Runner) appendReviewEvidence(ctx context.Context, input stepInput, even
 	headSHA, _ := payload["headSha"].(string)
 	reviewID, _ := payload["reviewId"].(string)
 	reason, _ := payload["reason"].(string)
-	eventID := stableReviewEvidenceID(eventType, input.Repo, input.PRNumber, headSHA, reviewID, reason)
+	eventID := eventlog.StableReviewEvidenceID(eventType, input.Repo, input.PRNumber, headSHA, reviewID, reason)
 	entityID := fmt.Sprintf("%s#%d", input.Repo, input.PRNumber)
 	existing, err := r.repos.Events.ListByEntityAndEventTypes(ctx, "pull_request", entityID, []string{eventType})
 	if err != nil {
@@ -3983,12 +3983,6 @@ func (r *Runner) appendReviewEvidence(ctx context.Context, input stepInput, even
 		}
 	}
 	return err
-}
-
-func stableReviewEvidenceID(eventType, repo string, prNumber int64, headSHA, reviewID, reason string) string {
-	identity := fmt.Sprintf("%s\x00%s\x00%d\x00%s\x00%s\x00%s", eventType, strings.TrimSpace(repo), prNumber, strings.TrimSpace(headSHA), strings.TrimSpace(reviewID), strings.TrimSpace(reason))
-	digest := sha256.Sum256([]byte(identity))
-	return fmt.Sprintf("%s:%x", eventType, digest[:])
 }
 
 type eventInput struct {

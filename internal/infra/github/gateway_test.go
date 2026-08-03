@@ -3167,7 +3167,7 @@ func TestGatewayListMergedPullRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListMergedPullRequests() error = %v", err)
 	}
-	if len(prs) != 1 || prs[0].HeadSHA != "abc123" || prs[0].Additions != 120 || prs[0].Deletions != 30 {
+	if len(prs) != 1 || prs[0].Number != 42 || prs[0].MergedAt != "2026-07-30T12:00:00Z" || prs[0].HeadSHA != "abc123" || prs[0].Additions != 120 || prs[0].Deletions != 30 || !prs[0].AdditionsKnown || !prs[0].DeletionsKnown {
 		t.Fatalf("ListMergedPullRequests() = %#v", prs)
 	}
 }

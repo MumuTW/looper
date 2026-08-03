@@ -82,7 +82,7 @@ func latestCodexReviewForHead(ctx context.Context, repos *storage.Repositories, 
 // latter answers the current projection, while discovery needs an event-time
 // edge so a below-threshold success is invalidated exactly once when a later
 // blocking review arrives.
-func reviewerReviewEvidenceAppearedSince(ctx context.Context, repos *storage.Repositories, projectID, repo string, prNumber int64, requiredHeadSHA, since string) (bool, error) {
+func reviewerReviewEvidenceAppearedSince(ctx context.Context, repos *storage.Repositories, projectID, repo string, prNumber int64, requiredHeadSHA, since, previousRecordedAt string) (bool, error) {
 	if repos == nil || repos.Events == nil {
 		return false, fmt.Errorf("events repository is not configured")
 	}
@@ -112,8 +112,25 @@ func reviewerReviewEvidenceAppearedSince(ctx context.Context, repos *storage.Rep
 			continue
 		}
 		eventTime, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(event.CreatedAt))
-		if parseErr == nil && eventTime.After(sinceTime) {
+		if parseErr != nil {
+			continue
+		}
+		if eventTime.After(sinceTime) {
 			return true, nil
+		}
+		// Event-log timestamps are millisecond precision while a report can
+		// preserve a nanosecond-precision clock value. An event created at the
+		// same instant as the report must still invalidate the cache. Once a
+		// report has projected that event into CodexReview.RecordedAt, the equal
+		// timestamp is known evidence and must not trigger every later tick.
+		if eventTime.Equal(sinceTime) {
+			if strings.TrimSpace(previousRecordedAt) == "" {
+				return true, nil
+			}
+			previousTime, previousErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(previousRecordedAt))
+			if previousErr != nil || !eventTime.Equal(previousTime) {
+				return true, nil
+			}
 		}
 	}
 	return false, nil

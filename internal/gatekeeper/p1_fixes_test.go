@@ -213,9 +213,9 @@ func TestDiscoverPullRequestsPublishesKnownHeadsOnAbort(t *testing.T) {
 		case 1:
 			f.detail = githubinfra.PullRequestDetail{
 				Number: 41, State: "OPEN", HeadSHA: "head-a", BaseRefName: "main", BaseSHA: "base-1",
-				ReviewDecision: "APPROVED", Labels: []string{labels.HoldGlobal},
+				ReviewDecision: "APPROVED", Labels: []string{labels.HoldGlobal}, AdditionsKnown: true, DeletionsKnown: true,
 			}
-			f.mergeable = githubinfra.PullRequestDetail{Number: 41, HeadSHA: "head-a", BaseSHA: "base-1", Mergeable: &mergeable, MergeableState: "clean"}
+			f.mergeable = githubinfra.PullRequestDetail{Number: 41, HeadSHA: "head-a", BaseSHA: "base-1", Mergeable: &mergeable, MergeableState: "clean", AdditionsKnown: true, DeletionsKnown: true}
 			f.finalHeadSHA = "head-a"
 			f.finalBaseSHA = "base-1"
 		default:
@@ -223,9 +223,9 @@ func TestDiscoverPullRequestsPublishesKnownHeadsOnAbort(t *testing.T) {
 				_ = fixture.closeDB()
 			}
 			f.detail = githubinfra.PullRequestDetail{
-				Number: 42, State: "OPEN", HeadSHA: "head-b", BaseRefName: "main", BaseSHA: "base-1", ReviewDecision: "APPROVED",
+				Number: 42, State: "OPEN", HeadSHA: "head-b", BaseRefName: "main", BaseSHA: "base-1", ReviewDecision: "APPROVED", AdditionsKnown: true, DeletionsKnown: true,
 			}
-			f.mergeable = githubinfra.PullRequestDetail{Number: 42, HeadSHA: "head-b", BaseSHA: "base-1", Mergeable: &mergeable, MergeableState: "clean"}
+			f.mergeable = githubinfra.PullRequestDetail{Number: 42, HeadSHA: "head-b", BaseSHA: "base-1", Mergeable: &mergeable, MergeableState: "clean", AdditionsKnown: true, DeletionsKnown: true}
 			f.finalHeadSHA = "head-b"
 			f.finalBaseSHA = "base-1"
 		}

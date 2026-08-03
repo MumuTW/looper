@@ -92,6 +92,46 @@ func TestDiscoverPullRequestsReevaluatesSmallAutoChangeAfterReviewEvent(t *testi
 	}
 }
 
+// A Reviewer event can share the report's millisecond timestamp when both
+// writes observe the same clock tick. Discovery must treat that event as new,
+// then remember the projected event timestamp so the same row does not force a
+// full evaluation on every subsequent tick.
+func TestDiscoverPullRequestsReevaluatesReviewEventAtReportTimestamp(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	fixture.github.detail.Additions = 1
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{}
+	runner := fixture.autoRunner()
+
+	first := discoverWithRunner(t, runner)
+	if first.Evaluated != 1 || !first.Reports[0].Eligible {
+		t.Fatalf("first discovery = %#v, want eligible below-threshold report", first)
+	}
+	second := discoverWithRunner(t, runner)
+	if second.Evaluated != 0 || second.Skipped != 1 {
+		t.Fatalf("second discovery = %#v, want unchanged report skipped", second)
+	}
+	seedReviewerReviewEvent(t, fixture, "head-1", "REQUEST_CHANGES", "reviewer-loop", 0)
+
+	third := discoverWithRunner(t, runner)
+	if third.Evaluated != 1 || third.Skipped != 0 {
+		t.Fatalf("third discovery = %#v, want equal-timestamp review to invalidate cache", third)
+	}
+	fourth := discoverWithRunner(t, runner)
+	if fourth.Evaluated != 0 || fourth.Skipped != 1 {
+		t.Fatalf("fourth discovery = %#v, want equal-timestamp event consumed once", fourth)
+	}
+}
+
+func discoverWithRunner(t *testing.T, runner *Runner) DiscoveryResult {
+	t.Helper()
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	return result
+}
+
 // Anything the list page can observe changing must force a fresh evaluation.
 func TestDiscoverPullRequestsReevaluatesWhenTheListPageChanges(t *testing.T) {
 	for _, testCase := range []struct {
