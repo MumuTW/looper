@@ -678,9 +678,9 @@ func TestRunDiskSweepDryRunRemovesNothing(t *testing.T) {
 func TestRunDiskSweepBudgetSpansRoots(t *testing.T) {
 	firstRoot := t.TempDir()
 	secondRoot := t.TempDir()
-	mkdirAt(t, filepath.Join(firstRoot, "a"), old())
-	mkdirAt(t, filepath.Join(firstRoot, "b"), old())
-	mkdirAt(t, filepath.Join(secondRoot, "c"), old())
+	mkdirAt(t, filepath.Join(firstRoot, "a"), sweepNow.Add(-90*24*time.Hour))
+	mkdirAt(t, filepath.Join(firstRoot, "b"), sweepNow.Add(-60*24*time.Hour))
+	mkdirAt(t, filepath.Join(secondRoot, "c"), sweepNow.Add(-30*24*time.Hour))
 
 	var removed []string
 	options := sweepOptions(DiskSweepRoot{ProjectID: "one", RepoPath: filepath.Join(t.TempDir(), "repo"), WorktreeRoot: firstRoot}, stubSweepGit{}, &removed)
@@ -1065,8 +1065,8 @@ func TestRunContainerSweepHonorsRetentionAndBudget(t *testing.T) {
 
 func TestRunContainerSweepDoesNotSpendBudgetOnFailedRemoval(t *testing.T) {
 	sharedRoot := t.TempDir()
-	first := mkContainer(t, sharedRoot, "repo-first", old())
-	second := mkContainer(t, sharedRoot, "repo-second", old())
+	first := mkContainer(t, sharedRoot, "repo-first", sweepNow.Add(-90*24*time.Hour))
+	second := mkContainer(t, sharedRoot, "repo-second", sweepNow.Add(-60*24*time.Hour))
 	var attempts []string
 	options := containerOptions(sharedRoot, nil, stubSweepGit{}, &attempts)
 	options.Budget = 2

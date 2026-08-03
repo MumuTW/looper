@@ -1196,6 +1196,7 @@ shutdownTimeoutMs = 1000
 [daemon.worktreeCleanup]
 enabled = false
 interval = "24h"
+maxDiskSweepPerTick = 2000
 retentionDays = 7
 maxPerTick = 10
 includeOrphans = false
@@ -1742,6 +1743,7 @@ Defaults:
 - `daemon.worktreeCleanup.interval = "24h"`
 - `daemon.worktreeCleanup.retentionDays = 7`
 - `daemon.worktreeCleanup.maxPerTick = 10`
+- `daemon.worktreeCleanup.maxDiskSweepPerTick = 2000` — the shared per-pass budget for unregistered directories and unreachable containers. Set to `0` to disable only the filesystem disk-sweep tier while keeping record-driven cleanup enabled.
 - `daemon.worktreeCleanup.includeOrphans = true` — a worktree record that no loop, run, or queue item references is still gated by `retentionDays`, because the planner ages every candidate by its own `createdAt`/`updatedAt`. Set this to `false` only to keep unreferenced worktrees indefinitely; the sweeper then reclaims almost nothing, since the reference graph drops old worktrees as loops move on.
 - `daemon.worktreeCleanup.dryRun = false`
 
@@ -1774,4 +1776,4 @@ looper worktree cleanup --confirm
 looper worktree cleanup --json
 ```
 
-Cleanup removes Looper-managed worktree checkouts only. It does not delete branches, skips dirty worktrees, preserves worktrees referenced by active loop state, and does not automatically delete filesystem-only orphan directories that are not present in Looper's worktree records.
+Record-driven cleanup removes only clean Looper-managed worktree checkouts and preserves filesystem-only paths that have no worktrees row. The separate disk-sweep tier may remove eligible unregistered directories and unreachable containers when `maxDiskSweepPerTick` is positive. Neither tier deletes branches; both skip dirty or otherwise protected work.
