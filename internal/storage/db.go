@@ -85,12 +85,20 @@ func openPathWithPreservedURIOptions(original, frozenFS string) string {
 	if len(trimmed) < 5 || !strings.EqualFold(trimmed[:5], "file:") {
 		return frozenFS
 	}
-	rest := trimmed[5:]
-	query := ""
-	if i := strings.Index(rest, "?"); i >= 0 {
-		query = rest[i:]
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return frozenFS
 	}
-	return "file:" + filepath.ToSlash(frozenFS) + query
+	// URL.String escapes delimiters in Path (for example ? and #) while
+	// keeping RawQuery separate. Rebuilding by concatenating the frozen path
+	// with the original query would turn an escaped filename delimiter into a
+	// new SQLite URI delimiter.
+	parsed.Scheme = "file"
+	parsed.Host = ""
+	parsed.Opaque = ""
+	parsed.Path = filepath.ToSlash(frozenFS)
+	parsed.RawPath = ""
+	return parsed.String()
 }
 
 // resolveOpenedDatabasePath freezes storage.dbPath for restore metadata: file:

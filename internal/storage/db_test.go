@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -131,6 +132,82 @@ func TestSQLiteFilesystemPathParsesOpaqueFileURI(t *testing.T) {
 	}
 	if !isFile || path != "looper.sqlite" {
 		t.Fatalf("SQLiteFilesystemPath(opaque file URI) = (%q, %t), want (looper.sqlite, true)", path, isFile)
+	}
+}
+
+func TestOpenPathWithPreservedURIOptionsEscapesFrozenPath(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		original string
+		frozen   string
+	}{
+		{
+			name:     "question mark",
+			original: "file:/data/a%3Fb.sqlite?cache=shared",
+			frozen:   "/data/a?b.sqlite",
+		},
+		{
+			name:     "hash",
+			original: "file:/data/a%23b.sqlite?cache=shared",
+			frozen:   "/data/a#b.sqlite",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := openPathWithPreservedURIOptions(tt.original, tt.frozen)
+			parsed, err := url.Parse(got)
+			if err != nil {
+				t.Fatalf("url.Parse(%q) error = %v", got, err)
+			}
+			if parsed.Path != tt.frozen {
+				t.Fatalf("parsed.Path = %q, want %q", parsed.Path, tt.frozen)
+			}
+			if parsed.RawQuery != "cache=shared" {
+				t.Fatalf("parsed.RawQuery = %q, want %q", parsed.RawQuery, "cache=shared")
+			}
+			if strings.Contains(got, tt.frozen[strings.IndexAny(tt.frozen, "?#"):]) {
+				t.Fatalf("URI path delimiter was not escaped: %q", got)
+			}
+		})
+	}
+}
+
+func TestOpenSQLiteCoordinatorEscapedURIFilenames(t *testing.T) {
+	for _, filename := range []string{"question?mark.sqlite", "hash#mark.sqlite"} {
+		filename := filename
+		t.Run(filename, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), filename)
+			dsn := (&url.URL{Scheme: "file", Path: dbPath, RawQuery: "cache=shared"}).String()
+			coordinator, err := OpenSQLiteCoordinator(context.Background(), dsn, SQLiteCoordinatorOptions{})
+			if err != nil {
+				t.Fatalf("OpenSQLiteCoordinator(%q) error = %v", dsn, err)
+			}
+			t.Cleanup(func() {
+				if err := coordinator.Close(); err != nil {
+					t.Fatalf("coordinator.Close() error = %v", err)
+				}
+			})
+
+			expectedPath, err := filepath.Abs(dbPath)
+			if err != nil {
+				t.Fatalf("filepath.Abs(%q) error = %v", dbPath, err)
+			}
+			if resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(expectedPath)); err == nil {
+				expectedPath = filepath.Join(filepath.Clean(resolvedParent), filepath.Base(expectedPath))
+			}
+			if got := coordinator.DatabasePath(); got != expectedPath {
+				t.Fatalf("coordinator.DatabasePath() = %q, want %q", got, expectedPath)
+			}
+			if _, err := coordinator.DB().ExecContext(context.Background(), `CREATE TABLE uri_filename_probe (id INTEGER PRIMARY KEY)`); err != nil {
+				t.Fatalf("create probe table: %v", err)
+			}
+			if _, err := os.Stat(dbPath); err != nil {
+				t.Fatalf("stat escaped URI database %q: %v", dbPath, err)
+			}
+		})
 	}
 }
 
