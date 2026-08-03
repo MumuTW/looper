@@ -91,6 +91,7 @@ type fileOperations struct {
 	rename           func(string, string) error
 	link             func(string, string) error
 	exclusivePublish func(source, dest string) error
+	syncDirectory    func(string) error
 }
 
 var defaultFileOperations = fileOperations{rename: os.Rename, link: os.Link}
@@ -1047,7 +1048,19 @@ func publishNoReplace(operations fileOperations, source, dest, description strin
 	if link == nil {
 		link = os.Link
 	}
+	syncDirectory := operations.syncDirectory
+	if syncDirectory == nil {
+		syncDirectory = func(directory string) error {
+			return syncDirectories(directory)
+		}
+	}
 	if err := link(source, dest); err == nil {
+		// The destination link must be durable before unlinking the only other
+		// name for the restored bytes. Rollback/recovery can then survive a crash
+		// between publication and source cleanup without losing both names.
+		if err := syncDirectory(filepath.Dir(dest)); err != nil {
+			return fmt.Errorf("sync destination directory after installing %s: %w", description, err)
+		}
 		if err := os.Remove(source); err != nil {
 			return fmt.Errorf("remove source after installing %s: %w", description, err)
 		}
@@ -1060,11 +1073,17 @@ func publishNoReplace(operations fileOperations, source, dest, description strin
 		if err := operations.exclusivePublish(source, dest); err != nil {
 			return fmt.Errorf("install %s: %w", description, err)
 		}
+		if err := syncDirectory(filepath.Dir(dest)); err != nil {
+			return fmt.Errorf("sync destination directory after installing %s: %w", description, err)
+		}
 		_ = os.Remove(source)
 		return nil
 	}
 	if err := copyFileExclusive(source, dest); err != nil {
 		return fmt.Errorf("install %s: %w", description, err)
+	}
+	if err := syncDirectory(filepath.Dir(dest)); err != nil {
+		return fmt.Errorf("sync destination directory after installing %s: %w", description, err)
 	}
 	if err := os.Remove(source); err != nil {
 		return fmt.Errorf("remove source after installing %s: %w", description, err)

@@ -396,6 +396,52 @@ func TestRestorePreservesCommittedArtifactsWhenTargetDriftsBeforeCleanup(t *test
 	}
 }
 
+func TestPublishNoReplaceSyncsDestinationBeforeRemovingSource(t *testing.T) {
+	for _, forceCopy := range []bool{false, true} {
+		name := "hard link"
+		if forceCopy {
+			name = "exclusive copy"
+		}
+		t.Run(name, func(t *testing.T) {
+			directory := t.TempDir()
+			source := filepath.Join(directory, "source")
+			destination := filepath.Join(directory, "destination")
+			writeTestFile(t, source, "restored bytes", 0o600)
+			synced := false
+			operations := fileOperations{
+				link: func(sourcePath, targetPath string) error {
+					if forceCopy {
+						return errors.New("force exclusive copy")
+					}
+					return os.Link(sourcePath, targetPath)
+				},
+				syncDirectory: func(path string) error {
+					if path != directory {
+						t.Fatalf("syncDirectory path = %q, want %q", path, directory)
+					}
+					if _, err := os.Stat(source); err != nil {
+						t.Fatalf("source at sync = %v, want source to remain until directory sync", err)
+					}
+					if _, err := os.Stat(destination); err != nil {
+						t.Fatalf("destination at sync = %v", err)
+					}
+					synced = true
+					return nil
+				},
+			}
+
+			if err := publishNoReplace(operations, source, destination, "test restore"); err != nil {
+				t.Fatalf("publishNoReplace() error = %v", err)
+			}
+			if !synced {
+				t.Fatal("publishNoReplace() did not sync destination directory")
+			}
+			assertPathMissing(t, source)
+			assertFileContents(t, destination, "restored bytes")
+		})
+	}
+}
+
 func assertJournalArtifactsBesideTargets(t *testing.T, journal restoreJournal) {
 	t.Helper()
 	if len(journal.Entries) != 4 {
