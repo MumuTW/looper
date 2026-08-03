@@ -11,12 +11,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/daemonbinary"
-	networkclient "github.com/nexu-io/looper/internal/network/client"
-	looperdruntime "github.com/nexu-io/looper/internal/runtime"
-	"github.com/nexu-io/looper/internal/triager"
-	"github.com/nexu-io/looper/internal/version"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/daemonbinary"
+	networkclient "github.com/MumuTW/looper/internal/network/client"
+	looperdruntime "github.com/MumuTW/looper/internal/runtime"
+	"github.com/MumuTW/looper/internal/triager"
+	"github.com/MumuTW/looper/internal/version"
 )
 
 type statusResponse struct {
@@ -28,6 +28,7 @@ type statusResponse struct {
 	Webhook         statusWebhook       `json:"webhook"`
 	Loops           statusLoops         `json:"loops"`
 	Network         any                 `json:"network,omitempty"`
+	ResourceGuard   any                 `json:"resourceGuard"`
 	Safety          statusSafety        `json:"safety"`
 	Notifications   statusNotifications `json:"notifications"`
 	Tools           statusTools         `json:"tools"`
@@ -310,6 +311,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 		Webhook:         summarizeWebhookStatus(h.buildWebhookStatusResponse()),
 		Loops:           loopCounts,
 		Network:         h.buildNetworkStatusResponse(),
+		ResourceGuard:   h.buildResourceGuardStatusResponse(),
 		Safety: statusSafety{
 			AllowAutoCommit:    h.context.Config.Defaults.AllowAutoCommit,
 			AllowAutoPush:      h.context.Config.Defaults.AllowAutoPush,
@@ -350,6 +352,18 @@ func (h *Handler) buildNetworkStatusResponse() any {
 		return runtimeWithNetwork.NetworkStatus()
 	}
 	return nil
+}
+
+func (h *Handler) buildResourceGuardStatusResponse() any {
+	if runtimeWithGuard, ok := any(h.context.Runtime).(interface {
+		HostAdmissionStatus() looperdruntime.HostAdmissionStatus
+	}); ok {
+		return runtimeWithGuard.HostAdmissionStatus()
+	}
+	return looperdruntime.HostAdmissionStatus{
+		Enabled: h.context.Config.Daemon.ResourceGuard.Enabled,
+		Admit:   true,
+	}
 }
 
 type storageState struct {

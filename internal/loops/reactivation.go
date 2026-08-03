@@ -7,16 +7,15 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/eventlog"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // These errors describe durable queue-reactivation failures. Entry points map
 // them to their own transport errors; the authority remains the loop and queue
 // records passed to ReactivateQueue, not the HTTP handler.
 var (
-	ErrLoopNotFound             = errors.New("loop not found")
 	ErrActiveLoopConflict       = errors.New("active loop conflict")
 	ErrInvalidQueueTarget       = errors.New("invalid queue target")
 	ErrReactivationUnconfigured = errors.New("queue reactivation is not configured")

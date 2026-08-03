@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/nexu-io/looper/internal/fixer"
-	"github.com/nexu-io/looper/internal/storage"
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	"github.com/MumuTW/looper/internal/fixer"
+	"github.com/MumuTW/looper/internal/storage"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 func (h *Handler) buildLoopLogsResponse(ctx context.Context, loop storage.LoopRecord) (loopLogsResponse, error) {
@@ -116,6 +116,7 @@ func serializeLoop(loop storage.LoopRecord) loopResponse {
 		Status:       loop.Status,
 		ConfigJSON:   loop.ConfigJSON,
 		MetadataJSON: loop.MetadataJSON,
+		Convergence:  parseReviewerConvergenceProjection(loop.MetadataJSON),
 		LastRunAt:    loop.LastRunAt,
 		NextRunAt:    loop.NextRunAt,
 		CreatedAt:    loop.CreatedAt,

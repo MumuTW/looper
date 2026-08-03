@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/nexu-io/looper/internal/config"
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	"github.com/MumuTW/looper/internal/config"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 func (h *Handler) handleConfigRoute(w http.ResponseWriter, r *http.Request, requestID string) {
@@ -105,6 +105,7 @@ type configRolesResponse struct {
 	Fixer       config.FixerRoleConfig             `json:"fixer"`
 	Worker      config.WorkerRoleConfig            `json:"worker"`
 	Coordinator config.CoordinatorRoleConfig       `json:"coordinator"`
+	Escalator   config.EscalatorRoleConfig         `json:"escalator"`
 }
 
 type configServerResponse struct {
@@ -134,6 +135,7 @@ type configDaemonResponse struct {
 	WorkingDirectory       string                       `json:"workingDirectory"`
 	Environment            map[string]string            `json:"environment"`
 	WorktreeCleanup        config.WorktreeCleanupConfig `json:"worktreeCleanup"`
+	ResourceGuard          config.ResourceGuardConfig   `json:"resourceGuard"`
 }
 
 type configPackageResponse struct {
@@ -182,6 +184,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 			WorkingDirectory:       cfg.Daemon.WorkingDirectory,
 			Environment:            map[string]string{},
 			WorktreeCleanup:        cfg.Daemon.WorktreeCleanup,
+			ResourceGuard:          cfg.Daemon.ResourceGuard,
 		},
 		Package: configPackageResponse{
 			Distribution:               cfg.Package.Distribution,
@@ -199,6 +202,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 			Fixer:       cfg.Roles.Fixer,
 			Worker:      cfg.Roles.Worker,
 			Coordinator: cfg.Roles.Coordinator,
+			Escalator:   cfg.Roles.Escalator,
 		},
 		Providers: append([]config.ProviderConfig{}, cfg.Providers...),
 		Projects:  redactProjectSecrets(cfg.Projects),

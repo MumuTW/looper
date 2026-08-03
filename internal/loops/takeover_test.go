@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestPrepareHandbackCapturesSessionAndCancelsQueueTogether(t *testing.T) {

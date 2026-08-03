@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestReactivateQueueRevivesCancelledQueueWithoutDuplicate(t *testing.T) {

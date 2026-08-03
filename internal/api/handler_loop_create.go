@@ -10,14 +10,14 @@ import (
 	"os"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/eventlog"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/storage"
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/eventlog"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/storage"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 type createLoopRequest struct {
@@ -119,6 +119,12 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	if err != nil {
 		return loopResponse{}, err
 	}
+	if domain.LoopType(loopType) == domain.LoopTypeWorker && target.TargetType == domain.LoopTargetTypeIssue {
+		metadataJSON, err = issueWorkerMetadataJSON(metadataJSON, target, derefBool(body.Force))
+		if err != nil {
+			return loopResponse{}, err
+		}
+	}
 	if domain.LoopType(loopType) == domain.LoopTypePlanner {
 		metadataJSON, err = manualPlannerMetadataJSON(metadataJSON, target.IssueNumber)
 		if err != nil {
@@ -149,6 +155,9 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
 		return loopResponse{}, err
 	}
+	if err := h.validateCodingProjectRunnable(*project, domain.LoopType(loopType)); err != nil {
+		return loopResponse{}, err
+	}
 	if err := h.validateManualHoldBypassForLoopTarget(r.Context(), projectID, domain.LoopType(loopType), target, derefBool(body.Force)); err != nil {
 		return loopResponse{}, err
 	}
@@ -174,6 +183,19 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			return storage.LoopRecord{}, err
 		}
 		candidateStatus := domain.LoopStatus(status)
+		candidate := storage.LoopRecord{
+			ProjectID:    projectID,
+			Type:         loopType,
+			TargetType:   targetType,
+			TargetID:     loopTargetIDCompat(target),
+			Repo:         repoFromTargetCompat(target),
+			PRNumber:     prNumberFromTargetCompat(target),
+			Status:       string(candidateStatus),
+			MetadataJSON: metadataJSON,
+		}
+		if err := assertIssueClaimAdmission(r.Context(), transactionRepos, candidate, derefBool(body.Force)); err != nil {
+			return storage.LoopRecord{}, err
+		}
 		if err := assertUniqueActiveLoopCompat(existing, "", projectID, domain.LoopType(loopType), target, candidateStatus); err != nil {
 			return storage.LoopRecord{}, err
 		}
@@ -208,7 +230,7 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			record.NextRunAt = &nowISO
 		}
 
-		if err := transactionRepos.Loops.Upsert(r.Context(), record); err != nil {
+		if err := upsertLoopAfterIssueClaimAdmission(r.Context(), transactionRepos.Loops, record, derefBool(body.Force)); err != nil {
 			return storage.LoopRecord{}, err
 		}
 
@@ -364,6 +386,9 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
 		return workerCreateResponse{}, err
 	}
+	if err := h.validateCodingProjectRunnable(project, domain.LoopTypeWorker); err != nil {
+		return workerCreateResponse{}, err
+	}
 	if requestedIssueTarget != nil {
 		if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), *requestedIssueTarget); err != nil {
 			return workerCreateResponse{}, err
@@ -390,21 +415,23 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	}
 
 	workerPayload := struct {
-		Title       string  `json:"title"`
-		Prompt      *string `json:"prompt"`
-		SpecPath    *string `json:"specPath"`
-		Repo        string  `json:"repo"`
-		BaseBranch  string  `json:"baseBranch"`
-		IssueNumber *int64  `json:"issueNumber,omitempty"`
-		PRNumber    *int64  `json:"prNumber,omitempty"`
+		Title              string  `json:"title"`
+		Prompt             *string `json:"prompt"`
+		SpecPath           *string `json:"specPath"`
+		Repo               string  `json:"repo"`
+		BaseBranch         string  `json:"baseBranch"`
+		IssueNumber        *int64  `json:"issueNumber,omitempty"`
+		PRNumber           *int64  `json:"prNumber,omitempty"`
+		IssueClaimOverride bool    `json:"issueClaimOverride,omitempty"`
 	}{
-		Title:       title,
-		Prompt:      prompt,
-		SpecPath:    effectiveSpecPath,
-		Repo:        *repo,
-		BaseBranch:  *baseBranch,
-		IssueNumber: issueNumber,
-		PRNumber:    effectivePRNumber,
+		Title:              title,
+		Prompt:             prompt,
+		SpecPath:           effectiveSpecPath,
+		Repo:               *repo,
+		BaseBranch:         *baseBranch,
+		IssueNumber:        issueNumber,
+		PRNumber:           effectivePRNumber,
+		IssueClaimOverride: issueNumber != nil && derefBool(body.Force),
 	}
 	payloadJSONBytes, err := json.Marshal(struct {
 		Worker any `json:"worker"`
@@ -462,6 +489,9 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 			}
 		}
 	}
+	if reuseStopGateLoopID != "" && h.workerReuseAfterClearStopGateHook != nil {
+		h.workerReuseAfterClearStopGateHook(reuseStopGateLoopID)
+	}
 	restoreReuseStopGate := func() error {
 		if reuseGateWasActive && reuseStopGateLoopID != "" && services.ActiveExecutions != nil {
 			return services.ActiveExecutions.RestoreLoopStop(reuseStopGateLoopID)
@@ -476,33 +506,76 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		if listErr != nil {
 			return storage.LoopRecord{}, listErr
 		}
+		var reusableLoop *storage.LoopRecord
 		if issueNumber != nil {
-			if existingLoop, existingTarget, ok, reuseErr := reusableWorkerLoopForIssueRequestCompat(existing, projectID, *requestedIssueTarget, target); reuseErr != nil {
+			if existingLoop, _, ok, reuseErr := reusableWorkerLoopForIssueRequestCompat(existing, projectID, *requestedIssueTarget, target); reuseErr != nil {
 				return storage.LoopRecord{}, reuseErr
 			} else if ok {
-				reusedWorkerLoop = true
-				// Ensure gate is open even when the pre-TX scan missed this loop;
-				// still before commit so the queue item is not yet claimable.
-				if services.ActiveExecutions != nil {
-					if reuseStopGateLoopID == "" {
-						reuseStopGateLoopID = existingLoop.ID
-					}
-					// Clear+report under one lock: looper stop may establish the gate
-					// after the pre-TX clear saw it inactive. Without this return
-					// value, TX abort restore would skip (flag still false).
-					if services.ActiveExecutions.ClearLoopStop(existingLoop.ID) {
-						reuseGateWasActive = true
-					}
-				}
-				resumed, resumeErr := h.resumeReusableWorkerLoopCompat(r.Context(), repos, existingLoop, existingTarget, nowISO, derefBool(body.Force))
-				if resumeErr != nil {
-					return storage.LoopRecord{}, resumeErr
-				}
-				return resumed, nil
+				loop := existingLoop
+				reusableLoop = &loop
 			}
+		}
+		if requestedIssueTarget != nil {
+			reusedLoopID := ""
+			if reusableLoop != nil {
+				reusedLoopID = reusableLoop.ID
+			}
+			admissionCandidate := storage.LoopRecord{
+				ID:           reusedLoopID,
+				ProjectID:    projectID,
+				Type:         string(domain.LoopTypeWorker),
+				TargetType:   targetType,
+				TargetID:     &targetID,
+				Repo:         repo,
+				PRNumber:     effectivePRNumber,
+				Status:       string(domain.LoopStatusQueued),
+				MetadataJSON: &metadataJSON,
+			}
+			if admissionErr := assertIssueClaimAdmission(r.Context(), repos, admissionCandidate, derefBool(body.Force)); admissionErr != nil {
+				return storage.LoopRecord{}, admissionErr
+			}
+		}
+		if reusableLoop != nil {
+			reusedWorkerLoop = true
+			existingLoop := *reusableLoop
+			existingTarget, targetErr := loopTargetFromRecordCompat(existingLoop)
+			if targetErr != nil {
+				return storage.LoopRecord{}, targetErr
+			}
+			// Ensure gate is open even when the pre-TX scan missed this loop;
+			// still before commit so the queue item is not yet claimable.
+			if services.ActiveExecutions != nil {
+				if reuseStopGateLoopID == "" {
+					reuseStopGateLoopID = existingLoop.ID
+				}
+				// Clear+report under one lock: looper stop may establish the gate
+				// after the pre-TX clear saw it inactive. Without this return
+				// value, TX abort restore would skip (flag still false).
+				if services.ActiveExecutions.ClearLoopStop(existingLoop.ID) {
+					reuseGateWasActive = true
+				}
+			}
+			resumed, resumeErr := h.resumeReusableWorkerLoopCompat(r.Context(), repos, existingLoop, existingTarget, nowISO, derefBool(body.Force))
+			if resumeErr != nil {
+				return storage.LoopRecord{}, resumeErr
+			}
+			return resumed, nil
 		}
 		if uniqueErr := assertUniqueActiveLoopCompat(existing, "", projectID, domain.LoopTypeWorker, target, domain.LoopStatusQueued); uniqueErr != nil {
 			return storage.LoopRecord{}, uniqueErr
+		}
+		candidate := storage.LoopRecord{
+			ProjectID:    projectID,
+			Type:         string(domain.LoopTypeWorker),
+			TargetType:   targetType,
+			TargetID:     &targetID,
+			Repo:         repo,
+			PRNumber:     effectivePRNumber,
+			Status:       string(domain.LoopStatusQueued),
+			MetadataJSON: &metadataJSON,
+		}
+		if err := assertIssueClaimAdmission(r.Context(), repos, candidate, derefBool(body.Force)); err != nil {
+			return storage.LoopRecord{}, err
 		}
 
 		seq, seqErr := repos.Loops.AllocateSeq(r.Context())
@@ -525,7 +598,7 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 			CreatedAt:    nowISO,
 			UpdatedAt:    nowISO,
 		}
-		if upsertErr := repos.Loops.Upsert(r.Context(), record); upsertErr != nil {
+		if upsertErr := upsertLoopAfterIssueClaimAdmission(r.Context(), repos.Loops, record, derefBool(body.Force)); upsertErr != nil {
 			return storage.LoopRecord{}, upsertErr
 		}
 
@@ -615,6 +688,9 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	if force || (loopType != domain.LoopTypePlanner && loopType != domain.LoopTypeWorker && loopType != domain.LoopTypeReviewer && loopType != domain.LoopTypeFixer) {
 		return nil
 	}
+	if target.TargetType != domain.LoopTargetTypeIssue && target.TargetType != domain.LoopTargetTypePullRequest {
+		return nil
+	}
 	services := h.context.Runtime.Services()
 	if services.Repositories == nil || services.Repositories.Projects == nil {
 		return nil
@@ -622,6 +698,19 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	project, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, projectID)
 	if err != nil {
 		return err
+	}
+	// An injected refresher is already the caller's explicit freshness authority;
+	// unlike the default GitHub gateway, it does not require a local checkout or
+	// a configured gh binary.
+	if h.context.RefreshTargetLabels != nil {
+		labels, refreshErr := h.refreshTargetLabels(ctx, target, project.RepoPath, "")
+		if refreshErr != nil {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", refreshErr)}
+		}
+		if domain.IsAutoLaneHeld(loopType, labels) {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}
+		}
+		return nil
 	}
 	// Hold preflight is best-effort at create time: when we cannot reliably talk to
 	// GitHub from this handler context (missing repo path, missing gh path, etc.) we
@@ -636,30 +725,30 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	if ghPath == "" {
 		return nil
 	}
-	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: project.RepoPath, Env: config.DaemonGitHubCredentialEnv(h.context.Config), GHRun: shell.Run})
-	labels := []string(nil)
-	switch target.TargetType {
-	case domain.LoopTargetTypeIssue:
-		// Labels-only: ViewIssue would additionally page through every comment
-		// on the issue, and this preflight reads nothing but the labels.
-		issueLabels, err := gh.GetIssueLabels(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: project.RepoPath})
-		if err != nil {
-			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
-		}
-		labels = issueLabels
-	case domain.LoopTargetTypePullRequest:
-		detail, err := gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: target.Repo, PRNumber: target.PRNumber, CWD: project.RepoPath})
-		if err != nil {
-			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
-		}
-		labels = detail.Labels
-	default:
-		return nil
+	labels, refreshErr := h.refreshTargetLabels(ctx, target, project.RepoPath, ghPath)
+	if refreshErr != nil {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", refreshErr)}
 	}
 	if !domain.IsAutoLaneHeld(loopType, labels) {
 		return nil
 	}
 	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}
+}
+
+func (h *Handler) refreshTargetLabels(ctx context.Context, target domain.LoopTarget, cwd, ghPath string) ([]string, error) {
+	if h.context.RefreshTargetLabels != nil {
+		return h.context.RefreshTargetLabels(ctx, target, cwd)
+	}
+	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: cwd, Env: config.DaemonGitHubCredentialEnv(h.context.Config), GHRun: shell.Run})
+	switch target.TargetType {
+	case domain.LoopTargetTypeIssue:
+		return gh.GetIssueLabels(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: cwd})
+	case domain.LoopTargetTypePullRequest:
+		detail, err := gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: target.Repo, PRNumber: target.PRNumber, CWD: cwd})
+		return detail.Labels, err
+	default:
+		return nil, nil
+	}
 }
 
 // refuseOccupiedIssueTarget asks the forge whether the issue is still open and
@@ -748,7 +837,7 @@ func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *sto
 		loop.Status = string(domain.LoopStatusQueued)
 		loop.NextRunAt = &nowISO
 		loop.UpdatedAt = nowISO
-		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+		if err := upsertLoopAfterIssueClaimAdmission(ctx, repos.Loops, loop, force); err != nil {
 			return storage.LoopRecord{}, err
 		}
 	}
@@ -1020,6 +1109,17 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 		if uniqueErr := assertUniqueActiveLoopCompat(existing, "", projectID, domain.LoopTypePlanner, target, domain.LoopStatusRunning); uniqueErr != nil {
 			return storage.LoopRecord{}, uniqueErr
 		}
+		plannerCandidate := storage.LoopRecord{
+			ProjectID:  projectID,
+			Type:       string(domain.LoopTypePlanner),
+			TargetType: string(domain.LoopTargetTypeIssue),
+			TargetID:   &targetID,
+			Repo:       repo,
+			Status:     string(domain.LoopStatusRunning),
+		}
+		if err := assertIssueClaimAdmission(r.Context(), repos, plannerCandidate, derefBool(body.Force)); err != nil {
+			return storage.LoopRecord{}, err
+		}
 
 		record := storage.LoopRecord{
 			ID:           generateRequestID(),
@@ -1037,7 +1137,7 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 			CreatedAt:    nowISO,
 			UpdatedAt:    nowISO,
 		}
-		if upsertErr := repos.Loops.Upsert(r.Context(), record); upsertErr != nil {
+		if upsertErr := upsertLoopAfterIssueClaimAdmission(r.Context(), repos.Loops, record, derefBool(body.Force)); upsertErr != nil {
 			return storage.LoopRecord{}, upsertErr
 		}
 

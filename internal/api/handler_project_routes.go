@@ -7,10 +7,10 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/storage"
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/storage"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 func (h *Handler) buildProjectsRouteResponse(r *http.Request) (any, error) {
@@ -162,6 +162,7 @@ func (h *Handler) buildUpdateProjectResponse(r *http.Request, service projectSer
 	updated, err := service.UpdateProject(r.Context(), identifier, projects.UpdateInput{
 		Repo: updateProjectField(body.Repo), Name: updateProjectField(body.Name),
 		BaseBranch: updateProjectField(body.BaseBranch), WorktreeRoot: updateProjectField(body.WorktreeRoot),
+		Validation: body.Validation,
 	})
 	if err != nil {
 		var notFound projects.ProjectNotFoundError
@@ -226,7 +227,6 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		IDSource:     idSource,
 		WorktreeRoot: normalizeOptionalString(body.WorktreeRoot),
 		Repo:         normalizeOptionalString(body.Repo),
-		Provider:     normalizeOptionalString(body.Provider),
 		Validation:   cloneProjectValidation(body.Validation),
 		SnapshotMode: snapshotMode,
 	})
