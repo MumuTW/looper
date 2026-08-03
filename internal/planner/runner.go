@@ -180,6 +180,7 @@ type GitHubGateway interface {
 	AddIssueAssignees(context.Context, IssueAssigneesInput) error
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
+	ViewPullRequestForDiscovery(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	CreatePullRequest(context.Context, CreatePullRequestInput) (CreatePullRequestResult, error)
 	UpdatePullRequestBody(context.Context, UpdatePullRequestBodyInput) error
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
@@ -1612,7 +1613,7 @@ func (r *Runner) plannerHoldSummaryForCheckpoint(ctx context.Context, project st
 	if checkpoint.Publish == nil || checkpoint.Publish.PullRequest == nil || checkpoint.Publish.PullRequest.Number == 0 {
 		return false, "", nil
 	}
-	prDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: checkpoint.Issue.Repo, PRNumber: checkpoint.Publish.PullRequest.Number, CWD: project.RepoPath})
+	prDetail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: checkpoint.Issue.Repo, PRNumber: checkpoint.Publish.PullRequest.Number, CWD: project.RepoPath})
 	if err != nil {
 		return false, "", err
 	}
@@ -1626,7 +1627,7 @@ func (r *Runner) plannerAdoptedPullRequestHoldSummary(ctx context.Context, proje
 	if plannerQueueItemIsManual(queueItem) || r.github == nil || repo == "" || prNumber == 0 {
 		return false, "", nil
 	}
-	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
+	detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
 	if err != nil {
 		return false, "", err
 	}
@@ -1712,7 +1713,7 @@ func (r *Runner) validatedLifecyclePullRequest(ctx context.Context, input stepIn
 	if state == nil || state.PRNumber <= 0 {
 		return nil, nil
 	}
-	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: issue.Repo, PRNumber: state.PRNumber, CWD: input.Project.RepoPath})
+	detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: issue.Repo, PRNumber: state.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
 		return nil, nil
 	}
@@ -1733,7 +1734,7 @@ func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, run storage
 	if r.github == nil || prNumber <= 0 || !r.disclosure.Enabled || !r.disclosure.Channels.PullRequest {
 		return nil
 	}
-	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		return err
 	}

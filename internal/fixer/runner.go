@@ -346,6 +346,7 @@ type GitHubGateway interface {
 	GetCurrentUserLogin(context.Context, string, string) (string, error)
 	GetPullRequestAuthor(context.Context, ViewPullRequestInput) (string, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
+	ViewPullRequestForDiscovery(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ListReviewThreads(context.Context, ListReviewThreadsInput) ([]ReviewThread, error)
 	ViewReviewThread(context.Context, ViewReviewThreadInput) (ReviewThread, error)
 	ResolveReviewThread(context.Context, ResolveReviewThreadInput) error

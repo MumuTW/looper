@@ -1696,6 +1696,9 @@ func (s *stubCoordinatorGitHub) ViewPullRequest(_ context.Context, input githubi
 	}
 	return githubinfra.PullRequestDetail{}, nil
 }
+func (s *stubCoordinatorGitHub) ViewPullRequestForDiscovery(_ context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
+	return s.ViewPullRequest(context.Background(), input)
+}
 func (s *stubCoordinatorGitHub) GetIssueState(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueState, error) {
 	detail := s.details[input.IssueNumber]
 	return githubinfra.IssueState{State: detail.State, StateReason: detail.StateReason}, nil
