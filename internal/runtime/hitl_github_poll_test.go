@@ -82,6 +82,25 @@ func TestPollGitHubHITLAnswersOnce(t *testing.T) {
 	}
 }
 
+func TestPollGitHubHITLAnswersOnceDoesNotClearAfterUnappliedAnswer(t *testing.T) {
+	cleared := 0
+	deps := githubHITLPollDeps{
+		listComments: func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
+			return []githubAnswerComment{{ID: 501, Author: "maintainer", Body: "publish it"}}, nil
+		},
+		deliverAnswer: func(_ contextType, _, _ string) error { return errHITLAnswerNotApplied },
+		clearAwaiting: func(_ contextType, _ string, _ int64, _ string) { cleared++ },
+		answerAuthors: []string{"maintainer"},
+	}
+
+	got := pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{{
+		ID: "loop-a", Repo: "acme/x", Transport: "github", AskStatus: "awaiting", PRNumber: 42, AskCommentID: 500,
+	}}, deps)
+	if got != 0 || cleared != 0 {
+		t.Fatalf("unapplied answer side effects = (delivered:%d, cleared:%d), want (0, 0)", got, cleared)
+	}
+}
+
 func TestPollGitHubHITLAnswersOnceEmptyAllowlistRejectsUnauthorizedComment(t *testing.T) {
 	delivered := 0
 	deps := githubHITLPollDeps{
@@ -284,7 +303,7 @@ func TestRunGitHubHITLPollUsesHostScopedRepositoryPermissionAndIsReplaySafe(t *t
 		}
 	}})
 	cfg := config.Config{HITL: config.HITLConfig{Enabled: true, AnswerTransport: "github"}}
-	input := defaultSchedulerTickInput{Repos: repos, GitHubGateway: gateway, Config: &cfg, Now: func() time.Time { return now }}
+	input := defaultSchedulerTickInput{DB: coordinator.DB(), Repos: repos, GitHubGateway: gateway, Config: &cfg, Now: func() time.Time { return now }}
 	project := storage.ProjectRecord{ID: projectID, RepoPath: "/tmp/repo"}
 
 	runGitHubHITLPoll(context.Background(), input, project)

@@ -75,6 +75,25 @@ func TestPollFeishuHITLInboxCursorBlocksOnFailedDelivery(t *testing.T) {
 	}
 }
 
+func TestPollFeishuHITLInboxCursorBlocksOnUnappliedAnswer(t *testing.T) {
+	callbackAttempts := 0
+	deps := feishuHITLPollDeps{
+		loopBySeq: func(_ contextType, _ int64) string { return "loop-seq" },
+		deliverAnswer: func(_ contextType, _, _ string) error {
+			callbackAttempts++
+			return errHITLAnswerNotApplied
+		},
+	}
+
+	n, newCursor := pollFeishuHITLInboxOnce(context.Background(), []feishuInboxEvent{
+		makeCardAction(9, "1", "ok"),
+		makeCardAction(10, "1", "later"),
+	}, deps, 0)
+	if n != 0 || newCursor != 0 || callbackAttempts != 1 {
+		t.Fatalf("unapplied answer = (handled:%d, cursor:%d, attempts:%d), want (0, 0, 1)", n, newCursor, callbackAttempts)
+	}
+}
+
 func TestPollFeishuHITLInboxCursorAdvancesPastSkippedEvents(t *testing.T) {
 	events := []feishuInboxEvent{
 		{ID: 10, Kind: "message", RootID: "om_root", Text: "   "},

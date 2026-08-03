@@ -155,7 +155,7 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			return loop.ID
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			if err := deliverHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer); err != nil {
+			if err := deliverHITLAnswerToLoop(ctx, input.DB, input.Repos, nowISO, loopID, answer); err != nil {
 				return err
 			}
 			if input.OnHITLAnswerDelivered != nil {
