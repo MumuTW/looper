@@ -243,14 +243,46 @@ func TestRunDiskSweepChecksCancellationBeforeRemoval(t *testing.T) {
 	var removed []string
 	options := sweepOptions(DiskSweepRoot{ProjectID: "app", RepoPath: filepath.Join(t.TempDir(), "repo"), WorktreeRoot: root}, stubSweepGit{clean: map[string]bool{path: true}, cancel: cancel}, &removed)
 	plan, err := RunDiskSweep(ctx, options)
-	if err != nil {
-		t.Fatalf("RunDiskSweep() error = %v", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunDiskSweep() error = %v, want context.Canceled", err)
 	}
 	if len(removed) != 0 {
 		t.Fatalf("removed = %v, want cancellation to prevent removal", removed)
 	}
 	if action, reason := reasonFor(t, plan, path); action != ActionSkipped || reason != "context_canceled" {
 		t.Fatalf("candidate = (%q, %q), want context_canceled skip", action, reason)
+	}
+}
+
+func TestRunContainerSweepReturnsFinalBoundaryCancellation(t *testing.T) {
+	sharedRoot := t.TempDir()
+	container := filepath.Join(sharedRoot, "repo-canceled")
+	mkdirAt(t, filepath.Join(container, "project_1", "worker-worktree"), old())
+	if err := os.Chtimes(container, old(), old()); err != nil {
+		t.Fatalf("Chtimes(container): %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var removed []string
+	options := containerOptions(sharedRoot, nil, stubSweepGit{}, &removed)
+	containerReads := 0
+	options.ReadDir = func(path string) ([]DiskEntry, error) {
+		entries, err := readDirEntries(path)
+		if err == nil && path == container {
+			containerReads++
+			if containerReads == 2 {
+				cancel()
+			}
+		}
+		return entries, err
+	}
+
+	_, err := RunContainerSweep(ctx, options)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunContainerSweep() error = %v, want context.Canceled", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want no removal after final-boundary cancellation", removed)
 	}
 }
 

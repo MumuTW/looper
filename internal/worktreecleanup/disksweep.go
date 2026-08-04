@@ -430,7 +430,7 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 			result.Summary.Skipped++
 			result.Candidates = append(result.Candidates, decided)
 			releaseMutation()
-			continue
+			return result, err
 		}
 
 		result.Summary.WouldRemove++
@@ -1013,7 +1013,7 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 				result.Summary.Skipped++
 				result.Candidates = append(result.Candidates, decided)
 				releaseMutation()
-				continue
+				return result, err
 			}
 			registered, err := options.IsRegisteredPath(ctx, decided.Path)
 			if err != nil {
@@ -1076,7 +1076,7 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 				result.Summary.Skipped++
 				result.Candidates = append(result.Candidates, decided)
 				releaseMutation()
-				continue
+				return result, err
 			}
 
 			result.Summary.WouldRemove++
