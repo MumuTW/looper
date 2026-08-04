@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/MumuTW/looper/internal/escalator"
+	"github.com/MumuTW/looper/internal/gatekeeper"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // countingLoader records how often durable state was actually read.
@@ -49,8 +51,9 @@ func TestLoadCacheAdvancesEscalatorAgesInsideTheWindow(t *testing.T) {
 	cache := NewLoadCache(RefreshInterval, func() time.Time { return clock })
 	load := cache.Wrap(func(context.Context) Input {
 		return Input{Now: clock, Escalator: escalator.Snapshot{
-			Items:   []escalator.Item{{ID: "item", AgeSeconds: 7}},
-			Backlog: []escalator.StageBacklog{{ProjectID: "project", OldestAgeSeconds: 11}},
+			GeneratedAt: clock.Add(-2 * time.Second).Format(time.RFC3339Nano),
+			Items:       []escalator.Item{{ID: "item", AgeSeconds: 7}},
+			Backlog:     []escalator.StageBacklog{{ProjectID: "project", OldestAgeSeconds: 11}},
 		}}
 	})
 
@@ -61,8 +64,8 @@ func TestLoadCacheAdvancesEscalatorAgesInsideTheWindow(t *testing.T) {
 	if first.Escalator.Items[0].AgeSeconds != 7 || first.Escalator.Backlog[0].OldestAgeSeconds != 11 {
 		t.Fatalf("cached source was mutated: %#v", first.Escalator)
 	}
-	if second.Escalator.Items[0].AgeSeconds != 12 || second.Escalator.Backlog[0].OldestAgeSeconds != 16 {
-		t.Fatalf("cached Escalator ages = %#v, want item 12s/backlog 16s", second.Escalator)
+	if second.Escalator.Items[0].AgeSeconds != 14 || second.Escalator.Backlog[0].OldestAgeSeconds != 18 {
+		t.Fatalf("cached Escalator ages = %#v, want collector-relative item 14s/backlog 18s", second.Escalator)
 	}
 }
 
@@ -154,5 +157,25 @@ func TestLoadCacheIsSafeForConcurrentPolls(t *testing.T) {
 	defer mu.Unlock()
 	if calls == 0 || calls > 8 {
 		t.Fatalf("underlying loads = %d, want between 1 and 8", calls)
+	}
+}
+
+func TestUnreadableGateReportBecomesBlockedEvidence(t *testing.T) {
+	t.Parallel()
+
+	projectID, entityID := "proj", "acme/widgets#1"
+	record := storage.EventLogRecord{
+		ProjectID: &projectID, EntityID: &entityID, CreatedAt: iso(testNow.Add(-time.Minute)),
+		PayloadJSON: "{not-json",
+	}
+	report, ok := unreadableGateReport(record)
+	if !ok {
+		t.Fatal("unreadableGateReport() = false, want durable identity projection")
+	}
+	if report.Status != gatekeeper.StatusBlocked || report.Eligible || report.Repo != "acme/widgets" || report.PRNumber != 1 {
+		t.Fatalf("unreadable report = %#v, want blocked acme/widgets#1", report)
+	}
+	if len(report.Reasons) != 1 || report.Reasons[0].Code != gatekeeper.ReasonProviderStateUnavailable {
+		t.Fatalf("unreadable report reasons = %#v, want provider-state block", report.Reasons)
 	}
 }

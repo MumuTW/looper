@@ -59,6 +59,10 @@ func TestBootstrapExchangeOnceWorksSecondFails(t *testing.T) {
 	if data["token"] != token {
 		t.Fatalf("token = %#v, want %q", data["token"], token)
 	}
+	cookies := rec1.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != dashboardSessionCookieName || cookies[0].Value != token || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteLaxMode {
+		t.Fatalf("bootstrap session cookie = %#v, want HttpOnly Lax browser session", cookies)
+	}
 
 	// Second exchange fails with generic message.
 	rec2 := exchangeBootstrapCode(t, h, code, "")
@@ -68,6 +72,32 @@ func TestBootstrapExchangeOnceWorksSecondFails(t *testing.T) {
 	errMap := parseEnvelopeError(t, rec2)
 	if errMap["message"] != bootstrapInvalidMsg {
 		t.Fatalf("message = %#v, want %q", errMap["message"], bootstrapInvalidMsg)
+	}
+}
+
+func TestBootstrapSessionCookieAuthorizesServerRenderedWebUI(t *testing.T) {
+	t.Parallel()
+
+	token := "secret-token"
+	h := NewHandler(Context{Config: config.Config{
+		Server: config.ServerConfig{AuthMode: config.AuthModeLocalToken, LocalToken: &token},
+	}})
+	code := mintBootstrapCode(t, h, token)
+	exchange := exchangeBootstrapCode(t, h, code, "")
+	if exchange.Code != http.StatusOK {
+		t.Fatalf("exchange status = %d, want 200", exchange.Code)
+	}
+	cookies := exchange.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("exchange cookies = %#v, want one session cookie", cookies)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/ui/triage", nil)
+	request.AddCookie(cookies[0])
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("cookie-authenticated /ui status = %d, want 200: %s", recorder.Code, recorder.Body.String())
 	}
 }
 

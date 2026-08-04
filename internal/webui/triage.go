@@ -249,6 +249,11 @@ type Input struct {
 	// map keeps pure callers backwards-compatible; a non-nil map excludes
 	// archived/removed projects from the board.
 	ActiveProjects map[string]bool
+	// ActiveProjectRepositories is the current durable repository binding for
+	// active projects. A nil map, or a project without a known binding, keeps
+	// the pure projection backwards-compatible; a known binding excludes rows
+	// left behind by a repository rebinding.
+	ActiveProjectRepositories map[string]string
 	// Reports holds the latest merge-gate report per pull request.
 	Reports []gatekeeper.Report
 	Loops   []storage.LoopRecord
@@ -269,8 +274,10 @@ func Classify(in Input) Board {
 	}
 	now = now.UTC()
 
-	pullRequests, terminalPRs := latestSnapshotPerPR(in.Snapshots, in.ActiveProjects)
-	for _, loop := range in.Loops {
+	loops := activeLoops(in.Loops, in.ActiveProjects, in.ActiveProjectRepositories)
+	queue := activeQueue(in.Queue, in.ActiveProjects, in.ActiveProjectRepositories)
+	pullRequests, terminalPRs := latestSnapshotPerPR(in.Snapshots, in.ActiveProjects, in.ActiveProjectRepositories)
+	for _, loop := range loops {
 		if loop.Repo == nil || loop.PRNumber == nil || !domain.IsActiveLoopStatus(domain.LoopStatus(loop.Status)) {
 			continue
 		}
@@ -294,8 +301,8 @@ func Classify(in Input) Board {
 		}
 	}
 	reports := latestReportPerPR(in.Reports)
-	loopsByPR, loopLinks := indexLoops(in.Loops, in.Links)
-	queueByPR := indexQueue(in.Queue)
+	loopsByPR, loopLinks := indexLoops(loops, in.Links)
+	queueByPR := indexQueue(queue)
 	pullRequestLinks := prLinks(pullRequests, in.Links)
 	pullRequestLinkFallback := uniqueLinkFallback(pullRequestLinks)
 	terminalPRLinks := terminalPullRequestLinks(terminalPRs, in.Links)
@@ -391,6 +398,13 @@ func Classify(in Input) Board {
 func reportForSnapshot(report *gatekeeper.Report, snapshot storage.PullRequestSnapshotRecord) *gatekeeper.Report {
 	if report == nil {
 		return nil
+	}
+	// Gatekeeper evaluates the durable forge state after discovery captures a
+	// snapshot. An older snapshot must not invalidate that newer report merely
+	// because its evidence naturally differs; the report is the fresher source
+	// of truth until discovery produces a later capture.
+	if evaluatedAt, capturedAt := parseTimestamp(report.EvaluatedAt), parseTimestamp(snapshot.CapturedAt); !evaluatedAt.IsZero() && !capturedAt.IsZero() && evaluatedAt.After(capturedAt) {
+		return report
 	}
 	observed, current := strings.TrimSpace(report.ObservedHeadSHA), strings.TrimSpace(snapshot.HeadSHA)
 	if observed != "" && current != "" && !strings.EqualFold(observed, current) {
@@ -660,12 +674,18 @@ func pullRequestRow(now time.Time, key PRKey, snapshot storage.PullRequestSnapsh
 		}
 	}
 	blocker := primaryBlocker(report, payload, snapshot, items)
+	if (blocker.Code == "draft" || blocker.Code == string(gatekeeper.ReasonPullRequestDraft)) && !working {
+		// A draft without a live queued/running loop is an unattended human
+		// decision, not machine progress. Keep draft's reason/label, but move
+		// ownership to the actionable side of the board.
+		blocker.owner = ownerHuman
+	}
 	group := groupFor(blocker, working)
 	stuck := false
 	for _, item := range items {
+		changedAt = later(changedAt, now.Add(-time.Duration(item.AgeSeconds)*time.Second))
 		if item.Kind == escalator.KindStuck {
 			stuck = true
-			changedAt = later(changedAt, now.Add(-time.Duration(item.AgeSeconds)*time.Second))
 		}
 	}
 	// A stuck digest item means the machine has already given up on this pull
@@ -1165,10 +1185,13 @@ func checksPending(summary *string) bool {
 // latestSnapshotPerPR keeps the newest capture per pull request. It returns
 // open rows plus the latest terminal keys separately so loop synthesis cannot
 // resurrect a closed/merged PR while cleanup is still in progress.
-func latestSnapshotPerPR(records []storage.PullRequestSnapshotRecord, activeProjects map[string]bool) (map[PRKey]storage.PullRequestSnapshotRecord, map[PRKey]struct{}) {
+func latestSnapshotPerPR(records []storage.PullRequestSnapshotRecord, activeProjects map[string]bool, activeProjectRepositories map[string]string) (map[PRKey]storage.PullRequestSnapshotRecord, map[PRKey]struct{}) {
 	latest := map[PRKey]storage.PullRequestSnapshotRecord{}
 	for _, record := range records {
 		if activeProjects != nil && !activeProjects[record.ProjectID] {
+			continue
+		}
+		if !projectRepositoryMatches(activeProjectRepositories, record.ProjectID, record.Repo) {
 			continue
 		}
 		key := newPRKey(record.ProjectID, record.Repo, record.PRNumber)
@@ -1187,6 +1210,49 @@ func latestSnapshotPerPR(records []storage.PullRequestSnapshotRecord, activeProj
 		}
 	}
 	return out, terminal
+}
+
+func projectRepositoryMatches(activeProjectRepositories map[string]string, projectID, repo string) bool {
+	if activeProjectRepositories == nil {
+		return true
+	}
+	configured, known := activeProjectRepositories[projectID]
+	if !known || strings.TrimSpace(configured) == "" {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(configured), strings.TrimSpace(repo))
+}
+
+func activeLoops(records []storage.LoopRecord, activeProjects map[string]bool, activeProjectRepositories map[string]string) []storage.LoopRecord {
+	filtered := make([]storage.LoopRecord, 0, len(records))
+	for _, loop := range records {
+		if activeProjects != nil && !activeProjects[loop.ProjectID] {
+			continue
+		}
+		if loop.Repo != nil && !projectRepositoryMatches(activeProjectRepositories, loop.ProjectID, *loop.Repo) {
+			continue
+		}
+		filtered = append(filtered, loop)
+	}
+	return filtered
+}
+
+func activeQueue(records []storage.QueueItemRecord, activeProjects map[string]bool, activeProjectRepositories map[string]string) []storage.QueueItemRecord {
+	filtered := make([]storage.QueueItemRecord, 0, len(records))
+	for _, item := range records {
+		projectID := ""
+		if item.ProjectID != nil {
+			projectID = *item.ProjectID
+		}
+		if activeProjects != nil && !activeProjects[projectID] {
+			continue
+		}
+		if item.Repo != nil && !projectRepositoryMatches(activeProjectRepositories, projectID, *item.Repo) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
 }
 
 func newerSnapshot(candidate, existing storage.PullRequestSnapshotRecord) bool {

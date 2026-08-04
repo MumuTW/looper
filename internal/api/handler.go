@@ -946,7 +946,13 @@ func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 		return nil
 	}
 
-	if r.Header.Get("Authorization") != fmt.Sprintf("Bearer %s", *cfg.Server.LocalToken) {
+	authenticatedToken := r.Header.Get("Authorization")
+	if strings.TrimSpace(authenticatedToken) == "" {
+		if cookie, err := r.Cookie(dashboardSessionCookieName); err == nil {
+			authenticatedToken = "Bearer " + cookie.Value
+		}
+	}
+	if authenticatedToken != fmt.Sprintf("Bearer %s", *cfg.Server.LocalToken) {
 		return apiError{
 			code:    pkgapi.ErrorCodeUnauthorized,
 			status:  http.StatusUnauthorized,

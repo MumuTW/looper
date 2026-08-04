@@ -13,6 +13,7 @@ import (
 const (
 	dashboardBootstrapCodePath     = apiBasePath + "/dashboard/bootstrap/code"
 	dashboardBootstrapExchangePath = apiBasePath + "/dashboard/bootstrap/exchange"
+	dashboardSessionCookieName     = "looper_dashboard_session"
 )
 
 type bootstrapCodeResponse struct {
@@ -122,6 +123,18 @@ func (h *Handler) handleBootstrapExchange(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Browser surfaces cannot attach an Authorization header to a top-level
+	// navigation, stylesheet, or htmx request. The one-shot exchange is the
+	// existing bootstrap authority, so bind its result to a host-only session
+	// cookie as well as returning the token for the SPA's in-memory client.
+	http.SetCookie(w, &http.Cookie{
+		Name:     dashboardSessionCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil,
+		SameSite: http.SameSiteLaxMode,
+	})
 	h.writeSuccessNoStore(w, requestID, bootstrapExchangeResponse{Token: token})
 }
 

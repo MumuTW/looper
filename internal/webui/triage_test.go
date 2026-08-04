@@ -280,8 +280,9 @@ func TestClassifyPrimaryBlockerAndGroup(t *testing.T) {
 			wantTone:  ToneActionable,
 		},
 		{
-			name:      "a draft is machine work, not a decision",
+			name:      "a draft being worked is machine work",
 			options:   payloadOptions{draft: true},
+			loops:     []storage.LoopRecord{activeLoop(1)},
 			wantCode:  "draft",
 			wantLabel: "draft",
 			wantGroup: GroupMachine,
@@ -510,6 +511,7 @@ func TestClassifyMarksSameHeadSnapshotEvidenceAsStale(t *testing.T) {
 		t.Fatalf("marshal snapshot payload: %v", err)
 	}
 	current := snapshot(t, 1, payloadOptions{})
+	current.CapturedAt = iso(testNow.Add(-time.Hour))
 	current.PayloadJSON = ptr(string(payloadJSON))
 	current.ReviewState = &reviewState
 	current.UnresolvedThreadCount = ptrInt64(0)
@@ -531,6 +533,7 @@ func TestClassifyMarksMissingChecksAsStaleEvidence(t *testing.T) {
 	t.Parallel()
 
 	current := snapshot(t, 1, payloadOptions{})
+	current.CapturedAt = iso(testNow.Add(-time.Hour))
 	report := report(1, true)
 	report.ObservedHeadSHA = current.HeadSHA
 	report.SourceFingerprint = "source-fingerprint"
@@ -548,6 +551,103 @@ func TestClassifyMarksMissingChecksAsStaleEvidence(t *testing.T) {
 	}
 	if group != GroupMachine {
 		t.Fatalf("missing-check evidence group = %v, want machine", group)
+	}
+}
+
+func TestClassifyLetsNewerGateReportOutrankOlderSnapshot(t *testing.T) {
+	t.Parallel()
+
+	current := snapshot(t, 1, payloadOptions{})
+	// The report is newer than this capture; an older discovery view must not
+	// invalidate the fresher Gatekeeper verdict.
+	newer := report(1, true)
+	board := Classify(Input{
+		Now: testNow, Snapshots: []storage.PullRequestSnapshotRecord{current},
+		Reports: []gatekeeper.Report{newer}, Links: testLinker{},
+	})
+	row, _ := rowFor(t, board, 1)
+	if row.Blocker.Code != "eligible" {
+		t.Fatalf("newer report blocker = %#v, want eligible", row.Blocker)
+	}
+}
+
+func TestClassifyDatesWaitingBlockerFromEscalatorItem(t *testing.T) {
+	t.Parallel()
+
+	item := escalator.Item{
+		ID: "triage_confirmation:proj:acme/widgets:1", ProjectID: "proj",
+		Kind: escalator.KindWaiting, Reason: escalator.ReasonTriageConfirmation,
+		Link: testLinker{}.PullRequest("proj", "acme/widgets", 1), AgeSeconds: 5 * 60,
+	}
+	board := Classify(Input{
+		Now: testNow, Snapshots: []storage.PullRequestSnapshotRecord{snapshot(t, 1, payloadOptions{})},
+		Escalator: escalator.Snapshot{Items: []escalator.Item{item}}, Links: testLinker{},
+	})
+	row, _ := rowFor(t, board, 1)
+	want := testNow.Add(-5 * time.Minute)
+	if !row.ChangedAt.Equal(want) || row.Changed {
+		t.Fatalf("waiting blocker age = (%v, changed=%v), want %v and settled", row.ChangedAt, row.Changed, want)
+	}
+}
+
+func TestClassifyKeepsUnattendedDraftActionable(t *testing.T) {
+	t.Parallel()
+
+	board := Classify(Input{
+		Now:       testNow,
+		Snapshots: []storage.PullRequestSnapshotRecord{snapshot(t, 1, payloadOptions{draft: true})},
+		Links:     testLinker{},
+	})
+	row, group := rowFor(t, board, 1)
+	if row.Blocker.Code != "draft" || group != GroupActionable {
+		t.Fatalf("unattended draft = (%#v, %v), want draft/actionable", row.Blocker, group)
+	}
+}
+
+func TestClassifyKeepsGatekeeperDraftActionableWithoutWork(t *testing.T) {
+	t.Parallel()
+
+	draft := report(1, false, gatekeeper.ReasonPullRequestDraft)
+	board := Classify(Input{
+		Now:       testNow,
+		Snapshots: []storage.PullRequestSnapshotRecord{snapshot(t, 1, payloadOptions{})},
+		Reports:   []gatekeeper.Report{draft}, Links: testLinker{},
+	})
+	row, group := rowFor(t, board, 1)
+	if row.Blocker.Code != string(gatekeeper.ReasonPullRequestDraft) || group != GroupActionable {
+		t.Fatalf("Gatekeeper draft = (%#v, %v), want pull_request_draft/actionable", row.Blocker, group)
+	}
+}
+
+func TestClassifyScopesRowsToCurrentProjectRepository(t *testing.T) {
+	t.Parallel()
+
+	old := snapshot(t, 1, payloadOptions{})
+	current := snapshot(t, 2, payloadOptions{})
+	current.Repo = "acme/current"
+	oldLoop := activeLoop(1)
+	oldLoop.Repo = ptr("acme/old")
+	oldLoop.PRNumber = ptr(int64(1))
+	board := Classify(Input{
+		Now:                       testNow,
+		ActiveProjects:            map[string]bool{"proj": true},
+		ActiveProjectRepositories: map[string]string{"proj": "acme/current"},
+		Snapshots:                 []storage.PullRequestSnapshotRecord{old, current},
+		Loops:                     []storage.LoopRecord{oldLoop}, Links: testLinker{},
+	})
+	if board.Total() != 1 {
+		t.Fatalf("repository-scoped board total = %d, want only current repository", board.Total())
+	}
+	found := false
+	for _, section := range board.Sections {
+		for _, row := range section.Rows {
+			if row.Key == "pr-proj-acme-current-2" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("current repository pull request row is missing")
 	}
 }
 

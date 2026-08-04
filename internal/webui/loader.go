@@ -3,6 +3,8 @@ package webui
 import (
 	"context"
 	"encoding/json"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,9 +62,14 @@ func (c *LoadCache) Wrap(inner Loader) Loader {
 		if c.loaded && now.Sub(c.loadedAt) < c.ttl {
 			cached := c.input
 			c.mu.Unlock()
-			// The state is the state that was read; advance relative Escalator
-			// ages by the cache wait so the board stays honest about the wait.
-			cached = advanceCachedAges(cached, now.Sub(c.loadedAt))
+			// The state is the state that was read; advance relative to the
+			// collector's durable generation timestamp so a slow Collect call
+			// cannot make the digest look younger than the data it contains.
+			elapsed := now.Sub(c.loadedAt)
+			if generatedAt := parseTimestamp(cached.Escalator.GeneratedAt); !generatedAt.IsZero() {
+				elapsed = now.Sub(generatedAt)
+			}
+			cached = advanceCachedAges(cached, elapsed)
 			cached.Now = now
 			return cached
 		}
@@ -125,8 +132,12 @@ func NewRepositoryLoader(repos *storage.Repositories, collector *escalator.Colle
 				input.Notices = append(input.Notices, "Projects could not be read.")
 			} else {
 				input.ActiveProjects = make(map[string]bool, len(projects))
+				input.ActiveProjectRepositories = make(map[string]string, len(projects))
 				for _, project := range projects {
 					input.ActiveProjects[project.ID] = !project.Archived
+					if repo := projectRepository(project.MetadataJSON); repo != "" {
+						input.ActiveProjectRepositories[project.ID] = repo
+					}
 				}
 			}
 		}
@@ -175,6 +186,22 @@ func NewRepositoryLoader(repos *storage.Repositories, collector *escalator.Colle
 	}
 }
 
+// projectRepository is the durable Project binding, not a value copied from a
+// stale snapshot. A missing or malformed metadata payload leaves the repo
+// unknown so the read surface remains backwards-compatible with legacy rows.
+func projectRepository(metadataJSON *string) string {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return ""
+	}
+	var metadata struct {
+		Repo string `json:"repo"`
+	}
+	if err := json.Unmarshal([]byte(*metadataJSON), &metadata); err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(metadata.Repo))
+}
+
 // loadGateReports projects the durable merge-gate events. Gatekeeper appends one
 // report per evaluation, so the newest per pull request is the current verdict:
 // the query returns only that row per entity, because every earlier evaluation
@@ -190,11 +217,43 @@ func loadGateReports(ctx context.Context, events *storage.EventsRepository) ([]g
 	for _, record := range records {
 		var report gatekeeper.Report
 		if json.Unmarshal([]byte(record.PayloadJSON), &report) != nil {
-			// A payload this surface cannot read is one report missing from the
-			// board, not a reason to drop every other report with it.
+			// The event row is still durable evidence that Gatekeeper evaluated
+			// this PR. Preserve its identity as a blocked provider-state report;
+			// silently dropping it would make an unreadable verdict look ready.
+			if blocked, ok := unreadableGateReport(record); ok {
+				reports = append(reports, blocked)
+			}
 			continue
 		}
 		reports = append(reports, report)
 	}
 	return reports, nil
+}
+
+func unreadableGateReport(record storage.EventLogRecord) (gatekeeper.Report, bool) {
+	if record.ProjectID == nil || record.EntityID == nil {
+		return gatekeeper.Report{}, false
+	}
+	entity := strings.TrimSpace(*record.EntityID)
+	separator := strings.LastIndexByte(entity, '#')
+	if separator <= 0 || separator == len(entity)-1 {
+		return gatekeeper.Report{}, false
+	}
+	number, err := strconv.ParseInt(entity[separator+1:], 10, 64)
+	if err != nil || number <= 0 {
+		return gatekeeper.Report{}, false
+	}
+	repo := strings.TrimSpace(entity[:separator])
+	if repo == "" {
+		return gatekeeper.Report{}, false
+	}
+	return gatekeeper.Report{
+		Version:     2,
+		Status:      gatekeeper.StatusBlocked,
+		ProjectID:   strings.TrimSpace(*record.ProjectID),
+		Repo:        repo,
+		PRNumber:    number,
+		Reasons:     []gatekeeper.Reason{{Code: gatekeeper.ReasonProviderStateUnavailable, Subject: "gate_report"}},
+		EvaluatedAt: strings.TrimSpace(record.CreatedAt),
+	}, true
 }
