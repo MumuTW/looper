@@ -1675,8 +1675,11 @@ func TestRunExecuteStepPersistsProgressBeforeTimeoutTermination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseCheckpoint() error = %v", err)
 	}
-	if storedCheckpoint.Execution == nil || storedCheckpoint.Execution.ProgressBeforeTimeout == nil || storedCheckpoint.Execution.ProgressBeforeTimeout.DiffFingerprint != "status-only-sha" {
+	if storedCheckpoint.Execution == nil || storedCheckpoint.Execution.RunID != run.ID || storedCheckpoint.Execution.ExecutionID != checkpoint.Execution.ExecutionID || storedCheckpoint.Execution.ProgressBeforeTimeout == nil || storedCheckpoint.Execution.ProgressBeforeTimeout.DiffFingerprint != "status-only-sha" {
 		t.Fatalf("stored timeout snapshot = %#v, want persisted progress", storedCheckpoint.Execution)
+	}
+	if storedCheckpoint.Continuation == nil || storedCheckpoint.Continuation.PredecessorRunID != run.ID || storedCheckpoint.Continuation.PredecessorExecutionID != checkpoint.Execution.ExecutionID {
+		t.Fatalf("stored timeout continuation = %#v, want correlation IDs", storedCheckpoint.Continuation)
 	}
 	if len(git.inspectCalls) != 2 {
 		t.Fatalf("InspectHead calls = %#v, want pre-timeout and post-termination observations", git.inspectCalls)
@@ -2490,6 +2493,59 @@ func TestRetryRunExecuteUsesPersistedReasoningEffortSnapshot(t *testing.T) {
 	}
 	if started.SnapshotReasoningEffort == nil || *started.SnapshotReasoningEffort != stickyEffort {
 		t.Fatalf("SnapshotReasoningEffort = %v, want %q", started.SnapshotReasoningEffort, stickyEffort)
+	}
+}
+
+func TestCreateRunContextCarriesTimeoutContinuationIntoRetryCheckpoint(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	before := &worktreeProgress{HeadSHA: "before-head", WorktreeID: "wt_timeout", Branch: "feature/timeout", DiffFingerprint: "before-status"}
+	after := &worktreeProgress{HeadSHA: "after-head", WorktreeID: "wt_timeout", Branch: "feature/timeout", DiffFingerprint: "after-status"}
+	checkpointJSON := runpipe.MustMarshalJSON(workerCheckpoint{
+		Work:         &workerInput{Title: "Worker timeout retry", Repo: "acme/looper", BaseBranch: "main"},
+		Worktree:     &checkpointWorktree{ID: "wt_timeout", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/timeout", BaseBranch: "main"},
+		Plan:         &checkpointPlan{Summary: "retry plan"},
+		Execution:    &checkpointExecution{RunID: "run_timeout", ExecutionID: "agent_timeout", Status: "timeout", ProgressBeforeTimeout: before},
+		Continuation: &checkpointContinuation{PredecessorRunID: "run_timeout", PredecessorExecutionID: "agent_timeout", Mode: "checkpoint_same_worktree", Outcome: "preserved", BeforeTimeout: before, AfterRestart: after},
+		ResumePolicy: "retry_from_timeout_context",
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_timeout",
+		LoopID:            "loop_worker_1",
+		Status:            "failed",
+		CurrentStep:       runpipe.StringPtr(string(stepPlan)),
+		LastCompletedStep: runpipe.StringPtr(string(stepPrepareWork)),
+		CheckpointJSON:    &checkpointJSON,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if !resumed.Resumed || resumed.Checkpoint.Continuation == nil {
+		t.Fatalf("resumed = %#v, want carried timeout continuation", resumed)
+	}
+	if resumed.Checkpoint.Continuation.PredecessorRunID != "run_timeout" || resumed.Checkpoint.Continuation.PredecessorExecutionID != "agent_timeout" || resumed.Checkpoint.Continuation.Outcome != "preserved" || resumed.Checkpoint.Continuation.AfterRestart == nil {
+		t.Fatalf("resumed continuation = %#v, want predecessor retry evidence", resumed.Checkpoint.Continuation)
+	}
+	persisted, err := fixture.repos.Runs.GetByID(context.Background(), resumed.Run.ID)
+	if err != nil || persisted == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", persisted, err)
+	}
+	persistedCheckpoint, err := parseCheckpoint(persisted.CheckpointJSON)
+	if err != nil || persistedCheckpoint.Continuation == nil || persistedCheckpoint.Continuation.Outcome != "preserved" {
+		t.Fatalf("persisted checkpoint = %#v, err=%v, want timeout continuation", persistedCheckpoint, err)
 	}
 }
 

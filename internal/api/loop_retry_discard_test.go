@@ -193,7 +193,7 @@ func TestHandlerLoopRetryDiscardClearsWorkerTimeoutEvidence(t *testing.T) {
 	if err != nil || worktree == nil {
 		t.Fatalf("Worktrees.GetByPath() = (%#v, %v)", worktree, err)
 	}
-	checkpoint := fmt.Sprintf(`{"worktree":{"id":%q,"path":%q,"branch":"feature/discard-worker-timeout"},"execution":{"status":"timeout","progressBeforeTimeout":{"headSha":"before","contentFingerprint":"preserve-me"},"progressSnapshotError":"operator action required"}}`, worktree.ID, fixture.WorktreePath)
+	checkpoint := fmt.Sprintf(`{"worktree":{"id":%q,"path":%q,"branch":"feature/discard-worker-timeout"},"execution":{"status":"timeout","progressBeforeTimeout":{"headSha":"before","contentFingerprint":"preserve-me"},"progressSnapshotError":"operator action required"},"continuation":{"mode":"checkpoint_same_worktree","outcome":"preserved","beforeTimeout":{"headSha":"before"},"afterRestart":{"headSha":"before"}}}`, worktree.ID, fixture.WorktreePath)
 	previous.CheckpointJSON = &checkpoint
 	if err := services.Repositories.Runs.Upsert(context.Background(), *previous); err != nil {
 		t.Fatalf("Runs.Upsert(timeout checkpoint) error = %v", err)
@@ -223,6 +223,19 @@ func TestHandlerLoopRetryDiscardClearsWorkerTimeoutEvidence(t *testing.T) {
 	if _, ok := execution["progressSnapshotError"]; ok {
 		t.Fatalf("progressSnapshotError remained after operator discard: %#v", execution)
 	}
+	active, err := h.buildActiveRunsResponse(httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil))
+	if err != nil {
+		t.Fatalf("buildActiveRunsResponse() error = %v", err)
+	}
+	for _, item := range active.Items {
+		if item.LoopID == fixture.LoopID {
+			if item.Continuation != nil {
+				t.Fatalf("active run continuation = %#v, want discard to remove stale evidence", item.Continuation)
+			}
+			return
+		}
+	}
+	t.Fatalf("active runs = %#v, want retried loop %s", active.Items, fixture.LoopID)
 }
 
 func TestHandlerLoopRetryDiscardWorktreeChangesResolvesBranchOnlyCheckpoint(t *testing.T) {

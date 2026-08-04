@@ -709,6 +709,7 @@ func TestHandlerActiveRunsProjectsWorkerTimeoutContinuationWithoutPaths(t *testi
 func TestBuildActiveRunContinuationUsesTimeoutEvidenceBeforeRetry(t *testing.T) {
 	checkpoint := `{
 		"execution":{
+			"runId":"run_timeout",
 			"executionId":"agent_timed_out",
 			"progressBeforeTimeout":{
 				"headSha":"before-head",
@@ -723,7 +724,7 @@ func TestBuildActiveRunContinuationUsesTimeoutEvidenceBeforeRetry(t *testing.T) 
 		}
 	}`
 
-	continuation := buildActiveRunContinuation(&storage.RunRecord{CheckpointJSON: &checkpoint})
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_timeout", CheckpointJSON: &checkpoint})
 	if continuation == nil {
 		t.Fatal("buildActiveRunContinuation() = nil, want timeout evidence")
 	}
@@ -751,6 +752,7 @@ func TestBuildActiveRunContinuationPrefersNewestTimeoutEvidenceAfterRetry(t *tes
 			"afterRestart":{"headSha":"first-head","diffFingerprint":"first-restart"}
 		},
 		"execution":{
+			"runId":"run_second_timeout",
 			"executionId":"agent_second_timeout",
 			"progressBeforeTimeout":{
 				"headSha":"second-head",
@@ -763,7 +765,7 @@ func TestBuildActiveRunContinuationPrefersNewestTimeoutEvidenceAfterRetry(t *tes
 		}
 	}`
 
-	continuation := buildActiveRunContinuation(&storage.RunRecord{CheckpointJSON: &checkpoint})
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_second_timeout", CheckpointJSON: &checkpoint})
 	if continuation == nil || continuation.BeforeTimeout == nil {
 		t.Fatalf("buildActiveRunContinuation() = %#v, want newest timeout evidence", continuation)
 	}
@@ -779,7 +781,7 @@ func TestBuildActiveRunContinuationPrefersNewestTimeoutEvidenceAfterRetry(t *tes
 
 func TestBuildActiveRunContinuationReportsObservationError(t *testing.T) {
 	checkpoint := `{"execution":{"runId":"run_timeout","executionId":"agent_timeout","status":"timeout","progressSnapshotError":"git status unavailable"}}`
-	continuation := buildActiveRunContinuation(&storage.RunRecord{CheckpointJSON: &checkpoint})
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_timeout", CheckpointJSON: &checkpoint})
 	if continuation == nil {
 		t.Fatal("buildActiveRunContinuation() = nil, want failed-observation projection")
 	}
@@ -794,7 +796,7 @@ func TestBuildActiveRunContinuationReportsObservationError(t *testing.T) {
 
 func TestBuildActiveRunContinuationPrefersObservationErrorOverPartialSnapshot(t *testing.T) {
 	checkpoint := `{"execution":{"runId":"run_timeout","executionId":"agent_timeout","status":"timeout","progressSnapshotError":"worktree changed after termination","progressBeforeTimeout":{"headSha":"before-head","diffFingerprint":"before-status"}}}`
-	continuation := buildActiveRunContinuation(&storage.RunRecord{CheckpointJSON: &checkpoint})
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_timeout", CheckpointJSON: &checkpoint})
 	if continuation == nil {
 		t.Fatal("buildActiveRunContinuation() = nil, want failed-observation projection")
 	}
@@ -806,7 +808,7 @@ func TestBuildActiveRunContinuationPrefersObservationErrorOverPartialSnapshot(t 
 
 func TestBuildActiveRunContinuationProjectsWorkerRetryOutcome(t *testing.T) {
 	checkpoint := `{"execution":{"status":"completed","runId":"run_retry","executionId":"agent_retry"},"continuation":{"predecessorRunId":"run_timeout","predecessorExecutionId":"agent_timeout","mode":"checkpoint_same_worktree","outcome":"preserved","beforeTimeout":{"headSha":"before-head","diffFingerprint":"before-status"},"afterRestart":{"headSha":"before-head","diffFingerprint":"before-status"}}}`
-	continuation := buildActiveRunContinuation(&storage.RunRecord{CheckpointJSON: &checkpoint})
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_retry", CheckpointJSON: &checkpoint})
 	if continuation == nil || continuation.BeforeTimeout == nil || continuation.AfterRestart == nil {
 		t.Fatalf("buildActiveRunContinuation() = %#v, want persisted retry comparison", continuation)
 	}
@@ -814,6 +816,19 @@ func TestBuildActiveRunContinuationProjectsWorkerRetryOutcome(t *testing.T) {
 	assertEqual(t, continuation.PredecessorExecutionID, "agent_timeout")
 	assertEqual(t, continuation.Mode, "checkpoint_same_worktree")
 	assertEqual(t, continuation.Outcome, "preserved")
+}
+
+func TestBuildActiveRunContinuationIgnoresInheritedExecutionForRetryComparison(t *testing.T) {
+	checkpoint := `{"execution":{"runId":"run_timeout","executionId":"agent_timeout","progressBeforeTimeout":{"headSha":"old-head","diffFingerprint":"old-timeout"}},"continuation":{"predecessorRunId":"run_timeout","predecessorExecutionId":"agent_timeout","mode":"checkpoint_same_worktree","outcome":"changed","beforeTimeout":{"headSha":"old-head","diffFingerprint":"old-timeout"},"afterRestart":{"headSha":"new-head","diffFingerprint":"new-timeout"}}}`
+
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_retry", CheckpointJSON: &checkpoint})
+	if continuation == nil || continuation.AfterRestart == nil {
+		t.Fatalf("buildActiveRunContinuation() = %#v, want retry comparison", continuation)
+	}
+	assertEqual(t, continuation.PredecessorRunID, "run_timeout")
+	assertEqual(t, continuation.Mode, "checkpoint_same_worktree")
+	assertEqual(t, continuation.Outcome, "changed")
+	assertEqual(t, continuation.AfterRestart.HeadSHA, "new-head")
 }
 
 // Successful completeRun summaries must not populate lastFailureReason when there

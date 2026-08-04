@@ -4009,24 +4009,30 @@ func buildActiveRunContinuation(run *storage.RunRecord) *activeRunContinuation {
 		return nil
 	}
 	checkpoint := parseJSONObject(run.CheckpointJSON)
+	// A resumed run carries the predecessor's timeout execution while the
+	// worker records a fresh checkpoint_same_worktree comparison. Execution is
+	// authoritative only when its correlation ID belongs to this run; otherwise
+	// projecting it would hide the newer retry outcome below.
 	// A retry can time out again after inheriting a predecessor continuation.
 	// Its own execution evidence is newer than that inherited comparison, so
 	// expose it first while the operator decides how to recover this attempt.
 	if execution, ok := readOptionalObject(checkpoint, "execution"); ok {
-		if progressError := derefString(readObjectString(execution, "progressSnapshotError")); progressError != "" {
-			return &activeRunContinuation{
-				PredecessorRunID:       derefString(readObjectString(execution, "runId")),
-				PredecessorExecutionID: derefString(readObjectString(execution, "executionId")),
-				Mode:                   "timeout_observed",
-				Outcome:                "observation failed",
+		if executionRunID := derefString(readObjectString(execution, "runId")); executionRunID == run.ID && strings.TrimSpace(run.ID) != "" {
+			if progressError := derefString(readObjectString(execution, "progressSnapshotError")); progressError != "" {
+				return &activeRunContinuation{
+					PredecessorRunID:       executionRunID,
+					PredecessorExecutionID: derefString(readObjectString(execution, "executionId")),
+					Mode:                   "timeout_observed",
+					Outcome:                "observation failed",
+				}
 			}
-		}
-		if progressBeforeTimeout, ok := readOptionalObject(execution, "progressBeforeTimeout"); ok {
-			return &activeRunContinuation{
-				PredecessorRunID:       derefString(readObjectString(execution, "runId")),
-				PredecessorExecutionID: derefString(readObjectString(execution, "executionId")),
-				Mode:                   "timeout_observed",
-				BeforeTimeout:          buildActiveRunProgress(progressBeforeTimeout),
+			if progressBeforeTimeout, ok := readOptionalObject(execution, "progressBeforeTimeout"); ok {
+				return &activeRunContinuation{
+					PredecessorRunID:       executionRunID,
+					PredecessorExecutionID: derefString(readObjectString(execution, "executionId")),
+					Mode:                   "timeout_observed",
+					BeforeTimeout:          buildActiveRunProgress(progressBeforeTimeout),
+				}
 			}
 		}
 	}
