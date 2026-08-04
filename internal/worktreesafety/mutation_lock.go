@@ -4,13 +4,15 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/MumuTW/looper/internal/config"
 )
 
 // WorktreeMutationScope returns the managed repository-container scope that
 // must be shared by worktree creation/restoration and disk-sweep removal. A
-// project root is one level below its container in the managed layout, so
-// unrelated repositories do not contend while container removal still fences
-// every checkout that it could delete.
+// project root may be nested below an explicit container, so derive the first
+// segment below the canonical shared root when possible; the parent fallback
+// preserves callers that operate outside the managed shared-root layout.
 func WorktreeMutationScope(worktreeRoot string) string {
 	root := strings.TrimSpace(worktreeRoot)
 	if root == "" {
@@ -20,6 +22,15 @@ func WorktreeMutationScope(worktreeRoot string) string {
 	// A lexical alias must share the lock with its resolved root or creation can
 	// race a sweep that is mutating the same physical checkout.
 	root = NormalizePath(root)
+	if sharedRoot, err := config.DefaultWorktreeRoot(); err == nil {
+		shared := NormalizePath(sharedRoot)
+		if rel, err := filepath.Rel(shared, root); err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+			parts := strings.Split(rel, string(filepath.Separator))
+			if len(parts) >= 2 && parts[0] != "" {
+				return filepath.Join(shared, parts[0])
+			}
+		}
+	}
 	return filepath.Clean(filepath.Dir(root))
 }
 

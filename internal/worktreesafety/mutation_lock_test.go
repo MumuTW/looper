@@ -27,6 +27,22 @@ func TestWorktreeMutationScopeResolvesSymlinkIdentity(t *testing.T) {
 	}
 }
 
+func TestWorktreeMutationScopeUsesEnclosingContainerForNestedRoot(t *testing.T) {
+	looperHome := t.TempDir()
+	t.Setenv("LOOPER_HOME", looperHome)
+	sharedRoot := filepath.Join(looperHome, "worktrees")
+	deepRoot := filepath.Join(sharedRoot, "custom", "team", "project")
+	if err := os.MkdirAll(deepRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", deepRoot, err)
+	}
+
+	got := WorktreeMutationScope(deepRoot)
+	want := NormalizePath(filepath.Join(sharedRoot, "custom"))
+	if got != want {
+		t.Fatalf("WorktreeMutationScope(%q) = %q, want enclosing container %q", deepRoot, got, want)
+	}
+}
+
 func TestManagedMutationLockSerializesSameScopeAndAllowsIndependentScope(t *testing.T) {
 	release := AcquireManagedMutationLock("/tmp/looper/repo-a")
 	defer release()

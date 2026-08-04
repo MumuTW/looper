@@ -324,7 +324,7 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 	liveProjects := normalizedPathSet(options.LiveProjectPaths)
 	for _, candidate := range plan.Candidates {
 		if candidate.Action != DiskSweepActionRemove {
-			if candidate.Reason == "live_project_container" && len(options.LiveProjectPaths) > 0 {
+			if candidate.Reason == "live_project_container" && len(options.LiveProjectPaths) > 0 && !liveProjects[normalizeSweepPath(candidate.Path)] {
 				nested, nestedErr := sweepLiveContainerProjects(ctx, options, candidate.Path, liveProjects, registered, budget)
 				used := nested.Summary.Removed
 				if options.DryRun {

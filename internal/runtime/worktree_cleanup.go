@@ -566,7 +566,9 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 					if err != nil {
 						return false, err
 					}
-					if worktreesafety.NormalizePath(projectRoot) == worktreesafety.NormalizePath(path) {
+					projectIdentity := worktreesafety.NormalizePath(projectRoot)
+					candidateIdentity := worktreesafety.NormalizePath(path)
+					if projectIdentity == candidateIdentity || pathContains(candidateIdentity, projectIdentity) {
 						return true, nil
 					}
 				}

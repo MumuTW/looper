@@ -966,6 +966,62 @@ func TestRunContainerSweepRechecksLiveContainerOwnershipBeforeRemoval(t *testing
 	}
 }
 
+func TestRunContainerSweepSkipsNestedTraversalWhenContainerIsLiveProjectRoot(t *testing.T) {
+	sharedRoot := t.TempDir()
+	container := filepath.Join(sharedRoot, "project-root")
+	checkout := mkdirAt(t, filepath.Join(container, "old-checkout"), old())
+	if err := os.Chtimes(container, old(), old()); err != nil {
+		t.Fatalf("Chtimes(container): %v", err)
+	}
+	var removed []string
+	options := containerOptions(sharedRoot, []string{"project-root"}, stubSweepGit{}, &removed)
+	options.LiveProjectPaths = []string{container}
+
+	plan, err := RunContainerSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunContainerSweep() error = %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want live project root preserved", removed)
+	}
+	if _, err := os.Stat(checkout); err != nil {
+		t.Fatalf("checkout under live project root was removed: %v", err)
+	}
+	if action, reason := reasonFor(t, plan, container); action != ActionSkipped || reason != "live_project_container" {
+		t.Fatalf("container = (%q, %q), want live project container skip", action, reason)
+	}
+}
+
+func TestRunContainerSweepRechecksLiveProjectAncestorsAtRemoval(t *testing.T) {
+	sharedRoot := t.TempDir()
+	container := filepath.Join(sharedRoot, "repo-live")
+	projectPath := filepath.Join(container, "team")
+	mkdirAt(t, filepath.Join(projectPath, "checkout"), old())
+	if err := os.Chtimes(projectPath, old(), old()); err != nil {
+		t.Fatalf("Chtimes(project): %v", err)
+	}
+	if err := os.Chtimes(container, old(), old()); err != nil {
+		t.Fatalf("Chtimes(container): %v", err)
+	}
+	var removed []string
+	options := containerOptions(sharedRoot, []string{"repo-live"}, stubSweepGit{}, &removed)
+	options.LiveProjectPaths = []string{filepath.Join(container, "old-project")}
+	options.IsLiveProjectPath = func(_ context.Context, path string) (bool, error) {
+		return path == projectPath, nil
+	}
+
+	plan, err := RunContainerSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunContainerSweep() error = %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want newly live project ancestor preserved", removed)
+	}
+	if action, reason := reasonFor(t, plan, projectPath); action != ActionSkipped || reason != "project_live_at_removal" {
+		t.Fatalf("project = (%q, %q), want project_live_at_removal skip", action, reason)
+	}
+}
+
 func TestRunContainerSweepPropagatesNestedCancellation(t *testing.T) {
 	sharedRoot := t.TempDir()
 	container := filepath.Join(sharedRoot, "repo-live")
