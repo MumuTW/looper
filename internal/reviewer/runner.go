@@ -313,6 +313,7 @@ type GitHubGateway interface {
 	ListReviewRequestedPullRequests(context.Context, ListReviewRequestedPullRequestsInput) ([]PullRequestSummary, error)
 	GetCurrentUserLogin(context.Context, string, string) (string, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
+	ViewPullRequestForDiscovery(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
 	GetPullRequestHeadSHA(context.Context, ViewPullRequestInput) (string, error)
 	GetRepositorySettings(context.Context, githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error)
@@ -732,7 +733,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		if policy.EnableSelfReview || strings.TrimSpace(pr.Author) != "" {
 			return pr
 		}
-		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: pr.Number, CWD: project.RepoPath})
+		detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: pr.Number, CWD: project.RepoPath})
 		if err != nil {
 			return pr
 		}
