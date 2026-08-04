@@ -486,6 +486,17 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 		})
 		rootIndexes[rootKey] = len(roots) - 1
 	}
+	if sharedRootErr == nil {
+		sharedRootErr = validateSharedDiskSweepRoot(sharedRoot, managedRepoPaths, allRoots)
+		if sharedRootErr != nil {
+			status.Failed++
+			status.LastError = sharedRootErr.Error()
+			// A shared-root alias can overlap a configured project root even when
+			// the per-root pass accepted its lexical spelling. Do not run either
+			// destructive tier until the shared identity is safe.
+			roots = nil
+		}
+	}
 	roots, overlapErrs := rejectOverlappingDiskSweepRoots(roots, allRoots)
 	if len(overlapErrs) > 0 {
 		status.Failed += len(overlapErrs)
@@ -932,6 +943,37 @@ func validateDiskSweepRoot(root string, managedRepoPaths []string, sharedRoot st
 		sharedRoot = strings.TrimSpace(sharedRoot)
 		if rootIdentity == worktreesafety.NormalizePath(sharedRoot) {
 			return fmt.Errorf("worktree sweep root %q is the shared root", root)
+		}
+	}
+	return nil
+}
+
+func validateSharedDiskSweepRoot(sharedRoot string, managedRepoPaths []string, configuredRoots []worktreecleanup.DiskSweepRoot) error {
+	sharedRoot = strings.TrimSpace(sharedRoot)
+	if sharedRoot == "" {
+		return fmt.Errorf("shared worktree root is empty")
+	}
+	identity := worktreesafety.NormalizePath(sharedRoot)
+	if identity == filepath.Dir(identity) || identity == string(filepath.Separator) || identity == worktreesafety.NormalizePath(os.TempDir()) {
+		return fmt.Errorf("shared worktree root %q is not dedicated", sharedRoot)
+	}
+	if home, err := os.UserHomeDir(); err == nil && identity == worktreesafety.NormalizePath(home) {
+		return fmt.Errorf("shared worktree root %q is not dedicated", sharedRoot)
+	}
+	for _, managedRepoPath := range managedRepoPaths {
+		managedRepoPath = strings.TrimSpace(managedRepoPath)
+		if managedRepoPath == "" {
+			continue
+		}
+		managedIdentity := worktreesafety.NormalizePath(managedRepoPath)
+		if identity == managedIdentity || pathContains(identity, managedIdentity) || pathContains(managedIdentity, identity) {
+			return fmt.Errorf("shared worktree root %q overlaps managed repository %q", sharedRoot, managedRepoPath)
+		}
+	}
+	for _, configuredRoot := range configuredRoots {
+		rootIdentity := worktreesafety.NormalizePath(configuredRoot.WorktreeRoot)
+		if identity == rootIdentity || pathContains(rootIdentity, identity) {
+			return fmt.Errorf("shared worktree root %q overlaps configured worktree root %q", sharedRoot, configuredRoot.WorktreeRoot)
 		}
 	}
 	return nil

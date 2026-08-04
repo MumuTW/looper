@@ -147,6 +147,31 @@ func TestValidateDiskSweepRootChecksAllRepositoriesAndSymlinkAliases(t *testing.
 	}
 }
 
+func TestValidateSharedDiskSweepRootRejectsBroadSymlinkAlias(t *testing.T) {
+	alias := filepath.Join(t.TempDir(), "shared-root-link")
+	if err := os.Symlink(os.TempDir(), alias); err != nil {
+		t.Skipf("Symlink() unsupported: %v", err)
+	}
+	if err := validateSharedDiskSweepRoot(alias, []string{filepath.Join(t.TempDir(), "repo")}, nil); err == nil {
+		t.Fatal("validateSharedDiskSweepRoot() = nil for a symlink alias of the system temp root")
+	}
+}
+
+func TestValidateSharedDiskSweepRootRejectsConfiguredRootAlias(t *testing.T) {
+	configuredRoot := filepath.Join(t.TempDir(), "configured")
+	if err := os.MkdirAll(configuredRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "shared-root-link")
+	if err := os.Symlink(configuredRoot, alias); err != nil {
+		t.Skipf("Symlink() unsupported: %v", err)
+	}
+	configured := []worktreecleanup.DiskSweepRoot{{ProjectID: "configured", WorktreeRoot: configuredRoot}}
+	if err := validateSharedDiskSweepRoot(alias, nil, configured); err == nil {
+		t.Fatal("validateSharedDiskSweepRoot() = nil for an alias of a configured project root")
+	}
+}
+
 func TestRejectOverlappingDiskSweepRootsIncludesArchivedRoots(t *testing.T) {
 	active := filepath.Join(t.TempDir(), "container", "active")
 	archived := filepath.Join(active, "archived")
