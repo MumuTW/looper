@@ -395,7 +395,7 @@ func (r *Runner) listCoordinatorBacklog(ctx context.Context, projectID, repo, cw
 		{dispatchLabel: dispatchCfg.Namespace.DispatchPlan(), triggerLabels: dispatchCfg.PlannerTriggerLabels},
 		{dispatchLabel: dispatchCfg.Namespace.DispatchImplement(), triggerLabels: dispatchCfg.WorkerTriggerLabels},
 	}
-	targets := backlogScanTargets(backlogLanes, r.projectNetworkMode(projectID) == config.ProjectNetworkModeRouted)
+	targets := backlogScanTargets(backlogLanes, r.projectNetworkMode(projectID) == config.ProjectNetworkModeRouted, dispatchCfg.Namespace.DispatchImplement())
 	if len(targets) == 0 {
 		return issues, nil
 	}
@@ -470,13 +470,17 @@ func (r *Runner) backlogHydrationBudget(ctx context.Context, triageCfg triage.Co
 	return min(limit, max(r.config.Scheduler.MaxConcurrentRuns-running, 0)), nil
 }
 
-func backlogScanTargets(lanes []backlogLane, includeWorkerRecovery bool) []backlogTarget {
+func backlogScanTargets(lanes []backlogLane, includeWorkerRecovery bool, workerDispatchLabel string) []backlogTarget {
+	workerLabel := strings.TrimSpace(workerDispatchLabel)
+	if workerLabel == "" {
+		workerLabel = dispatch.DispatchImplement
+	}
 	targets := make([]backlogTarget, 0)
 	for laneIndex, lane := range lanes {
 		for _, triggerLabel := range lane.triggerLabels {
 			if triggerLabel = strings.TrimSpace(triggerLabel); triggerLabel != "" {
 				targets = append(targets, backlogTarget{lane: laneIndex, triggerLabel: triggerLabel})
-				if includeWorkerRecovery && lane.dispatchLabel == dispatch.DispatchImplement {
+				if includeWorkerRecovery && lane.dispatchLabel == workerLabel {
 					targets = append(targets, backlogTarget{lane: laneIndex, triggerLabel: triggerLabel, recovery: true})
 				}
 			}

@@ -43,6 +43,21 @@ func TestTriageCompletionLabelUsesProjectNamespace(t *testing.T) {
 	}
 }
 
+func TestBacklogScanTargetsUsesNamespacedWorkerDispatchForRecovery(t *testing.T) {
+	namespace := labels.NewNamespace("team.looper:")
+	lanes := []backlogLane{
+		{dispatchLabel: namespace.DispatchPlan(), triggerLabels: []string{namespace.PlanTrigger()}},
+		{dispatchLabel: namespace.DispatchImplement(), triggerLabels: []string{namespace.WorkerReadyTrigger()}},
+	}
+	targets := backlogScanTargets(lanes, true, namespace.DispatchImplement())
+	if len(targets) != 3 {
+		t.Fatalf("backlog targets = %#v, want plan plus worker normal/recovery targets", targets)
+	}
+	if targets[2].lane != 1 || !targets[2].recovery {
+		t.Fatalf("worker recovery target = %#v, want namespaced worker lane", targets[2])
+	}
+}
+
 func containsExact(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {

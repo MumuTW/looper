@@ -1182,7 +1182,7 @@ func TestRunnerAutonomousDispatchRotatesWithinBacklogPage(t *testing.T) {
 	targetCount := len(backlogScanTargets([]backlogLane{
 		{dispatchLabel: dispatch.DispatchPlan, triggerLabels: []string{labels.DefaultPlanTrigger}},
 		{dispatchLabel: dispatch.DispatchImplement, triggerLabels: []string{labels.DefaultWorkerReadyTrigger}},
-	}, false))
+	}, false, dispatch.DispatchImplement))
 	for {
 		targetStart, page, candidateStart := fixture.runner.backlogScanPosition(fixture.projectID, targetCount)
 		if targetStart == 1 && page == 0 && candidateStart == 0 {
