@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -91,13 +92,27 @@ func TestWorkerReproductionAbsentBlocksPreExecutionAdoption(t *testing.T) {
 		t.Fatalf("capture = %v, want pre-execution refusal", err)
 	}
 	// After completed execution, worker-authored adoption is allowed.
-	checkpoint.Execution = &checkpointExecution{Status: "completed"}
+	checkpoint.Execution = &checkpointExecution{Status: "completed", CompletionPayload: workerReproductionCompletionJSON(t, expected)}
 	if err := captureWorkerReproduction(&checkpoint, root); err != nil {
 		t.Fatalf("post-execution capture error = %v", err)
 	}
 	if checkpoint.Work.Reproduction == nil || !checkpoint.Work.Reproduction.Equal(*expected) {
 		t.Fatalf("captured = %#v, want %#v", checkpoint.Work.Reproduction, expected)
 	}
+}
+
+func workerReproductionCompletionPayload(t *testing.T, manifest *reproducer.Manifest) string {
+	t.Helper()
+	return "__LOOPER_RESULT__=" + workerReproductionCompletionJSON(t, manifest)
+}
+
+func workerReproductionCompletionJSON(t *testing.T, manifest *reproducer.Manifest) string {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{"summary": "added reproduction", "reproduction": manifest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(payload)
 }
 
 func TestWorkerReproductionCaptureVerifiesOnFirstAdopt(t *testing.T) {
@@ -448,6 +463,40 @@ func TestWorkerCaptureReproductionIgnoresUntrustedManifestDuringRetry(t *testing
 	}
 	if checkpoint.Work.Reproduction != nil || !checkpoint.ReproductionAbsent {
 		t.Fatalf("checkpoint = %#v, want untrusted manifest ignored while absence remains", checkpoint)
+	}
+}
+
+func TestWorkerCaptureReproductionRejectsAuthoredManifestWithoutStructuredContract(t *testing.T) {
+	root, _ := writeWorkerReproductionFixtureWithIssue(t, 113, "MumuTW/looper")
+	checkpoint := workerCheckpoint{
+		Work:               &workerInput{Repo: "MumuTW/looper", IssueNumber: 113},
+		ReproductionAbsent: true,
+		Execution:          &checkpointExecution{Status: "completed"},
+	}
+	err := captureWorkerReproduction(&checkpoint, root)
+	if err == nil || !strings.Contains(err.Error(), "missing a structured completion contract") {
+		t.Fatalf("captureWorkerReproduction() = %v, want missing structured contract refusal", err)
+	}
+	if checkpoint.Work.Reproduction != nil {
+		t.Fatalf("Reproduction = %#v, want no authority adopted", checkpoint.Work.Reproduction)
+	}
+}
+
+func TestWorkerCaptureReproductionRejectsMismatchedStructuredContract(t *testing.T) {
+	root, manifest := writeWorkerReproductionFixtureWithIssue(t, 113, "MumuTW/looper")
+	declared := *manifest
+	declared.TestCommand = "go test ./... -run '^TestOther$'"
+	checkpoint := workerCheckpoint{
+		Work:               &workerInput{Repo: "MumuTW/looper", IssueNumber: 113},
+		ReproductionAbsent: true,
+		Execution:          &checkpointExecution{Status: "completed", Stdout: workerReproductionCompletionPayload(t, &declared)},
+	}
+	err := captureWorkerReproduction(&checkpoint, root)
+	if err == nil || !strings.Contains(err.Error(), "does not match the structured completion contract") {
+		t.Fatalf("captureWorkerReproduction() = %v, want contract mismatch refusal", err)
+	}
+	if checkpoint.Work.Reproduction != nil {
+		t.Fatalf("Reproduction = %#v, want no authority adopted", checkpoint.Work.Reproduction)
 	}
 }
 

@@ -399,6 +399,7 @@ type AgentResult struct {
 	Stdout                       string
 	Stderr                       string
 	ParseStatus                  string
+	CompletionPayload            string
 	ChangedFiles                 []string
 	Commits                      []string
 	Lifecycle                    *lifecycle.State
@@ -416,6 +417,8 @@ const validationGatedLocalOnlyPrompt = `
 
 VALIDATION-GATED LOCAL-ONLY EXECUTION:
 Looper's daemon already fetched and prepared the repository state. Tool network access is intentionally disabled. Do not run gh, git fetch/pull/push, access remote URLs, or fail merely because the forge is unavailable. Use the local checkout and the context already supplied in this prompt. Edit, test, and commit locally only; Looper will validate the exact commit and publish it afterward.`
+
+const workerReproductionCompletionInstruction = `If you create .looper/reproducer.json because no reproduction contract was present when this run started, include a top-level "reproduction" object in the final __LOOPER_RESULT__ JSON. It must exactly match the committed manifest, including testPath, testName, testCommand, testSha256, and any issue scope. Omit the object when you did not create a new reproduction contract.`
 
 const testFirstDeliveryPrompt = `TEST-FIRST DELIVERY EXPECTATION:
 When feasible, add or update a failing automated test first and confirm it captures the requested behavior. Then write the smallest implementation that makes it pass, and refactor while keeping the suite green.
@@ -706,11 +709,16 @@ type checkpointPlan struct {
 }
 
 type checkpointExecution struct {
-	RunID                        string            `json:"runId,omitempty"`
-	ExecutionID                  string            `json:"executionId,omitempty"`
-	Status                       string            `json:"status,omitempty"`
-	Summary                      string            `json:"summary,omitempty"`
-	ParseStatus                  string            `json:"parseStatus,omitempty"`
+	RunID       string `json:"runId,omitempty"`
+	ExecutionID string `json:"executionId,omitempty"`
+	Status      string `json:"status,omitempty"`
+	Summary     string `json:"summary,omitempty"`
+	ParseStatus string `json:"parseStatus,omitempty"`
+	// CompletionPayload is the daemon-parsed final marker. It is persisted
+	// separately from stdout so authored reproduction authority survives
+	// adapters that return the structured payload without retaining the raw
+	// marker in their transcript.
+	CompletionPayload            string            `json:"completionPayload,omitempty"`
 	ChangedFiles                 []string          `json:"changedFiles,omitempty"`
 	Commits                      []string          `json:"commits,omitempty"`
 	Lifecycle                    *lifecycle.State  `json:"gitPrLifecycle,omitempty"`
@@ -880,6 +888,9 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 				// new unscoped file would become authority for unrelated issues.
 				return reproductionFailure(errors.New("worker-authored reproduction manifest must identify the current issue"))
 			}
+			if err := verifyWorkerAuthoredReproductionContract(checkpoint.Execution, *manifest); err != nil {
+				return reproductionFailure(err)
+			}
 		} else if checkpoint.Work.Reproduction == nil && workerPastInitialReproductionCapture(*checkpoint) {
 			// Legacy checkpoint without ReproductionAbsent after upgrade:
 			// fail closed rather than adopt a mid-run agent file as authority.
@@ -900,6 +911,62 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 		checkpoint.ReproductionAbsent = true
 	}
 	return nil
+}
+
+func verifyWorkerAuthoredReproductionContract(execution *checkpointExecution, manifest reproducer.Manifest) error {
+	if execution == nil || !strings.EqualFold(strings.TrimSpace(execution.Status), "completed") {
+		return errors.New("worker-authored reproduction has no completed execution evidence")
+	}
+	payload := strings.TrimSpace(execution.CompletionPayload)
+	if payload == "" {
+		payload = workerCompletionPayload(execution.Stdout)
+	}
+	if payload == "" {
+		return errors.New("worker-authored reproduction is missing a structured completion contract")
+	}
+	var envelope struct {
+		Reproduction json.RawMessage `json:"reproduction"`
+	}
+	if err := json.Unmarshal([]byte(payload), &envelope); err != nil {
+		return fmt.Errorf("decode worker reproduction completion contract: %w", err)
+	}
+	if len(envelope.Reproduction) == 0 || string(envelope.Reproduction) == "null" {
+		return errors.New("worker-authored reproduction completion contract is missing reproduction")
+	}
+	declared, err := reproducer.Parse(envelope.Reproduction)
+	if err != nil {
+		return fmt.Errorf("validate worker reproduction completion contract: %w", err)
+	}
+	if !declared.Equal(manifest) {
+		return errors.New("worker-authored reproduction does not match the structured completion contract")
+	}
+	return nil
+}
+
+func workerCompletionPayload(stdout string) string {
+	for _, payload := range agent.CompletionMarkerPayloads(stdout) {
+		if json.Valid([]byte(payload)) && !isWorkerCompletionTemplate(payload) {
+			return payload
+		}
+	}
+	if translated := agent.CombinedTextFromJSONL(stdout); translated != "" {
+		for _, payload := range agent.CompletionMarkerPayloads(translated) {
+			if json.Valid([]byte(payload)) && !isWorkerCompletionTemplate(payload) {
+				return payload
+			}
+		}
+	}
+	return ""
+}
+
+func isWorkerCompletionTemplate(payload string) bool {
+	var parsed struct {
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+		return false
+	}
+	return strings.TrimSpace(parsed.Summary) == "<one-sentence summary>"
 }
 
 // workerPastInitialReproductionCapture reports whether the run already advanced
@@ -1152,7 +1219,7 @@ func sanitizePublicPausedIssueClaimSummary(summary string) string {
 func checkpointExecutionFromAgentResult(result AgentResult, runID, executionID string) *checkpointExecution {
 	return &checkpointExecution{
 		RunID: runID, ExecutionID: executionID,
-		Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus,
+		Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus, CompletionPayload: result.CompletionPayload,
 		ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle, Stdout: result.Stdout,
 		TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds,
 		ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt,
@@ -5016,6 +5083,9 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 	} else {
 		parts = append(parts, "Make the necessary code changes, validate them, and leave the branch ready for PR creation.")
 		parts = append(parts, noRemoteLifecyclePromptInstruction("worker", work.Branch, work.BaseBranch, disclosureCfg, agentRuntime, agentModel))
+	}
+	if work.Reproduction == nil {
+		parts = append(parts, workerReproductionCompletionInstruction)
 	}
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock, nil
 }

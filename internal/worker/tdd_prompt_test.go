@@ -28,6 +28,7 @@ func TestWorkerPromptRequiresTestFirstWorkflowAndPREvidence(t *testing.T) {
 		"refactor while keeping the suite green",
 		"automated coverage added or updated",
 		"explain why coverage is not feasible",
+		`top-level "reproduction" object`,
 	} {
 		if !strings.Contains(prompt, phrase) {
 			t.Fatalf("prompt missing %q:\n%s", phrase, prompt)
