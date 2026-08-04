@@ -1045,6 +1045,14 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 	}
 	if manifest != nil {
 		if checkpoint.ReproductionAbsent {
+			if fixerRetryHasUnfinishedRepair(checkpoint) {
+				// The previous repair attempt did not complete. Keep the
+				// durable negative observation authoritative, but let the
+				// agent retry against the retained worktree instead of
+				// converting an untrusted mid-attempt manifest into manual
+				// intervention.
+				return nil
+			}
 			// The Fixer started without a committed reproduction contract. An
 			// agent-authored manifest mid-run is not authority: adopting it
 			// would let the agent invent the testCommand the daemon executes.
@@ -1066,6 +1074,14 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 	// newly written manifest as the original contract.
 	checkpoint.ReproductionAbsent = true
 	return nil
+}
+
+func fixerRetryHasUnfinishedRepair(checkpoint *fixerCheckpoint) bool {
+	if checkpoint == nil || checkpoint.Repair == nil {
+		return false
+	}
+	status := strings.TrimSpace(checkpoint.Repair.Status)
+	return status != "" && !strings.EqualFold(status, "completed")
 }
 
 // fixerPastInitialReproductionCapture reports whether the run already advanced
@@ -3560,10 +3576,16 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, nil
 	}
 	if checkpoint.Repair != nil {
-		if err := validateCompletedRepairCheckpoint(checkpoint.Repair, checkpoint.Worktree); err != nil {
-			return checkpoint, err
+		if !fixerRetryHasUnfinishedRepair(&checkpoint) {
+			if err := validateCompletedRepairCheckpoint(checkpoint.Repair, checkpoint.Worktree); err != nil {
+				return checkpoint, err
+			}
+			return checkpoint, nil
 		}
-		return checkpoint, nil
+		// A retryable non-completed execution is replayed from repair. Keep
+		// its status through the reproduction capture boundary so a manifest
+		// written by that attempt remains untrusted, then discard the stale
+		// repair record before starting the replacement execution.
 	}
 	if len(checkpoint.FixItems) == 0 {
 		return checkpoint, &runpipe.LoopError{Message: "Missing fix items checkpoint for repair step", Kind: runpipe.FailureRetryableTransient}
@@ -3632,6 +3654,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
 	}
+	checkpoint.Repair = nil
 	validationCommands = fixerValidationCommands(validationCommands, checkpoint)
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
 		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
@@ -8312,7 +8335,9 @@ func rewindCheckpointForPrepareRetry(checkpoint fixerCheckpoint) fixerCheckpoint
 		worktree.CleanedAt = ""
 		checkpoint.Worktree = &worktree
 	}
-	checkpoint.Repair = nil
+	if !fixerRetryHasUnfinishedRepair(&checkpoint) {
+		checkpoint.Repair = nil
+	}
 	checkpoint.ReconcileCommits = nil
 	checkpoint.Validation = nil
 	checkpoint.Push = nil

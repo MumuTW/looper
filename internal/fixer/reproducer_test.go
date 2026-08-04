@@ -149,6 +149,66 @@ func TestFixerReproductionRefusesAgentAuthoredManifestAfterAbsentStart(t *testin
 	}
 }
 
+func TestFixerReproductionIgnoresNewManifestDuringRetry(t *testing.T) {
+	root := t.TempDir()
+	checkpoint := fixerCheckpoint{}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("initial capture = %v", err)
+	}
+	if !checkpoint.ReproductionAbsent {
+		t.Fatal("ReproductionAbsent = false, want durable negative observation")
+	}
+
+	testPath := filepath.Join(root, "internal", "bug_test.go")
+	if err := os.MkdirAll(filepath.Dir(testPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testContent := []byte("func TestBug(t *testing.T) {}\n")
+	if err := os.WriteFile(testPath, testContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(testContent)
+	if err := os.MkdirAll(filepath.Join(root, ".looper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{"version":1,"testPath":"internal/bug_test.go","testName":"TestBug","testCommand":"go test ./internal -run '^TestBug$'","testSha256":"` + hex.EncodeToString(hash[:]) + `"}`
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	checkpoint.Repair = &checkpointRepair{Status: "failed", Summary: "agent timed out"}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("retry capture = %v, want the untrusted manifest ignored", err)
+	}
+	if checkpoint.Reproduction != nil || !checkpoint.ReproductionAbsent {
+		t.Fatalf("checkpoint after retry capture = %#v, want nil reproduction with absence retained", checkpoint)
+	}
+
+	checkpoint.Repair = nil
+	err := captureFixerReproduction(&checkpoint, root)
+	if err == nil || !strings.Contains(err.Error(), "appeared after run start") {
+		t.Fatalf("capture without unfinished repair = %v, want fail-closed refusal", err)
+	}
+}
+
+func TestRewindCheckpointForPrepareRetryPreservesOnlyUnfinishedRepair(t *testing.T) {
+	t.Parallel()
+
+	unfinished := rewindCheckpointForPrepareRetry(fixerCheckpoint{
+		Repair: &checkpointRepair{Status: "failed"},
+	})
+	if unfinished.Repair == nil || unfinished.Repair.Status != "failed" {
+		t.Fatalf("unfinished retry checkpoint Repair = %#v, want preserved non-completed record", unfinished.Repair)
+	}
+
+	completed := rewindCheckpointForPrepareRetry(fixerCheckpoint{
+		Repair: &checkpointRepair{Status: "completed"},
+	})
+	if completed.Repair != nil {
+		t.Fatalf("completed retry checkpoint Repair = %#v, want cleared for a fresh repair", completed.Repair)
+	}
+}
+
 func TestFixerReproductionFirstCaptureWithPreparedWorktreeAdoptsManifest(t *testing.T) {
 	// Fresh Fixer runs always have FixItems and PreparedAt before the first
 	// capture; that must not be treated as "already past first capture".
