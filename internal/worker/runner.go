@@ -891,7 +891,7 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 			if checkpoint.Execution == nil {
 				return reproductionFailure(errors.New("reproduction manifest appeared before agent execution completed"))
 			}
-			if checkpoint.Execution.Status != "completed" {
+			if checkpoint.Execution.Status != "completed" || checkpoint.Execution.ParseStatus != "parsed" {
 				return nil
 			}
 			if err := verifyWorkerAuthoredReproductionContract(checkpoint.Execution, *manifest); err != nil {
@@ -2410,11 +2410,13 @@ func (r *Runner) runPlanStep(input stepInput) (workerCheckpoint, error) {
 
 func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
 	checkpoint := input.Checkpoint
-	executionCompleted := checkpoint.Execution != nil && checkpoint.Execution.Status == "completed"
-	if executionCompleted {
+	executionCompleted := checkpoint.Execution != nil && checkpoint.Execution.Status == "completed" && validateCompletedExecutionCheckpoint(checkpoint.Execution) == nil
+	if !executionCompleted && checkpoint.Work == nil && checkpoint.Execution != nil {
 		if err := validateCompletedExecutionCheckpoint(checkpoint.Execution); err != nil {
 			return checkpoint, err
 		}
+	}
+	if executionCompleted {
 		if checkpoint.Execution.GitReconciled {
 			return checkpoint, nil
 		}
@@ -4812,7 +4814,7 @@ func shouldReplayExecuteOnResume(status string, failedStep WorkerStep, checkpoin
 // the raw predecessor checkpoint, so a replay-execute rewind (Execution=nil)
 // correctly reports false.
 func executeStepAlreadyCompleted(checkpoint workerCheckpoint) bool {
-	return checkpoint.Execution != nil && checkpoint.Execution.Status == "completed"
+	return checkpoint.Execution != nil && checkpoint.Execution.Status == "completed" && validateCompletedExecutionCheckpoint(checkpoint.Execution) == nil
 }
 
 func rewindCheckpointForExecuteRetry(checkpoint workerCheckpoint) workerCheckpoint {
@@ -4820,10 +4822,12 @@ func rewindCheckpointForExecuteRetry(checkpoint workerCheckpoint) workerCheckpoi
 	// daemon can crash after the observation intent is persisted but before the
 	// executor returns; clearing that marker would let the replacement bypass
 	// verifyTimeoutProgressBeforeReplacement's fail-closed containment gate.
+	// Invalid completion evidence is also preserved so it can be replayed in a
+	// fresh execute turn rather than silently discarded.
 	execution := checkpoint.Execution
 	preserveTimeoutObservation := execution != nil && execution.Status == "timeout_observing"
 	preserveTimeout := execution != nil && execution.Status == "timeout" && execution.ProgressBeforeTimeout != nil
-	if !preserveTimeoutObservation && !preserveTimeout {
+	if !preserveTimeoutObservation && !preserveTimeout && validateCompletedExecutionCheckpoint(checkpoint.Execution) == nil {
 		checkpoint.Execution = nil
 	}
 	checkpoint.Validation = nil

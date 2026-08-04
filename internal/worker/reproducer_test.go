@@ -92,7 +92,7 @@ func TestWorkerReproductionAbsentBlocksPreExecutionAdoption(t *testing.T) {
 		t.Fatalf("capture = %v, want pre-execution refusal", err)
 	}
 	// After completed execution, worker-authored adoption is allowed.
-	checkpoint.Execution = &checkpointExecution{Status: "completed", CompletionPayload: workerReproductionCompletionJSON(t, expected)}
+	checkpoint.Execution = &checkpointExecution{Status: "completed", ParseStatus: "parsed", CompletionPayload: workerReproductionCompletionJSON(t, expected)}
 	if err := captureWorkerReproduction(&checkpoint, root); err != nil {
 		t.Fatalf("post-execution capture error = %v", err)
 	}
@@ -464,7 +464,7 @@ func TestWorkerCaptureReproductionRejectsNewUnscopedManifestForIssue(t *testing.
 	checkpoint := workerCheckpoint{
 		Work:               &workerInput{Repo: "MumuTW/looper", IssueNumber: 113},
 		ReproductionAbsent: true,
-		Execution:          &checkpointExecution{Status: "completed"},
+		Execution:          &checkpointExecution{Status: "completed", ParseStatus: "parsed"},
 	}
 	if err := captureWorkerReproduction(&checkpoint, root); err == nil || !strings.Contains(err.Error(), "does not match the current issue scope") {
 		t.Fatalf("captureWorkerReproduction() = %v, want issue-scoped worker-authored rejection", err)
@@ -510,6 +510,32 @@ func TestWorkerCaptureReproductionDefersMalformedManifestDuringRetry(t *testing.
 	}
 }
 
+func TestWorkerCaptureReproductionIgnoresInvalidCompletedExecutionDuringRetry(t *testing.T) {
+	root, _ := writeWorkerReproductionFixtureWithIssue(t, 113, "MumuTW/looper")
+	checkpoint := workerCheckpoint{
+		Work:               &workerInput{Repo: "MumuTW/looper", IssueNumber: 113},
+		ReproductionAbsent: true,
+		Execution:          &checkpointExecution{Status: "completed", ParseStatus: "missing"},
+	}
+	if err := captureWorkerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("captureWorkerReproduction() = %v, want invalid completed retry evidence deferred", err)
+	}
+	if !checkpoint.ReproductionAbsent || checkpoint.Work.Reproduction != nil {
+		t.Fatalf("checkpoint = %#v, want absence retained and no adopted reproduction", checkpoint)
+	}
+}
+
+func TestWorkerInvalidCompletedExecutionReplaysExecute(t *testing.T) {
+	checkpoint := workerCheckpoint{Execution: &checkpointExecution{Status: "completed", ParseStatus: "missing"}}
+	if !shouldReplayExecuteOnResume("failed", stepExecute, checkpoint) {
+		t.Fatal("shouldReplayExecuteOnResume() = false, want replay for invalid completed execution")
+	}
+	rewound := rewindCheckpointForExecuteRetry(checkpoint)
+	if rewound.Execution == nil || executeStepAlreadyCompleted(rewound) {
+		t.Fatalf("rewound checkpoint = %#v, want invalid execution retained but not treated as completed", rewound)
+	}
+}
+
 func TestWorkerCaptureReproductionRejectsMismatchedAuthoredIssueScope(t *testing.T) {
 	root, manifest := writeWorkerReproductionFixtureWithIssue(t, 999, "MumuTW/looper")
 	checkpoint := workerCheckpoint{
@@ -546,7 +572,7 @@ func TestWorkerCaptureReproductionRejectsAuthoredManifestWithoutStructuredContra
 	checkpoint := workerCheckpoint{
 		Work:               &workerInput{Repo: "MumuTW/looper", IssueNumber: 113},
 		ReproductionAbsent: true,
-		Execution:          &checkpointExecution{Status: "completed"},
+		Execution:          &checkpointExecution{Status: "completed", ParseStatus: "parsed"},
 	}
 	err := captureWorkerReproduction(&checkpoint, root)
 	if err == nil || !strings.Contains(err.Error(), "missing a structured completion contract") {
@@ -564,7 +590,7 @@ func TestWorkerCaptureReproductionRejectsMismatchedStructuredContract(t *testing
 	checkpoint := workerCheckpoint{
 		Work:               &workerInput{Repo: "MumuTW/looper", IssueNumber: 113},
 		ReproductionAbsent: true,
-		Execution:          &checkpointExecution{Status: "completed", Stdout: workerReproductionCompletionPayload(t, &declared)},
+		Execution:          &checkpointExecution{Status: "completed", ParseStatus: "parsed", Stdout: workerReproductionCompletionPayload(t, &declared)},
 	}
 	err := captureWorkerReproduction(&checkpoint, root)
 	if err == nil || !strings.Contains(err.Error(), "does not match the structured completion contract") {

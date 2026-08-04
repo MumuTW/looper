@@ -3076,8 +3076,8 @@ func TestCreateRunContextReplaysExecuteWhenResumeCheckpointParseStatusIsInvalid(
 	if !resumed.Resumed || resumed.StartStep != stepExecute {
 		t.Fatalf("resumed = %#v, want resumed execute replay", resumed)
 	}
-	if resumed.Checkpoint.Execution != nil {
-		t.Fatalf("Execution = %#v, want cleared execution checkpoint", resumed.Checkpoint.Execution)
+	if resumed.Checkpoint.Execution == nil || resumed.Checkpoint.Execution.Status != "completed" || resumed.Checkpoint.Execution.ParseStatus != "" {
+		t.Fatalf("Execution = %#v, want invalid completed evidence retained for replay", resumed.Checkpoint.Execution)
 	}
 	if resumed.Checkpoint.Validation != nil {
 		t.Fatalf("Validation = %#v, want cleared validation checkpoint", resumed.Checkpoint.Validation)

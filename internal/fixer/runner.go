@@ -1292,6 +1292,12 @@ func checkpointRepairFromAgentResult(executionID, headSHA string, result AgentRe
 	return &checkpointRepair{AgentExecutionID: executionID, Status: result.Status, Summary: result.Summary, HeadSHA: headSHA, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, CompletedAt: nowISO, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}
 }
 
+func fixerRetryPendingRepair(executionID, headSHA string, result AgentResult, nowISO string) *checkpointRepair {
+	repair := checkpointRepairFromAgentResult(executionID, headSHA, result, nowISO)
+	repair.Status = "retry_pending"
+	return repair
+}
+
 // maxReplyExplanationLength caps each agent-supplied explanation. Replies are
 // posted on review threads where verbose bodies create noise; the cap also
 // limits prompt-injection blast radius if a malicious reviewer plants payload.
@@ -3900,20 +3906,23 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// local-only via RestrictToolNetwork -- and closing it means changing the
 	// fixer's push model, tracked separately rather than folded into this gate.
 	//
-	// Neither rejection path records checkpoint.Repair. A stored repair record with
-	// ParseStatus "parsed" is what the replay guard at the top of this function
-	// treats as a finished repair, so recording one here would let the next
-	// automatic retry of a retryable block skip the agent entirely and publish
-	// whatever the blocked attempt left behind. The agent's own reason survives as
-	// the run's failure summary and in the event log; leaving the repair unrecorded
-	// keeps the step replayable, which is what a retryable classification means.
+	// A retry-pending repair record is distinct from a completed parsed repair:
+	// it preserves the post-agent boundary so reproduction capture can defer an
+	// untrusted manifest on the next run, while the replay guard still starts a
+	// replacement agent.
 	blocked, blockedMessage, blockedKind, outcomeErr := fixerRepairTaskOutcome(result)
 	if outcomeErr != nil {
+		checkpoint.Repair = fixerRetryPendingRepair(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
+		checkpoint.ResumePolicy = "retry_from_timeout_context"
 		return checkpoint, outcomeErr
 	}
 	if blocked {
 		// A declared block is the agent reporting it could not do the work, not a
 		// Looper failure, so it fails with the kind the agent declared.
+		if blockedKind != runpipe.FailureManualIntervention {
+			checkpoint.Repair = fixerRetryPendingRepair(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
+			checkpoint.ResumePolicy = "retry_from_timeout_context"
+		}
 		return checkpoint, &runpipe.LoopError{Message: blockedMessage, Kind: blockedKind}
 	}
 	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
