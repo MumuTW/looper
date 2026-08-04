@@ -3466,6 +3466,51 @@ func (r *QueueRepository) ListQueuedSnapshotVendors(ctx context.Context, types [
 	return vendors, nil
 }
 
+// ListRunningSnapshotVendors returns vendors carried by the latest run
+// snapshots of durably claimed coding items. A queue row can be running after
+// config removal but before its operation lease reaches spawn admission, so
+// status='running' is a separate retention authority from queued sticky
+// retries.
+func (r *QueueRepository) ListRunningSnapshotVendors(ctx context.Context, types []string) ([]string, error) {
+	if len(types) == 0 {
+		return []string{}, nil
+	}
+	placeholders, typeArgs := queueTypeInClause(types)
+	latestSnapshot := `(SELECT agent_snapshot_json
+			FROM runs
+			WHERE loop_id = qi.loop_id
+			ORDER BY ` + latestRunOrder("runs") + `
+			LIMIT 1)`
+	safeSnapshot := "CASE WHEN json_valid(" + latestSnapshot + ") THEN " + latestSnapshot + " ELSE '{}' END"
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT DISTINCT trim(json_extract(`+safeSnapshot+`, '$.vendor'))
+		FROM queue_items qi
+		WHERE qi.status = 'running'
+			AND qi.type IN (`+placeholders+`)
+			AND qi.loop_id IS NOT NULL
+			AND length(trim(coalesce(json_extract(`+safeSnapshot+`, '$.vendor'), ''))) > 0
+		ORDER BY 1 ASC
+	`, typeArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("list running snapshot vendors: %w", err)
+	}
+	defer rows.Close()
+	vendors := make([]string, 0)
+	for rows.Next() {
+		var vendor string
+		if err := rows.Scan(&vendor); err != nil {
+			return nil, fmt.Errorf("scan running snapshot vendor: %w", err)
+		}
+		if vendor = strings.TrimSpace(vendor); vendor != "" {
+			vendors = append(vendors, vendor)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate running snapshot vendors: %w", err)
+	}
+	return vendors, nil
+}
+
 func queueClaimProjectPredicate(projectScopedTypes, projectIDs []string, stickyOnlyProjectIDs ...[]string) (predicate string, args []any) {
 	if len(projectScopedTypes) == 0 {
 		return "", nil

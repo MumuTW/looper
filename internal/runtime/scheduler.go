@@ -186,27 +186,31 @@ type defaultSchedulerTickInput struct {
 	// OperationOwner, when set, admits a Supervisor operation lease before each
 	// durable ClaimNext* and holds it until durable complete/cancel/requeue
 	// (ADR-0015 R6 / #579). Nil means ungated claim ownership (unit tests).
-	OperationOwner           *ActiveExecutionRegistry
-	ReconcileStaleRuns       func(context.Context) (StaleRunReconcileSummary, error)
-	AsyncRunner              schedulerAsyncRunner
-	RequestSchedulerWake     func()
-	Triager                  triagerScheduler
-	Escalator                escalatorScheduler
-	EscalatorCadence         *schedulerEscalatorCadence
-	Planner                  plannerScheduler
-	Coordinator              coordinatorScheduler
-	Reviewer                 reviewerScheduler
-	Fixer                    fixerScheduler
-	Gatekeeper               gatekeeperScheduler
-	Worker                   workerScheduler
-	Snapshotter              snapshotScheduler
-	Config                   *config.Config
-	PlannerDiscoveryEnabled  *bool
-	TriagerEnabled           func(string) bool
-	CoordinatorEnabled       func(string) bool
-	ReviewerDiscoveryEnabled *bool
-	FixerDiscoveryEnabled    *bool
-	WorkerDiscoveryEnabled   *bool
+	OperationOwner *ActiveExecutionRegistry
+	// RefreshAgentHealthStickyReferences re-reads queued/running snapshot
+	// references after a queue claim is finalized so removed-provider breakers
+	// do not remain visible until an unrelated config reload.
+	RefreshAgentHealthStickyReferences func()
+	ReconcileStaleRuns                 func(context.Context) (StaleRunReconcileSummary, error)
+	AsyncRunner                        schedulerAsyncRunner
+	RequestSchedulerWake               func()
+	Triager                            triagerScheduler
+	Escalator                          escalatorScheduler
+	EscalatorCadence                   *schedulerEscalatorCadence
+	Planner                            plannerScheduler
+	Coordinator                        coordinatorScheduler
+	Reviewer                           reviewerScheduler
+	Fixer                              fixerScheduler
+	Gatekeeper                         gatekeeperScheduler
+	Worker                             workerScheduler
+	Snapshotter                        snapshotScheduler
+	Config                             *config.Config
+	PlannerDiscoveryEnabled            *bool
+	TriagerEnabled                     func(string) bool
+	CoordinatorEnabled                 func(string) bool
+	ReviewerDiscoveryEnabled           *bool
+	FixerDiscoveryEnabled              *bool
+	WorkerDiscoveryEnabled             *bool
 	// OnHITLAsk is the exact transport callback captured by the snapshot's
 	// worker runner. Keeping it beside the answer callback makes the snapshot
 	// ownership boundary explicit and testable end to end.
@@ -1932,6 +1936,7 @@ type schedulerProviderGate struct {
 	withLanes     func([]storage.QueueClaimLane, func()) error
 	snapshotAllow func(string) error
 	snapshotWith  func(string, func()) error
+	refreshSticky func()
 }
 
 func newSchedulerNotificationGatewayFactory() *schedulerNotificationGatewayFactory {
@@ -1955,6 +1960,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	var withAllowClaimLanes func([]storage.QueueClaimLane, func()) error
 	var allowSnapshotClaimForVendor func(string) error
 	var withAllowSnapshotClaimForVendor func(string, func()) error
+	var refreshSticky func()
 	if len(providerGates) > 0 {
 		allowLifecycleWork = providerGates[0].lifecycle
 		withAllowLifecycleWork = providerGates[0].lifecycleWith
@@ -1964,6 +1970,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 		withAllowClaimLanes = providerGates[0].withLanes
 		allowSnapshotClaimForVendor = providerGates[0].snapshotAllow
 		withAllowSnapshotClaimForVendor = providerGates[0].snapshotWith
+		refreshSticky = providerGates[0].refreshSticky
 	}
 	if source == nil {
 		fail := func(context.Context, Services) error { return fmt.Errorf("project catalog is not configured") }
@@ -2041,6 +2048,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 		input.WithAllowClaimLanes = withAllowClaimLanes
 		input.AllowSnapshotClaimForVendor = allowSnapshotClaimForVendor
 		input.WithAllowSnapshotClaimForVendor = withAllowSnapshotClaimForVendor
+		input.RefreshAgentHealthStickyReferences = refreshSticky
 		// Wire Supervisor operation leases for claim ownership span (#579).
 		// Prefer the live registry from Services when present (daemon path).
 		if services.ActiveExecutions != nil {
@@ -2065,6 +2073,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 				stopped.WithAllowClaimLanes = withAllowClaimLanes
 				stopped.AllowSnapshotClaimForVendor = allowSnapshotClaimForVendor
 				stopped.WithAllowSnapshotClaimForVendor = withAllowSnapshotClaimForVendor
+				stopped.RefreshAgentHealthStickyReferences = refreshSticky
 				if services.ActiveExecutions != nil {
 					stopped.OperationOwner = services.ActiveExecutions
 				} else if activeExecutions != nil {
@@ -2085,6 +2094,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			latest.WithAllowClaimLanes = withAllowClaimLanes
 			latest.AllowSnapshotClaimForVendor = allowSnapshotClaimForVendor
 			latest.WithAllowSnapshotClaimForVendor = withAllowSnapshotClaimForVendor
+			latest.RefreshAgentHealthStickyReferences = refreshSticky
 			if services.ActiveExecutions != nil {
 				latest.OperationOwner = services.ActiveExecutions
 			} else if activeExecutions != nil {
@@ -3432,6 +3442,9 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 	claimedItems := make([]storage.QueueItemRecord, 0)
 	if availableSlots > 0 && input.Repos != nil && input.Repos.Queue != nil {
 		claimedItems, err = claimAndRunScheduledQueueItems(ctx, availableSlots, input)
+		if input.RefreshAgentHealthStickyReferences != nil {
+			input.RefreshAgentHealthStickyReferences()
+		}
 		if err == nil {
 			requestWakeForClaimedDiscovery(claimedItems, discoveredRunnableIDs, input.RequestSchedulerWake)
 		}
@@ -4431,6 +4444,11 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 		now = time.Now
 	}
 	errList := make([]error, 0)
+	refreshSticky := func() {
+		if input.RefreshAgentHealthStickyReferences != nil {
+			input.RefreshAgentHealthStickyReferences()
+		}
+	}
 	// Do not abort the launch loop on ctx cancel: every item is already durable
 	// as claimed/running under an operation lease. Skipping remaining launches
 	// strands those claims (BeginShutdown cancels the scheduler context during drain).
@@ -4454,6 +4472,7 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 				}
 			} else if lease != nil {
 				lease.Release()
+				refreshSticky()
 			}
 			if input.Logger != nil {
 				loopID := ""
@@ -4485,6 +4504,7 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 				}
 			} else if lease != nil {
 				lease.Release()
+				refreshSticky()
 			}
 			continue
 		}
@@ -4503,6 +4523,7 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 					continue
 				}
 				lease.Release()
+				refreshSticky()
 			}
 			errList = append(errList, err)
 			continue
@@ -4531,6 +4552,7 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 						return
 					}
 					lease.Release()
+					refreshSticky()
 					return
 				}
 			}
@@ -4567,6 +4589,7 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 					return
 				}
 				lease.Release()
+				refreshSticky()
 			}
 			if runErr != nil && input.Logger != nil {
 				input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": runErr.Error()})

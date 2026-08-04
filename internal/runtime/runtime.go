@@ -1512,6 +1512,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			lifecycleWith: r.WithAllowLifecycleWork,
 			allow:         r.AllowClaimForVendor, with: r.WithAllowAgentClaimForVendor, capacity: r.ClaimCapacityForVendor, withLanes: r.WithAllowAgentClaimLanes,
 			snapshotAllow: r.AllowSnapshotClaimForVendor, snapshotWith: r.WithAllowSnapshotAgentClaimForVendor,
+			refreshSticky: r.refreshAgentHealthStickyReferences,
 		})
 		if !r.customSchedulerTick {
 			r.defaultSchedulerTick = handlers.tick
@@ -1864,6 +1865,14 @@ func (r *Runtime) refreshAgentHealthStickyReferences() {
 			return
 		}
 		refs = append(refs, queued...)
+		running, err := repos.Queue.ListRunningSnapshotVendors(context.Background(), []string{"planner", "reviewer", "fixer", "worker"})
+		if err != nil {
+			if logger != nil {
+				logger.Warn("agent health running-vendor reference refresh deferred", map[string]any{"error": err.Error()})
+			}
+			return
+		}
+		refs = append(refs, running...)
 	}
 	r.agentHealth.SetStickyVendorReferences(refs)
 }

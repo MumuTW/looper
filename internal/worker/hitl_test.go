@@ -16,8 +16,6 @@ import (
 	"github.com/MumuTW/looper/internal/storage"
 )
 
-const hitlSentinelRelPath = ".looper/ask.json"
-
 func TestConsumeAskSentinelReadsAndRemoves(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, ".looper"), 0o755); err != nil {
@@ -55,6 +53,29 @@ func TestConsumeAskSentinelReadsAndRemoves(t *testing.T) {
 	}
 	if missing, missingEv, err := consumeAskSentinel(t.TempDir()); err != nil || missing != nil || missingEv != nil {
 		t.Fatalf("consumeAskSentinel(empty dir) = (%#v, %#v, %v), want (nil, nil, nil)", missing, missingEv, err)
+	}
+}
+
+func TestValidAskSentinelForHealthIsReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, hitlSentinelRelPath)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll error = %v", err)
+	}
+	if err := os.WriteFile(path, []byte(`{"question":"Which datastore?","options":["redis","postgres"]}`), 0o600); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	if !validAskSentinelForHealth(dir) {
+		t.Fatal("validAskSentinelForHealth() = false, want true")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("health check removed ask sentinel: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(`{"options":["redis"]}`), 0o600); err != nil {
+		t.Fatalf("WriteFile malformed error = %v", err)
+	}
+	if validAskSentinelForHealth(dir) {
+		t.Fatal("validAskSentinelForHealth() = true for ask without question")
 	}
 }
 

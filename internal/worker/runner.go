@@ -388,10 +388,12 @@ type AgentRunInput struct {
 	OnBeforeTimeout          func(context.Context, agent.TimeoutObservation) error
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
-	UseSnapshot             bool
-	SnapshotVendor          string
-	SnapshotModel           *string
-	SnapshotReasoningEffort *config.ReasoningEffort
+	UseSnapshot                bool
+	SnapshotVendor             string
+	SnapshotModel              *string
+	SnapshotReasoningEffort    *config.ReasoningEffort
+	CompletionContract         agent.CompletionContract
+	CompletionOutcomeValidator func() bool
 }
 
 type AgentResult struct {
@@ -2521,6 +2523,10 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			RestrictToolNetwork: len(validationCommands) > 0,
 			OnBeforeTimeout:     onBeforeTimeout,
 			UseSnapshot:         useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
+			CompletionContract: agent.CompletionContractWorkerHITL,
+			CompletionOutcomeValidator: func() bool {
+				return r.hitlEnabled && validAskSentinelForHealth(worktree.Path)
+			},
 		})
 		if err != nil {
 			return checkpoint, err

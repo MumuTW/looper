@@ -393,6 +393,7 @@ const (
 	CompletionContractRawJSONEnvelope     CompletionContract = "raw_json_envelope"
 	CompletionContractReviewerMarker      CompletionContract = "reviewer_marker"
 	CompletionContractReviewerPublication CompletionContract = "reviewer_publication"
+	CompletionContractWorkerHITL          CompletionContract = "worker_hitl"
 	CompletionContractFixerMarker         CompletionContract = "fixer_marker"
 	// CompletionContractPlannerMarker matches Planner's optional completion
 	// marker. Planner can advance from a successful agent result without a
@@ -1469,6 +1470,11 @@ func (x *execution) reportOutcome(status, parseStatus, completionPayload, stdout
 	} else if x.input.CompletionContract == CompletionContractReviewerPublication {
 		succeeded = succeeded && parseStatus == "parsed" && validReviewerMarkerOutcome(completionPayload)
 		if !succeeded && x.input.CompletionOutcomeValidator != nil {
+			succeeded = x.input.CompletionOutcomeValidator()
+		}
+	} else if x.input.CompletionContract == CompletionContractWorkerHITL {
+		succeeded = succeeded && parseStatus == "parsed" && validMarkerOutcome(completionPayload)
+		if !succeeded && status == "completed" && x.input.CompletionOutcomeValidator != nil {
 			succeeded = x.input.CompletionOutcomeValidator()
 		}
 	} else if x.input.CompletionContract == CompletionContractFixerMarker {

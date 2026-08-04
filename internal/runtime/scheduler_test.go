@@ -1220,6 +1220,7 @@ func TestExecuteClaimPhaseAllowsAgentFreeSnapshotDuringProviderBrownout(t *testi
 
 	lifecycleChecks := 0
 	lifecycleSections := 0
+	stickyRefreshes := 0
 	aggregateCalls := 0
 	claimedCount, _, err := executeClaimPhase(context.Background(), "claim_pump", defaultSchedulerTickInput{
 		Repos: repos, Config: &cfg, Now: func() time.Time { return now }, MaxConcurrentRuns: 1,
@@ -1242,6 +1243,7 @@ func TestExecuteClaimPhaseAllowsAgentFreeSnapshotDuringProviderBrownout(t *testi
 			fn()
 			return nil
 		},
+		RefreshAgentHealthStickyReferences: func() { stickyRefreshes++ },
 	}, nil, true)
 	if err != nil {
 		t.Fatalf("executeClaimPhase() error = %v", err)
@@ -1251,6 +1253,9 @@ func TestExecuteClaimPhaseAllowsAgentFreeSnapshotDuringProviderBrownout(t *testi
 	}
 	if lifecycleChecks == 0 || lifecycleSections == 0 {
 		t.Fatalf("lifecycle admission checks/sections = %d/%d, want both", lifecycleChecks, lifecycleSections)
+	}
+	if stickyRefreshes == 0 {
+		t.Fatal("sticky-vendor references were not refreshed after the claim pass")
 	}
 	if aggregateCalls != 0 {
 		t.Fatalf("aggregate claim gate calls = %d, want none for agent-free snapshot", aggregateCalls)

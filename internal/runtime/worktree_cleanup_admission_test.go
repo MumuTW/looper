@@ -137,6 +137,7 @@ func TestWorktreeCleanupPlanSkipHoldsAdmission(t *testing.T) {
 		t.Fatalf("events = %#v, want no skip event when admission closed at write boundary", events)
 	}
 }
+
 // Contract (#580 review): candidate skip/failure record helpers hold admission
 // across worktrees touch + event append so degradation after eligibility checks
 // cannot commit durable cleanup mutations after close.

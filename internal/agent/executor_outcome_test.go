@@ -260,3 +260,28 @@ func TestReportOutcomeAcceptsVerifiedReviewerPublicationAfterIncompleteProcessRe
 		t.Fatalf("unverified reviewer publication = %#v, want one failed provider outcome", outcomes)
 	}
 }
+
+func TestReportOutcomeAcceptsWorkerHITLAskAfterMarkerlessTurn(t *testing.T) {
+	outcomes := make([]Outcome, 0, 1)
+	exec := outcomeExecution(&outcomes)
+	exec.input.CompletionContract = CompletionContractWorkerHITL
+	exec.input.CompletionOutcomeValidator = func() bool { return true }
+	exec.reportOutcome("completed", "missing", "", "")
+	if len(outcomes) != 1 || !outcomes[0].Succeeded {
+		t.Fatalf("valid HITL ask outcome = %#v, want one successful provider outcome", outcomes)
+	}
+
+	outcomes = outcomes[:0]
+	exec.input.CompletionOutcomeValidator = func() bool { return false }
+	exec.reportOutcome("completed", "missing", "", "")
+	if len(outcomes) != 1 || outcomes[0].Succeeded {
+		t.Fatalf("missing HITL ask outcome = %#v, want one failed provider outcome", outcomes)
+	}
+
+	outcomes = outcomes[:0]
+	exec.input.CompletionOutcomeValidator = func() bool { return true }
+	exec.reportOutcome("failed", "missing", "", "")
+	if len(outcomes) != 1 || outcomes[0].Succeeded {
+		t.Fatalf("failed non-HITL worker outcome = %#v, want one failed provider outcome", outcomes)
+	}
+}

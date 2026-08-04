@@ -3331,6 +3331,37 @@ func TestQueueStickySnapshotClaimInspectsNewestTiedRun(t *testing.T) {
 	}
 }
 
+func TestQueueListRunningSnapshotVendorsIncludesClaimedItems(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_running", Name: "running", RepoPath: "/tmp/running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loopID := "loop_running_snapshot_vendor"
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_running", Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	snapshot := `{"vendor":"codex"}`
+	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_running_snapshot_vendor", LoopID: loopID, Status: "running", AgentSnapshotJSON: &snapshot, StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: "qi_running_snapshot_vendor", LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: "project_running", DedupeKey: "running-snapshot-vendor", Priority: 1, Status: "running", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	vendors, err := repos.Queue.ListRunningSnapshotVendors(ctx, []string{"worker"})
+	if err != nil {
+		t.Fatalf("ListRunningSnapshotVendors() error = %v", err)
+	}
+	if len(vendors) != 1 || vendors[0] != "codex" {
+		t.Fatalf("ListRunningSnapshotVendors() = %#v, want [codex]", vendors)
+	}
+}
+
 // TestQueueClaimStickyOnlyProjectScopePreservesQuarantinedRetries verifies that
 // stickyOnlyProjectIDs admits sticky-snapshot retries for quarantined projects
 // (absent from the runnable project list) without admitting fresh work for
