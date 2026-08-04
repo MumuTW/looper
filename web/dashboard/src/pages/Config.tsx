@@ -1429,13 +1429,18 @@ export function ConfigPage() {
       });
       setUnsetPaths((current) => {
         const next = new Set(current);
-        if (next.has(path)) next.delete(path);
+        // A newly staged leaf with no published value is undone by clearing
+        // the draft; sending an unset for an absent field would turn a local
+        // discard into a durable no-op patch (and can confuse OCC/rebase).
+        const published = data ? getConfigValue(data, path) : undefined;
+        const hasPublishedValue = published !== undefined && published !== null;
+        if (next.has(path) || !hasPublishedValue) next.delete(path);
         else next.add(path);
         return next;
       });
       clearPathError(path);
     },
-    [clearPathError, retireLoad],
+    [clearPathError, data, retireLoad],
   );
 
   const onSecretSet = useCallback(

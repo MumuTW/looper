@@ -1499,10 +1499,13 @@ describe("ConfigPage", { timeout: 30_000 }, () => {
     );
     expect(effort.value).toBe("");
     expect(
-      screen.getByRole("button", {
-        name: "Undo unset agent.profiles.fast.reasoningEffort",
+      screen.queryByRole("button", {
+        name: "Unset agent.profiles.fast.reasoningEffort",
       }),
-    ).toBeTruthy();
+    ).toBeNull();
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+      false,
+    );
   });
 
   it("retains cleared role profile draft so Save sends unset", async () => {
