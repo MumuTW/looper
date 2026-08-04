@@ -904,6 +904,47 @@ func TestRunContainerSweepPreservesContainerWithRecentCheckout(t *testing.T) {
 	}
 }
 
+func TestRunContainerSweepPreservesProjectCreatedDuringAdmission(t *testing.T) {
+	sharedRoot := t.TempDir()
+	container := filepath.Join(sharedRoot, "repo-dead")
+	mkdirAt(t, filepath.Join(container, "project-existing"), old())
+	if err := os.Chtimes(container, old(), old()); err != nil {
+		t.Fatalf("Chtimes(container) error = %v", err)
+	}
+
+	created := filepath.Join(container, "project-created", "checkout")
+	inserted := false
+	var removed []string
+	options := containerOptions(sharedRoot, nil, stubSweepGit{}, &removed)
+	options.ReadDir = func(path string) ([]DiskEntry, error) {
+		entries, err := readDirEntries(path)
+		if err != nil {
+			return nil, err
+		}
+		if path == container && !inserted {
+			inserted = true
+			if err := os.MkdirAll(created, 0o755); err != nil {
+				t.Fatalf("MkdirAll(%s) error = %v", created, err)
+			}
+		}
+		return entries, nil
+	}
+
+	plan, err := RunContainerSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunContainerSweep() error = %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want newly created project preserved", removed)
+	}
+	if action, reason := reasonFor(t, plan, container); action != ActionSkipped || reason != "changed_at_removal" {
+		t.Fatalf("container = (%q, %q), want changed_at_removal skip", action, reason)
+	}
+	if _, err := os.Stat(created); err != nil {
+		t.Fatalf("newly created checkout was removed: %v", err)
+	}
+}
+
 func TestRunContainerSweepPreservesContainerWithRegularFiles(t *testing.T) {
 	tests := []struct {
 		name       string

@@ -89,6 +89,10 @@ type DiskSweepPlan struct {
 	Candidates []DiskCandidate
 }
 
+type containerTreeObservation struct {
+	mtimes map[string]time.Time
+}
+
 // PlanDiskSweep decides, for each child of one worktree root, whether it is
 // unmanaged debris old enough to remove. Every gate that can be answered from
 // already-read state lives here; the two that need to run against the
@@ -355,8 +359,19 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 			result.Candidates = append(result.Candidates, decided)
 			continue
 		}
-		decided, ok := admitContainer(ctx, options.Git, readDir, registered, decided, options.RetentionCutoff)
+		decided, ok, observation := admitContainer(ctx, options.Git, readDir, registered, decided, options.RetentionCutoff)
 		if !ok {
+			releaseMutation()
+			if decided.Action == "error" {
+				result.Summary.Errors++
+			} else {
+				result.Summary.Skipped++
+			}
+			result.Candidates = append(result.Candidates, decided)
+			continue
+		}
+		decided, changed := revalidateContainerTree(readDir, decided, observation)
+		if changed {
 			releaseMutation()
 			if decided.Action == "error" {
 				result.Summary.Errors++
@@ -629,60 +644,161 @@ func revalidateContainerCandidate(candidate DiskCandidate, cutoff time.Time) (Di
 // registered, fixer-owned, or a usable checkout with uncommitted work. One
 // protected leaf protects its container: partial removal would leave a
 // half-deleted tree that no later pass can reason about.
-func admitContainer(ctx context.Context, git DiskSweepGit, readDir func(string) ([]DiskEntry, error), registered map[string]bool, container DiskCandidate, cutoff time.Time) (DiskCandidate, bool) {
+func admitContainer(ctx context.Context, git DiskSweepGit, readDir func(string) ([]DiskEntry, error), registered map[string]bool, container DiskCandidate, cutoff time.Time) (DiskCandidate, bool, containerTreeObservation) {
+	observation := containerTreeObservation{mtimes: make(map[string]time.Time)}
+	containerInfo, err := os.Stat(container.Path)
+	if err != nil {
+		container.Action = "error"
+		container.Reason = "stat_container_failed"
+		container.Error = err.Error()
+		return container, false, observation
+	}
+	observation.mtimes[normalizeSweepPath(container.Path)] = containerInfo.ModTime()
 	projects, err := readDir(container.Path)
 	if err != nil {
 		container.Action = "error"
 		container.Reason = "read_container_failed"
 		container.Error = err.Error()
-		return container, false
+		return container, false, observation
 	}
 	for _, project := range projects {
 		if !project.IsDir {
 			container.Action = ActionSkipped
 			container.Reason = "non_directory_inside"
-			return container, false
+			return container, false, observation
 		}
+		projectInfo, err := os.Stat(project.Path)
+		if err != nil {
+			container.Action = "error"
+			container.Reason = "stat_project_failed"
+			container.Error = err.Error()
+			return container, false, observation
+		}
+		observation.mtimes[normalizeSweepPath(project.Path)] = projectInfo.ModTime()
 		checkouts, err := readDir(project.Path)
 		if err != nil {
 			container.Action = "error"
 			container.Reason = "read_container_failed"
 			container.Error = err.Error()
-			return container, false
+			return container, false, observation
 		}
 		for _, checkout := range checkouts {
 			if !checkout.IsDir {
 				container.Action = ActionSkipped
 				container.Reason = "non_directory_inside"
-				return container, false
+				return container, false, observation
 			}
+			checkoutInfo, err := os.Stat(checkout.Path)
+			if err != nil {
+				container.Action = "error"
+				container.Reason = "stat_checkout_failed"
+				container.Error = err.Error()
+				return container, false, observation
+			}
+			observation.mtimes[normalizeSweepPath(checkout.Path)] = checkoutInfo.ModTime()
 			freshCheckout, checkoutEligible := revalidateContainerCandidate(DiskCandidate{Path: checkout.Path}, cutoff)
 			if !checkoutEligible {
 				container.Action = freshCheckout.Action
 				container.Reason = freshCheckout.Reason + "_inside"
 				container.Error = freshCheckout.Error
-				return container, false
+				return container, false, observation
 			}
 			if registered[normalizeSweepPath(freshCheckout.Path)] {
 				container.Action = ActionSkipped
 				container.Reason = "registered_checkout_inside"
-				return container, false
+				return container, false, observation
 			}
 			leaf, ok := admitRemoval(ctx, git, freshCheckout)
 			if !ok {
 				container.Action = leaf.Action
 				container.Reason = leaf.Reason + "_inside"
 				container.Error = leaf.Error
-				return container, false
+				return container, false, observation
 			}
 			if worktreesafety.IsUsableStandaloneGitRepository(freshCheckout.Path) {
 				container.Action = ActionSkipped
 				container.Reason = "standalone_git_repository_inside"
-				return container, false
+				return container, false, observation
 			}
 		}
 	}
-	return container, true
+	return container, true, observation
+}
+
+// revalidateContainerTree compares the current two-level container/project
+// layout with the admission snapshot. A creator can materialize a project or
+// checkout after admitContainer has read its parents; any new or changed
+// directory is preserved before RemoveAll, even when the enclosing container's
+// own mtime remains old.
+func revalidateContainerTree(readDir func(string) ([]DiskEntry, error), candidate DiskCandidate, observation containerTreeObservation) (DiskCandidate, bool) {
+	check := func(path string, modifiedAt time.Time) bool {
+		previous, ok := observation.mtimes[normalizeSweepPath(path)]
+		return !ok || !modifiedAt.Equal(previous)
+	}
+	containerInfo, err := os.Stat(candidate.Path)
+	if err != nil {
+		candidate.Action = ActionSkipped
+		candidate.Reason = "missing_at_removal"
+		return candidate, true
+	}
+	if check(candidate.Path, containerInfo.ModTime()) {
+		candidate.Action = ActionSkipped
+		candidate.Reason = "changed_at_removal"
+		return candidate, true
+	}
+	projects, err := readDir(candidate.Path)
+	if err != nil {
+		candidate.Action = "error"
+		candidate.Reason = "read_container_at_removal_failed"
+		candidate.Error = err.Error()
+		return candidate, true
+	}
+	for _, project := range projects {
+		if !project.IsDir {
+			candidate.Action = ActionSkipped
+			candidate.Reason = "non_directory_inside"
+			return candidate, true
+		}
+		projectInfo, err := os.Stat(project.Path)
+		if err != nil {
+			candidate.Action = "error"
+			candidate.Reason = "stat_project_at_removal_failed"
+			candidate.Error = err.Error()
+			return candidate, true
+		}
+		if check(project.Path, projectInfo.ModTime()) {
+			candidate.Action = ActionSkipped
+			candidate.Reason = "changed_at_removal"
+			return candidate, true
+		}
+		checkouts, err := readDir(project.Path)
+		if err != nil {
+			candidate.Action = "error"
+			candidate.Reason = "read_project_at_removal_failed"
+			candidate.Error = err.Error()
+			return candidate, true
+		}
+		for _, checkout := range checkouts {
+			if !checkout.IsDir {
+				candidate.Action = ActionSkipped
+				candidate.Reason = "non_directory_inside"
+				return candidate, true
+			}
+			checkoutInfo, err := os.Stat(checkout.Path)
+			if err != nil {
+				candidate.Action = "error"
+				candidate.Reason = "stat_checkout_at_removal_failed"
+				candidate.Error = err.Error()
+				return candidate, true
+			}
+			if check(checkout.Path, checkoutInfo.ModTime()) {
+				candidate.Action = ActionSkipped
+				candidate.Reason = "changed_at_removal"
+				return candidate, true
+			}
+		}
+	}
+	return candidate, false
 }
 
 // DiskSweepGit is the git surface the executor needs.
