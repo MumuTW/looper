@@ -644,8 +644,10 @@ func (c *closureCollector) addPackageTree(root, runtimePath string) error {
 				}
 			}
 			return c.addInterpreterClosure(interpreter)
-		default:
+		case info.IsDir():
 			return nil
+		default:
+			return fmt.Errorf("package tree %s contains unsupported special file type %s", path, info.Mode().String())
 		}
 	})
 }

@@ -182,6 +182,20 @@ func TestDigestEntryRejectsSpecialFile(t *testing.T) {
 	}
 }
 
+func TestBuildRejectsUnrecordedSpecialPackageFile(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("fixture requires a Unix FIFO")
+	}
+	fixture := newFixture(t)
+	fifo := filepath.Join(fixture.packageRoot, "untrusted.fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(fixture.input()); err == nil || !strings.Contains(err.Error(), "unsupported special file type") {
+		t.Fatalf("Build() error = %v, want unrecorded special-file rejection", err)
+	}
+}
+
 func TestCompareManifestsRejectsClosureEntryDrift(t *testing.T) {
 	fixture := newFixture(t)
 	sealed, err := Build(fixture.input())
