@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -2281,6 +2282,20 @@ func TestGatewayMergeBaseResumesExistingConflictState(t *testing.T) {
 	inspectResolved, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.WorktreePath})
 	if err != nil || inspectResolved.HasUnresolvedConflicts {
 		t.Fatalf("InspectHead() after abort = (%#v, %v), want no unresolved conflicts", inspectResolved, err)
+	}
+}
+
+func TestUnresolvedConflictFilesRecognizesAllUnmergedStatuses(t *testing.T) {
+	entries := []statusEntry{
+		{Code: "AA", Path: "add-add.txt"},
+		{Code: "DD", Path: "both-deleted.txt"},
+		{Code: "UU", Path: "both-modified.txt"},
+		{Code: " M", Path: "ordinary-change.txt"},
+	}
+	got := unresolvedConflictFiles(entries)
+	want := []string{"add-add.txt", "both-deleted.txt", "both-modified.txt"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unresolvedConflictFiles() = %#v, want %#v", got, want)
 	}
 }
 

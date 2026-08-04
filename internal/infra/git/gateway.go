@@ -996,7 +996,8 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 		}
 	}
 
-	unresolvedConflictFiles := unresolvedConflictFiles(status)	return InspectHeadResult{
+	unresolvedConflictFiles := unresolvedConflictFiles(status)
+	return InspectHeadResult{
 		HeadSHA:                    headSHA,
 		Branch:                     branch,
 		NewCommitSHAs:              newCommitSHAs,
@@ -1015,7 +1016,7 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 		WorktreeMatchesHead:        worktreeMatchesHead,
 		HeadDescendsFromCompare:    headDescendsFromCompare,
 		HasUnresolvedConflicts:     len(unresolvedConflictFiles) > 0,
-		UnresolvedConflictFiles:    unresolvedConflictFiles,	}, nil
+		UnresolvedConflictFiles:    unresolvedConflictFiles}, nil
 }
 
 func (g *Gateway) worktreeMatchesHead(ctx context.Context, worktreePath string, paths []string) (bool, error) {
@@ -1947,18 +1948,6 @@ func (g *Gateway) mergeInProgress(ctx context.Context, worktreePath string) (boo
 	return !info.IsDir(), nil
 }
 
-func (g *Gateway) isAncestor(ctx context.Context, repoPath, ancestor, descendant string) (bool, error) {
-	_, err := g.runGitResult(ctx, repoPath, nil, "merge-base", "--is-ancestor", ancestor, descendant)
-	if err == nil {
-		return true, nil
-	}
-	var commandErr *shell.CommandExecutionError
-	if errors.As(err, &commandErr) && commandErr.Result.ExitCode == 1 {
-		return false, nil
-	}
-	return false, err
-}
-
 func (g *Gateway) isHealthyWorktree(ctx context.Context, worktreePath string) (bool, error) {
 	if _, err := os.Stat(worktreePath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -2245,7 +2234,7 @@ type statusEntry struct {
 func unresolvedConflictFiles(entries []statusEntry) []string {
 	paths := make([]string, 0)
 	for _, entry := range entries {
-		if strings.Contains(entry.Code, "U") {
+		if strings.Contains(entry.Code, "U") || entry.Code == "AA" || entry.Code == "DD" {
 			paths = append(paths, entry.Path)
 		}
 	}
