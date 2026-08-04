@@ -1,10 +1,13 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/escalator"
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/webui"
@@ -29,7 +32,7 @@ func (h *Handler) handleWebUIRoute(w http.ResponseWriter, r *http.Request) {
 		repositories = h.context.Runtime.Services().Repositories
 	}
 
-	collector := looperdruntime.NewEscalatorCollector(cfg, repositories, h.now)
+	collector := h.webUIEscalatorCollector(cfg, repositories)
 	links := looperdruntime.NewEscalatorLinker(cfg)
 	pathPrefix := ""
 	if cfg.Server.BaseURL != nil {
@@ -42,4 +45,20 @@ func (h *Handler) handleWebUIRoute(w http.ResponseWriter, r *http.Request) {
 		Now:        h.now,
 		PathPrefix: pathPrefix,
 	}).ServeHTTP(w, r)
+}
+
+func (h *Handler) webUIEscalatorCollector(cfg config.Config, repositories *storage.Repositories) *escalator.Collector {
+	key := fmt.Sprintf("%d/%d/%d/%d|%s|%s|%d", cfg.Roles.Escalator.RetryAttemptThreshold, cfg.Roles.Escalator.UnroutedAfterSeconds, cfg.Roles.Escalator.StaleHeadAfterSeconds, cfg.Roles.Escalator.MaxItems, derefString(cfg.Server.BaseURL), cfg.Server.Host, cfg.Server.Port)
+	if h.webUICollectorState == nil {
+		return looperdruntime.NewEscalatorCollector(cfg, repositories, h.now)
+	}
+	state := h.webUICollectorState
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.collector == nil || state.repositories != repositories || state.configKey != key {
+		state.collector = looperdruntime.NewEscalatorCollector(cfg, repositories, h.now)
+		state.repositories = repositories
+		state.configKey = key
+	}
+	return state.collector
 }

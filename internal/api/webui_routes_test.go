@@ -32,6 +32,24 @@ func TestWebUITriageRendersThroughTheAPIHandler(t *testing.T) {
 	}
 }
 
+func TestWebUIReusesEscalatorCollectorAcrossRequests(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	repositories := rt.Services().Repositories
+	first := h.webUIEscalatorCollector(cfg, repositories)
+	second := h.webUIEscalatorCollector(cfg, repositories)
+	if first == nil || first != second {
+		t.Fatalf("collectors = (%p, %p), want one request-shared collector", first, second)
+	}
+
+	changed := cfg
+	changed.Roles.Escalator.UnroutedAfterSeconds++
+	third := h.webUIEscalatorCollector(changed, repositories)
+	if third == nil || third == second {
+		t.Fatal("collector was not rebuilt after its threshold configuration changed")
+	}
+}
+
 func TestWebUIMountRedirectsToTriage(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})

@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MumuTW/looper/internal/agent"
@@ -27,6 +28,7 @@ import (
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/daemonbinary"
 	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/escalator"
 	"github.com/MumuTW/looper/internal/eventlog"
 	"github.com/MumuTW/looper/internal/fixer"
 	"github.com/MumuTW/looper/internal/gatekeeper"
@@ -163,6 +165,10 @@ type Handler struct {
 	// webUICache bounds what the /ui/ poll costs when several tabs are open:
 	// the page handler is rebuilt per request, so the cache has to live here.
 	webUICache *webui.LoadCache
+	// webUICollectorState keeps the Escalator's bounded triage cursor across
+	// request-local page handlers. Its pointer survives ServeHTTP's shallow
+	// Handler copy while its mutex protects concurrent web requests.
+	webUICollectorState *webUICollectorState
 	// discardBeforeGitHook is test-only: invoked after discard preflight recheck
 	// and immediately before git reset/clean so tests can inject a requeue race
 	// that bypasses LockLoopRequeue (defense-in-depth for the pre-git recheck).
@@ -178,6 +184,13 @@ type Handler struct {
 	// loopLogsFollowObserve is test-only instrumentation for enforcing the
 	// stream's query/read budgets without coupling tests to SQLite internals.
 	loopLogsFollowObserve func(loopLogsFollowObservation)
+}
+
+type webUICollectorState struct {
+	mu           sync.Mutex
+	collector    *escalator.Collector
+	repositories *storage.Repositories
+	configKey    string
 }
 
 // effectiveConfig returns the live config when ConfigSnapshot is wired, else
@@ -224,12 +237,13 @@ func NewHandler(context Context) *Handler {
 	bootstrap.now = now
 
 	return &Handler{
-		context:          context,
-		now:              now,
-		recoverySummary:  recoverySummary,
-		webhookForwarder: forwarder,
-		bootstrap:        bootstrap,
-		webUICache:       webui.NewLoadCache(webui.RefreshInterval, now),
+		context:             context,
+		now:                 now,
+		recoverySummary:     recoverySummary,
+		webhookForwarder:    forwarder,
+		bootstrap:           bootstrap,
+		webUICache:          webui.NewLoadCache(webui.RefreshInterval, now),
+		webUICollectorState: &webUICollectorState{},
 	}
 }
 
