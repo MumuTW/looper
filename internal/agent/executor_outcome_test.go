@@ -242,3 +242,21 @@ func TestReportOutcomeAcceptsReviewerOutcomes(t *testing.T) {
 		t.Fatalf("invalid reviewer outcome = %#v, want one failed outcome", outcomes)
 	}
 }
+
+func TestReportOutcomeAcceptsVerifiedReviewerPublicationAfterIncompleteProcessResult(t *testing.T) {
+	outcomes := make([]Outcome, 0, 1)
+	exec := outcomeExecution(&outcomes)
+	exec.input.CompletionContract = CompletionContractReviewerPublication
+	exec.input.CompletionOutcomeValidator = func() bool { return true }
+	exec.reportOutcome("failed", "missing", "", "")
+	if len(outcomes) != 1 || !outcomes[0].Succeeded {
+		t.Fatalf("verified reviewer publication = %#v, want one successful provider outcome", outcomes)
+	}
+
+	outcomes = outcomes[:0]
+	exec.input.CompletionOutcomeValidator = func() bool { return false }
+	exec.reportOutcome("failed", "missing", "", "")
+	if len(outcomes) != 1 || outcomes[0].Succeeded {
+		t.Fatalf("unverified reviewer publication = %#v, want one failed provider outcome", outcomes)
+	}
+}

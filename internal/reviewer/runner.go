@@ -366,8 +366,9 @@ type AgentRunInput struct {
 	// agent-health success accounting. Thread-resolution classifiers emit raw
 	// JSON without the generic completion marker; review runs use the reviewer
 	// marker contract aligned with clean/non_blocking/blocking outcomes.
-	CompletionContract  agent.CompletionContract
-	CompletionValidator func(string) bool
+	CompletionContract         agent.CompletionContract
+	CompletionValidator        func(string) bool
+	CompletionOutcomeValidator func() bool
 }
 
 type AgentResult struct {
@@ -2676,7 +2677,11 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		Prompt: prompt, NativeResumePrompt: nativeResumePrompt, WorkingDirectory: worktree.Path,
 		Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey,
 		UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
-		CompletionContract: agent.CompletionContractReviewerMarker,
+		CompletionContract: agent.CompletionContractReviewerPublication,
+		CompletionOutcomeValidator: func() bool {
+			found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{}))
+			return err == nil && found.Found
+		},
 	})
 	if err != nil {
 		return checkpoint, err

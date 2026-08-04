@@ -374,6 +374,11 @@ type RunInput struct {
 	// contracts it receives FinalMessage(stdout); file-backed callers may ignore
 	// the argument. It is evaluated only at terminal outcome reporting.
 	CompletionValidator func(string) bool
+	// CompletionOutcomeValidator is a caller-owned durable publication check.
+	// Reviewer runs use it only when the process status or stdout marker is
+	// incomplete; a verified remote review marker can therefore count as a
+	// successful provider outcome even when the agent exited non-zero.
+	CompletionOutcomeValidator func() bool
 	// BrownoutProbe is populated by the common spawn admission lease.
 	BrownoutProbe bool
 	// BrownoutProbeGeneration is copied from the common spawn admission lease.
@@ -383,11 +388,12 @@ type RunInput struct {
 type CompletionContract string
 
 const (
-	CompletionContractMarker          CompletionContract = "marker"
-	CompletionContractRawJSON         CompletionContract = "raw_json"
-	CompletionContractRawJSONEnvelope CompletionContract = "raw_json_envelope"
-	CompletionContractReviewerMarker  CompletionContract = "reviewer_marker"
-	CompletionContractFixerMarker     CompletionContract = "fixer_marker"
+	CompletionContractMarker              CompletionContract = "marker"
+	CompletionContractRawJSON             CompletionContract = "raw_json"
+	CompletionContractRawJSONEnvelope     CompletionContract = "raw_json_envelope"
+	CompletionContractReviewerMarker      CompletionContract = "reviewer_marker"
+	CompletionContractReviewerPublication CompletionContract = "reviewer_publication"
+	CompletionContractFixerMarker         CompletionContract = "fixer_marker"
 	// CompletionContractPlannerMarker matches Planner's optional completion
 	// marker. Planner can advance from a successful agent result without a
 	// marker, while a present marker is still validated by the Planner caller.
@@ -1460,6 +1466,11 @@ func (x *execution) reportOutcome(status, parseStatus, completionPayload, stdout
 		}
 	} else if x.input.CompletionContract == CompletionContractReviewerMarker {
 		succeeded = succeeded && parseStatus == "parsed" && validReviewerMarkerOutcome(completionPayload)
+	} else if x.input.CompletionContract == CompletionContractReviewerPublication {
+		succeeded = succeeded && parseStatus == "parsed" && validReviewerMarkerOutcome(completionPayload)
+		if !succeeded && x.input.CompletionOutcomeValidator != nil {
+			succeeded = x.input.CompletionOutcomeValidator()
+		}
 	} else if x.input.CompletionContract == CompletionContractFixerMarker {
 		succeeded = succeeded && parseStatus == "parsed" && validFixerMarkerOutcome(completionPayload)
 	} else if x.input.CompletionContract == CompletionContractPlannerMarker {
