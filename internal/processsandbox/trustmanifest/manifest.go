@@ -104,6 +104,7 @@ func Build(input Input) (Manifest, error) {
 		visitedInterpreters: make(map[string]struct{}),
 		interpreterPaths:    executableSearchPaths(normalized.Roots, normalized.LaunchPath),
 		elfContextPath:      normalized.Roots["node"],
+		machoContextPath:    normalized.Roots["node"],
 		visitedMachO:        make(map[string]struct{}),
 	}
 	if err := collector.addPackageTree(normalized.PackageRoot, normalized.Roots["srt"]); err != nil {
@@ -525,7 +526,11 @@ type closureCollector struct {
 	// with Node's loader context, but unlike an executable they do not carry a
 	// PT_INTERP segment of their own.
 	elfContextPath string
-	visitedMachO   map[string]struct{}
+	// machoContextPath is the main executable used for package-tree Mach-O
+	// images. Node loads native package dylibs, so @executable_path must be
+	// evaluated from Node rather than from the dylib's own directory.
+	machoContextPath string
+	visitedMachO     map[string]struct{}
 }
 
 func (c *closureCollector) addPackageTree(root, runtimePath string) error {
@@ -570,7 +575,11 @@ func (c *closureCollector) addPackageTree(root, runtimePath string) error {
 				if err := c.addContent(path, EntryMachOBinary, raw); err != nil {
 					return err
 				}
-				return c.addMachOClosure(path)
+				executablePath := c.machoContextPath
+				if executablePath == "" {
+					executablePath = path
+				}
+				return c.addMachOClosureFrom(path, executablePath)
 			}
 			if info.Mode().Perm()&0o111 == 0 {
 				return nil
@@ -609,7 +618,7 @@ func (c *closureCollector) addExecutable(path string, runtimeScript bool) error 
 		if err := c.addContent(path, EntryMachOBinary, raw); err != nil {
 			return err
 		}
-		return c.addMachOClosure(path)
+		return c.addMachOClosureFrom(path, path)
 	}
 	interpreter, envInterpreter, ok, err := resolveScriptInterpreter(path, raw, c.interpreterPaths)
 	if err != nil {
@@ -878,11 +887,16 @@ func (c *closureCollector) addMachOClosure(path string) error {
 }
 
 func (c *closureCollector) addMachOClosureFrom(path, executablePath string) error {
-	if _, ok := c.visitedMachO[path]; ok {
+	return c.addMachOClosureFromContext(path, executablePath, nil)
+}
+
+func (c *closureCollector) addMachOClosureFromContext(path, executablePath string, inheritedRpaths []string) error {
+	visitKey := path + "\x00" + executablePath + "\x00" + strings.Join(inheritedRpaths, "\x00")
+	if _, ok := c.visitedMachO[visitKey]; ok {
 		return nil
 	}
-	c.visitedMachO[path] = struct{}{}
-	dependencies, err := machoDependenciesForExecutable(path, executablePath)
+	c.visitedMachO[visitKey] = struct{}{}
+	dependencies, runpaths, err := machoDependenciesForExecutableWithRpaths(path, executablePath, inheritedRpaths)
 	if err != nil {
 		return err
 	}
@@ -895,7 +909,7 @@ func (c *closureCollector) addMachOClosureFrom(path, executablePath string) erro
 			return err
 		}
 		if isMachOBytes(raw) {
-			if err := c.addMachOClosureFrom(dependency, executablePath); err != nil {
+			if err := c.addMachOClosureFromContext(dependency, executablePath, runpaths); err != nil {
 				return err
 			}
 		}
@@ -903,53 +917,86 @@ func (c *closureCollector) addMachOClosureFrom(path, executablePath string) erro
 	return nil
 }
 
+//lint:ignore U1000 kept as a compatibility shim for package-level callers
 func machoDependenciesForExecutable(path, executablePath string) ([]string, error) {
+	dependencies, _, err := machoDependenciesForExecutableWithRpaths(path, executablePath, nil)
+	return dependencies, err
+}
+
+func machoDependenciesForExecutableWithRpaths(path, executablePath string, inheritedRpaths []string) ([]string, []string, error) {
 	file, err := macho.Open(path)
 	if err == nil {
 		defer file.Close()
-		return machoFileDependencies(file, path, executablePath)
+		return machoFileDependenciesWithRpaths(file, path, executablePath, inheritedRpaths)
 	}
 	fat, fatErr := macho.OpenFat(path)
 	if fatErr != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer fat.Close()
 	paths := make(map[string]struct{})
+	runpaths := []string{}
+	seenRunpaths := make(map[string]struct{}, len(inheritedRpaths))
 	for _, arch := range fat.Arches {
-		dependencies, archErr := machoFileDependencies(arch.File, path, executablePath)
+		dependencies, archRunpaths, archErr := machoFileDependenciesWithRpaths(arch.File, path, executablePath, inheritedRpaths)
 		if archErr != nil {
-			return nil, archErr
+			return nil, nil, archErr
 		}
 		for _, dependency := range dependencies {
 			paths[dependency] = struct{}{}
 		}
+		for _, runpath := range archRunpaths {
+			if _, ok := seenRunpaths[runpath]; ok {
+				continue
+			}
+			seenRunpaths[runpath] = struct{}{}
+			runpaths = append(runpaths, runpath)
+		}
+	}
+	if len(fat.Arches) == 0 {
+		runpaths = append(runpaths, inheritedRpaths...)
 	}
 	result := make([]string, 0, len(paths))
 	for dependency := range paths {
 		result = append(result, dependency)
 	}
 	sort.Strings(result)
-	return result, nil
+	return result, runpaths, nil
 }
 
+//lint:ignore U1000 kept as a compatibility shim for package-level callers
 func machoFileDependencies(file *macho.File, path string, executablePaths ...string) ([]string, error) {
 	executablePath := path
 	if len(executablePaths) > 0 && strings.TrimSpace(executablePaths[0]) != "" {
 		executablePath = executablePaths[0]
 	}
+	dependencies, _, err := machoFileDependenciesWithRpaths(file, path, executablePath, nil)
+	return dependencies, err
+}
+
+func machoFileDependenciesWithRpaths(file *macho.File, path, executablePath string, inheritedRpaths []string) ([]string, []string, error) {
 	libraries, err := file.ImportedLibraries()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	libraries = append(libraries, rawMachOLibraries(file)...)
-	rpaths := []string{}
+	currentRpaths := []string{}
 	for _, load := range file.Loads {
 		if rpath, ok := load.(*macho.Rpath); ok {
 			if err := validateMachORpath(rpath.Path); err != nil {
-				return nil, fmt.Errorf("Mach-O %s: %w", path, err)
+				return nil, nil, fmt.Errorf("Mach-O %s: %w", path, err)
 			}
-			rpaths = append(rpaths, rpath.Path)
+			currentRpaths = append(currentRpaths, rpath.Path)
 		}
+	}
+	rpaths := make([]string, 0, len(currentRpaths)+len(inheritedRpaths))
+	seenRpaths := make(map[string]struct{}, len(currentRpaths)+len(inheritedRpaths))
+	for _, candidate := range append(currentRpaths, inheritedRpaths...) {
+		if _, ok := seenRpaths[candidate]; ok {
+			continue
+		}
+		seenRpaths[candidate] = struct{}{}
+		rpaths = append(rpaths, candidate)
 	}
 	resolved := make(map[string]struct{}, len(libraries))
 	for _, library := range libraries {
@@ -962,7 +1009,7 @@ func machoFileDependencies(file *macho.File, path string, executablePaths ...str
 				// still fail closed above.
 				continue
 			}
-			return nil, err
+			return nil, nil, err
 		}
 		resolved[candidate] = struct{}{}
 	}
@@ -971,7 +1018,7 @@ func machoFileDependencies(file *macho.File, path string, executablePaths ...str
 		result = append(result, dependency)
 	}
 	sort.Strings(result)
-	return result, nil
+	return result, rpaths, nil
 }
 
 const (
