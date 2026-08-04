@@ -894,8 +894,8 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	if completed[0].Status != "success" || completed[0].PullRequestNumber != 101 || completed[0].PullRequestURL != "https://example/pr/101" {
 		t.Fatalf("completed[0] = %#v, want success with PR details", completed[0])
 	}
-	if !strings.Contains(agent.starts[0].Prompt, `__LOOPER_RESULT__={"summary":"<one-sentence summary>"}`) {
-		t.Fatalf("prompt = %q, want canonical completion instruction", agent.starts[0].Prompt)
+	if !strings.Contains(agent.starts[0].Prompt, `__LOOPER_RESULT__={"summary":"<one-sentence summary>","reproduction":null}`) {
+		t.Fatalf("prompt = %q, want Worker completion instruction with optional reproduction", agent.starts[0].Prompt)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
 	if err != nil {

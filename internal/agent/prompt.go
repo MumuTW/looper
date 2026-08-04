@@ -38,6 +38,25 @@ func AppendCompletionInstruction(prompt string) string {
 	}, "\n\n")
 }
 
+// AppendWorkerCompletionInstruction is the Worker-specific completion contract.
+// A Worker may author a reproduction after its first capture, so the single
+// template carries an explicit nullable reproduction slot rather than
+// contradicting a separate prose requirement with the generic summary-only
+// template.
+func AppendWorkerCompletionInstruction(prompt string, reproductionOptional bool) string {
+	if !reproductionOptional {
+		return AppendCompletionInstruction(prompt)
+	}
+	return strings.Join([]string{
+		prompt,
+		"When finished, print exactly one final line to stdout in this format:",
+		CompletionMarkerPrefix + `{"summary":"<one-sentence summary>","reproduction":null}`,
+		`If you created .looper/reproducer.json because no reproduction contract was present when this run started, replace null with a "reproduction" object that exactly matches the committed manifest, including testPath, testName, testCommand, testSha256, and any issue scope. Leave it null when you did not create a new reproduction contract.`,
+		"Do not wrap that line in markdown.",
+		"Do not print anything after that line.",
+	}, "\n\n")
+}
+
 // AppendFixerCompletionInstruction is the fixer-specific completion contract.
 //
 // The fixer repair pipeline treats a top-level `outcome` as the authority for

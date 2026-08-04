@@ -3661,7 +3661,6 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
 	}
-	checkpoint.Repair = nil
 	validationCommands = fixerValidationCommands(validationCommands, checkpoint)
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
 		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
@@ -3703,9 +3702,11 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 			return checkpoint, err
 		}
 	}
-	// Durable "agent is live" marker before Wait. Repair is only written after
-	// Wait; without this, a crash mid-Wait leaves no past-initial evidence and
-	// resume could adopt an agent-authored reproduction manifest.
+	// Durable "agent is live" marker before Wait. Clear a retained
+	// non-completed repair only in the same checkpoint that records replacement
+	// startup; before this point a startup failure must leave retry provenance
+	// available so an untrusted manifest remains deferrable.
+	checkpoint.Repair = nil
 	checkpoint.PendingAgentExecutionID = executionID
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
 		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}

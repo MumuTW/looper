@@ -418,8 +418,6 @@ const validationGatedLocalOnlyPrompt = `
 VALIDATION-GATED LOCAL-ONLY EXECUTION:
 Looper's daemon already fetched and prepared the repository state. Tool network access is intentionally disabled. Do not run gh, git fetch/pull/push, access remote URLs, or fail merely because the forge is unavailable. Use the local checkout and the context already supplied in this prompt. Edit, test, and commit locally only; Looper will validate the exact commit and publish it afterward.`
 
-const workerReproductionCompletionInstruction = `If you create .looper/reproducer.json because no reproduction contract was present when this run started, include a top-level "reproduction" object in the final __LOOPER_RESULT__ JSON. It must exactly match the committed manifest, including testPath, testName, testCommand, testSha256, and any issue scope. Omit the object when you did not create a new reproduction contract.`
-
 const testFirstDeliveryPrompt = `TEST-FIRST DELIVERY EXPECTATION:
 When feasible, add or update a failing automated test first and confirm it captures the requested behavior. Then write the smallest implementation that makes it pass, and refactor while keeping the suite green.
 Every pull request must state the automated coverage added or updated and the relevant commands run. If automated coverage is not feasible, explain why coverage is not feasible in the final summary so the PR records that exception.
@@ -5113,10 +5111,7 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 		parts = append(parts, "Make the necessary code changes, validate them, and leave the branch ready for PR creation.")
 		parts = append(parts, noRemoteLifecyclePromptInstruction("worker", work.Branch, work.BaseBranch, disclosureCfg, agentRuntime, agentModel))
 	}
-	if work.Reproduction == nil {
-		parts = append(parts, workerReproductionCompletionInstruction)
-	}
-	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock, nil
+	return agent.AppendWorkerCompletionInstruction(strings.Join(parts, "\n\n"), work.Reproduction == nil), instructionBlock, nil
 }
 
 func customInstructionConfig(value *config.Config) config.Config {
