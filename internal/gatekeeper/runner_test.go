@@ -760,6 +760,7 @@ type fakeGatekeeperGitHub struct {
 	statusErr             error
 	validateMergifyErr    error
 	validateMergifyCalls  int
+	validateMergifyInputs []githubinfra.ValidateMergifyRoutingInput
 	listCalls             int
 	loginCalls            int
 	comments              []githubinfra.CommentInfo
@@ -953,8 +954,9 @@ func (f *fakeGatekeeperGitHub) SetCommitStatus(_ context.Context, input githubin
 	return nil
 }
 
-func (f *fakeGatekeeperGitHub) ValidateMergifyRouting(context.Context, githubinfra.ValidateMergifyRoutingInput) error {
+func (f *fakeGatekeeperGitHub) ValidateMergifyRouting(_ context.Context, input githubinfra.ValidateMergifyRoutingInput) error {
 	f.validateMergifyCalls++
+	f.validateMergifyInputs = append(f.validateMergifyInputs, input)
 	return f.validateMergifyErr
 }
 

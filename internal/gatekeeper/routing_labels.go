@@ -80,7 +80,7 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 	}
 	if plan.autoMerge {
 		if err := r.github.ValidateMergifyRouting(ctx, githubinfra.ValidateMergifyRoutingInput{
-			Repo: reportRepositoryTarget(report), CWD: r.projectCWD(ctx, report.ProjectID),
+			Repo: reportRepositoryTarget(report), BaseRefName: strings.TrimSpace(report.Evidence.BaseRefName), CWD: r.projectCWD(ctx, report.ProjectID),
 		}); err != nil {
 			// A repository contract failure must retire an already-published
 			// route before returning. Leaving auto-merge in place while the

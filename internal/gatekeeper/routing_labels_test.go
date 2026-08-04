@@ -57,6 +57,9 @@ func TestAutoTrustRoutesEligiblePullRequestThroughMergify(t *testing.T) {
 	if len(fixture.github.commitStatuses) != 1 {
 		t.Fatalf("commit statuses = %#v, want one current-head status", fixture.github.commitStatuses)
 	}
+	if len(fixture.github.validateMergifyInputs) != 1 || fixture.github.validateMergifyInputs[0].BaseRefName != "main" {
+		t.Fatalf("Mergify validation inputs = %#v, want evaluated base main", fixture.github.validateMergifyInputs)
+	}
 	status := fixture.github.commitStatuses[0]
 	if status.SHA != "head-1" || status.Context != RequiredStatusContext || status.State != "success" {
 		t.Fatalf("commit status = %#v, want success for head-1 in %q context", status, RequiredStatusContext)

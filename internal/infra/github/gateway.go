@@ -660,8 +660,9 @@ type PullRequestLabelsInput struct {
 // ValidateMergifyRoutingInput identifies the repository configuration whose
 // queue contract Gatekeeper relies on when it publishes the auto-merge label.
 type ValidateMergifyRoutingInput struct {
-	Repo string
-	CWD  string
+	Repo        string
+	BaseRefName string
+	CWD         string
 }
 
 // MergifyRoutingContractFingerprint returns a stable digest of the repository's
@@ -2385,9 +2386,9 @@ func (g *Gateway) GetPullRequestHeadAndBaseSHA(ctx context.Context, input ViewPu
 
 // ValidateMergifyRouting checks the repository-owned Mergify contract before
 // Gatekeeper publishes an auto-merge label. The repository file is the
-// authority for how that label is consumed; Gatekeeper must fail closed when
-// the file is absent or does not contain the vetoes that protect manual queue
-// entries as well as the automatic route.
+// authority for how that label is consumed; Gatekeeper fails closed when the
+// file is absent, misses the vetoes protecting manual queue entries, or has no
+// queue rule applicable to the evaluated base branch.
 func (g *Gateway) ValidateMergifyRouting(ctx context.Context, input ValidateMergifyRoutingInput) error {
 	hostname, repo := splitRepoHostname(input.Repo)
 	args := []string{"api", fmt.Sprintf("repos/%s/contents/.mergify.yml", repo), "--jq", ".content", "-H", "Accept: application/vnd.github+json"}
@@ -2495,12 +2496,23 @@ func (g *Gateway) ValidateMergifyRouting(ctx context.Context, input ValidateMerg
 	if len(contract.QueueRules) == 0 {
 		return fmt.Errorf(".mergify.yml has no queue_rules")
 	}
+	baseRefName := strings.TrimSpace(input.BaseRefName)
+	if baseRefName == "" {
+		return fmt.Errorf("Mergify routing validation requires the evaluated base branch")
+	}
+	baseRuleApplicable := false
 	for index, rule := range contract.QueueRules {
 		for _, condition := range []string{"label != " + labels.NeedsHumanReview, "label != " + labels.DoNotMerge} {
 			if !hasMergifyCondition(rule.QueueConditions, condition) {
 				return fmt.Errorf(".mergify.yml queue_rules[%d] queue_conditions missing %q", index, condition)
 			}
 		}
+		if queueRuleAppliesToBase(rule.QueueConditions, baseRefName) {
+			baseRuleApplicable = true
+		}
+	}
+	if !baseRuleApplicable {
+		return fmt.Errorf(".mergify.yml has no queue rule applicable to base branch %q", baseRefName)
 	}
 	if len(contract.MergeProtections) == 0 {
 		return fmt.Errorf(".mergify.yml has no merge_protections; auto_merge_conditions require at least one active merge-protection rule")
@@ -2512,6 +2524,31 @@ func (g *Gateway) ValidateMergifyRouting(ctx context.Context, input ValidateMerg
 		return fmt.Errorf(`.mergify.yml has no current-head Gatekeeper status contract`)
 	}
 	return nil
+}
+
+func queueRuleAppliesToBase(conditions []string, baseRefName string) bool {
+	baseRefName = strings.TrimSpace(baseRefName)
+	if baseRefName == "" {
+		return true
+	}
+	for _, condition := range conditions {
+		fields := strings.Fields(condition)
+		if len(fields) != 3 || fields[0] != "base" {
+			continue
+		}
+		value := strings.Trim(strings.TrimSpace(fields[2]), "\"'")
+		switch fields[1] {
+		case "=":
+			if value != baseRefName {
+				return false
+			}
+		case "!=":
+			if value == baseRefName {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func hasMergifyCondition(conditions []string, expected string) bool {
