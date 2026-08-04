@@ -3897,6 +3897,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 			for i := range active {
 				active[i] = true
 			}
+		atomicClaims:
 			for len(queueItems) < availableSlots {
 				if err := ctx.Err(); err != nil {
 					stopClaiming = true
@@ -3944,7 +3945,9 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 					// Rebuild the admitted lane union for every slot. The SQL UPDATE
 					// chooses the winner after all producers' writes are visible.
 				case claimEmpty:
-					return
+					// No coding item is currently eligible. Continue into the
+					// lifecycle-only lanes below instead of abandoning this pass.
+					break atomicClaims
 				case claimSkip:
 					// A provider changed state between point admission and the
 					// atomic claim. Recheck lanes on the next pass.

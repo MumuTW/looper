@@ -1098,6 +1098,71 @@ func TestExecuteClaimPhaseAllowsAgentFreeSnapshotDuringProviderBrownout(t *testi
 	}
 }
 
+func TestClaimLanesFallThroughToLifecycleAfterEmptyProviderUnion(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-empty-provider.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	projectID := "looper"
+	repo := "MumuTW/looper"
+	prNumber := int64(110)
+	item := storage.QueueItemRecord{
+		ID: "snapshot-after-empty-provider", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request",
+		TargetID: "MumuTW/looper#110", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:empty-provider",
+		Priority: storage.QueuePrioritySnapshot, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	vendor := config.AgentVendorCodex
+	cfg.Agent.Vendor = &vendor
+	cfg.Projects = []config.ProjectRefConfig{{ID: projectID, Validation: &config.ProjectValidationConfig{OptOut: true}}}
+
+	lifecycleSections := 0
+	providerSections := 0
+	claimedCount, _, err := executeClaimPhase(context.Background(), "claim_pump", defaultSchedulerTickInput{
+		Repos: repos, Config: &cfg, Now: func() time.Time { return now }, MaxConcurrentRuns: 1,
+		AsyncRunner: immediateSchedulerRunner{}, Snapshotter: stubSnapshotScheduler{}, Worker: &stubWorkerScheduler{},
+		AllowLifecycleWork: func() error { return nil },
+		WithAllowLifecycleWork: func(fn func()) error {
+			lifecycleSections++
+			fn()
+			return nil
+		},
+		WithAllowClaimLanes: func(_ []storage.QueueClaimLane, fn func()) error {
+			providerSections++
+			fn()
+			return nil
+		},
+	}, nil, true)
+	if err != nil {
+		t.Fatalf("executeClaimPhase() error = %v", err)
+	}
+	if claimedCount != 1 {
+		t.Fatalf("claimed count = %d, want lifecycle snapshot after empty provider union", claimedCount)
+	}
+	if providerSections == 0 || lifecycleSections == 0 {
+		t.Fatalf("provider/lifecycle sections = %d/%d, want both", providerSections, lifecycleSections)
+	}
+	updated, err := repos.Queue.GetByID(context.Background(), item.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if updated == nil || updated.Status != "completed" {
+		t.Fatalf("snapshot queue item = %#v, want completed", updated)
+	}
+}
+
 func TestClaimAndRunScheduledQueueItemsRoutesStickyRetryBySnapshotVendor(t *testing.T) {
 	t.Parallel()
 	workingDir := t.TempDir()
