@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 
 	"github.com/MumuTW/looper/internal/config"
@@ -27,6 +29,29 @@ type bootstrapExchangeRequest struct {
 
 type bootstrapExchangeResponse struct {
 	Token string `json:"token"`
+}
+
+// dashboardSessionCookieAttributes follows the externally advertised server
+// URL. The daemon may sit behind a TLS-terminating proxy, so the inbound
+// connection is not authoritative for the browser-facing Secure attribute.
+func dashboardSessionCookieAttributes(cfg config.ServerConfig, request *http.Request) (secure bool, cookiePath string) {
+	cookiePath = "/"
+	if cfg.BaseURL != nil {
+		if parsed, err := url.Parse(strings.TrimSpace(*cfg.BaseURL)); err == nil {
+			secure = strings.EqualFold(parsed.Scheme, "https")
+			if parsed.Path != "" && parsed.Path != "/" {
+				cleaned := path.Clean("/" + strings.TrimPrefix(parsed.Path, "/"))
+				if cleaned != "." && cleaned != "" {
+					cookiePath = cleaned
+				}
+			}
+			return secure, cookiePath
+		}
+	}
+	// With no advertised URL, preserve the direct-connection behavior for
+	// local HTTPS requests while still using the configured URL whenever one
+	// exists.
+	return request != nil && request.TLS != nil, cookiePath
 }
 
 func isDashboardBootstrapExchange(path, method string) bool {
@@ -123,16 +148,18 @@ func (h *Handler) handleBootstrapExchange(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	secure, cookiePath := dashboardSessionCookieAttributes(h.context.Config.Server, r)
 	// Browser surfaces cannot attach an Authorization header to a top-level
 	// navigation, stylesheet, or htmx request. The one-shot exchange is the
-	// existing bootstrap authority, so bind its result to a host-only session
-	// cookie as well as returning the token for the SPA's in-memory client.
+	// existing bootstrap authority, so bind its result to a path-scoped,
+	// browser-facing session cookie as well as returning the token for the SPA's
+	// in-memory client.
 	http.SetCookie(w, &http.Cookie{
 		Name:     dashboardSessionCookieName,
 		Value:    token,
-		Path:     "/",
+		Path:     cookiePath,
 		HttpOnly: true,
-		Secure:   r.TLS != nil,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 	h.writeSuccessNoStore(w, requestID, bootstrapExchangeResponse{Token: token})

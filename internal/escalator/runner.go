@@ -79,7 +79,8 @@ func (r *Runner) Run(ctx context.Context) (RunResult, error) {
 	if snapshot.Partial {
 		// A rotating source window is a useful read projection, but omitted rows
 		// are not resolution evidence. Wait for the collector to complete its
-		// cycle before comparing or persisting the digest baseline.
+		// cycle before comparing or persisting the digest baseline. The result
+		// retains Partial so the scheduler can retry without consuming cadence.
 		return RunResult{Snapshot: snapshot, Suppressed: true}, nil
 	}
 	previous, err := r.loadPrevious(ctx)

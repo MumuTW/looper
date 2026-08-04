@@ -101,6 +101,31 @@ func TestBootstrapSessionCookieAuthorizesServerRenderedWebUI(t *testing.T) {
 	}
 }
 
+func TestBootstrapSessionCookieUsesAdvertisedHTTPSAndPath(t *testing.T) {
+	t.Parallel()
+
+	token := "secret-token"
+	baseURL := "https://daemon.example.test/looper"
+	h := NewHandler(Context{Config: config.Config{
+		Server: config.ServerConfig{AuthMode: config.AuthModeLocalToken, LocalToken: &token, BaseURL: &baseURL},
+	}})
+	code := mintBootstrapCode(t, h, token)
+	rec := exchangeBootstrapCode(t, h, code, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("exchange status = %d, want 200", rec.Code)
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("exchange cookies = %#v, want one session cookie", cookies)
+	}
+	if !cookies[0].Secure {
+		t.Fatal("session cookie is not Secure for advertised HTTPS")
+	}
+	if cookies[0].Path != "/looper" {
+		t.Fatalf("session cookie path = %q, want /looper", cookies[0].Path)
+	}
+}
+
 func TestBootstrapExpiredFails(t *testing.T) {
 	t.Parallel()
 

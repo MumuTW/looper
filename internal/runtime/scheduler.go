@@ -2931,8 +2931,10 @@ func runEscalatorIfDue(ctx context.Context, input defaultSchedulerTickInput, run
 	if !input.EscalatorCadence.start(runAt, cadence) {
 		return nil
 	}
-	_, err := input.Escalator.Run(ctx)
-	input.EscalatorCadence.finish(runAt, err == nil)
+	result, err := input.Escalator.Run(ctx)
+	// A rotating census is intentionally not a successful cadence tick: its
+	// snapshot omits source rows and must be retried on the next scheduler tick.
+	input.EscalatorCadence.finish(runAt, err == nil && !result.Snapshot.Partial)
 	return err
 }
 

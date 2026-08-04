@@ -11,13 +11,14 @@ import (
 )
 
 type fakeScheduledEscalator struct {
-	calls int
-	err   error
+	calls  int
+	err    error
+	result escalator.RunResult
 }
 
 func (f *fakeScheduledEscalator) Run(context.Context) (escalator.RunResult, error) {
 	f.calls++
-	return escalator.RunResult{}, f.err
+	return f.result, f.err
 }
 
 func TestRunEscalatorIfDueHonorsCadenceAcrossSnapshots(t *testing.T) {
@@ -74,6 +75,31 @@ func TestRunEscalatorIfDueRetriesFailedAttemptNextTick(t *testing.T) {
 	}
 	if runner.calls != 2 {
 		t.Fatalf("calls = %d, want failed attempt retried next tick", runner.calls)
+	}
+}
+
+func TestRunEscalatorIfDueRetriesPartialCensusNextTick(t *testing.T) {
+	now := time.Date(2026, 7, 31, 8, 0, 0, 0, time.UTC)
+	runner := &fakeScheduledEscalator{result: escalator.RunResult{
+		Snapshot: escalator.Snapshot{Partial: true}, Suppressed: true,
+	}}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Roles.Escalator.Enabled = true
+	cfg.Roles.Escalator.CadenceSeconds = 3600
+	input := defaultSchedulerTickInput{Config: &cfg, Escalator: runner, EscalatorCadence: &schedulerEscalatorCadence{}}
+
+	if err := runEscalatorIfDue(context.Background(), input, now); err != nil {
+		t.Fatalf("partial run error = %v", err)
+	}
+	runner.result = escalator.RunResult{}
+	if err := runEscalatorIfDue(context.Background(), input, now.Add(time.Minute)); err != nil {
+		t.Fatalf("retry run error = %v", err)
+	}
+	if runner.calls != 2 {
+		t.Fatalf("calls = %d, want partial census retried on next tick", runner.calls)
 	}
 }
 
