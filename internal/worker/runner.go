@@ -2690,18 +2690,6 @@ func preservesWorktreeProgress(before, after worktreeProgress) bool {
 	return before.WorktreeMatchesHead && before.IndexFingerprint != "" && before.IndexFingerprint == after.IndexFingerprint
 }
 
-func equalStringSlices(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		if left[i] != right[i] {
-			return false
-		}
-	}
-	return true
-}
-
 func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *workerCheckpoint, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree, run storage.RunRecord) (bool, error) {
 	checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
 	if r.git == nil {
