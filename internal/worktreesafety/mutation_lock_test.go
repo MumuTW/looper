@@ -1,9 +1,31 @@
 package worktreesafety
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestWorktreeMutationScopeResolvesSymlinkIdentity(t *testing.T) {
+	root := t.TempDir()
+	realContainer := filepath.Join(root, "real-container")
+	if err := os.MkdirAll(realContainer, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	realRoot := filepath.Join(realContainer, "project")
+	if err := os.MkdirAll(realRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aliasRoot := filepath.Join(root, "alias-project")
+	if err := os.Symlink(realRoot, aliasRoot); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := WorktreeMutationScope(aliasRoot), WorktreeMutationScope(realRoot); got != want {
+		t.Fatalf("WorktreeMutationScope(alias) = %q, want resolved scope %q", got, want)
+	}
+}
 
 func TestManagedMutationLockSerializesSameScopeAndAllowsIndependentScope(t *testing.T) {
 	release := AcquireManagedMutationLock("/tmp/looper/repo-a")

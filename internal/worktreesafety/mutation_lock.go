@@ -16,9 +16,10 @@ func WorktreeMutationScope(worktreeRoot string) string {
 	if root == "" {
 		return ""
 	}
-	if absolute, err := filepath.Abs(root); err == nil {
-		root = absolute
-	}
+	// Use the same symlink-aware identity as the safety and sweep authorities.
+	// A lexical alias must share the lock with its resolved root or creation can
+	// race a sweep that is mutating the same physical checkout.
+	root = NormalizePath(root)
 	return filepath.Clean(filepath.Dir(root))
 }
 
