@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/url"
 	"os"
@@ -112,6 +113,10 @@ type InspectHeadResult struct {
 	RenameSourceFiles []string
 	// UntrackedFiles lists paths with ?? status.
 	UntrackedFiles []string
+	// UnstagedFileCount counts tracked paths with a non-space worktree status
+	// column, distinguishing mixed staged/unstaged content from staged plus
+	// untracked additions.
+	UnstagedFileCount int
 	// DiffFingerprint fingerprints porcelain status codes and paths only (not
 	// file contents), so content-only edits of untracked files stay stable.
 	DiffFingerprint           string
@@ -894,10 +899,14 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 	if err != nil {
 		return InspectHeadResult{}, err
 	}
+	if err := g.rejectHiddenTrackedPaths(ctx, input.WorktreePath); err != nil {
+		return InspectHeadResult{}, err
+	}
 
 	changedFiles := make([]string, 0, len(status))
 	stagedFiles := make([]string, 0)
 	untrackedFiles := make([]string, 0)
+	unstagedFileCount := 0
 	renameSourceFiles := make([]string, 0)
 	fingerprintParts := make([]string, 0, len(status))
 	for _, entry := range status {
@@ -913,6 +922,9 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 		if entry.Code == "??" {
 			untrackedFiles = append(untrackedFiles, entry.Path)
 			continue
+		}
+		if len(entry.Code) > 1 && entry.Code[1] != ' ' && entry.Code[1] != '?' {
+			unstagedFileCount++
 		}
 		// Index column non-space means staged (including rename/copy).
 		if len(entry.Code) > 0 && entry.Code[0] != ' ' && entry.Code[0] != '?' {
@@ -971,6 +983,7 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 		ChangedFiles:              changedFiles,
 		StagedFiles:               stagedFiles,
 		UntrackedFiles:            untrackedFiles,
+		UnstagedFileCount:         unstagedFileCount,
 		RenameSourceFiles:         renameSourceFiles,
 		DiffFingerprint:           diffFingerprint,
 		ContentFingerprint:        contentFingerprint,
@@ -1026,7 +1039,7 @@ func (g *Gateway) worktreeMatchesHead(ctx context.Context, worktreePath string, 
 		for _, path := range sortedPaths[start:end] {
 			args = append(args, ":(literal)"+path)
 		}
-		result, err := g.runGitResult(ctx, worktreePath, nil, args...)
+		result, err := g.runGitResult(ctx, worktreePath, gitNoReplaceObjectsEnv(), args...)
 		if err != nil {
 			return false, err
 		}
@@ -1048,6 +1061,10 @@ func (g *Gateway) worktreeMatchesHead(ctx context.Context, worktreePath string, 
 			}{mode: metadata[0], sha: metadata[2]}
 		}
 		start = end
+	}
+	objectFormat, err := g.objectFormat(ctx, worktreePath)
+	if err != nil {
+		return false, err
 	}
 
 	for _, path := range sortedPaths {
@@ -1076,21 +1093,32 @@ func (g *Gateway) worktreeMatchesHead(ctx context.Context, worktreePath string, 
 		}
 		var data []byte
 		if info.Mode()&os.ModeSymlink != 0 {
+			if entry.mode != "120000" {
+				return false, nil
+			}
 			target, err := os.Readlink(filepath.Join(worktreePath, path))
 			if err != nil {
 				return false, err
 			}
 			data = []byte(target)
 		} else {
+			worktreeMode := "100644"
+			if info.Mode().Perm()&0o111 != 0 {
+				worktreeMode = "100755"
+			}
+			if entry.mode != worktreeMode {
+				return false, nil
+			}
 			data, err = os.ReadFile(filepath.Join(worktreePath, path))
 			if err != nil {
 				return false, err
 			}
 		}
-		blob := sha1.New()
-		_, _ = fmt.Fprintf(blob, "blob %d\x00", len(data))
-		_, _ = blob.Write(data)
-		if hex.EncodeToString(blob.Sum(nil)) != entry.sha {
+		digest, err := gitBlobDigest(objectFormat, data)
+		if err != nil {
+			return false, err
+		}
+		if digest != entry.sha {
 			return false, nil
 		}
 	}
@@ -1279,6 +1307,18 @@ func (g *Gateway) contentFingerprint(ctx context.Context, worktreePath string, p
 			if !gitlink {
 				return "", fmt.Errorf("worktree content path %q is a directory but not a staged gitlink", path)
 			}
+			initialized, err := g.isInitializedSubmodule(ctx, filepath.Join(worktreePath, path))
+			if err != nil {
+				return "", fmt.Errorf("inspect submodule content boundary %q: %w", path, err)
+			}
+			if !initialized {
+				// A deinitialized gitlink may leave an empty directory behind.
+				// Record that bounded state without descending through the
+				// enclosing superproject as if it were the submodule.
+				_, _ = fingerprint.Write([]byte("uninitialized-submodule"))
+				_, _ = fingerprint.Write([]byte{'\x00'})
+				continue
+			}
 			submoduleFingerprint, err := g.submoduleContentFingerprint(ctx, filepath.Join(worktreePath, path))
 			if err != nil {
 				return "", fmt.Errorf("fingerprint submodule %q: %w", path, err)
@@ -1344,14 +1384,14 @@ func (g *Gateway) isGitlinkPath(ctx context.Context, worktreePath, path string) 
 }
 
 func (g *Gateway) isAncestor(ctx context.Context, repoPath, ancestor, descendant string) (bool, error) {
-	result, err := g.runGitResult(ctx, repoPath, nil, "merge-base", "--is-ancestor", ancestor, descendant)
+	result, err := g.runGitResult(ctx, repoPath, gitNoReplaceObjectsEnv(), "merge-base", "--is-ancestor", ancestor, descendant)
 	if err != nil {
 		// `--is-ancestor` legitimately exits 1 for a non-descendant. The
 		// shell wrapper returns that exit as a CommandExecutionError, so
 		// classify only that explicit result as false; a start/cancel/transport
 		// error with a zero or unknown result must remain fail-closed.
 		var commandErr *shell.CommandExecutionError
-		if errors.As(err, &commandErr) && commandErr.Result.ExitCode == 1 {
+		if errors.As(err, &commandErr) && commandErr.Category == shell.FailureNonZeroExit && commandErr.Result.ExitCode == 1 {
 			return false, nil
 		}
 		return false, fmt.Errorf("git merge-base --is-ancestor %s %s: %w", ancestor, descendant, err)
@@ -1363,6 +1403,45 @@ func (g *Gateway) isAncestor(ctx context.Context, repoPath, ancestor, descendant
 		return false, nil
 	}
 	return false, fmt.Errorf("git merge-base --is-ancestor %s %s exited with unexpected status %d", ancestor, descendant, result.ExitCode)
+}
+
+func gitNoReplaceObjectsEnv() map[string]string {
+	env := make(map[string]string, len(os.Environ())+1)
+	for _, value := range os.Environ() {
+		parts := strings.SplitN(value, "=", 2)
+		if len(parts) == 2 {
+			env[parts[0]] = parts[1]
+		}
+	}
+	env["GIT_NO_REPLACE_OBJECTS"] = "1"
+	return env
+}
+
+func (g *Gateway) objectFormat(ctx context.Context, worktreePath string) (string, error) {
+	result, err := g.runGitResult(ctx, worktreePath, nil, "rev-parse", "--show-object-format")
+	if err != nil {
+		return "", err
+	}
+	format := strings.TrimSpace(result.Stdout)
+	if format != "sha1" && format != "sha256" {
+		return "", fmt.Errorf("unsupported Git object format %q", format)
+	}
+	return format, nil
+}
+
+func gitBlobDigest(format string, data []byte) (string, error) {
+	var digest hash.Hash
+	switch format {
+	case "sha1":
+		digest = sha1.New()
+	case "sha256":
+		digest = sha256.New()
+	default:
+		return "", fmt.Errorf("unsupported Git object format %q", format)
+	}
+	_, _ = fmt.Fprintf(digest, "blob %d\x00", len(data))
+	_, _ = digest.Write(data)
+	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 func emptyIndexFingerprint() string {
@@ -1465,7 +1544,18 @@ func (g *Gateway) indexFingerprint(ctx context.Context, worktreePath string, pat
 		if !filepath.IsLocal(path) {
 			return "", fmt.Errorf("unsafe submodule index path %q", path)
 		}
-		nested, err := g.indexFingerprint(ctx, filepath.Join(worktreePath, path), nil)
+		nestedPath := filepath.Join(worktreePath, path)
+		initialized, err := g.isInitializedSubmodule(ctx, nestedPath)
+		if err != nil {
+			return "", fmt.Errorf("inspect submodule index boundary %q: %w", path, err)
+		}
+		if !initialized {
+			// A deinitialized gitlink has no nested index to observe. The
+			// superproject record above remains authoritative; do not run Git
+			// from the empty directory and rediscover the enclosing repository.
+			continue
+		}
+		nested, err := g.indexFingerprint(ctx, nestedPath, nil)
 		if err != nil {
 			return "", fmt.Errorf("fingerprint submodule index %q: %w", path, err)
 		}
@@ -1477,6 +1567,64 @@ func (g *Gateway) indexFingerprint(ctx context.Context, worktreePath string, pat
 		_, _ = fingerprint.Write([]byte{0})
 	}
 	return fmt.Sprintf("%x", fingerprint.Sum(nil)), nil
+}
+
+func (g *Gateway) isInitializedSubmodule(ctx context.Context, path string) (bool, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.IsDir() {
+		return false, nil
+	}
+	result, err := g.runGitResult(ctx, path, nil, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return false, err
+	}
+	root := strings.TrimSpace(result.Stdout)
+	if root == "" {
+		return false, fmt.Errorf("git submodule root is empty for %q", path)
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return false, err
+	}
+	expected, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false, err
+	}
+	return filepath.Clean(root) == filepath.Clean(expected), nil
+}
+
+func (g *Gateway) rejectHiddenTrackedPaths(ctx context.Context, worktreePath string) error {
+	result, err := g.runGitResult(ctx, worktreePath, nil, "ls-files", "-v", "-z")
+	if err != nil {
+		return err
+	}
+	if err := rejectTruncatedGitStdout(result, "ls-files -v"); err != nil {
+		return err
+	}
+	for _, record := range strings.Split(result.Stdout, "\x00") {
+		if len(record) < 2 {
+			continue
+		}
+		flag := record[0]
+		// `ls-files -v` uses lowercase `h` for assume-unchanged and
+		// uppercase `S` for skip-worktree. Both hide tracked bytes from
+		// porcelain status, so neither is safe as timeout evidence.
+		if flag != 'h' && flag != 's' && flag != 'S' {
+			continue
+		}
+		path := record[1:]
+		if len(path) > 0 && path[0] == ' ' {
+			path = path[1:]
+		}
+		return fmt.Errorf("tracked path %q has hidden Git index flag %q; refusing timeout evidence", path, string(flag))
+	}
+	return nil
 }
 
 func stagedGitlinkPaths(output string) []string {
@@ -2082,14 +2230,14 @@ func parseNULStatusResult(output string) []statusEntry {
 		}
 		code := record[:2]
 		if code == "!!" {
-			if (code[0] == 'R' || code[0] == 'C') && i+1 < len(parts) {
+			if len(code) > 1 && (code[0] == 'R' || code[0] == 'C' || code[1] == 'R' || code[1] == 'C') && i+1 < len(parts) {
 				i++
 			}
 			continue
 		}
 		path := record[3:]
 		originalPath := ""
-		if code[0] == 'R' || code[0] == 'C' {
+		if len(code) > 1 && (code[0] == 'R' || code[0] == 'C' || code[1] == 'R' || code[1] == 'C') {
 			if i+1 < len(parts) {
 				originalPath = parts[i+1]
 				i++

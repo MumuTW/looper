@@ -1737,6 +1737,29 @@ func TestVerifyTimeoutProgressBeforeReplacementFailsClosedForObservingCheckpoint
 	}
 }
 
+func TestVerifyTimeoutProgressBeforeReplacementFailsClosedForTerminalTimeoutWithoutSnapshot(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	run := storage.RunRecord{ID: "run_timeout_without_snapshot", LoopID: "loop_worker_1", Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := workerCheckpoint{Execution: &checkpointExecution{Status: "timeout", ProgressSnapshotError: "git status unavailable"}}
+	err = runner.verifyTimeoutProgressBeforeReplacement(context.Background(), *project, run.ID, workerInput{}, checkpointWorktree{}, &checkpoint)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureManualIntervention {
+		t.Fatalf("verifyTimeoutProgressBeforeReplacement() error = %v, want manual intervention", err)
+	}
+	if checkpoint.ResumePolicy != loops.ResumePolicyManualIntervention || checkpoint.Execution.ProgressSnapshotError == "" {
+		t.Fatalf("checkpoint = %#v, want durable no-snapshot containment gate", checkpoint)
+	}
+}
+
 func TestVerifyTimeoutProgressAfterTerminationRejectsDrift(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1755,7 +1778,22 @@ func TestPreservesWorktreeProgressRequiresContentAndCommitEvidence(t *testing.T)
 	t.Parallel()
 
 	before := worktreeProgress{
-		HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "new.txt"}, StagedFiles: []string{"tracked.go"}, UntrackedFiles: []string{"new.txt"}, ChangedFileCount: 2, DiffFingerprint: "before-status", ContentFingerprint: "before-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "before-index",
+		HeadSHA:                   "before-head",
+		Branch:                    "feature/test",
+		ChangedFiles:              []string{"tracked.go", "new.txt"},
+		ChangedFileBytes:          [][]byte{[]byte("tracked.go"), []byte("new.txt")},
+		ChangedFileCount:          2,
+		StagedFiles:               []string{"tracked.go"},
+		StagedFileBytes:           [][]byte{[]byte("tracked.go")},
+		StagedFileCount:           1,
+		UntrackedFiles:            []string{"new.txt"},
+		UntrackedFileBytes:        [][]byte{[]byte("new.txt")},
+		UntrackedFileCount:        1,
+		UnstagedFileCount:         0,
+		DiffFingerprint:           "before-status",
+		ContentFingerprint:        "before-content",
+		ContentFingerprintVersion: worktreeFingerprintVersion,
+		IndexFingerprint:          "before-index",
 	}
 	for _, tc := range []struct {
 		name  string
@@ -1764,7 +1802,7 @@ func TestPreservesWorktreeProgressRequiresContentAndCommitEvidence(t *testing.T)
 	}{
 		{
 			name:  "preserves identical content and status at the same head",
-			after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "new.txt"}, StagedFiles: []string{"tracked.go"}, UntrackedFiles: []string{"new.txt"}, ChangedFileCount: 2, DiffFingerprint: "before-status", ContentFingerprint: "before-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "before-index"},
+			after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "new.txt"}, ChangedFileBytes: [][]byte{[]byte("tracked.go"), []byte("new.txt")}, StagedFiles: []string{"tracked.go"}, StagedFileBytes: [][]byte{[]byte("tracked.go")}, UntrackedFiles: []string{"new.txt"}, UntrackedFileBytes: [][]byte{[]byte("new.txt")}, ChangedFileCount: 2, DiffFingerprint: "before-status", ContentFingerprint: "before-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "before-index"},
 			want:  true,
 		},
 		{
@@ -1802,6 +1840,11 @@ func TestPreservesWorktreeProgressRequiresContentAndCommitEvidence(t *testing.T)
 			after: worktreeProgress{HeadSHA: "committed-head", Branch: "feature/test", ContentFingerprint: "staged-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "before-index", HeadDescendsFromCompare: true},
 			want:  false,
 		},
+		{
+			name:  "rejects mixed staged and unstaged content despite equal working content",
+			after: worktreeProgress{HeadSHA: "committed-head", Branch: "feature/test", ContentFingerprint: "before-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "different-index", HeadDescendsFromCompare: true},
+			want:  false,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			progress := before
@@ -1811,6 +1854,9 @@ func TestPreservesWorktreeProgressRequiresContentAndCommitEvidence(t *testing.T)
 			if tc.name == "rejects an unchanged legacy status-only checkpoint after upgrade" {
 				progress.ContentFingerprint = ""
 				progress.ContentFingerprintVersion = ""
+			}
+			if tc.name == "rejects mixed staged and unstaged content despite equal working content" {
+				progress.UnstagedFileCount = 1
 			}
 			if got := preservesWorktreeProgress(progress, tc.after); got != tc.want {
 				t.Fatalf("preservesWorktreeProgress() = %t, want %t", got, tc.want)
@@ -1871,6 +1917,18 @@ func TestRewindCheckpointForExecuteRetryPreservesTimeoutSnapshot(t *testing.T) {
 	got := rewindCheckpointForExecuteRetry(workerCheckpoint{Execution: &checkpointExecution{Status: "timeout", ProgressBeforeTimeout: progress}, Validation: &ValidationResult{}, PullRequest: &checkpointPullPR{Number: 1}, SkipReason: "retry"})
 	if got.Execution == nil || got.Execution.ProgressBeforeTimeout != progress {
 		t.Fatalf("rewindCheckpointForExecuteRetry().Execution = %#v, want timeout snapshot retained", got.Execution)
+	}
+	if got.Validation != nil || got.PullRequest != nil || got.SkipReason != "" {
+		t.Fatalf("rewindCheckpointForExecuteRetry() = %#v, want execute-only checkpoint", got)
+	}
+}
+
+func TestRewindCheckpointForExecuteRetryPreservesTimeoutObservingSnapshot(t *testing.T) {
+	t.Parallel()
+	progress := &worktreeProgress{HeadSHA: "head", Branch: "feature/test", DiffFingerprint: "status"}
+	got := rewindCheckpointForExecuteRetry(workerCheckpoint{Execution: &checkpointExecution{Status: "timeout_observing", ProgressBeforeTimeout: progress}, Validation: &ValidationResult{}, PullRequest: &checkpointPullPR{Number: 1}, SkipReason: "retry"})
+	if got.Execution == nil || got.Execution.ProgressBeforeTimeout != progress {
+		t.Fatalf("rewindCheckpointForExecuteRetry().Execution = %#v, want timeout_observing snapshot retained", got.Execution)
 	}
 	if got.Validation != nil || got.PullRequest != nil || got.SkipReason != "" {
 		t.Fatalf("rewindCheckpointForExecuteRetry() = %#v, want execute-only checkpoint", got)

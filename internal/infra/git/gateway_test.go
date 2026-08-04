@@ -257,6 +257,16 @@ func TestGatewayInspectHeadRecordsExactRenamePathsAndDetachedBranch(t *testing.T
 	}
 }
 
+func TestParseNULStatusResultHandlesWorktreeRenameColumn(t *testing.T) {
+	entries := parseNULStatusResult(" R new.txt\x00old.txt\x00")
+	if len(entries) != 1 {
+		t.Fatalf("entries = %#v, want one worktree rename", entries)
+	}
+	if entries[0].Code != " R" || entries[0].Path != "new.txt" || entries[0].OriginalPath != "old.txt" {
+		t.Fatalf("entry = %#v, want destination/source from worktree rename column", entries[0])
+	}
+}
+
 func TestParseStatusResultRejectsTruncatedOutput(t *testing.T) {
 	t.Parallel()
 
@@ -297,6 +307,76 @@ func TestGatewayInspectHeadContentFingerprintIncludesExecutableMode(t *testing.T
 	}
 	if before.ContentFingerprint == after.ContentFingerprint {
 		t.Fatalf("content fingerprint ignored executable mode: before=%q after=%q", before.ContentFingerprint, after.ContentFingerprint)
+	}
+}
+
+func TestGatewayInspectHeadRejectsWorktreeModeDriftAgainstHead(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+	path := filepath.Join(fixture.repoPath, "README.md")
+	if err := os.Chmod(path, 0o755); err != nil {
+		t.Fatalf("Chmod(executable) error = %v", err)
+	}
+	inspect, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead() error = %v", err)
+	}
+	if inspect.WorktreeMatchesHead {
+		t.Fatal("WorktreeMatchesHead = true, want false for executable-bit drift")
+	}
+}
+
+func TestGatewayInspectHeadRejectsAssumeUnchangedTrackedPath(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+	runGit(t, fixture.repoPath, "update-index", "--assume-unchanged", "README.md")
+	t.Cleanup(func() { runGit(t, fixture.repoPath, "update-index", "--no-assume-unchanged", "README.md") })
+	_, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err == nil || !strings.Contains(err.Error(), "hidden Git index flag") {
+		t.Fatalf("InspectHead() error = %v, want assume-unchanged rejection", err)
+	}
+}
+
+func TestGatewayInspectHeadRejectsSkipWorktreeTrackedPath(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+	runGit(t, fixture.repoPath, "update-index", "--skip-worktree", "README.md")
+	t.Cleanup(func() { runGit(t, fixture.repoPath, "update-index", "--no-skip-worktree", "README.md") })
+	_, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err == nil || !strings.Contains(err.Error(), "hidden Git index flag") {
+		t.Fatalf("InspectHead() error = %v, want skip-worktree rejection", err)
+	}
+}
+
+func TestGatewayWorktreeMatchesHeadSupportsSHA256ObjectFormat(t *testing.T) {
+	t.Parallel()
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--object-format=sha256")
+	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "config", "user.name", "Test")
+	path := filepath.Join(repo, "README.md")
+	writeFile(t, path, "base\n")
+	runGit(t, repo, "add", "README.md")
+	runGit(t, repo, "commit", "-m", "initial")
+	indexFile := filepath.Join(t.TempDir(), "staged-content")
+	writeFile(t, indexFile, "staged\n")
+	indexObject := stringsTrimSpace(runGit(t, repo, "hash-object", "-w", indexFile))
+	runGit(t, repo, "update-index", "--cacheinfo", "100644,"+indexObject+",README.md")
+	inspect, err := New(Options{GitPath: "git"}).InspectHead(context.Background(), InspectHeadInput{WorktreePath: repo})
+	if err != nil {
+		t.Fatalf("InspectHead() error = %v", err)
+	}
+	if !inspect.WorktreeMatchesHead {
+		t.Fatal("WorktreeMatchesHead = false, want true for SHA-256 staged-index-only edit")
 	}
 }
 
@@ -452,6 +532,36 @@ func TestGatewayInspectHeadFingerprintsStagedSubmoduleIndex(t *testing.T) {
 	}
 	if first.IndexFingerprint == second.IndexFingerprint {
 		t.Fatalf("index fingerprint unchanged for staged submodule blob drift: first=%q second=%q", first.IndexFingerprint, second.IndexFingerprint)
+	}
+}
+
+func TestGatewayInspectHeadSkipsUninitializedSubmoduleIndex(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	submoduleSource := filepath.Join(fixture.rootDir, "submodule-uninitialized-source")
+	mustMkdirAll(t, submoduleSource)
+	runGit(t, submoduleSource, "init", "-b", "main")
+	configureRepo(t, submoduleSource)
+	writeFile(t, filepath.Join(submoduleSource, "nested.txt"), "base\n")
+	runGit(t, submoduleSource, "add", "nested.txt")
+	runGit(t, submoduleSource, "commit", "-m", "init nested")
+	runGit(t, fixture.repoPath, "-c", "protocol.file.allow=always", "submodule", "add", submoduleSource, "modules/uninitialized")
+	runGit(t, fixture.repoPath, "commit", "-am", "add nested module")
+	runGit(t, fixture.repoPath, "submodule", "deinit", "-f", "modules/uninitialized")
+
+	inspect, err := gateway.InspectHead(ctx, InspectHeadInput{
+		WorktreePath: fixture.repoPath,
+		ContentPaths: []string{"modules/uninitialized"},
+	})
+	if err != nil {
+		t.Fatalf("InspectHead(uninitialized submodule) error = %v", err)
+	}
+	if inspect.ContentFingerprint == "" || inspect.IndexFingerprint == "" {
+		t.Fatalf("InspectHead(uninitialized submodule) = %#v, want bounded evidence", inspect)
 	}
 }
 

@@ -325,6 +325,7 @@ type InspectHeadResult struct {
 	ChangedFiles              []string
 	StagedFiles               []string
 	UntrackedFiles            []string
+	UnstagedFileCount         int
 	RenameSourceFiles         []string
 	DiffFingerprint           string
 	ContentFingerprint        string
@@ -724,6 +725,7 @@ type worktreeProgress struct {
 	StagedFileCount    int      `json:"stagedFileCount"`
 	UntrackedFiles     []string `json:"untrackedFiles,omitempty"`
 	UntrackedFileCount int      `json:"untrackedFileCount"`
+	UnstagedFileCount  int      `json:"unstagedFileCount"`
 	RenameSourceFiles  []string `json:"renameSourceFiles,omitempty"`
 	// The string path fields are kept for human-facing diagnostics. The byte
 	// fields are the lossless comparison authority: encoding/json base64-encodes
@@ -2543,6 +2545,7 @@ func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.Pr
 		StagedFileCount:       len(inspect.StagedFiles),
 		UntrackedFiles:        boundPathList(inspect.UntrackedFiles, worktreeProgressPathCap),
 		UntrackedFileCount:    len(inspect.UntrackedFiles),
+		UnstagedFileCount:     inspect.UnstagedFileCount,
 		RenameSourceFiles:     boundPathList(inspect.RenameSourceFiles, worktreeProgressPathCap),
 		ChangedFileBytes:      pathByteList(boundPathList(inspect.ChangedFiles, worktreeProgressPathCap)),
 		StagedFileBytes:       pathByteList(boundPathList(inspect.StagedFiles, worktreeProgressPathCap)),
@@ -2603,8 +2606,19 @@ func (r *Runner) verifyTimeoutProgressBeforeReplacement(ctx context.Context, pro
 		}
 		return &runpipe.LoopError{Message: checkpoint.Execution.ProgressSnapshotError, Kind: runpipe.FailureManualIntervention}
 	}
-	if checkpoint.Execution.Status != "timeout" || checkpoint.Execution.ProgressBeforeTimeout == nil {
+	if checkpoint.Execution.Status != "timeout" {
 		return nil
+	}
+	if checkpoint.Execution.ProgressBeforeTimeout == nil {
+		if strings.TrimSpace(checkpoint.Execution.ProgressSnapshotError) == "" {
+			return nil
+		}
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		message := "worker timeout has no preserved progress snapshot; operator must discard or restore the worktree before retry"
+		if err := r.persistCheckpoint(ctx, runID, *checkpoint); err != nil {
+			return &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		}
+		return &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
 	}
 	current, err := r.captureWorktreeProgress(ctx, project, work, worktree, agent.TimeoutObservation{}, checkpoint.Execution.ProgressBeforeTimeout)
 	if err != nil {
@@ -2626,18 +2640,15 @@ func sameWorktreeProgress(before, after worktreeProgress) bool {
 }
 
 func equalPathEvidence(left []string, leftBytes [][]byte, right []string, rightBytes [][]byte) bool {
-	if len(leftBytes) == len(left) && len(rightBytes) == len(right) && (len(leftBytes) > 0 || len(rightBytes) > 0) {
-		if len(leftBytes) != len(rightBytes) {
+	if len(leftBytes) != len(left) || len(rightBytes) != len(right) || len(leftBytes) != len(rightBytes) {
+		return false
+	}
+	for i := range leftBytes {
+		if !bytes.Equal(leftBytes[i], rightBytes[i]) {
 			return false
 		}
-		for i := range leftBytes {
-			if !bytes.Equal(leftBytes[i], rightBytes[i]) {
-				return false
-			}
-		}
-		return true
 	}
-	return equalStringSlices(left, right)
+	return true
 }
 
 func preservesWorktreeProgress(before, after worktreeProgress) bool {
@@ -2667,7 +2678,7 @@ func preservesWorktreeProgress(before, after worktreeProgress) bool {
 	if before.HeadSHA == "" || after.HeadSHA == "" || before.HeadSHA == after.HeadSHA || before.Branch != after.Branch || after.ChangedFileCount != 0 || !after.HeadDescendsFromCompare || after.ContentFingerprintVersion != worktreeFingerprintVersion {
 		return false
 	}
-	if before.ContentFingerprint == after.ContentFingerprint {
+	if before.ContentFingerprint == after.ContentFingerprint && (before.StagedFileCount == 0 || before.UnstagedFileCount == 0) {
 		return true
 	}
 	// A staged-index-only snapshot can have old HEAD bytes in the worktree and
@@ -4474,7 +4485,7 @@ func executeStepAlreadyCompleted(checkpoint workerCheckpoint) bool {
 }
 
 func rewindCheckpointForExecuteRetry(checkpoint workerCheckpoint) workerCheckpoint {
-	if checkpoint.Execution == nil || checkpoint.Execution.Status != "timeout" || checkpoint.Execution.ProgressBeforeTimeout == nil {
+	if checkpoint.Execution == nil || (checkpoint.Execution.Status != "timeout" && checkpoint.Execution.Status != "timeout_observing") {
 		checkpoint.Execution = nil
 	}
 	checkpoint.Validation = nil
