@@ -916,6 +916,87 @@ func TestClaimAndRunScheduledQueueItemsGatesEachProviderLane(t *testing.T) {
 	}
 }
 
+func TestClaimAndRunScheduledQueueItemsCapsHalfOpenProviderBatch(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-half-open-capacity.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	cfg.Agent.Vendor = &codex
+	cfg.Roles.Reviewer.Agent = &config.RoleAgentConfig{Vendor: &claude}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Validation: &config.ProjectValidationConfig{OptOut: true}}}
+
+	workerOne := schedulerTestQueueItem("half_open_worker_1", "worker", nowISO)
+	workerTwo := schedulerTestQueueItem("half_open_worker_2", "worker", nowISO)
+	reviewer := schedulerTestQueueItem("half_open_reviewer", "reviewer", nowISO)
+	reviewer.Priority = storage.QueuePriorityReviewer
+	for seq, item := range []storage.QueueItemRecord{workerOne, workerTwo, reviewer} {
+		loopID := "loop_" + item.ID
+		item.LoopID = &loopID
+		if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: int64(seq + 1), ProjectID: "looper", Type: item.Type, TargetType: item.TargetType, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loopID, err)
+		}
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	allowVendor := func(string) error { return nil }
+	withVendor := func(_ string, fn func()) error { fn(); return nil }
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 3, defaultSchedulerTickInput{
+		Repos: repos, Config: &cfg, Now: func() time.Time { return now }, AsyncRunner: immediateSchedulerRunner{},
+		Worker: &stubWorkerScheduler{}, Reviewer: &stubReviewerScheduler{},
+		AllowClaimForVendor: allowVendor, WithAllowClaimForVendor: withVendor,
+		// The Codex lane is half-open with one remaining probe; the Claude lane
+		// is closed/unlimited. Capacity is observational, while spawn admission
+		// remains responsible for reserving the actual probe.
+		ClaimCapacityForVendor: func(vendor string, snapshot bool) int {
+			if snapshot {
+				return -1
+			}
+			if vendor == string(codex) {
+				return 1
+			}
+			return -1
+		},
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("claimed = %#v, want one Codex item plus the Claude reviewer", claimed)
+	}
+	claimedIDs := map[string]bool{}
+	for _, item := range claimed {
+		claimedIDs[item.ID] = true
+	}
+	if !claimedIDs[reviewer.ID] || (claimedIDs[workerOne.ID] == claimedIDs[workerTwo.ID]) {
+		t.Fatalf("claimed = %#v, want reviewer and exactly one half-open provider item", claimed)
+	}
+	for _, id := range []string{workerOne.ID, workerTwo.ID} {
+		item, err := repos.Queue.GetByID(context.Background(), id)
+		if err != nil {
+			t.Fatalf("Queue.GetByID(%s) error = %v", id, err)
+		}
+		if item == nil {
+			t.Fatalf("Queue.GetByID(%s) = nil", id)
+		}
+		if !claimedIDs[id] && item.Status != "queued" {
+			t.Fatalf("queue item %s = %#v, want one claimed and one queued", id, item)
+		}
+	}
+}
+
 func TestClaimAndRunScheduledQueueItemsSelectsGlobalHighestPriorityAcrossProviderLanes(t *testing.T) {
 	t.Parallel()
 

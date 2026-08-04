@@ -285,6 +285,33 @@ func TestHalfOpenAdmissionReservesProbeSlots(t *testing.T) {
 	}
 }
 
+func TestAdmissionCapacityReportsRemainingHalfOpenBudget(t *testing.T) {
+	cfg := testConfig()
+	cfg.ProbeSuccesses = 2
+	b, c, _ := newTestBreaker(t, cfg)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	c.add(cfg.Cooldown)
+	if got := b.AdmissionCapacity(); got != 2 {
+		t.Fatalf("initial half-open capacity = %d, want 2", got)
+	}
+	probe, err := b.AllowAdmission()
+	if err != nil || !probe {
+		t.Fatalf("first probe admission = (%t, %v), want reserved probe", probe, err)
+	}
+	if got := b.AdmissionCapacity(); got != 1 {
+		t.Fatalf("capacity after first reservation = %d, want 1", got)
+	}
+	probe, err = b.AllowAdmission()
+	if err != nil || !probe {
+		t.Fatalf("second probe admission = (%t, %v), want reserved probe", probe, err)
+	}
+	if got := b.AdmissionCapacity(); got != 0 {
+		t.Fatalf("capacity after filling round = %d, want 0", got)
+	}
+}
+
 func TestHalfOpenAdmissionReleaseReturnsProbeSlot(t *testing.T) {
 	b, c, _ := newTestBreaker(t, testConfig())
 	b.Record(c.now(), false)
@@ -630,6 +657,40 @@ func TestLoweringMaxCooldownShortensTheOpenDeadline(t *testing.T) {
 	c.add(13 * time.Minute)
 	if err := b.Allow(); err != nil {
 		t.Fatalf("gate still refused work past the lowered ceiling: %v", err)
+	}
+}
+
+func TestReloadedCooldownAppliesToNextFailedProbe(t *testing.T) {
+	b, c, _ := newTestBreaker(t, testConfig())
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	c.add(10 * time.Minute)
+	if err := b.Allow(); err != nil {
+		t.Fatalf("Allow() = %v, want half-open", err)
+	}
+	// The first failed probe backs off from the original ten-minute base.
+	b.Record(c.now(), false)
+	if got := b.Snapshot().Cooldown; got != 20*time.Minute {
+		t.Fatalf("initial probe backoff = %s, want 20m", got)
+	}
+
+	// Keep the current open deadline, but change the base used by the next
+	// failed probe. The following cooldown should be 10m, not 4m from the old
+	// policy's doubled 20m backoff.
+	reloaded := testConfig()
+	reloaded.Cooldown = 5 * time.Minute
+	b.SetConfig(reloaded)
+	if got := b.Snapshot().Cooldown; got != 5*time.Minute {
+		t.Fatalf("reloaded cooldown = %s, want 5m base for next round", got)
+	}
+	c.add(20 * time.Minute)
+	if err := b.Allow(); err != nil {
+		t.Fatalf("Allow() after current deadline = %v, want half-open", err)
+	}
+	b.Record(c.now(), false)
+	if got := b.Snapshot().Cooldown; got != 10*time.Minute {
+		t.Fatalf("next failed-probe cooldown = %s, want 10m from reloaded base", got)
 	}
 }
 

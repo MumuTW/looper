@@ -142,7 +142,9 @@ func TestReportOutcomeUsesOptionalPlannerMarkerContract(t *testing.T) {
 	outcomes := make([]Outcome, 0, 1)
 	exec := outcomeExecution(&outcomes)
 	exec.input.CompletionContract = CompletionContractPlannerMarker
-	exec.input.CompletionValidator = func(payload string) bool { return payload == "" || payload == `{"summary":"done"}` }
+	exec.input.CompletionValidator = func(payload string) bool {
+		return payload == "" || payload == `{"summary":"done"}` || payload == `{"outcome":"blocked","failure_kind":"retryable_transient","summary":"rate limited"}`
+	}
 	exec.reportOutcome("completed", "missing", "", "")
 	if len(outcomes) != 1 || !outcomes[0].Succeeded {
 		t.Fatalf("missing Planner marker outcome = %#v, want one successful outcome", outcomes)
@@ -152,6 +154,12 @@ func TestReportOutcomeUsesOptionalPlannerMarkerContract(t *testing.T) {
 	exec.reportOutcome("completed", "parsed", `{"summary":"done"}`, "")
 	if len(outcomes) != 1 || !outcomes[0].Succeeded {
 		t.Fatalf("valid Planner marker outcome = %#v, want one successful outcome", outcomes)
+	}
+
+	outcomes = outcomes[:0]
+	exec.reportOutcome("completed", "parsed", `{"outcome":"blocked","failure_kind":"retryable_transient","summary":"rate limited"}`, "")
+	if len(outcomes) != 1 || !outcomes[0].Succeeded {
+		t.Fatalf("retryable blocked Planner outcome = %#v, want one successful outcome", outcomes)
 	}
 
 	outcomes = outcomes[:0]

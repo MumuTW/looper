@@ -198,6 +198,40 @@ func (b *Breaker) AllowAdmissionWithGeneration() (bool, uint64, error) {
 	return b.allowAdmission(true)
 }
 
+// AdmissionCapacity reports the number of additional half-open executions
+// that may be admitted before the recovery round is full. A negative result
+// means the breaker is not half-open and therefore has no probe-specific
+// batch limit; zero means the half-open round has no remaining capacity.
+// This is observational and does not reserve a slot. The common spawn gate
+// remains the reservation authority.
+func (b *Breaker) AdmissionCapacity() int {
+	if b == nil {
+		return -1
+	}
+	b.mu.Lock()
+	if !b.cfg.Enabled {
+		b.mu.Unlock()
+		return -1
+	}
+	transition, changed := b.refreshLocked()
+	capacity := -1
+	if b.state == StateHalfOpen {
+		limit := b.cfg.ProbeSuccesses
+		if limit <= 0 {
+			limit = 1
+		}
+		capacity = limit - b.probeSuccesses - b.probeInFlight
+		if capacity < 0 {
+			capacity = 0
+		}
+	}
+	b.mu.Unlock()
+	if changed {
+		b.emit(transition)
+	}
+	return capacity
+}
+
 func (b *Breaker) allowAdmission(reserveProbe bool) (bool, uint64, error) {
 	if b == nil {
 		return false, 0, nil
@@ -375,12 +409,12 @@ func (b *Breaker) SetConfig(cfg Config) {
 		}
 		return
 	}
-	// A cooldown the operator shortened should take effect on the next round,
-	// not retroactively extend or truncate the one already being served, except
-	// where the new maximum is lower than the backoff currently in force.
-	if previous.Cooldown != cfg.Cooldown && b.state == StateClosed {
-		b.cooldown = cfg.Cooldown
-	}
+	// A reloaded cooldown is the base for the next failed probe regardless of
+	// the current state. Preserve the deadline already being served; only a
+	// lowered maximum is allowed to shorten that in-progress interval.
+	// Updating the backoff while open/half-open prevents the next failed probe
+	// from continuing to double a duration from the old policy.
+	currentCooldown := b.cooldown
 	if cfg.MaxCooldown > 0 && b.cooldown > cfg.MaxCooldown {
 		// Move the deadline with the duration. Lowering the maximum while an
 		// exponentially backed-off interval is being served must actually
@@ -388,12 +422,18 @@ func (b *Breaker) SetConfig(cfg Config) {
 		// for the old hour after the operator lowered the ceiling to fifteen
 		// minutes, which reads as the reload having been ignored.
 		if b.state == StateOpen {
-			shortened := b.openUntil.Add(cfg.MaxCooldown - b.cooldown)
+			shortened := b.openUntil.Add(cfg.MaxCooldown - currentCooldown)
 			if shortened.Before(b.openUntil) {
 				b.openUntil = shortened
 			}
 		}
 		b.cooldown = cfg.MaxCooldown
+	}
+	if previous.Cooldown != cfg.Cooldown {
+		b.cooldown = cfg.Cooldown
+		if cfg.MaxCooldown > 0 && b.cooldown > cfg.MaxCooldown {
+			b.cooldown = cfg.MaxCooldown
+		}
 	}
 	if b.cooldown <= 0 {
 		b.cooldown = cfg.Cooldown

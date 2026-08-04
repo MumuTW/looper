@@ -1193,3 +1193,27 @@ func TestStatusReportsStickyOnlyProviderBrownout(t *testing.T) {
 		t.Fatalf("status output = %q, want sticky-provider pause line", got)
 	}
 }
+
+func TestStatusPreservesGlobalBrownoutStateWithProviderRows(t *testing.T) {
+	var stdout bytes.Buffer
+	retryAt := "2026-08-01T22:30:00.000Z"
+	writeStatusOpsLines(&stdout, daemonStatusResponse{Service: statusServiceView{
+		AgentHealth: &statusAgentHealthView{
+			State:     "open",
+			Failures:  5,
+			Total:     5,
+			OpenUntil: &retryAt,
+			Providers: []statusAgentProviderHealthView{
+				{Provider: "claude", State: "open", OpenUntil: &retryAt},
+				{Provider: "codex", State: "half_open"},
+			},
+		},
+	}})
+	got := stdout.String()
+	if !strings.Contains(got, "agents:   work paused: 5 of 5 recent agent runs failed; retrying at 2026-08-01T22:30:00.000Z") {
+		t.Fatalf("status output = %q, want global pause line", got)
+	}
+	if strings.Contains(got, "partially paused") {
+		t.Fatalf("status output = %q, must not downgrade a global outage to partial", got)
+	}
+}

@@ -1289,11 +1289,17 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 }
 
 func agentHealthLine(health statusAgentHealthView) string {
-	stickyProviderPaused := health.State == "closed"
-	for _, provider := range health.Providers {
-		if provider.State != "closed" {
-			stickyProviderPaused = true
-			break
+	// A non-closed retained provider row is a sticky-only pause only when the
+	// active-provider aggregate is closed. If every active provider is open or
+	// probing, preserve the aggregate state below so status does not downgrade a
+	// global outage to a misleading partial outage.
+	stickyProviderPaused := false
+	if health.State == "closed" {
+		for _, provider := range health.Providers {
+			if provider.State != "closed" {
+				stickyProviderPaused = true
+				break
+			}
 		}
 	}
 	if health.Partial || stickyProviderPaused {

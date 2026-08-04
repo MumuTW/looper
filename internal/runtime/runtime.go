@@ -748,6 +748,16 @@ func (r *Runtime) AllowSnapshotClaimForVendor(vendor string) error {
 	return r.agentHealth.AllowSnapshot(vendor)
 }
 
+// ClaimCapacityForVendor is the scheduler's observational half-open batch
+// limit. It does not reserve a probe; common spawn admission remains the
+// authority that reserves and transfers probe capacity to an execution.
+func (r *Runtime) ClaimCapacityForVendor(vendor string, snapshot bool) int {
+	if r == nil || r.agentHealth == nil {
+		return -1
+	}
+	return r.agentHealth.ClaimCapacity(vendor, snapshot)
+}
+
 func (r *Runtime) allowAgentSpawn(meta *agent.SpawnMeta) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionStopping
@@ -1500,7 +1510,7 @@ func (r *Runtime) start(ctx context.Context) error {
 		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowAgentClaim, schedulerProviderGate{
 			lifecycle:     r.AllowLifecycleWork,
 			lifecycleWith: r.WithAllowLifecycleWork,
-			allow:         r.AllowClaimForVendor, with: r.WithAllowAgentClaimForVendor, withLanes: r.WithAllowAgentClaimLanes,
+			allow:         r.AllowClaimForVendor, with: r.WithAllowAgentClaimForVendor, capacity: r.ClaimCapacityForVendor, withLanes: r.WithAllowAgentClaimLanes,
 			snapshotAllow: r.AllowSnapshotClaimForVendor, snapshotWith: r.WithAllowSnapshotAgentClaimForVendor,
 		})
 		if !r.customSchedulerTick {

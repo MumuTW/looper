@@ -1474,6 +1474,14 @@ func (x *execution) reportOutcome(status, parseStatus, completionPayload, stdout
 	} else {
 		succeeded = succeeded && parseStatus == "parsed" && validMarkerOutcome(completionPayload)
 	}
+	// Planner's runner treats a valid blocked marker as a completed Planner
+	// step (it may still advance the checkpoint); do not apply the generic
+	// retryable-block classification to that caller-owned contract. Other role
+	// runners replay retryable blocks, so those remain provider-health failures.
+	healthSucceeded := succeeded
+	if x.input.CompletionContract != CompletionContractPlannerMarker {
+		healthSucceeded = healthSucceeded && !declaresRetryableBlock(completionPayload)
+	}
 	x.executor.onOutcome(Outcome{
 		ProjectID:               x.input.ProjectID,
 		LoopID:                  x.input.LoopID,
@@ -1488,7 +1496,7 @@ func (x *execution) reportOutcome(status, parseStatus, completionPayload, stdout
 		// structured output contract is the executor's completion authority;
 		// missing or malformed output must feed the health gate as a failure so
 		// brownout backs off from agents that exit cleanly without doing the work.
-		Succeeded: succeeded && !declaresRetryableBlock(completionPayload),
+		Succeeded: healthSucceeded,
 		StartedAt: x.startedAt,
 	})
 }

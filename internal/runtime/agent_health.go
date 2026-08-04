@@ -274,6 +274,41 @@ func (r *agentHealthRegistry) AllowSnapshot(vendor string) error {
 	return breaker.Allow()
 }
 
+// ClaimCapacity reports the remaining non-reserving capacity for a half-open
+// provider lane. Closed/open providers return -1 because their normal lane
+// admission already decides whether the lane is eligible; zero is reserved for
+// a half-open round whose probe budget is exhausted.
+func (r *agentHealthRegistry) ClaimCapacity(vendor string, snapshot bool) int {
+	if r == nil {
+		return -1
+	}
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	var breaker *brownout.Breaker
+	r.mu.Lock()
+	if snapshot {
+		breaker = r.ensureSnapshotBreakerLocked(vendor)
+	} else {
+		// Resolve membership under the same registry lock as normal admission;
+		// an unknown live vendor must not gain a synthetic capacity bucket.
+		key := strings.TrimSpace(vendor)
+		if r.configured {
+			if _, ok := r.configuredVendors[key]; !ok && (key == "" || key == defaultAgentHealthVendor) && len(r.configuredVendors) == 1 {
+				for active := range r.configuredVendors {
+					key = active
+				}
+			}
+			if _, ok := r.configuredVendors[key]; !ok {
+				r.mu.Unlock()
+				return -1
+			}
+		}
+		breaker = r.ensureBreakerLocked(key)
+	}
+	r.mu.Unlock()
+	return breaker.AdmissionCapacity()
+}
+
 func (r *agentHealthRegistry) AllowAdmission(vendor string) (bool, error) {
 	probe, _, err := r.AllowAdmissionWithGeneration(vendor)
 	return probe, err

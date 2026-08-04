@@ -174,7 +174,11 @@ type defaultSchedulerTickInput struct {
 	// legacy/unit-test scheduler inputs ungated.
 	AllowClaimForVendor     func(string) error
 	WithAllowClaimForVendor func(string, func()) error
-	WithAllowClaimLanes     func([]storage.QueueClaimLane, func()) error
+	// ClaimCapacityForVendor reports a non-reserving half-open probe budget.
+	// Negative means no half-open batch limit; zero means no probe capacity is
+	// available. The common spawn boundary still owns actual reservation.
+	ClaimCapacityForVendor func(string, bool) int
+	WithAllowClaimLanes    func([]storage.QueueClaimLane, func()) error
 	// AllowSnapshotClaimForVendor and its critical-section counterpart apply to
 	// sticky retries whose persisted run snapshot is the execution authority.
 	AllowSnapshotClaimForVendor     func(string) error
@@ -1924,6 +1928,7 @@ type schedulerProviderGate struct {
 	lifecycleWith func(func()) error
 	allow         func(string) error
 	with          func(string, func()) error
+	capacity      func(string, bool) int
 	withLanes     func([]storage.QueueClaimLane, func()) error
 	snapshotAllow func(string) error
 	snapshotWith  func(string, func()) error
@@ -1946,6 +1951,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	var withAllowLifecycleWork func(func()) error
 	var allowClaimForVendor func(string) error
 	var withAllowClaimForVendor func(string, func()) error
+	var claimCapacityForVendor func(string, bool) int
 	var withAllowClaimLanes func([]storage.QueueClaimLane, func()) error
 	var allowSnapshotClaimForVendor func(string) error
 	var withAllowSnapshotClaimForVendor func(string, func()) error
@@ -1954,6 +1960,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 		withAllowLifecycleWork = providerGates[0].lifecycleWith
 		allowClaimForVendor = providerGates[0].allow
 		withAllowClaimForVendor = providerGates[0].with
+		claimCapacityForVendor = providerGates[0].capacity
 		withAllowClaimLanes = providerGates[0].withLanes
 		allowSnapshotClaimForVendor = providerGates[0].snapshotAllow
 		withAllowSnapshotClaimForVendor = providerGates[0].snapshotWith
@@ -2009,13 +2016,16 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			}},
 			Logger: logger,
 			Now:    now,
-			// Accept-time gate only: once Forward returns accepted/202 the
-			// delivery is committed and workers complete discovery even if
-			// admission later degrades. BeginShutdown/Stop aborts via CancelExecute.
-			AllowExecute: allowClaim,
-			// Hold admission across accept+enqueue so MarkDegraded cannot
-			// flip closed mid-section before the accepted-delivery record.
-			AllowExecuteWhile: withAllowClaim,
+			// Webhook acceptance is lifecycle work: routing, dedupe, and the
+			// gatekeeper lane do not call an agent. Provider admission remains at
+			// the discovery/claim/spawn boundaries for reviewer/fixer work, so a
+			// provider brownout does not reject otherwise agent-free deliveries.
+			// Once Forward returns accepted/202 the delivery is committed and
+			// workers complete discovery even if admission later degrades.
+			AllowExecute: allowLifecycleWork,
+			// Hold admission across accept+enqueue so MarkDegraded cannot flip
+			// closed mid-section before the accepted-delivery record.
+			AllowExecuteWhile: withAllowLifecycleWork,
 		})
 	}
 	attachClaimGate := func(input defaultSchedulerTickInput, services Services) defaultSchedulerTickInput {
@@ -2027,6 +2037,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 		input.WithAllowClaim = withAllowClaim
 		input.AllowClaimForVendor = allowClaimForVendor
 		input.WithAllowClaimForVendor = withAllowClaimForVendor
+		input.ClaimCapacityForVendor = claimCapacityForVendor
 		input.WithAllowClaimLanes = withAllowClaimLanes
 		input.AllowSnapshotClaimForVendor = allowSnapshotClaimForVendor
 		input.WithAllowSnapshotClaimForVendor = withAllowSnapshotClaimForVendor
@@ -2050,6 +2061,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 				stopped.WithAllowClaim = withAllowClaim
 				stopped.AllowClaimForVendor = allowClaimForVendor
 				stopped.WithAllowClaimForVendor = withAllowClaimForVendor
+				stopped.ClaimCapacityForVendor = claimCapacityForVendor
 				stopped.WithAllowClaimLanes = withAllowClaimLanes
 				stopped.AllowSnapshotClaimForVendor = allowSnapshotClaimForVendor
 				stopped.WithAllowSnapshotClaimForVendor = withAllowSnapshotClaimForVendor
@@ -2069,6 +2081,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			latest.WithAllowClaim = withAllowClaim
 			latest.AllowClaimForVendor = allowClaimForVendor
 			latest.WithAllowClaimForVendor = withAllowClaimForVendor
+			latest.ClaimCapacityForVendor = claimCapacityForVendor
 			latest.WithAllowClaimLanes = withAllowClaimLanes
 			latest.AllowSnapshotClaimForVendor = allowSnapshotClaimForVendor
 			latest.WithAllowSnapshotClaimForVendor = withAllowSnapshotClaimForVendor
@@ -3892,6 +3905,18 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 			}
 		}
 		atomicAcrossLanes := input.WithAllowClaimLanes != nil && len(atomicTypeSets) > 0
+		// An atomic union can select several items from a half-open provider
+		// before dispatch has a chance to reserve probe slots. Fall back to the
+		// lane-aware path for that pass so each lane is capped by its observed
+		// remaining recovery capacity while healthy sibling lanes stay eligible.
+		if atomicAcrossLanes && input.ClaimCapacityForVendor != nil {
+			for _, typeSet := range atomicTypeSets {
+				if input.ClaimCapacityForVendor(typeSet.vendor, typeSet.snapshotScoped) >= 0 {
+					atomicAcrossLanes = false
+					break
+				}
+			}
+		}
 		if atomicAcrossLanes {
 			active := make([]bool, len(atomicTypeSets))
 			for i := range active {
@@ -3996,6 +4021,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		// only prevents one lane from draining its backlog; it can still let a
 		// lower-priority worker consume the last slot ahead of a reviewer lane.
 		active := make([]bool, len(providerTypeSets))
+		claimedByLane := make([]int, len(providerTypeSets))
 		remaining := len(providerTypeSets)
 		for i := range active {
 			active[i] = true
@@ -4013,6 +4039,14 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 				typeSet := providerTypeSets[index]
 				if !active[index] || stopClaiming {
 					continue
+				}
+				if input.ClaimCapacityForVendor != nil {
+					capacity := input.ClaimCapacityForVendor(typeSet.vendor, typeSet.snapshotScoped)
+					if capacity >= 0 && claimedByLane[index] >= capacity {
+						active[index] = false
+						remaining--
+						continue
+					}
 				}
 				if skip, stop := admitClaim(typeSet.vendor, typeSet.providerScoped, typeSet.snapshotScoped, typeSet.lifecycleOnly); skip {
 					// Do not include an open provider in the global priority
@@ -4070,6 +4104,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 			}
 			switch result {
 			case claimContinue:
+				claimedByLane[winner.index]++
 				// Re-peek every active lane after each claim. This preserves the
 				// repository's priority/availability ordering for the next slot.
 			case claimEmpty, claimSkip:

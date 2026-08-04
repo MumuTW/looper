@@ -839,17 +839,17 @@ func TestLifecycleWorkStillRespectsAdmission(t *testing.T) {
 	}
 }
 
-// Webhook acceptance spends agent budget downstream, so it must see the gate.
-func TestWebhookAcceptanceIsHeldBackByTheBrownoutGate(t *testing.T) {
+// Webhook acceptance is lifecycle work; provider admission remains at the
+// agent-producing discovery/claim/spawn boundaries.
+func TestWebhookAcceptanceUsesLifecycleAdmissionDuringBrownout(t *testing.T) {
 	rt, clock := brownoutRuntime(t, nil)
 	failAgent(rt, clock, 3)
 
 	ran := false
-	err := rt.WithAllowClaim(func() { ran = true })
-	if !errors.Is(err, brownout.ErrOpen) {
-		t.Fatalf("WithAllowClaim() = %v, want brownout.ErrOpen", err)
+	if err := rt.WithAllowLifecycleWork(func() { ran = true }); err != nil {
+		t.Fatalf("WithAllowLifecycleWork() = %v, want lifecycle admission during brownout", err)
 	}
-	if ran {
-		t.Fatal("WithAllowClaim() ran its critical section while the gate was open")
+	if !ran {
+		t.Fatal("WithAllowLifecycleWork() did not run its critical section")
 	}
 }
