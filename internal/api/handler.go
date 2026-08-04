@@ -4009,15 +4009,15 @@ func buildActiveRunContinuation(run *storage.RunRecord) *activeRunContinuation {
 		return nil
 	}
 	checkpoint := parseJSONObject(run.CheckpointJSON)
-	// A resumed run carries the predecessor's timeout execution while the
-	// worker records a fresh checkpoint_same_worktree comparison. Execution is
-	// authoritative only when its correlation ID belongs to this run; otherwise
-	// projecting it would hide the newer retry outcome below.
+	continuation, _ := readOptionalObject(checkpoint, "continuation")
+	meaningfulContinuation := hasMeaningfulTimeoutContinuation(continuation)
 	// A retry can time out again after inheriting a predecessor continuation.
 	// Its own execution evidence is newer than that inherited comparison, so
 	// expose it first while the operator decides how to recover this attempt.
 	if execution, ok := readOptionalObject(checkpoint, "execution"); ok {
-		if executionRunID := derefString(readObjectString(execution, "runId")); executionRunID == run.ID && strings.TrimSpace(run.ID) != "" {
+		executionRunID := derefString(readObjectString(execution, "runId"))
+		sameRun := strings.TrimSpace(run.ID) != "" && executionRunID == run.ID
+		if sameRun || !meaningfulContinuation {
 			if progressError := derefString(readObjectString(execution, "progressSnapshotError")); progressError != "" {
 				return &activeRunContinuation{
 					PredecessorRunID:       executionRunID,
@@ -4026,7 +4026,7 @@ func buildActiveRunContinuation(run *storage.RunRecord) *activeRunContinuation {
 					Outcome:                "observation failed",
 				}
 			}
-			if progressBeforeTimeout, ok := readOptionalObject(execution, "progressBeforeTimeout"); ok {
+			if progressBeforeTimeout, hasProgress := readOptionalObject(execution, "progressBeforeTimeout"); hasProgress {
 				return &activeRunContinuation{
 					PredecessorRunID:       executionRunID,
 					PredecessorExecutionID: derefString(readObjectString(execution, "executionId")),
@@ -4036,23 +4036,33 @@ func buildActiveRunContinuation(run *storage.RunRecord) *activeRunContinuation {
 			}
 		}
 	}
-	if continuation, ok := readOptionalObject(checkpoint, "continuation"); ok {
-		beforeTimeout, hasBeforeTimeout := readOptionalObject(continuation, "beforeTimeout")
-		afterRestart, hasAfterRestart := readOptionalObject(continuation, "afterRestart")
-		if hasBeforeTimeout || hasAfterRestart {
-			before := buildActiveRunProgress(beforeTimeout)
-			after := buildActiveRunProgress(afterRestart)
-			return &activeRunContinuation{
-				PredecessorRunID:       derefString(readObjectString(continuation, "predecessorRunId")),
-				PredecessorExecutionID: derefString(readObjectString(continuation, "predecessorExecutionId")),
-				Mode:                   derefString(readObjectString(continuation, "mode")),
-				Outcome:                derefString(readObjectString(continuation, "outcome")),
-				BeforeTimeout:          before,
-				AfterRestart:           after,
-			}
+	if meaningfulContinuation {
+		beforeTimeout, _ := readOptionalObject(continuation, "beforeTimeout")
+		afterRestart, _ := readOptionalObject(continuation, "afterRestart")
+		before := buildActiveRunProgress(beforeTimeout)
+		after := buildActiveRunProgress(afterRestart)
+		return &activeRunContinuation{
+			PredecessorRunID:       derefString(readObjectString(continuation, "predecessorRunId")),
+			PredecessorExecutionID: derefString(readObjectString(continuation, "predecessorExecutionId")),
+			Mode:                   derefString(readObjectString(continuation, "mode")),
+			Outcome:                derefString(readObjectString(continuation, "outcome")),
+			BeforeTimeout:          before,
+			AfterRestart:           after,
 		}
 	}
 	return nil
+}
+
+func hasMeaningfulTimeoutContinuation(value map[string]any) bool {
+	if value == nil {
+		return false
+	}
+	for _, key := range []string{"predecessorRunId", "predecessorExecutionId", "mode", "outcome", "beforeTimeout", "afterRestart"} {
+		if _, ok := value[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func buildActiveRunProgress(value map[string]any) *activeRunProgressView {

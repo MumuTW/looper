@@ -741,6 +741,28 @@ func TestBuildActiveRunContinuationUsesTimeoutEvidenceBeforeRetry(t *testing.T) 
 	}
 }
 
+func TestBuildActiveRunContinuationAcceptsLegacyUncorrelatedTimeoutEvidence(t *testing.T) {
+	checkpoint := `{"execution":{"executionId":"agent_legacy","status":"timeout","progressBeforeTimeout":{"headSha":"legacy-head","changedFileCount":2,"diffFingerprint":"legacy-status"}}}`
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_upgraded", CheckpointJSON: &checkpoint})
+	if continuation == nil || continuation.BeforeTimeout == nil {
+		t.Fatalf("buildActiveRunContinuation() = %#v, want legacy timeout evidence", continuation)
+	}
+	assertEqual(t, continuation.PredecessorExecutionID, "agent_legacy")
+	assertEqual(t, continuation.BeforeTimeout.HeadSHA, "legacy-head")
+}
+
+func TestBuildActiveRunContinuationProjectsOutcomeWithoutSnapshots(t *testing.T) {
+	checkpoint := `{"continuation":{"predecessorRunId":"run_timeout","predecessorExecutionId":"agent_timeout","mode":"checkpoint_same_worktree","outcome":"observation failed"}}`
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_retry", CheckpointJSON: &checkpoint})
+	if continuation == nil {
+		t.Fatal("buildActiveRunContinuation() = nil, want outcome-only continuation")
+	}
+	assertEqual(t, continuation.Outcome, "observation failed")
+	if continuation.BeforeTimeout != nil || continuation.AfterRestart != nil {
+		t.Fatalf("continuation = %#v, want no snapshots for outcome-only evidence", continuation)
+	}
+}
+
 func TestBuildActiveRunContinuationPrefersNewestTimeoutEvidenceAfterRetry(t *testing.T) {
 	checkpoint := `{
 		"continuation":{

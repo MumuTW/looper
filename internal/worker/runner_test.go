@@ -2549,6 +2549,45 @@ func TestCreateRunContextCarriesTimeoutContinuationIntoRetryCheckpoint(t *testin
 	}
 }
 
+func TestCreateRunContextClearsTimeoutContinuationForSuccessfulInboxFollowUp(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, HITLEnabled: true})
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	metadata, err := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: fixture.nowISO(), Text: "follow up"})
+	if err != nil {
+		t.Fatalf("AppendHumanMessage() error = %v", err)
+	}
+	loop.MetadataJSON = &metadata
+	checkpointJSON := runpipe.MustMarshalJSON(workerCheckpoint{
+		Work:         &workerInput{Title: "Worker timeout retry", Repo: "acme/looper", BaseBranch: "main"},
+		Worktree:     &checkpointWorktree{ID: "wt_timeout", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/timeout", BaseBranch: "main"},
+		Execution:    &checkpointExecution{Status: "completed", Summary: "done", ParseStatus: "parsed", GitReconciled: true},
+		Continuation: &checkpointContinuation{PredecessorRunID: "run_timeout", PredecessorExecutionID: "agent_timeout", Mode: "checkpoint_same_worktree", Outcome: "preserved"},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_success_follow_up", LoopID: loop.ID, Status: "success", CurrentStep: runpipe.StringPtr(string(stepExecute)), LastCompletedStep: runpipe.StringPtr(string(stepExecute)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), *loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if resumed.Checkpoint.Continuation != nil {
+		t.Fatalf("Continuation = %#v, want cleared for a new human follow-up turn", resumed.Checkpoint.Continuation)
+	}
+	if resumed.Checkpoint.Execution != nil || resumed.Checkpoint.Validation != nil {
+		t.Fatalf("checkpoint = %#v, want completed execution/validation cleared for follow-up", resumed.Checkpoint)
+	}
+}
+
 func TestCreateRunContextRefreshesUnsupportedSnapshotWhenValidationGateEnabled(t *testing.T) {
 	t.Parallel()
 

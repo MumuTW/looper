@@ -3517,6 +3517,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	// completed execution so the next queued claim actually starts the agent.
 	if latestRun != nil && latestRun.Status == "success" && r.hitlEnabled && len(loops.ReadHumanInbox(loop.MetadataJSON)) > 0 {
 		resumedCheckpoint.Execution = nil
+		resumedCheckpoint.Continuation = nil
 		resumedCheckpoint.Validation = nil
 	}
 	switch decision.Mode {
