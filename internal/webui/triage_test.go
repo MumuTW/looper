@@ -673,6 +673,18 @@ func TestClassifyIncludesActivePullRequestLoopWithoutSnapshot(t *testing.T) {
 	}
 }
 
+func TestClassifyDoesNotTreatIdlePullRequestLoopAsMachineActive(t *testing.T) {
+	t.Parallel()
+
+	loop := activeLoop(7)
+	loop.Status = string(domain.LoopStatusIdle)
+	board := Classify(Input{Now: testNow, Loops: []storage.LoopRecord{loop}, Links: testLinker{}})
+	_, group := rowFor(t, board, 7)
+	if group != GroupActionable {
+		t.Fatalf("unsnapshotted idle loop group = %v, want actionable rather than machine", group)
+	}
+}
+
 func TestClassifyDoesNotResurrectTerminalSnapshotDuringLoopCleanup(t *testing.T) {
 	t.Parallel()
 
@@ -861,6 +873,17 @@ func TestCountDiffCountsPlusAndMinusContentAfterFileHeaders(t *testing.T) {
 	got := countDiff(diff)
 	if got.Additions != 2 || got.Deletions != 2 || !got.Known {
 		t.Fatalf("countDiff() = %#v, want 2 additions and 2 deletions", got)
+	}
+}
+
+func TestCountDiffResetsHunkStateAtFileBoundaries(t *testing.T) {
+	t.Parallel()
+
+	diff := "diff --git a/one.go b/one.go\n--- a/one.go\n+++ b/one.go\n@@ -1 +1 @@\n+added\n-removed\n" +
+		"diff --git a/two.go b/two.go\n--- a/two.go\n+++ b/two.go\n"
+	got := countDiff(diff)
+	if got.Additions != 1 || got.Deletions != 1 || !got.Known {
+		t.Fatalf("countDiff() = %#v, want only the first file's changed lines", got)
 	}
 }
 

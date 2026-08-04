@@ -1047,6 +1047,12 @@ func countDiff(diff string) DiffSize {
 		} else {
 			diff = ""
 		}
+		if strings.HasPrefix(line, "diff --git ") {
+			// A unified diff may contain several files. File headers after the
+			// first hunk are metadata too, not changed lines.
+			inHunk = false
+			continue
+		}
 		if strings.HasPrefix(line, "@@") {
 			inHunk = true
 			continue
@@ -1343,7 +1349,7 @@ func queueSettled(status string) bool {
 // must not make the board claim that the machine is advancing it.
 func machineLoopStatus(status string) bool {
 	switch domain.LoopStatus(status) {
-	case domain.LoopStatusIdle, domain.LoopStatusQueued, domain.LoopStatusRunning:
+	case domain.LoopStatusQueued, domain.LoopStatusRunning:
 		return true
 	default:
 		return false
