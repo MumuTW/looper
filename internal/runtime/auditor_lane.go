@@ -120,11 +120,6 @@ func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, g
 	})
 }
 
-func failedAuditorCheckPaths(ctx context.Context, gateway auditorGateway, repo, cwd string, checks githubinfra.PullRequestCheckRuns) ([]string, bool) {
-	paths, _, complete := failedAuditorCheckEvidenceWithPaths(ctx, gateway, repo, cwd, checks)
-	return paths, complete
-}
-
 func failedAuditorCheckEvidenceWithPaths(ctx context.Context, gateway auditorGateway, repo, cwd string, checks githubinfra.PullRequestCheckRuns) ([]string, []auditor.FailurePathSignature, bool) {
 	paths := make(map[string]struct{})
 	byCheck := make(map[string]map[string]struct{})
@@ -197,11 +192,6 @@ func recordAuditorBaseline(ctx context.Context, repos *storage.Repositories, pro
 		EventType: auditor.BaselineEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
 		Payload: auditor.BaselineObservation{Version: 1, ProjectID: project.ID, Repo: repo, HeadSHA: headSHA, ObservedAt: eventlog.FormatJavaScriptISOString(observedAt)}, CreatedAt: observedAt,
 	})
-}
-
-func auditorHasCleanBaseline(events []storage.EventLogRecord, projectID, repo, since string) bool {
-	ok, _ := auditorCleanBaseline(events, projectID, repo, since)
-	return ok
 }
 
 func auditorCleanBaseline(events []storage.EventLogRecord, projectID, repo, since string) (bool, auditor.BaselineObservation) {

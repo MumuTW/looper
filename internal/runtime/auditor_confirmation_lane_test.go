@@ -192,14 +192,6 @@ func TestCompletedAuditorRerunReportsFailureStatusAsFailure(t *testing.T) {
 	}
 }
 
-func TestAuditorObservedRerunIgnoresRunStartedBeforeObservation(t *testing.T) {
-	observedAt := time.Date(2026, time.July, 31, 12, 0, 0, 0, time.UTC)
-	checks := githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{CheckSuiteID: 7654, StartedAt: eventlog.FormatJavaScriptISOString(observedAt.Add(-time.Second)), CompletedAt: eventlog.FormatJavaScriptISOString(observedAt.Add(time.Second))}}}
-	if when, ok := auditorObservedRerun(checks, 7654, observedAt); ok || !when.IsZero() {
-		t.Fatalf("auditorObservedRerun() = (%v, %v), want no rerun for pre-observation run", when, ok)
-	}
-}
-
 func auditorConfirmationFixture(t *testing.T, suiteIDs []int64) (context.Context, *storage.Repositories, storage.ProjectRecord, string, string, time.Time) {
 	t.Helper()
 	ctx := context.Background()

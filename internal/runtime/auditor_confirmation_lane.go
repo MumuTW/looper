@@ -41,7 +41,7 @@ func progressAuditorConfirmation(ctx context.Context, repos *storage.Repositorie
 	if headSHA == "" {
 		return fmt.Errorf("auditor read default branch head for confirmation: empty SHA")
 	}
-	entityType, entityID := "branch_head", repo+"@"+headSHA
+	entityType := "branch_head"
 	events, err := repos.Events.ListByProjectAndEntityType(ctx, project.ID, entityType)
 	if err != nil {
 		return err
@@ -50,7 +50,7 @@ func progressAuditorConfirmation(ctx context.Context, repos *storage.Repositorie
 	if err != nil || !ok {
 		return err
 	}
-	entityID = selectedEntityID
+	entityID := selectedEntityID
 
 	requests, err := auditorRerunRequests(events, observationEvent.ID)
 	if err != nil {
@@ -245,28 +245,6 @@ func completedAuditorRerun(checks githubinfra.PullRequestCheckRuns, suiteIDs []i
 	return true, result
 }
 
-func auditorObservedRerun(checks githubinfra.PullRequestCheckRuns, suiteID int64, observedAt time.Time) (time.Time, bool) {
-	var latest time.Time
-	for _, check := range checks.CheckRuns {
-		if check.CheckSuiteID != suiteID {
-			continue
-		}
-		if startedAt, err := time.Parse(time.RFC3339Nano, check.StartedAt); err == nil {
-			if !startedAt.Before(observedAt) && startedAt.After(latest) {
-				latest = startedAt
-			}
-			continue
-		}
-		// Some provider projections omit StartedAt. In that case completion is
-		// the only post-observation evidence available; never use a completion
-		// timestamp when a pre-observation start is known.
-		if completedAt, err := time.Parse(time.RFC3339Nano, check.CompletedAt); err == nil && !completedAt.Before(observedAt) && completedAt.After(latest) {
-			latest = completedAt
-		}
-	}
-	return latest, !latest.IsZero()
-}
-
 func auditorRerunTimedOut(requests map[int64]time.Time, now time.Time, timeout time.Duration) bool {
 	if len(requests) == 0 || timeout <= 0 {
 		return false
@@ -277,11 +255,6 @@ func auditorRerunTimedOut(requests map[int64]time.Time, now time.Time, timeout t
 		}
 	}
 	return true
-}
-
-func failedAuditorRerunPaths(ctx context.Context, gateway auditorGateway, repo, cwd string, checks githubinfra.PullRequestCheckRuns, requests map[int64]time.Time) ([]string, bool) {
-	paths, _, complete := failedAuditorRerunEvidence(ctx, gateway, repo, cwd, checks, requests)
-	return paths, complete
 }
 
 func failedAuditorRerunEvidence(ctx context.Context, gateway auditorGateway, repo, cwd string, checks githubinfra.PullRequestCheckRuns, requests map[int64]time.Time) ([]string, []auditor.FailurePathSignature, bool) {

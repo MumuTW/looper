@@ -153,12 +153,12 @@ func TestFailedAuditorCheckPathsFiltersNonFailuresAndReportsReadGaps(t *testing.
 		},
 		annotationErrors: map[int64]error{100: errors.New("annotations unavailable")},
 	}
-	paths, complete := failedAuditorCheckPaths(context.Background(), gateway, "acme/looper", t.TempDir(), githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{
+	paths, _, complete := failedAuditorCheckEvidenceWithPaths(context.Background(), gateway, "acme/looper", t.TempDir(), githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{
 		{ID: 99, Status: "completed", Conclusion: "failure"},
 		{ID: 100, Status: "completed", Conclusion: "failure"},
 	}})
 	if !equalStringSlices(paths, []string{"failure.go"}) || complete {
-		t.Fatalf("failedAuditorCheckPaths() = (%#v, %v), want only failure-level path and incomplete evidence", paths, complete)
+		t.Fatalf("failedAuditorCheckEvidenceWithPaths() = (%#v, %v), want only failure-level path and incomplete evidence", paths, complete)
 	}
 }
 
