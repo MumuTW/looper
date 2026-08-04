@@ -5877,106 +5877,39 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 		}
 
 		if status == domain.LoopStatusRunning {
-			target, targetErr := loopTargetFromRecordCompat(*loop)
-			if targetErr != nil {
-				return storage.LoopRecord{}, targetErr
+			result, err := loops.ReactivateQueue(ctx, repos, loops.QueueReactivationInput{
+				Loop: *loop, NowISO: nowISO, MaxAttempts: int64(h.context.Config.Scheduler.RetryMaxAttempts),
+			})
+			if err != nil {
+				return storage.LoopRecord{}, err
 			}
-			existing, listErr := repos.Loops.List(ctx)
-			if listErr != nil {
-				return storage.LoopRecord{}, listErr
-			}
-			if uniqueErr := assertUniqueActiveLoopCompat(existing, loop.ID, loop.ProjectID, domain.LoopType(loop.Type), target, domain.LoopStatusRunning); uniqueErr != nil {
-				return storage.LoopRecord{}, uniqueErr
-			}
+			return result.Loop, nil
 		}
 
 		updated := *loop
 		updated.Status = string(status)
 		updated.UpdatedAt = nowISO
-		if status == domain.LoopStatusRunning {
-			updated.NextRunAt = &nowISO
-		} else {
-			updated.NextRunAt = nil
-		}
-
+		updated.NextRunAt = nil
 		if err := repos.Loops.Upsert(ctx, updated); err != nil {
 			return storage.LoopRecord{}, err
 		}
-
-		switch status {
-		case domain.LoopStatusPaused:
+		if status == domain.LoopStatusPaused {
 			reason := "loop paused"
 			if _, err := repos.Queue.CancelByLoop(ctx, updated.ID, nowISO, &reason); err != nil {
 				return storage.LoopRecord{}, err
 			}
-		case domain.LoopStatusRunning:
-			requeued, err := repos.Queue.RequeueLatestCancelledByLoop(ctx, updated.ID, nowISO)
-			if err != nil {
-				return storage.LoopRecord{}, err
-			}
-			if requeued == 0 {
-				activeQueue, err := repos.Queue.FindActiveByLoopID(ctx, updated.ID)
-				if err != nil {
-					return storage.LoopRecord{}, err
-				}
-				if activeQueue != nil {
-					break
-				}
-				latestQueue, err := repos.Queue.GetLatestByLoopID(ctx, updated.ID)
-				if err != nil {
-					return storage.LoopRecord{}, err
-				}
-				target, targetErr := loopTargetFromRecordCompat(updated)
-				if targetErr != nil {
-					return storage.LoopRecord{}, targetErr
-				}
-				if latestQueue != nil {
-					if latestQueue.Status == "queued" || latestQueue.Status == "running" {
-						break
-					}
-					if latestQueue.DedupeKey != "" {
-						activeQueue, err := repos.Queue.FindActiveByDedupe(ctx, latestQueue.DedupeKey)
-						if err != nil {
-							return storage.LoopRecord{}, err
-						}
-						if activeQueue != nil {
-							break
-						}
-					}
-					replacement := *latestQueue
-					replacement.ID = generateRequestID()
-					replacement.Status = "queued"
-					replacement.AvailableAt = nowISO
-					replacement.Attempts = 0
-					replacement.ClaimedBy = nil
-					replacement.ClaimedAt = nil
-					replacement.StartedAt = nil
-					replacement.FinishedAt = nil
-					replacement.LastError = nil
-					replacement.LastErrorKind = nil
-					replacement.CreatedAt = nowISO
-					replacement.UpdatedAt = nowISO
-					if _, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, replacement); err != nil {
-						return storage.LoopRecord{}, err
-					}
-				} else {
-					queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(updated, target, nowISO, updated.MetadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
-					if queueErr != nil {
-						return storage.LoopRecord{}, queueErr
-					}
-					if ok {
-						if _, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord); err != nil {
-							return storage.LoopRecord{}, err
-						}
-					}
-				}
-			}
 		}
-
 		return updated, nil
 	})
 	if err != nil {
 		err = mapIssueClaimAdmissionError(err)
+		if errors.Is(err, loops.ErrLoopNotFound) {
+			err = apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+		} else if errors.Is(err, loops.ErrActiveLoopConflict) {
+			err = apiError{code: pkgapi.ErrorCodeLoopConflict, status: http.StatusConflict, message: err.Error()}
+		} else if errors.Is(err, loops.ErrInvalidQueueTarget) {
+			err = apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
+		}
 		if restoreErr := restoreStopGate(); restoreErr != nil {
 			var typed apiError
 			if asAPIError(err, &typed) {
@@ -6063,29 +5996,10 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (struct{}, error) {
 		repos := storage.NewRepositories(tx)
-		loop, err := repos.Loops.GetByID(ctx, loopID)
-		if err != nil {
-			return struct{}{}, err
-		}
-		if loop == nil {
-			return struct{}{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
-		}
-		if execution, err := repos.AgentExecutions.GetLatestByLoopID(ctx, loopID); err == nil && execution != nil && execution.NativeSessionID != nil && strings.TrimSpace(*execution.NativeSessionID) != "" {
-			meta, werr := loops.WriteTakeoverResume(loop.MetadataJSON, loops.TakeoverResume{SessionID: strings.TrimSpace(*execution.NativeSessionID)})
-			if werr != nil {
-				// Without the resume marker the next worker run cannot attach
-				// to the human-driven session; leave the loop parked instead of
-				// pretending the handback succeeded.
-				return struct{}{}, fmt.Errorf("persist takeover resume marker: %w", werr)
+		if _, err := loops.PrepareHandback(ctx, repos, loops.HandbackPreparationInput{LoopID: loopID, NowISO: nowISO}); err != nil {
+			if errors.Is(err, loops.ErrLoopNotFound) {
+				return struct{}{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 			}
-			loop.MetadataJSON = &meta
-			loop.UpdatedAt = nowISO
-			if err := repos.Loops.UpsertChangingHumanHold(ctx, *loop); err != nil {
-				return struct{}{}, err
-			}
-		}
-		reason := "Cleared for takeover handback"
-		if _, err := repos.Queue.CancelByLoop(ctx, loopID, nowISO, &reason); err != nil {
 			return struct{}{}, err
 		}
 		return struct{}{}, nil
@@ -6157,40 +6071,11 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 	// guard). Hold only around the metadata write — mutateLoopStatus(Running)
 	// acquires the same lock and would deadlock if we nested.
 	unlock := loops.LockLoopRequeue(loopID)
-	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
-		repos := storage.NewRepositories(tx)
-		loop, err := repos.Loops.GetByID(ctx, loopID)
-		if err != nil {
-			return storage.LoopRecord{}, err
-		}
-		if loop == nil {
-			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
-		}
-		if loop.Status != string(domain.LoopStatusAwaitingHuman) {
-			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
-		}
-		ask, _ := loops.ReadHITLAsk(loop.MetadataJSON)
-		// The authenticated response is the authority to discard a malformed
-		// gate, but only when the staged filesystem identity still matches the
-		// bounded evidence persisted with this ask. A replacement leaves the
-		// loop parked and is never removed by daemon privilege.
-		if err := loops.ConsumeHITLGateEvidence(ask.GateEvidence); err != nil {
-			return storage.LoopRecord{}, fmt.Errorf("consume malformed HITL gate evidence: %w", err)
-		}
-		ask.Answer = answer
-		ask.Status = "answered"
-		ask.AnsweredAt = nowISO
-		metadataJSON, err := loops.WriteHITLAsk(loop.MetadataJSON, ask)
-		if err != nil {
-			return storage.LoopRecord{}, err
-		}
-		updated := *loop
-		updated.MetadataJSON = stringPtrOrNil(metadataJSON)
-		updated.UpdatedAt = nowISO
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
-			return storage.LoopRecord{}, err
-		}
-		return updated, nil
+	result, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (loops.HITLAnswerResult, error) {
+		return loops.RecordHITLAnswer(ctx, storage.NewRepositories(tx), loops.HITLAnswerInput{
+			LoopID: loopID, Answer: answer, NowISO: nowISO,
+			ConsumeGateEvidence: true,
+		})
 	})
 	unlock()
 	if err != nil {
@@ -6199,6 +6084,9 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 			return loopResponse{}, typed
 		}
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if !result.Applied {
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, result.Loop.Status)}
 	}
 
 	// Transition awaiting_human -> running (requeues + triggers a scheduler tick)

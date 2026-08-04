@@ -153,6 +153,10 @@
             "skipped": 0,
             "failed": 0
           },
+          "resourceGuard": {
+            "enabled": true,
+            "admit": true
+          },
           "webhook": {
             "enabled": false,
             "endpointUrl": "http://127.0.0.1:17310/webhook/forward",
@@ -216,10 +220,6 @@
             "routedProjects": 0,
             "localProjects": 0,
             "identityDrift": false
-          },
-          "resourceGuard": {
-            "enabled": true,
-            "admit": true
           },
           "safety": {
             "allowAutoCommit": true,
