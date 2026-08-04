@@ -19,6 +19,7 @@ type auditorGateway interface {
 	GetBranchHeadSHA(context.Context, githubinfra.BranchHeadInput) (string, error)
 	ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error)
 	ListCheckRunAnnotations(context.Context, githubinfra.CheckRunAnnotationsInput) ([]githubinfra.CheckRunAnnotation, error)
+	ListPullRequestFiles(context.Context, githubinfra.ViewPullRequestInput) ([]string, error)
 	RerequestCheckSuite(context.Context, githubinfra.RerequestCheckSuiteInput) error
 }
 
@@ -70,6 +71,11 @@ func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, g
 	}
 	failureEvidence := failedAuditorCheckEvidence(checks)
 	if len(failureEvidence.Names) == 0 {
+		if !cleanAuditorCheckEvidence(checks) {
+			// Absence of a visible failure is not a clean baseline while any
+			// check/status is pending, non-success, or truncated by pagination.
+			return nil
+		}
 		return recordAuditorBaseline(ctx, repos, project, repo, headSHA, observedAt)
 	}
 	since := eventlog.FormatJavaScriptISOString(observedAt.Add(-time.Duration(role.WindowMinutes) * time.Minute))
@@ -105,17 +111,23 @@ func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, g
 			return nil
 		}
 	}
-	failingPaths, pathEvidenceComplete := failedAuditorCheckPaths(ctx, gateway, repo, project.RepoPath, checks)
-	baselineKnown := auditorHasCleanBaseline(mergeEvents, project.ID, repo, since)
+	failingPaths, failureSignatures, pathEvidenceComplete := failedAuditorCheckEvidenceWithPaths(ctx, gateway, repo, project.RepoPath, checks)
+	baselineKnown, baseline := auditorCleanBaseline(mergeEvents, project.ID, repo, since)
 	projectID := project.ID
 	return eventlog.Append(ctx, repos, eventlog.AppendInput{
 		EventType: auditor.ObservedFailureEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
-		Payload: auditor.FailureObservation{Version: 4, ProjectID: project.ID, Repo: repo, HeadSHA: headSHA, FailedChecks: failureEvidence.Names, FailingPaths: failingPaths, FailingPathEvidenceComplete: pathEvidenceComplete, CheckSuiteIDs: failureEvidence.SuiteIDs, CandidatePRs: candidatePRs, BaselineKnown: baselineKnown, ObservedAt: eventlog.FormatJavaScriptISOString(observedAt)}, CreatedAt: observedAt,
+		Payload: auditor.FailureObservation{Version: 5, ProjectID: project.ID, Repo: repo, HeadSHA: headSHA, FailedChecks: failureEvidence.Names, FailingPaths: failingPaths, FailureSignatures: failureSignatures, FailingPathEvidenceComplete: pathEvidenceComplete, CheckSuiteIDs: failureEvidence.SuiteIDs, CandidatePRs: candidatePRs, BaselineKnown: baselineKnown, BaselineHeadSHA: baseline.HeadSHA, BaselineObservedAt: baseline.ObservedAt, ObservedAt: eventlog.FormatJavaScriptISOString(observedAt)}, CreatedAt: observedAt,
 	})
 }
 
 func failedAuditorCheckPaths(ctx context.Context, gateway auditorGateway, repo, cwd string, checks githubinfra.PullRequestCheckRuns) ([]string, bool) {
+	paths, _, complete := failedAuditorCheckEvidenceWithPaths(ctx, gateway, repo, cwd, checks)
+	return paths, complete
+}
+
+func failedAuditorCheckEvidenceWithPaths(ctx context.Context, gateway auditorGateway, repo, cwd string, checks githubinfra.PullRequestCheckRuns) ([]string, []auditor.FailurePathSignature, bool) {
 	paths := make(map[string]struct{})
+	byCheck := make(map[string]map[string]struct{})
 	complete := true
 	for _, check := range checks.CheckRuns {
 		if check.ID <= 0 || !isFailedCheckState(check.Status, check.Conclusion) {
@@ -132,6 +144,13 @@ func failedAuditorCheckPaths(ctx context.Context, gateway auditorGateway, repo, 
 			}
 			if path := strings.TrimSpace(annotation.Path); path != "" {
 				paths[path] = struct{}{}
+				checkName := strings.TrimSpace(check.Name)
+				if checkName != "" {
+					if byCheck[checkName] == nil {
+						byCheck[checkName] = make(map[string]struct{})
+					}
+					byCheck[checkName][path] = struct{}{}
+				}
 			}
 		}
 	}
@@ -140,7 +159,19 @@ func failedAuditorCheckPaths(ctx context.Context, gateway auditorGateway, repo, 
 		result = append(result, path)
 	}
 	sort.Strings(result)
-	return result, complete
+	signatures := make([]auditor.FailurePathSignature, 0, len(byCheck))
+	for checkName, checkPaths := range byCheck {
+		values := make([]string, 0, len(checkPaths))
+		for path := range checkPaths {
+			values = append(values, path)
+		}
+		sort.Strings(values)
+		signatures = append(signatures, auditor.FailurePathSignature{Check: checkName, Paths: values})
+	}
+	sort.Slice(signatures, func(i, j int) bool {
+		return strings.ToLower(signatures[i].Check) < strings.ToLower(signatures[j].Check)
+	})
+	return result, signatures, complete
 }
 
 func recordAuditorBaseline(ctx context.Context, repos *storage.Repositories, project storage.ProjectRecord, repo, headSHA string, observedAt time.Time) error {
@@ -150,7 +181,14 @@ func recordAuditorBaseline(ctx context.Context, repos *storage.Repositories, pro
 		return err
 	}
 	for _, event := range existing {
-		if event.EventType == auditor.BaselineEventType {
+		if event.EventType != auditor.BaselineEventType || event.ProjectID == nil || *event.ProjectID != project.ID {
+			continue
+		}
+		var baseline auditor.BaselineObservation
+		if json.Unmarshal([]byte(event.PayloadJSON), &baseline) != nil || !strings.EqualFold(baseline.Repo, repo) {
+			continue
+		}
+		if baseline.ProjectID == project.ID {
 			return nil
 		}
 	}
@@ -162,10 +200,17 @@ func recordAuditorBaseline(ctx context.Context, repos *storage.Repositories, pro
 }
 
 func auditorHasCleanBaseline(events []storage.EventLogRecord, projectID, repo, since string) bool {
+	ok, _ := auditorCleanBaseline(events, projectID, repo, since)
+	return ok
+}
+
+func auditorCleanBaseline(events []storage.EventLogRecord, projectID, repo, since string) (bool, auditor.BaselineObservation) {
 	sinceTime, err := time.Parse(time.RFC3339Nano, since)
 	if err != nil {
-		return false
+		return false, auditor.BaselineObservation{}
 	}
+	var latest auditor.BaselineObservation
+	var latestAt time.Time
 	for _, event := range events {
 		if event.EventType != auditor.BaselineEventType || event.ProjectID == nil || *event.ProjectID != projectID {
 			continue
@@ -174,12 +219,16 @@ func auditorHasCleanBaseline(events []storage.EventLogRecord, projectID, repo, s
 		if json.Unmarshal([]byte(event.PayloadJSON), &baseline) != nil || !strings.EqualFold(baseline.Repo, repo) {
 			continue
 		}
-		createdAt, parseErr := time.Parse(time.RFC3339Nano, event.CreatedAt)
-		if parseErr == nil && !createdAt.Before(sinceTime) {
-			return true
+		observedAt, parseErr := time.Parse(time.RFC3339Nano, baseline.ObservedAt)
+		if parseErr != nil {
+			observedAt, parseErr = time.Parse(time.RFC3339Nano, event.CreatedAt)
+		}
+		if parseErr == nil && !observedAt.Before(sinceTime) && (latestAt.IsZero() || observedAt.After(latestAt)) {
+			latestAt = observedAt
+			latest = baseline
 		}
 	}
-	return false
+	return !latestAt.IsZero(), latest
 }
 
 func auditorRoleForProject(cfg config.Config, projectID string) config.AuditorRoleConfig {
@@ -239,4 +288,24 @@ func isFailedCheckState(status, conclusion string) bool {
 	default:
 		return false
 	}
+}
+
+func cleanAuditorCheckEvidence(checks githubinfra.PullRequestCheckRuns) bool {
+	if checks.TotalCount > len(checks.CheckRuns) || checks.StatusesTotalCount > len(checks.Statuses) {
+		return false
+	}
+	observed := 0
+	for _, check := range checks.CheckRuns {
+		observed++
+		if !strings.EqualFold(strings.TrimSpace(check.Status), "completed") || !strings.EqualFold(strings.TrimSpace(check.Conclusion), "success") {
+			return false
+		}
+	}
+	for _, status := range checks.Statuses {
+		observed++
+		if !strings.EqualFold(strings.TrimSpace(status.State), "success") {
+			return false
+		}
+	}
+	return observed > 0
 }

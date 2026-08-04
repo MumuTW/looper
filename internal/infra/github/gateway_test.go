@@ -752,7 +752,7 @@ func TestListAttributionPathsUsesPaginatedGitHubEvidence(t *testing.T) {
 			if want := "api --paginate --slurp repos/acme/looper/check-runs/99/annotations?per_page=100 -H Accept: application/vnd.github+json --hostname ghes.example"; got != want {
 				t.Fatalf("annotation args = %q, want %q", got, want)
 			}
-			return shell.Result{Stdout: `[[{"path":"internal/runtime/a.go"},{"path":"internal/runtime/a.go"}]]`}, nil
+			return shell.Result{Stdout: `[[{"path":"internal/runtime/a.go","annotation_level":"failure"},{"path":"internal/runtime/a.go","annotation_level":"warning"}]]`}, nil
 		case 2:
 			if want := "api --paginate --slurp repos/acme/looper/pulls/42/files?per_page=100 -H Accept: application/vnd.github+json --hostname ghes.example"; got != want {
 				t.Fatalf("files args = %q, want %q", got, want)
@@ -768,6 +768,9 @@ func TestListAttributionPathsUsesPaginatedGitHubEvidence(t *testing.T) {
 	annotations, err := gateway.ListCheckRunAnnotations(context.Background(), CheckRunAnnotationsInput{Repo: "ghes.example/acme/looper", CheckRunID: 99})
 	if err != nil || len(annotations) != 2 || annotations[0].Path != "internal/runtime/a.go" {
 		t.Fatalf("ListCheckRunAnnotations() = %#v, %v", annotations, err)
+	}
+	if annotations[0].Level != "failure" || annotations[1].Level != "warning" {
+		t.Fatalf("annotation levels = %#v, want REST annotation_level values", annotations)
 	}
 	files, err := gateway.ListPullRequestFiles(context.Background(), ViewPullRequestInput{Repo: "ghes.example/acme/looper", PRNumber: 42})
 	if err != nil || len(files) != 2 || files[0] != "a.go" || files[1] != "z.go" {
@@ -812,6 +815,25 @@ func TestViewPullRequestForGatekeeperRetriesWithoutOptionalClosingIssues(t *test
 	detail, err := gateway.ViewPullRequestForGatekeeper(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
 	if err != nil || detail.Number != 42 || detail.HeadSHA != "head-1" || call != 2 {
 		t.Fatalf("ViewPullRequestForGatekeeper() = %#v, %v; calls=%d, want fallback success", detail, err, call)
+	}
+}
+
+func TestViewPullRequestForGatekeeperDoesNotRetryProviderFailures(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	call := 0
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		call++
+		if !strings.Contains(strings.Join(options.Args, " "), "closingIssuesReferences") {
+			t.Fatalf("gatekeeper view args = %q, want optional field on the only attempt", strings.Join(options.Args, " "))
+		}
+		return shell.Result{}, errors.New("rate limit exceeded")
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	_, err := gateway.ViewPullRequestForGatekeeper(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err == nil || call != 1 {
+		t.Fatalf("ViewPullRequestForGatekeeper() error=%v calls=%d, want one provider attempt", err, call)
 	}
 }
 

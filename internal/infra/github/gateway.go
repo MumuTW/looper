@@ -1824,7 +1824,26 @@ func (g *Gateway) ViewPullRequestForGatekeeper(ctx context.Context, input ViewPu
 	// closingIssuesReferences is provenance enrichment, not merge authority.
 	// Older GitHub Enterprise APIs may reject the optional field; retry the
 	// authoritative gate read without it rather than blocking every evaluation.
+	if !isUnsupportedClosingIssuesFieldError(err) {
+		return PullRequestDetail{}, err
+	}
 	return g.viewPullRequestWithFields(ctx, input, withoutJSONField(prViewGatekeeperJSONFields, "closingIssuesReferences"), false, false)
+}
+
+func isUnsupportedClosingIssuesFieldError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if !strings.Contains(message, "closingissuesreferences") {
+		return false
+	}
+	for _, marker := range []string{"unknown field", "unknown argument", "unsupported field", "doesn't exist", "does not exist", "cannot query field", "could not resolve to a field"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Gateway) viewPullRequestWithFields(ctx context.Context, input ViewPullRequestInput, fields []string, includeReviewThreads bool, includeIssueComments bool) (PullRequestDetail, error) {
@@ -2048,7 +2067,8 @@ func (g *Gateway) ListCheckRunAnnotations(ctx context.Context, input CheckRunAnn
 	annotations := make([]CheckRunAnnotation, 0, len(rows))
 	for _, row := range rows {
 		if path := strings.TrimSpace(asString(row["path"])); path != "" {
-			annotations = append(annotations, CheckRunAnnotation{Path: path, Level: strings.ToLower(strings.TrimSpace(asString(row["level"])))})
+			level := firstNonEmpty(asString(row["annotation_level"]), asString(row["level"]))
+			annotations = append(annotations, CheckRunAnnotation{Path: path, Level: strings.ToLower(strings.TrimSpace(level))})
 		}
 	}
 	return annotations, nil

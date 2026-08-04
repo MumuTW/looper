@@ -38,3 +38,22 @@ func TestConfirmFailureRejectsMissingPathSignature(t *testing.T) {
 		t.Fatalf("ConfirmFailure() = %#v, want different failure when rerun path signature is missing", result)
 	}
 }
+
+func TestConfirmFailureCorrelatesPerCheckPathSignatures(t *testing.T) {
+	result := ConfirmFailure(ConfirmationInput{
+		InitialFailedChecks: []string{"unit", "integration"},
+		InitialFailureSignatures: []FailurePathSignature{
+			{Check: "unit", Paths: []string{"unit.go"}},
+			{Check: "integration", Paths: []string{"integration.go"}},
+		},
+		RerunCompleted:    true,
+		RerunFailedChecks: []string{"unit", "integration"},
+		RerunFailureSignatures: []FailurePathSignature{
+			{Check: "unit", Paths: []string{"integration.go"}},
+			{Check: "integration", Paths: []string{"integration.go"}},
+		},
+	})
+	if result.Outcome != ConfirmationConfirmed || !slices.Equal(result.ConfirmedChecks, []string{"integration"}) {
+		t.Fatalf("ConfirmFailure() = %#v, want only the check with a matching path signature", result)
+	}
+}
