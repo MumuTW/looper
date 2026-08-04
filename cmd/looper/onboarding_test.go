@@ -1178,3 +1178,18 @@ func TestStatusReportsPartialProviderBrownout(t *testing.T) {
 		t.Fatalf("status output = %q, want provider-scoped partial brownout line", got)
 	}
 }
+
+func TestStatusReportsStickyOnlyProviderBrownout(t *testing.T) {
+	var stdout bytes.Buffer
+	retryAt := "2026-08-01T22:20:00.000Z"
+	writeStatusOpsLines(&stdout, daemonStatusResponse{Service: statusServiceView{
+		AgentHealth: &statusAgentHealthView{
+			State:     "closed",
+			Providers: []statusAgentProviderHealthView{{Provider: "codex", State: "open", OpenUntil: &retryAt}},
+		},
+	}})
+	got := stdout.String()
+	if !strings.Contains(got, "agents:   partially paused: codex=open (retrying at 2026-08-01T22:20:00.000Z)") {
+		t.Fatalf("status output = %q, want sticky-provider pause line", got)
+	}
+}

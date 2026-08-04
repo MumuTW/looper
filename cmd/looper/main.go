@@ -1289,7 +1289,14 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 }
 
 func agentHealthLine(health statusAgentHealthView) string {
-	if health.Partial {
+	stickyProviderPaused := health.State == "closed"
+	for _, provider := range health.Providers {
+		if provider.State != "closed" {
+			stickyProviderPaused = true
+			break
+		}
+	}
+	if health.Partial || stickyProviderPaused {
 		if len(health.Providers) == 0 {
 			return "partially paused: one or more agent providers are unavailable"
 		}
