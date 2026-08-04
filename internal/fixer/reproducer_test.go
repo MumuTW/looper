@@ -118,6 +118,56 @@ func TestFixerReproductionFailsClosedForLegacyUnknownAbsence(t *testing.T) {
 	_ = expected
 }
 
+func TestFixerLegacyFailureEvidenceOnlyBlocksAfterCaptureBoundary(t *testing.T) {
+	root, expected := writeFixerReproductionFixture(t)
+	preRepair := fixerCheckpoint{
+		Outcome: &FixerRunOutcome{PrimaryFailure: &FixerOutcomeFailure{Step: string(stepCollectFixes)}},
+	}
+	if err := captureFixerReproduction(&preRepair, root); err != nil {
+		t.Fatalf("pre-repair legacy capture = %v, want base manifest adoption", err)
+	}
+	if preRepair.Reproduction == nil || !preRepair.Reproduction.Equal(*expected) {
+		t.Fatalf("pre-repair Reproduction = %#v, want %#v", preRepair.Reproduction, expected)
+	}
+
+	postRepair := fixerCheckpoint{
+		Outcome: &FixerRunOutcome{PrimaryFailure: &FixerOutcomeFailure{Step: string(stepRepair)}},
+	}
+	err := captureFixerReproduction(&postRepair, root)
+	if err == nil || !strings.Contains(err.Error(), "legacy checkpoint") {
+		t.Fatalf("post-repair legacy capture = %v, want fail-closed refusal", err)
+	}
+}
+
+func TestFixerReproductionMergePhaseDefersConflictUntilResolution(t *testing.T) {
+	root, expected := writeFixerReproductionFixture(t)
+	conflicted := []byte("<<<<<<< HEAD\n{}\n=======\n{}\n>>>>>>> origin/main\n")
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), conflicted, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := fixerCheckpoint{
+		Reproduction:           expected,
+		ReproductionMergePhase: fixerReproductionMergeConflicted,
+	}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("conflicted capture = %v, want deferred recovery", err)
+	}
+	if checkpoint.ReproductionMergePhase != fixerReproductionMergeConflicted {
+		t.Fatalf("phase after conflict = %q, want conflicted", checkpoint.ReproductionMergePhase)
+	}
+
+	valid := []byte(`{"version":1,"testPath":"internal/bug_test.go","testName":"TestBug","testCommand":"go test ./internal -run '^TestBug$'","testSha256":"` + expected.TestSHA256 + `"}`)
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), valid, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("resolved capture = %v, want verified resolution", err)
+	}
+	if checkpoint.ReproductionMergePhase != "" {
+		t.Fatalf("phase after resolution = %q, want cleared", checkpoint.ReproductionMergePhase)
+	}
+}
+
 func TestFixerReproductionRefusesAgentAuthoredManifestAfterAbsentStart(t *testing.T) {
 	root := t.TempDir()
 	checkpoint := fixerCheckpoint{}

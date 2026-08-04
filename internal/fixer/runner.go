@@ -818,9 +818,22 @@ type fixerCheckpoint struct {
 	// ReproductionAbsent is set when the first capture observes no committed
 	// manifest. Later captures refuse to adopt an agent-authored manifest so
 	// the daemon cannot execute a testCommand that was not present at run start.
-	ReproductionAbsent bool   `json:"reproductionAbsent,omitempty"`
-	SkipReason         string `json:"skipReason,omitempty"`
+	ReproductionAbsent bool `json:"reproductionAbsent,omitempty"`
+	// ReproductionMergePhase records daemon-controlled base-merge authority
+	// across the conflict-resolution handoff. It is intentionally separate from
+	// ReproductionAbsent: a merge may introduce or update the contract even
+	// when the PR started without one.
+	ReproductionMergePhase fixerReproductionMergePhase `json:"reproductionMergePhase,omitempty"`
+	SkipReason             string                      `json:"skipReason,omitempty"`
 }
+
+type fixerReproductionMergePhase string
+
+const (
+	fixerReproductionMergePending    fixerReproductionMergePhase = "pending"
+	fixerReproductionMergeConflicted fixerReproductionMergePhase = "conflicted"
+	fixerReproductionMergeCompleted  fixerReproductionMergePhase = "completed"
+)
 
 type checkpointPause struct {
 	Reason              string   `json:"reason,omitempty"`
@@ -1036,6 +1049,9 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 			// the untrusted file.
 			return nil
 		}
+		if fixerMergePhaseDefersCapture(*checkpoint, worktreePath) {
+			return nil
+		}
 		return fixerReproductionFailure(err)
 	}
 	if checkpoint.Reproduction != nil {
@@ -1043,10 +1059,28 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 			return fixerReproductionFailure(errors.New("reproduction manifest is missing"))
 		}
 		if !checkpoint.Reproduction.Equal(*manifest) {
+			if checkpoint.ReproductionMergePhase == fixerReproductionMergeCompleted || checkpoint.ReproductionMergePhase == fixerReproductionMergeConflicted {
+				if err := manifest.Verify(worktreePath); err != nil {
+					if fixerMergePhaseDefersCapture(*checkpoint, worktreePath) {
+						return nil
+					}
+					return fixerReproductionFailure(err)
+				}
+				checkpoint.Reproduction = manifest
+				checkpoint.ReproductionAbsent = false
+				checkpoint.ReproductionMergePhase = ""
+				return nil
+			}
 			return fixerReproductionFailure(errors.New("reproduction manifest changed during run"))
 		}
 		if err := checkpoint.Reproduction.Verify(worktreePath); err != nil {
+			if fixerMergePhaseDefersCapture(*checkpoint, worktreePath) {
+				return nil
+			}
 			return fixerReproductionFailure(err)
+		}
+		if checkpoint.ReproductionMergePhase == fixerReproductionMergeConflicted {
+			checkpoint.ReproductionMergePhase = ""
 		}
 		return nil
 	}
@@ -1058,6 +1092,18 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 				// agent retry against the retained worktree instead of
 				// converting an untrusted mid-attempt manifest into manual
 				// intervention.
+				return nil
+			}
+			if checkpoint.ReproductionMergePhase == fixerReproductionMergeCompleted || checkpoint.ReproductionMergePhase == fixerReproductionMergeConflicted {
+				if fixerMergePhaseDefersCapture(*checkpoint, worktreePath) {
+					return nil
+				}
+				if err := manifest.Verify(worktreePath); err != nil {
+					return fixerReproductionFailure(err)
+				}
+				checkpoint.Reproduction = manifest
+				checkpoint.ReproductionAbsent = false
+				checkpoint.ReproductionMergePhase = ""
 				return nil
 			}
 			// The Fixer started without a committed reproduction contract. An
@@ -1091,6 +1137,45 @@ func fixerRetryHasUnfinishedRepair(checkpoint *fixerCheckpoint) bool {
 	return status != "" && !strings.EqualFold(status, "completed")
 }
 
+func fixerReproductionHasConflictMarkers(worktreePath string, manifest *reproducer.Manifest) (bool, error) {
+	paths := []string{reproducer.ManifestPath}
+	if manifest != nil && strings.TrimSpace(manifest.TestPath) != "" {
+		paths = append(paths, manifest.TestPath)
+	}
+	seen := make(map[string]struct{}, len(paths))
+	for _, relative := range paths {
+		relative = filepath.Clean(relative)
+		if filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return false, fmt.Errorf("reproduction conflict path escapes worktree: %s", relative)
+		}
+		if _, ok := seen[relative]; ok {
+			continue
+		}
+		seen[relative] = struct{}{}
+		path := filepath.Join(worktreePath, relative)
+		data, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		text := string(data)
+		if strings.Contains(text, "<<<<<<<") && strings.Contains(text, "=======") && strings.Contains(text, ">>>>>>>") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func fixerMergePhaseDefersCapture(checkpoint fixerCheckpoint, worktreePath string) bool {
+	if checkpoint.ReproductionMergePhase != fixerReproductionMergePending && checkpoint.ReproductionMergePhase != fixerReproductionMergeConflicted {
+		return false
+	}
+	conflicted, err := fixerReproductionHasConflictMarkers(worktreePath, checkpoint.Reproduction)
+	return err == nil && conflicted
+}
+
 // fixerPastInitialReproductionCapture reports whether the run already advanced
 // past the first durable capture opportunity. Used to fail closed for legacy
 // checkpoints that lack ReproductionAbsent after an upgrade.
@@ -1103,18 +1188,37 @@ func fixerPastInitialReproductionCapture(checkpoint fixerCheckpoint) bool {
 	// Steps after the initial capture opportunity. Repair is assigned only
 	// after Wait returns; PendingAgentExecutionID covers the active-agent
 	// window so a crash mid-Wait fails closed for legacy adoption.
-	return checkpoint.Repair != nil ||
+	if checkpoint.Repair != nil ||
 		strings.TrimSpace(checkpoint.PendingAgentExecutionID) != "" ||
 		checkpoint.Validation != nil ||
 		checkpoint.Push != nil ||
 		checkpoint.ReconcileCommits != nil ||
 		checkpoint.ResolvedComments != nil ||
 		checkpoint.SummaryComment != nil ||
-		checkpoint.Recheck != nil
+		checkpoint.Recheck != nil {
+		return true
+	}
+	// A legacy retry can fail after capture but before Repair is assigned. Use
+	// the durable failure step only for repair and downstream phases; discovery,
+	// claim, collect-fixes, and prepare failures have not reached the capture
+	// boundary and must not block a valid base-branch manifest on resume.
+	if checkpoint.Outcome != nil && checkpoint.Outcome.PrimaryFailure != nil {
+		switch FixerStep(strings.TrimSpace(checkpoint.Outcome.PrimaryFailure.Step)) {
+		case stepRepair, stepReconcileCommits, stepValidate, stepPush, stepResolveComments, stepRecheck:
+			return true
+		}
+	}
+	return false
 }
 
 func verifyFixerReproduction(checkpoint fixerCheckpoint, worktreePath string) error {
 	if checkpoint.Reproduction == nil {
+		return nil
+	}
+	if checkpoint.ReproductionMergePhase == fixerReproductionMergeConflicted {
+		// The merge authority remains pending until capture sees a resolved
+		// manifest/test after the agent turn. Do not compare the pre-merge
+		// contract against conflict markers or a legitimate base update.
 		return nil
 	}
 	if err := checkpoint.Reproduction.Verify(worktreePath); err != nil {
@@ -3639,27 +3743,51 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	} else if held {
 		return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 	}
-	// Autonomous conflict resolution (risky fixes on): merge the base into the
-	// worktree so the agent has the conflict markers to resolve, instead of punting
-	// the conflict to a human. A merge that fails for a non-conflict reason falls
-	// back to manual intervention.
+	// Autonomous conflict resolution (risky fixes on): capture the PR-side
+	// reproduction before the daemon merge, then persist the merge authority
+	// before handing conflict markers to the agent. This keeps an existing
+	// contract available for recovery and lets a daemon-introduced contract be
+	// adopted only after the merge completes.
+	mergeConflicted := false
 	if hasConflict {
-		base := strings.TrimSpace(checkpoint.Detail.BaseRefName)
-		if base == "" {
-			base = "main"
-		}
-		if _, mergeErr := r.git.MergeBaseIntoWorktree(ctx, MergeBaseInput{WorktreePath: worktree.Path, Remote: "origin", BaseBranch: base}); mergeErr != nil {
-			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
-			checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
-			return checkpoint, &runpipe.LoopError{Message: fmt.Sprintf("Could not merge base %q into %s#%d for conflict resolution: %v", base, input.Repo, input.PRNumber, mergeErr), Kind: runpipe.FailureManualIntervention}
+		if checkpoint.ReproductionMergePhase == fixerReproductionMergeConflicted {
+			mergeConflicted = true
+		} else {
+			if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
+				return checkpoint, err
+			}
+			checkpoint.ReproductionMergePhase = fixerReproductionMergePending
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+			}
+			base := strings.TrimSpace(checkpoint.Detail.BaseRefName)
+			if base == "" {
+				base = "main"
+			}
+			mergeResult, mergeErr := r.git.MergeBaseIntoWorktree(ctx, MergeBaseInput{WorktreePath: worktree.Path, Remote: "origin", BaseBranch: base})
+			if mergeErr != nil {
+				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+				checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
+				return checkpoint, &runpipe.LoopError{Message: fmt.Sprintf("Could not merge base %q into %s#%d for conflict resolution: %v", base, input.Repo, input.PRNumber, mergeErr), Kind: runpipe.FailureManualIntervention}
+			}
+			mergeConflicted = mergeResult.Conflicted
+			if mergeConflicted {
+				checkpoint.ReproductionMergePhase = fixerReproductionMergeConflicted
+			} else {
+				checkpoint.ReproductionMergePhase = fixerReproductionMergeCompleted
+			}
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+			}
 		}
 	}
-	// Capture after daemon-controlled merge so a base-introduced reproduction
-	// contract is accepted; later agent-authored files remain rejected via
-	// ReproductionAbsent. Persist before agent start so crash-resume sees the
-	// durable negative/positive observation.
-	if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
-		return checkpoint, err
+	if !mergeConflicted {
+		// Capture after a clean daemon merge so a base-introduced or updated
+		// contract is adopted under the merge phase; ordinary later
+		// agent-authored files remain fenced by ReproductionAbsent.
+		if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
+			return checkpoint, err
+		}
 	}
 	validationCommands = fixerValidationCommands(validationCommands, checkpoint)
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
