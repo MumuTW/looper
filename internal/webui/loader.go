@@ -180,7 +180,7 @@ func NewRepositoryLoader(repos *storage.Repositories, collector *escalator.Colle
 			}
 		}
 		if repos.Queue != nil {
-			queue, err := repos.Queue.List(ctx)
+			queue, err := repos.Queue.ListForTriage(ctx)
 			if err != nil {
 				input.Notices = append(input.Notices, "Queue items could not be read.")
 			} else {

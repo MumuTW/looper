@@ -2541,6 +2541,24 @@ func (r *QueueRepository) List(ctx context.Context) ([]QueueItemRecord, error) {
 	return scanQueueItems(rows)
 }
 
+// ListForTriage returns queue items whose status can still affect the
+// operator board. Terminal history remains available through List, while the
+// bounded read avoids decoding completed/failed/cancelled rows on every poll.
+func (r *QueueRepository) ListForTriage(ctx context.Context) ([]QueueItemRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT `+queueItemColumns+`
+		FROM queue_items
+		WHERE status IS NULL OR status NOT IN ('completed', 'failed', 'cancelled')
+		ORDER BY updated_at DESC, created_at DESC, id DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list queue items for triage: %w", err)
+	}
+	defer rows.Close()
+
+	return scanQueueItems(rows)
+}
+
 func (r *QueueRepository) ListByStatuses(ctx context.Context, statuses []string) ([]QueueItemRecord, error) {
 	if len(statuses) == 0 {
 		return []QueueItemRecord{}, nil

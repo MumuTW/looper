@@ -1565,6 +1565,42 @@ func TestQueueRoundTripBasics(t *testing.T) {
 	}
 }
 
+func TestQueueListForTriageExcludesTerminalHistory(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	for _, item := range []QueueItemRecord{
+		{ID: "triage_queued", Priority: 1, MaxAttempts: 1, Status: "queued", CreatedAt: now, UpdatedAt: now},
+		{ID: "triage_running", Priority: 1, MaxAttempts: 1, Status: "running", CreatedAt: now, UpdatedAt: now},
+		{ID: "triage_manual", Priority: 1, MaxAttempts: 1, Status: "manual_intervention", CreatedAt: now, UpdatedAt: now},
+		{ID: "triage_completed", Priority: 1, MaxAttempts: 1, Status: "completed", CreatedAt: now, UpdatedAt: now},
+		{ID: "triage_failed", Priority: 1, MaxAttempts: 1, Status: "failed", CreatedAt: now, UpdatedAt: now},
+		{ID: "triage_cancelled", Priority: 1, MaxAttempts: 1, Status: "cancelled", CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := repos.Queue.Upsert(ctx, item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	items, err := repos.Queue.ListForTriage(ctx)
+	if err != nil {
+		t.Fatalf("Queue.ListForTriage() error = %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("Queue.ListForTriage() returned %d items, want 3: %#v", len(items), items)
+	}
+	for _, item := range items {
+		switch item.Status {
+		case "queued", "running", "manual_intervention":
+		default:
+			t.Errorf("Queue.ListForTriage() returned terminal status %q", item.Status)
+		}
+	}
+}
+
 func TestQueueRequeueFailedByIDRequiresMatchingLoopAndNoActiveQueue(t *testing.T) {
 	t.Parallel()
 
