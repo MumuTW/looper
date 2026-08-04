@@ -40,6 +40,16 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 	} else if trust != config.GatekeeperTrustObserve && reportNeedsHumanReview(previous, report) {
 		plan.needsHumanReview = true
 	}
+	// A route accepted under auto trust remains a live Mergify queue entry until
+	// the queue observes a veto. Removing auto trust (to advise or observe) must
+	// therefore retain needs-human-review for an open pull request; removing both
+	// labels would withdraw Looper's authority while an already-accepted queue
+	// item can still merge. Terminal evaluations are removal-only because a closed
+	// pull request cannot be queued and must not retain an external human-review
+	// signal.
+	if trust != config.GatekeeperTrustAuto && previous != nil && reportRouteEstablished(*previous) && !reportIsTerminal(report) {
+		plan.needsHumanReview = true
+	}
 	// Removal-only projections are fail-safe and do not need an authority read:
 	// deleting a stale route can never authorize a merge. This also lets observe
 	// demotion retire labels even when the provider no longer returns a head.
@@ -272,15 +282,16 @@ func (r *Runner) applyRoutingLabelPlan(ctx context.Context, report Report, plan 
 	}
 	switch {
 	case plan.autoMerge:
-		// Remove the human-escalation route before adding the queue route. If
-		// the second mutation fails, the PR remains out of the queue rather than
-		// being blocked by a stale human-review label forever.
-		if err := r.github.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Labels: []string{labels.NeedsHumanReview}}); err != nil {
-			return fmt.Errorf("remove stale %s label: %w", labels.NeedsHumanReview, err)
-		}
+		// Add the queue route before removing the human-escalation label. If the
+		// second mutation fails, the existing veto keeps an already-queued PR
+		// blocked; removing the veto first would briefly (or permanently) reopen a
+		// stale queue entry without a durable route report.
 		input.Labels = []string{labels.AutoMerge}
 		if err := r.github.AddPullRequestLabels(ctx, input); err != nil {
 			return fmt.Errorf("add %s label: %w", labels.AutoMerge, err)
+		}
+		if err := r.github.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Labels: []string{labels.NeedsHumanReview}}); err != nil {
+			return fmt.Errorf("remove stale %s label: %w", labels.NeedsHumanReview, err)
 		}
 	case plan.needsHumanReview:
 		// Add the durable queue veto before removing the trigger. If the second
@@ -332,6 +343,14 @@ func reportNeedsHumanReview(previous *Report, report Report) bool {
 		}
 	}
 	return hasRepeatedReviewChanges
+}
+
+func reportIsTerminal(report Report) bool {
+	if hasReasonCode(report.Reasons, ReasonPullRequestNotOpen) {
+		return true
+	}
+	state := strings.ToUpper(strings.TrimSpace(report.Evidence.PullRequestState))
+	return state != "" && state != "OPEN"
 }
 
 func hasReasonCode(reasons []Reason, want ReasonCode) bool {

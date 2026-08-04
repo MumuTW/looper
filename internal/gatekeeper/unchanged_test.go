@@ -321,8 +321,18 @@ func TestDiscoverPullRequestsReevaluatesWhenTrustIsDemoted(t *testing.T) {
 	if second.Evaluated != 1 || second.Skipped != 0 {
 		t.Fatalf("demotion discovery = %d evaluated / %d skipped, want 1 / 0", second.Evaluated, second.Skipped)
 	}
-	if len(fixture.github.labelRemoves) < 2 || fixture.github.labelRemoves[len(fixture.github.labelRemoves)-2].Labels[0] != labels.AutoMerge {
+	removedAuto := false
+	for _, removal := range fixture.github.labelRemoves {
+		if len(removal.Labels) == 1 && removal.Labels[0] == labels.AutoMerge {
+			removedAuto = true
+			break
+		}
+	}
+	if !removedAuto {
 		t.Fatalf("label removals after trust demotion = %#v, want auto-merge retirement", fixture.github.labelRemoves)
+	}
+	if len(fixture.github.labelAdds) < 2 || fixture.github.labelAdds[len(fixture.github.labelAdds)-1].Labels[0] != labels.NeedsHumanReview {
+		t.Fatalf("label adds after trust demotion = %#v, want durable needs-human-review veto", fixture.github.labelAdds)
 	}
 }
 func hasReason(report Report, code ReasonCode) bool {
