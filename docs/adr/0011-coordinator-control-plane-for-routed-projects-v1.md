@@ -1,5 +1,7 @@
 # Coordinator control plane is supported for Routed projects in v1
 
+> Status: withdrawn from the supported product by #84. This ADR is retained as historical design context; Routed configuration and runtime maintenance are unavailable.
+
 ## Context
 
 The Coordinator Role (per ADRs 0001–0004) is proactive and assumes single-instance operation: each daemon configured with `roles.coordinator.enabled = true` polls open Issues and performs Triage independently. In a Network with multiple Nodes subscribed to the same repository, multiple Coordinators would race on `triaged` label idempotency, duplicate LLM cost, and produce conflicting dispatch/review-assignment decisions.

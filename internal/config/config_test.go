@@ -230,49 +230,29 @@ func TestReadConfigFileMatchesTopLevelKeysCaseInsensitively(t *testing.T) {
 	}
 }
 
-func TestLoadFileDecodesTopLevelNetworkSectionForRoutedProjects(t *testing.T) {
-	cwd := t.TempDir()
-	configPath := filepath.Join(cwd, "config.json")
-	contents := `{
-		"network": {
-			"enrolled": true,
-			"loopernetBaseUrl": "https://loopernet.example.test",
-			"nodeName": "worker-1",
-			"githubLogin": "mrcfps",
-			"githubUserId": 23410977
-		},
-		"projects": [
-			{
-				"id": "sandbox",
-				"name": "sandbox",
-				"repoPath": "/tmp/sandbox",
-				"network": {"mode": "routed"},
-				"roles": {
-					"planner": {"autoDiscovery": false},
-					"fixer": {"autoDiscovery": false}
-				}
+func TestLoadFileRejectsWithdrawnNetworkConfiguration(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name     string
+		fileName string
+		contents string
+		wantPath string
+	}{
+		{name: "global enrollment json", fileName: "config.json", contents: `{"network":{"enrolled":true}}`, wantPath: "network"},
+		{name: "global enrollment toml", fileName: "config.toml", contents: "[network]\nenrolled = true\n", wantPath: "network"},
+		{name: "project routed mode yaml", fileName: "config.yaml", contents: "projects:\n  - id: sandbox\n    name: sandbox\n    repoPath: /tmp/sandbox\n    network:\n      mode: routed\n", wantPath: "projects[0].network"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cwd := t.TempDir()
+			configPath := filepath.Join(cwd, test.fileName)
+			if err := os.WriteFile(configPath, []byte(test.contents), 0o644); err != nil {
+				t.Fatalf("os.WriteFile() error = %v", err)
 			}
-		]
-	}`
-	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
-		t.Fatalf("os.WriteFile() error = %v", err)
-	}
-
-	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
-	if err != nil {
-		t.Fatalf("LoadFile() error = %v", err)
-	}
-	if !loaded.Config.Network.Enrolled {
-		t.Fatal("LoadFile().Config.Network.Enrolled = false, want true")
-	}
-	if got := loaded.Config.Network.LoopernetBaseURL; got != "https://loopernet.example.test" {
-		t.Fatalf("LoadFile().Config.Network.LoopernetBaseURL = %q, want %q", got, "https://loopernet.example.test")
-	}
-	if got := loaded.Config.Network.NodeName; got != "worker-1" {
-		t.Fatalf("LoadFile().Config.Network.NodeName = %q, want %q", got, "worker-1")
-	}
-	if loaded.Partial.Network == nil || loaded.Partial.Network.GitHubLogin == nil || *loaded.Partial.Network.GitHubLogin != "mrcfps" {
-		t.Fatalf("LoadFile().Partial.Network = %#v, want githubLogin mrcfps", loaded.Partial.Network)
+			_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+			if err == nil || !strings.Contains(err.Error(), test.wantPath) || !strings.Contains(err.Error(), "no safe credential producer") {
+				t.Fatalf("LoadFile() error = %v, want explicit withdrawn Network error at %s", err, test.wantPath)
+			}
+		})
 	}
 }
 
