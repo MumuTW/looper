@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/MumuTW/looper/internal/coordinator/triage"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/network/protocol"
 )
 
 func TestBackfillIssuesSkipsPullRequestTargets(t *testing.T) {
@@ -85,6 +87,55 @@ func TestBackfillIssuesRechecksOpenAndLabelSelectionBeforeMutation(t *testing.T)
 	}
 }
 
+func TestBackfillIssuesPreservesPreAnalysisCommentSnapshot(t *testing.T) {
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.BackfillEnabled = true
+	})
+	original := githubinfra.CommentInfo{ID: 7, Author: "octo", Body: "original context", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
+	humanReply := githubinfra.CommentInfo{ID: 8, Author: "octo", Body: "new human evidence", CreatedAt: fixture.now.Format(time.RFC3339)}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1}}
+	fixture.github.details[1] = githubinfra.IssueDetail{
+		Number: 1, Title: "comment race", Author: "octo", State: "open",
+		CreatedAt: fixture.now.Add(-24 * time.Hour).Format(time.RFC3339), Comments: []githubinfra.CommentInfo{original},
+	}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{original}}
+	fixture.runner.triageLLM = concurrentHumanCommentLLM{github: fixture.github, comment: humanReply}
+
+	result, err := fixture.runner.BackfillIssues(context.Background(), BackfillInput{ProjectID: fixture.projectID, Repo: "acme/looper", SkipTriaged: true})
+	if err != nil {
+		t.Fatalf("BackfillIssues() error = %v", err)
+	}
+	if result.Triaged != 1 || len(fixture.github.createdBodies) != 0 || countAddedIssueOperations(fixture.github.addedLabels, 1, "triaged") != 0 {
+		t.Fatalf("result = %#v ops=%v addedLabels=%v, want human comment to veto stale triage comment", result, fixture.github.ops, fixture.github.addedLabels)
+	}
+}
+
+func TestBackfillIssuesRequiresCurrentCoordinatorLeaseInRoutedMode(t *testing.T) {
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.BackfillEnabled = true
+		cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	})
+	fixture.network.status = protocol.NodeStatusResponse{
+		Membership: protocol.Membership{NodeID: "coord-1", NodeName: "coord-1"},
+		Lease:      protocol.CoordinatorLease{HolderNodeID: "other-node", FencingToken: 12, ExpiresAt: timePtr(fixture.now.Add(time.Minute))},
+	}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1}}
+	fixture.github.details[1] = githubinfra.IssueDetail{
+		Number: 1, Title: "routed backfill", Author: "octo", State: "open",
+		CreatedAt: fixture.now.Add(-24 * time.Hour).Format(time.RFC3339),
+	}
+
+	_, err := fixture.runner.BackfillIssues(context.Background(), BackfillInput{ProjectID: fixture.projectID, Repo: "acme/looper", SkipTriaged: true})
+	if !errors.Is(err, ErrBackfillUnavailable) {
+		t.Fatalf("BackfillIssues() error = %v, want ErrBackfillUnavailable", err)
+	}
+	if len(fixture.github.createdBodies) != 0 || len(fixture.github.addedLabels) != 0 {
+		t.Fatalf("routed non-holder mutated GitHub: created=%v added=%v", fixture.github.createdBodies, fixture.github.addedLabels)
+	}
+}
+
 type holdAfterAnalysisLLM struct {
 	github *stubCoordinatorGitHub
 }
@@ -93,6 +144,19 @@ type selectionMutationLLM struct {
 	github *stubCoordinatorGitHub
 	state  string
 	labels []string
+}
+
+type concurrentHumanCommentLLM struct {
+	github  *stubCoordinatorGitHub
+	comment githubinfra.CommentInfo
+}
+
+func (l concurrentHumanCommentLLM) Complete(context.Context, triage.Request) (string, error) {
+	detail := l.github.details[1]
+	detail.Comments = append(detail.Comments, l.comment)
+	l.github.details[1] = detail
+	l.github.comments[1] = [][]githubinfra.CommentInfo{{detail.Comments[0], l.comment}}
+	return `{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["dispatch/plan"]}}`, nil
 }
 
 func (l selectionMutationLLM) Complete(context.Context, triage.Request) (string, error) {

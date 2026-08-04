@@ -143,3 +143,19 @@ func (r *ActiveExecutionRegistry) cancelBackgroundOperationsLocked(cause error) 
 	}
 	return wait
 }
+
+// CancelBackgroundOperations cancels already-admitted non-agent operations
+// without waiting for their owner callbacks. Runtime.MarkDegraded uses this
+// alongside scheduler/cleanup cancellation so a live backfill cannot continue
+// LLM or GitHub work after the single admission Authority becomes degraded.
+func (r *ActiveExecutionRegistry) CancelBackgroundOperations(cause error) {
+	if r == nil {
+		return
+	}
+	if cause == nil {
+		cause = ErrOperationAdmissionClosed
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cancelBackgroundOperationsLocked(cause)
+}

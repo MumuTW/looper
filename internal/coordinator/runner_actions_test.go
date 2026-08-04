@@ -1152,7 +1152,7 @@ func TestRunnerAutonomousDispatchRotatesPastBlockedBacklogPage(t *testing.T) {
 		t.Fatalf("assigned on blocked first page = %v, want none", assignedIssueNumbers(fixture.github.assigned))
 	}
 	if got := fixture.github.viewIssueReads; got != 1 {
-		t.Fatalf("hydrated issues on first page = %d, want 1 available dispatch slot", got)
+		t.Fatalf("hydrated issues on first page = %d, want one candidate before dispatch is eligible", got)
 	}
 
 	fixture.now = fixture.now.Add(5 * time.Minute)
@@ -1160,8 +1160,8 @@ func TestRunnerAutonomousDispatchRotatesPastBlockedBacklogPage(t *testing.T) {
 		t.Fatalf("DiscoverIssues() second tick error = %v", err)
 	}
 	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{101})
-	if got := fixture.github.viewIssueReads; got != 2 {
-		t.Fatalf("hydrated issues after two ticks = %d, want only one candidate per tick", got)
+	if got := fixture.github.viewIssueReads; got != 3 {
+		t.Fatalf("hydrated issues after two ticks = %d, want one candidate plus locked dispatch re-read per active tick", got)
 	}
 	if len(backlogLimits) != 2 || backlogLimits[0] != backlogPageSize || backlogLimits[1] != 2*backlogPageSize {
 		t.Fatalf("backlog query limits = %v, want [%d %d]", backlogLimits, backlogPageSize, 2*backlogPageSize)
@@ -1219,8 +1219,8 @@ func TestRunnerAutonomousDispatchRotatesWithinBacklogPage(t *testing.T) {
 		t.Fatalf("DiscoverIssues() second tick error = %v", err)
 	}
 	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{2})
-	if got := fixture.github.viewIssueReads; got != 2 {
-		t.Fatalf("issue-detail reads after two ticks = %d, want one candidate per tick", got)
+	if got := fixture.github.viewIssueReads; got != 3 {
+		t.Fatalf("issue-detail reads after two ticks = %d, want candidate hydration plus locked dispatch re-read", got)
 	}
 }
 
@@ -1298,11 +1298,11 @@ func TestRunnerBacklogHydrationMatchesAvailableDispatchCapacity(t *testing.T) {
 		t.Fatalf("DiscoverIssues() error = %v", err)
 	}
 
-	if fixture.github.viewIssueReads != 2 {
-		t.Fatalf("issue-detail reads = %d, want 2 available scheduler slots", fixture.github.viewIssueReads)
+	if fixture.github.viewIssueReads != 4 {
+		t.Fatalf("issue-detail reads = %d, want 2 available slots with locked dispatch re-reads", fixture.github.viewIssueReads)
 	}
-	if fixture.github.timelineReads != 2 {
-		t.Fatalf("timeline reads = %d, want 2 available scheduler slots", fixture.github.timelineReads)
+	if fixture.github.timelineReads != 4 {
+		t.Fatalf("timeline reads = %d, want 2 available slots with locked dispatch re-reads", fixture.github.timelineReads)
 	}
 	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{1, 2})
 }

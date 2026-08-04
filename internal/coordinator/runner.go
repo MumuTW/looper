@@ -37,6 +37,7 @@ const mergeWatchCommentMarkerPrefix = "<!-- looper:coordinator:merge-watch"
 const noEligibleNodeStatus = "no-eligible-node"
 const backlogPageSize = 100
 const backlogPageCount = 2
+const issueLockPollInterval = 10 * time.Millisecond
 
 // ErrBackfillUnavailable marks an operational/configuration failure that
 // should be surfaced as HTTP 503 rather than mistaken for invalid input.
@@ -170,6 +171,9 @@ func (r *Runner) BackfillIssues(ctx context.Context, input BackfillInput) (Backf
 	if !strings.EqualFold(configuredRepo, input.Repo) {
 		return result, fmt.Errorf("repo %q is not configured for project %q (configured repo: %q)", input.Repo, input.ProjectID, configuredRepo)
 	}
+	if err := r.requireBackfillCoordinatorLease(ctx, input.ProjectID, ""); err != nil {
+		return result, err
+	}
 
 	triageCfg := roleConfigToTriageConfig(roleCfg)
 	labelFilter := strings.TrimSpace(input.LabelFilter)
@@ -211,7 +215,10 @@ func (r *Runner) BackfillIssues(ctx context.Context, input BackfillInput) (Backf
 			break
 		}
 		result.Considered++
-		unlock := r.lockIssue(input.ProjectID, input.Repo, summary.Number)
+		unlock, locked := r.lockIssue(ctx, input.ProjectID, input.Repo, summary.Number)
+		if !locked {
+			return result, ctx.Err()
+		}
 
 		loaded, err := r.loadIssue(ctx, input.Repo, project.RepoPath, summary)
 		if err != nil {
@@ -270,9 +277,18 @@ func (r *Runner) BackfillIssues(ctx context.Context, input BackfillInput) (Backf
 			unlock()
 			continue
 		}
+		// Keep the pre-analysis comment snapshot for the human-comment veto.
+		// Fresh labels/state are authoritative for selection, but comments that
+		// arrived during inspection must remain new evidence rather than being
+		// folded into the known set passed to postOrEditComment.
+		fresh.issue.Comments = append([]triage.Comment(nil), loaded.issue.Comments...)
 		loaded = fresh
+		if err := r.requireBackfillCoordinatorLease(ctx, input.ProjectID, loaded.issue.URL); err != nil {
+			unlock()
+			return result, err
+		}
 
-		if err := r.applyDecision(ctx, input.Repo, project.RepoPath, loaded.issue, triageCfg, analysisStartedAt, decision); err != nil {
+		if err := r.applyBackfillDecision(ctx, input.Repo, project.RepoPath, loaded.issue, triageCfg, analysisStartedAt, decision); err != nil {
 			unlock()
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return result, ctxErr
@@ -617,7 +633,10 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if !mightNeedCoordinatorAction(loadedIssue.summary, triageCfg) {
 			continue
 		}
-		unlock := r.lockIssue(input.ProjectID, input.Repo, loadedIssue.summary.Number)
+		unlock, locked := r.lockIssue(ctx, input.ProjectID, input.Repo, loadedIssue.summary.Number)
+		if !locked {
+			return DiscoveryResult{}, ctx.Err()
+		}
 		// Re-read under the same per-project/issue lock used by the explicit
 		// backfill lane. The batch hydration above is only a candidate snapshot;
 		// the locked read is what prevents a stale periodic tick from issuing a
@@ -933,9 +952,12 @@ func (r *Runner) decideBackfill(ctx context.Context, repoPath string, repo strin
 	return triage.DecideWithError(ctx, r.triageLLM, triage.Input{Issue: issue, RepoContext: repoCtx, Config: cfg, Now: r.now().UTC()})
 }
 
-func (r *Runner) lockIssue(projectID, repo string, issueNumber int64) func() {
+func (r *Runner) lockIssue(ctx context.Context, projectID, repo string, issueNumber int64) (func(), bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if r == nil || r.state == nil {
-		return func() {}
+		return func() {}, true
 	}
 	key := fmt.Sprintf("%s\x00%s\x00%d", strings.TrimSpace(projectID), strings.ToLower(strings.TrimSpace(repo)), issueNumber)
 	r.state.mu.Lock()
@@ -949,9 +971,8 @@ func (r *Runner) lockIssue(projectID, repo string, issueNumber int64) func() {
 	}
 	entry.refs++
 	r.state.mu.Unlock()
-	entry.mu.Lock()
-	return func() {
-		entry.mu.Unlock()
+
+	releaseReference := func() {
 		r.state.mu.Lock()
 		entry.refs--
 		if entry.refs == 0 && r.state.issueLocks[key] == entry {
@@ -959,9 +980,46 @@ func (r *Runner) lockIssue(projectID, repo string, issueNumber int64) func() {
 		}
 		r.state.mu.Unlock()
 	}
+	for {
+		if err := ctx.Err(); err != nil {
+			releaseReference()
+			return func() {}, false
+		}
+		if entry.mu.TryLock() {
+			// Do not let a cancellation race turn a successful lock into new
+			// work after the caller's request/shutdown has ended.
+			if err := ctx.Err(); err != nil {
+				entry.mu.Unlock()
+				releaseReference()
+				return func() {}, false
+			}
+			return func() {
+				entry.mu.Unlock()
+				releaseReference()
+			}, true
+		}
+		timer := time.NewTimer(issueLockPollInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			releaseReference()
+			return func() {}, false
+		case <-timer.C:
+		}
+	}
 }
 
 func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, issue triage.Issue, cfg triage.Config, analysisStartedAt time.Time, decision triage.Decision) error {
+	return r.applyDecisionWithPolicy(ctx, repo, cwd, issue, cfg, analysisStartedAt, decision, false)
+}
+
+func (r *Runner) applyBackfillDecision(ctx context.Context, repo string, cwd string, issue triage.Issue, cfg triage.Config, analysisStartedAt time.Time, decision triage.Decision) error {
+	return r.applyDecisionWithPolicy(ctx, repo, cwd, issue, cfg, analysisStartedAt, decision, true)
+}
+
+func (r *Runner) applyDecisionWithPolicy(ctx context.Context, repo string, cwd string, issue triage.Issue, cfg triage.Config, analysisStartedAt time.Time, decision triage.Decision, suppressStaleComment bool) error {
 	remainingLabels := append([]string(nil), issue.Labels...)
 	hadTriaged := hasExactLabel(remainingLabels, cfg.TriagedLabel)
 	if decision.MarkTriaged && hadTriaged {
@@ -996,7 +1054,14 @@ func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, iss
 		}
 		commentPosted = posted
 	}
+	// A backfill human-comment veto means the LLM decision is stale. Do not add
+	// the triaged marker when the decision carried a comment that was
+	// suppressed; periodic legacy triage retains its historical label-only
+	// completion semantics.
 	shouldMarkTriaged := decision.MarkTriaged && (!hadTriaged || commentPosted)
+	if suppressStaleComment && strings.TrimSpace(decision.CommentBody) != "" && !commentPosted {
+		shouldMarkTriaged = false
+	}
 	if shouldMarkTriaged && !hasExactLabel(remainingLabels, cfg.TriagedLabel) {
 		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: []string{cfg.TriagedLabel}, LabelNamespace: cfg.Namespace, CWD: cwd}); err != nil {
 			return err
@@ -1383,17 +1448,29 @@ func (r *Runner) applyDispatches(ctx context.Context, projectID, repo, cwd strin
 		if _, skip := deps.retriageIssueNumbers[item.issue.Number]; skip {
 			continue
 		}
-		dispatchIssue, err := r.dispatchIssue(ctx, repo, cwd, item.issue, triageCfg.TriagedLabel, dispatchCfg)
+		unlock, locked := r.lockIssue(ctx, projectID, repo, item.summary.Number)
+		if !locked {
+			return ctx.Err()
+		}
+		fresh, err := r.loadIssue(ctx, repo, cwd, item.summary)
 		if err != nil {
+			unlock()
+			return err
+		}
+		dispatchIssue, err := r.dispatchIssue(ctx, repo, cwd, fresh.issue, triageCfg.TriagedLabel, dispatchCfg)
+		if err != nil {
+			unlock()
 			return err
 		}
 		action := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC(), &deps.graph)
-		action = applyHumanDependencyGate(action, item.issue.Number, deps)
-		if r.hasDispatchWork(action) || r.workerAdmissionIntent(item.issue, action, dispatchCfg).Active {
-			if _, err := r.applyDispatchAction(ctx, projectID, repo, cwd, item.issue, action, dispatchCfg); err != nil {
+		action = applyHumanDependencyGate(action, fresh.issue.Number, deps)
+		if r.hasDispatchWork(action) || r.workerAdmissionIntent(fresh.issue, action, dispatchCfg).Active {
+			if _, err := r.applyDispatchAction(ctx, projectID, repo, cwd, fresh.issue, action, dispatchCfg); err != nil {
+				unlock()
 				return err
 			}
 		}
+		unlock()
 	}
 	return nil
 }
@@ -1432,16 +1509,39 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID, repo,
 	}
 	dispatched := 0
 	for _, candidate := range ready {
-		if preemptWorkers && candidate.worker {
-			continue
-		}
 		if dispatched >= budget {
 			break
 		}
-		mutated, err := r.applyDispatchAction(ctx, projectID, repo, cwd, candidate.issue, candidate.action, dispatchCfg)
+		unlock, locked := r.lockIssue(ctx, projectID, repo, candidate.issue.Number)
+		if !locked {
+			return ctx.Err()
+		}
+		fresh, err := r.loadIssue(ctx, repo, cwd, githubinfra.IssueSummary{Number: candidate.issue.Number})
 		if err != nil {
+			unlock()
 			return err
 		}
+		dispatchIssue, err := r.dispatchIssue(ctx, repo, cwd, fresh.issue, triageCfg.TriagedLabel, dispatchCfg)
+		if err != nil {
+			unlock()
+			return err
+		}
+		action := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC(), &deps.graph)
+		action = applyHumanDependencyGate(action, fresh.issue.Number, deps)
+		if strings.TrimSpace(action.FailureCommentBody) != "" || (!r.hasDispatchWork(action) && !r.workerAdmissionIntent(fresh.issue, action, dispatchCfg).Active) {
+			unlock()
+			continue
+		}
+		if preemptWorkers && isWorkerDispatch(fresh.issue) {
+			unlock()
+			continue
+		}
+		mutated, err := r.applyDispatchAction(ctx, projectID, repo, cwd, fresh.issue, action, dispatchCfg)
+		if err != nil {
+			unlock()
+			return err
+		}
+		unlock()
 		if mutated {
 			dispatched++
 		}
@@ -2338,6 +2438,35 @@ func (r *Runner) projectNetworkMode(projectID string) config.ProjectNetworkMode 
 		break
 	}
 	return config.ProjectNetworkModeOff
+}
+
+// requireBackfillCoordinatorLease is the routed-mode mutation authority for
+// explicit backfill. A backfill can spend a long time in inspection/LLM work,
+// so the initial status check only admits the lane; the call immediately before
+// applyDecision repeats status and fencing-token validation. The Coordinator
+// LLM is a proposal, while the live lease holder is the authority for routed
+// GitHub side effects.
+func (r *Runner) requireBackfillCoordinatorLease(ctx context.Context, projectID, issueURL string) error {
+	if r.projectNetworkMode(projectID) != config.ProjectNetworkModeRouted {
+		return nil
+	}
+	if r.network == nil {
+		return fmt.Errorf("%w: routed coordinator network is not configured", ErrBackfillUnavailable)
+	}
+	status, err := r.network.Status(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: coordinator lease status: %v", ErrBackfillUnavailable, err)
+	}
+	if !r.currentNodeHoldsLease(status) {
+		return fmt.Errorf("%w: this node does not hold the routed Coordinator lease", ErrBackfillUnavailable)
+	}
+	if strings.TrimSpace(issueURL) == "" {
+		return nil
+	}
+	if err := r.revalidateCoordinatorLease(ctx, issueURL, status.Lease.FencingToken); err != nil {
+		return fmt.Errorf("%w: coordinator lease revalidation: %v", ErrBackfillUnavailable, err)
+	}
+	return nil
 }
 
 func (r *Runner) shouldRunTick(projectID string) bool {

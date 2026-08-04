@@ -606,6 +606,7 @@ type workProducerCancels struct {
 	recovery         context.CancelFunc
 	cleanup          context.CancelFunc
 	projectDiscovery *projectDiscoveryRunner
+	background       *ActiveExecutionRegistry
 	forwarder        interface{ CancelExecute() }
 }
 
@@ -624,6 +625,9 @@ func (c workProducerCancels) invokeForDegrade() {
 	}
 	if c.projectDiscovery != nil {
 		c.projectDiscovery.Cancel()
+	}
+	if c.background != nil {
+		c.background.CancelBackgroundOperations(errors.New("daemon admission degraded"))
 	}
 }
 
@@ -647,6 +651,7 @@ func (r *Runtime) snapshotWorkProducerCancels() workProducerCancels {
 		recovery:         r.recoveryCancel,
 		cleanup:          r.worktreeCleanupCancel,
 		projectDiscovery: r.projectDiscovery,
+		background:       r.activeExecutions,
 		forwarder:        r.webhookForwarder,
 	}
 }
@@ -747,8 +752,9 @@ func (r *Runtime) WithAllowClaim(fn func()) error {
 }
 
 // MarkDegraded sticks admission until process restart and cancels work-producing
-// contexts (scheduler, recovery, cleanup) so new discovery/claims/cleanup that
-// already passed AllowClaim cannot complete after the transition. Unlike
+// contexts (scheduler, recovery, cleanup, and already-admitted background
+// operations) so new discovery/claims/cleanup/backfills that already passed
+// AllowClaim cannot complete after the transition. Unlike
 // BeginShutdown, this does not drain active agent handles and does not
 // CancelExecute webhook workers: Forward may already have returned accepted/202
 // for in-memory queue entries, and sticky degrade leaves the daemon up with no
