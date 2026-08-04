@@ -1498,6 +1498,52 @@ func TestRunExecuteStepFailsResumedCompletedCheckpointWithoutParsedResult(t *tes
 	}
 }
 
+func TestRunExecuteStepRetainsHumanContextWhenCompletedResultIsInvalid(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	project := fixture.project(t)
+	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	metadata, err := loops.WriteHITLAsk(loop.MetadataJSON, loops.HITLAsk{Question: "Continue?", Answer: "yes", Status: "answered", Vendor: "codex", SessionID: "session-1"})
+	if err != nil {
+		t.Fatalf("WriteHITLAsk() error = %v", err)
+	}
+	loop.MetadataJSON = &metadata
+	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_invalid_human_context", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	worktreePath := fixture.usableWorktree(t, "invalid-human-context")
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{HeadSHA: "abc123", Branch: "looper/feature", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "invalid", ParseStatus: "missing"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, HITLEnabled: true, AllowAutoCommit: true, AgentRuntime: "codex"})
+	_, err = runner.runExecuteStep(ctx, stepInput{
+		Project: project, Loop: *loop, Run: run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "wt_1", Path: worktreePath, Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	if err == nil {
+		t.Fatal("runExecuteStep() error = nil, want invalid structured result")
+	}
+	updated, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() after invalid result = (%#v, %v)", updated, err)
+	}
+	ask, ok := loops.ReadHITLAsk(updated.MetadataJSON)
+	if !ok || ask.Status != "answered" {
+		t.Fatalf("HITL ask = %#v (ok=%t), want answered context retained for replay", ask, ok)
+	}
+}
+
 func TestBuildIssueClaimCommentBodySanitizesTranscriptSummary(t *testing.T) {
 	t.Parallel()
 
@@ -1895,6 +1941,44 @@ func TestVerifyTimeoutProgressBeforeReplacementFailsClosedForUnprovenReplacement
 	}
 	if checkpoint.Continuation == nil || checkpoint.Continuation.Outcome != "changed" || checkpoint.Continuation.AfterRestart == nil || len(checkpoint.Continuation.AfterRestart.ChangedFiles) != 2 || checkpoint.Execution == nil || checkpoint.Execution.ProgressSnapshotError == "" {
 		t.Fatalf("checkpoint.Continuation = %#v, execution = %#v, want fail-closed changed evidence", checkpoint.Continuation, checkpoint.Execution)
+	}
+}
+
+func TestVerifyTimeoutProgressBeforeReplacementAcceptsVerifiedAdditiveEdits(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	run := storage.RunRecord{ID: "run_retry_after_verified_edit", LoopID: "loop_worker_1", Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	baseline := &worktreeProgress{
+		HeadSHA: "head", WorktreeID: "wt_1", Branch: "feature/test",
+		ChangedFiles: []string{"tracked.go"}, ChangedFileBytes: [][]byte{[]byte("tracked.go")}, ChangedFileCount: 1,
+		ContentFingerprint: "before-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "before-index",
+	}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{
+		HeadSHA: "head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "replacement.go"},
+		ContentFingerprint: "after-content", ComparedContentFingerprint: "before-content", ComparedIndexFingerprint: "before-index",
+		ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "after-index",
+	}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := workerCheckpoint{
+		Execution: &checkpointExecution{RunID: run.ID, ExecutionID: "agent_failed", Status: "failed"},
+		Continuation: &checkpointContinuation{
+			PredecessorRunID: "run_timeout", PredecessorExecutionID: "agent_timeout", Mode: "checkpoint_same_worktree", Outcome: "preserved",
+			AfterRestart: baseline,
+		},
+	}
+	worktree := checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "worktree"), Branch: "feature/test", BaseBranch: "main"}
+	if err := runner.verifyTimeoutProgressBeforeReplacement(context.Background(), *project, run.ID, workerInput{BaseBranch: "main"}, worktree, &checkpoint); err != nil {
+		t.Fatalf("verifyTimeoutProgressBeforeReplacement() error = %v, want verified additive edits accepted", err)
+	}
+	if checkpoint.Continuation == nil || checkpoint.Continuation.Outcome != "preserved" || checkpoint.Continuation.AfterRestart == nil || len(checkpoint.Continuation.AfterRestart.ChangedFiles) != 2 {
+		t.Fatalf("checkpoint.Continuation = %#v, want updated preserved evidence", checkpoint.Continuation)
 	}
 }
 

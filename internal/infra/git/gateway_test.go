@@ -416,6 +416,39 @@ func TestGatewayInspectHeadIndexFingerprintDetectsStagedBlobDrift(t *testing.T) 
 	}
 }
 
+func TestGatewayInspectHeadReturnsScopedComparisonFingerprints(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	writeFile(t, filepath.Join(fixture.repoPath, "README.md"), "tracked change\n")
+	writeFile(t, filepath.Join(fixture.repoPath, "replacement.txt"), "new work\n")
+	allPaths, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(all) error = %v", err)
+	}
+	scoped, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath, ContentPaths: []string{"README.md"}})
+	if err != nil {
+		t.Fatalf("InspectHead(scoped) error = %v", err)
+	}
+	if scoped.ComparedContentFingerprint == "" || scoped.ComparedIndexFingerprint == "" {
+		t.Fatalf("scoped comparison fingerprints = %#v, want non-empty digests", scoped)
+	}
+	if scoped.ComparedContentFingerprint == allPaths.ContentFingerprint {
+		t.Fatalf("scoped content fingerprint = %q, unexpectedly includes replacement path", scoped.ComparedContentFingerprint)
+	}
+	writeFile(t, filepath.Join(fixture.repoPath, "README.md"), "tracked replacement\n")
+	changed, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath, ContentPaths: []string{"README.md"}})
+	if err != nil {
+		t.Fatalf("InspectHead(changed scoped) error = %v", err)
+	}
+	if changed.ComparedContentFingerprint == scoped.ComparedContentFingerprint {
+		t.Fatalf("scoped content fingerprint did not change after README edit: %q", changed.ComparedContentFingerprint)
+	}
+}
+
 func TestGatewayInspectHeadContentFingerprintPreservesWhitespacePaths(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

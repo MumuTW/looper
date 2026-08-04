@@ -319,21 +319,25 @@ type InspectHeadInput struct {
 }
 
 type InspectHeadResult struct {
-	HeadSHA                   string
-	Branch                    string
-	NewCommitSHAs             []string
-	HasUncommittedChanges     bool
-	ChangedFiles              []string
-	StagedFiles               []string
-	UntrackedFiles            []string
-	UnstagedFileCount         int
-	RenameSourceFiles         []string
-	DiffFingerprint           string
-	ContentFingerprint        string
-	ContentFingerprintVersion string
-	IndexFingerprint          string
-	WorktreeMatchesHead       bool
-	HeadDescendsFromCompare   bool
+	HeadSHA                    string
+	Branch                     string
+	NewCommitSHAs              []string
+	HasUncommittedChanges      bool
+	ChangedFiles               []string
+	StagedFiles                []string
+	UntrackedFiles             []string
+	UnstagedFileCount          int
+	RenameSourceFiles          []string
+	DiffFingerprint            string
+	ContentFingerprint         string
+	// Compared* fingerprints are scoped to InspectHeadInput.ContentPaths. They
+	// prove that predecessor paths survived while a replacement adds new paths.
+	ComparedContentFingerprint string
+	ComparedIndexFingerprint   string
+	ContentFingerprintVersion  string
+	IndexFingerprint           string
+	WorktreeMatchesHead        bool
+	HeadDescendsFromCompare    bool
 }
 
 type VerifyWorktreeIdentityInput struct {
@@ -754,19 +758,21 @@ type worktreeProgress struct {
 	// The string path fields are kept for human-facing diagnostics. The byte
 	// fields are the lossless comparison authority: encoding/json base64-encodes
 	// []byte so Git paths that are not valid UTF-8 survive checkpoint round trips.
-	ChangedFileBytes          [][]byte `json:"changedFileBytes,omitempty"`
-	StagedFileBytes           [][]byte `json:"stagedFileBytes,omitempty"`
-	UntrackedFileBytes        [][]byte `json:"untrackedFileBytes,omitempty"`
-	RenameSourceFileBytes     [][]byte `json:"renameSourceFileBytes,omitempty"`
-	DiffFingerprint           string   `json:"diffFingerprint,omitempty"`
-	ContentFingerprint        string   `json:"contentFingerprint,omitempty"`
-	ContentFingerprintVersion string   `json:"contentFingerprintVersion,omitempty"`
-	IndexFingerprint          string   `json:"indexFingerprint,omitempty"`
-	WorktreeMatchesHead       bool     `json:"worktreeMatchesHead"`
-	HeadDescendsFromCompare   bool     `json:"-"`
-	TimeoutType               string   `json:"timeoutType,omitempty"`
-	LastProgressAt            string   `json:"lastProgressAt,omitempty"`
-	CapturedAt                string   `json:"capturedAt,omitempty"`
+	ChangedFileBytes            [][]byte `json:"changedFileBytes,omitempty"`
+	StagedFileBytes             [][]byte `json:"stagedFileBytes,omitempty"`
+	UntrackedFileBytes          [][]byte `json:"untrackedFileBytes,omitempty"`
+	RenameSourceFileBytes       [][]byte `json:"renameSourceFileBytes,omitempty"`
+	DiffFingerprint             string   `json:"diffFingerprint,omitempty"`
+	ContentFingerprint          string   `json:"contentFingerprint,omitempty"`
+	PreservedContentFingerprint string   `json:"preservedContentFingerprint,omitempty"`
+	PreservedIndexFingerprint   string   `json:"preservedIndexFingerprint,omitempty"`
+	ContentFingerprintVersion   string   `json:"contentFingerprintVersion,omitempty"`
+	IndexFingerprint            string   `json:"indexFingerprint,omitempty"`
+	WorktreeMatchesHead         bool     `json:"worktreeMatchesHead"`
+	HeadDescendsFromCompare     bool     `json:"-"`
+	TimeoutType                 string   `json:"timeoutType,omitempty"`
+	LastProgressAt              string   `json:"lastProgressAt,omitempty"`
+	CapturedAt                  string   `json:"capturedAt,omitempty"`
 }
 
 type checkpointPullPR struct {
@@ -2575,11 +2581,6 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		} else if held {
 			return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 		}
-		// HITL (gated): the resumed turn completed without asking again, so the human
-		// answer that seeded it has been acted on. Flip it to "consumed" now — after
-		// the turn, never before — so a failed/timed-out turn re-reads the answer on
-		// retry, while a successful one never re-injects it on a later run.
-		r.acknowledgePostTurnMetadata(ctx, &input.Loop, includedHumanInbox)
 		checkpoint.recordContinuationResumeMode(result)
 		checkpoint.Execution = checkpointExecutionFromAgentResult(result, input.Run.ID, executionID)
 		checkpoint.Execution.ProgressBeforeTimeout = preTimeoutProgress
@@ -2589,6 +2590,10 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			}
 			return checkpoint, err
 		}
+		// HITL (gated): only consume the human context after the completed result
+		// passes validation. Invalid structured output is replayed in a fresh
+		// execute turn and must still receive the answer/message that authorized it.
+		r.acknowledgePostTurnMetadata(ctx, &input.Loop, includedHumanInbox)
 		checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
 		if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {
 			return checkpoint, err
@@ -2626,6 +2631,10 @@ func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.Pr
 	contentPaths := []string(nil)
 	compareHeadSHA := ""
 	if compare != nil {
+		// Keep an explicit empty slice for a clean predecessor. Nil means that
+		// no scoped comparison was requested; an empty scope still has a
+		// deterministic content/index digest.
+		contentPaths = make([]string, 0, len(compare.ChangedFiles)+len(compare.RenameSourceFiles))
 		contentPaths = append(contentPaths, compare.ChangedFiles...)
 		contentPaths = append(contentPaths, compare.RenameSourceFiles...)
 		compareHeadSHA = compare.HeadSHA
@@ -2633,6 +2642,14 @@ func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.Pr
 	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: firstNonEmpty(worktree.HeadSHA, worktree.BaseBranch, work.BaseBranch), ContentPaths: contentPaths, CompareHeadSHA: compareHeadSHA})
 	if err != nil {
 		return worktreeProgress{}, err
+	}
+	preservedContentFingerprint := inspect.ComparedContentFingerprint
+	preservedIndexFingerprint := inspect.ComparedIndexFingerprint
+	if compare == nil {
+		// The first timeout observation has no predecessor scope; its complete
+		// aggregate becomes the scope for a later additive replacement.
+		preservedContentFingerprint = inspect.ContentFingerprint
+		preservedIndexFingerprint = inspect.IndexFingerprint
 	}
 	return worktreeProgress{
 		HeadSHA:               inspect.HeadSHA,
@@ -2651,6 +2668,7 @@ func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.Pr
 		UntrackedFileBytes:    pathByteList(boundPathList(inspect.UntrackedFiles, worktreeProgressPathCap)),
 		RenameSourceFileBytes: pathByteList(boundPathList(inspect.RenameSourceFiles, worktreeProgressPathCap)),
 		DiffFingerprint:       inspect.DiffFingerprint, ContentFingerprint: inspect.ContentFingerprint,
+		PreservedContentFingerprint: preservedContentFingerprint, PreservedIndexFingerprint: preservedIndexFingerprint,
 		ContentFingerprintVersion: firstNonEmpty(inspect.ContentFingerprintVersion, worktreeFingerprintVersion),
 		IndexFingerprint:          inspect.IndexFingerprint, HeadDescendsFromCompare: inspect.HeadDescendsFromCompare,
 		WorktreeMatchesHead: inspect.WorktreeMatchesHead,
@@ -2790,6 +2808,14 @@ func (r *Runner) reobserveContinuationBeforeReplacement(ctx context.Context, pro
 		return &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
 	}
 	preserved := preservesWorktreeProgress(*baseline, current)
+	if !preserved && continuation.Outcome == "preserved" {
+		// A replacement may add work only after the previous observation proved
+		// this baseline. Compare scoped digests for the baseline paths instead of
+		// requiring the aggregate fingerprint to remain unchanged. The scoped
+		// proof composes across repeated failed replacement attempts and rejects
+		// same-path destructive rewrites.
+		preserved = preservesAdditiveWorktreeProgress(*baseline, current)
+	}
 	continuation.AfterRestart = &current
 	if !preserved {
 		if checkpoint.Execution == nil {
@@ -2815,6 +2841,29 @@ func (r *Runner) reobserveContinuationBeforeReplacement(ctx context.Context, pro
 		return &runpipe.LoopError{Message: checkpoint.Execution.ProgressSnapshotError, Kind: runpipe.FailureManualIntervention}
 	}
 	return nil
+}
+
+// preservesAdditiveWorktreeProgress proves that a failed replacement changed
+// only by adding work to the already-proven checkout. The current observation
+// carries fingerprints scoped to the previous baseline paths; comparing them
+// with the baseline's full fingerprints is content/index authority, while the
+// same-head check prevents a replacement from smuggling an unrelated commit.
+func preservesAdditiveWorktreeProgress(before, after worktreeProgress) bool {
+	if before.HeadSHA == "" || after.HeadSHA == "" || before.HeadSHA != after.HeadSHA || before.Branch != after.Branch {
+		return false
+	}
+	if before.ContentFingerprintVersion != worktreeFingerprintVersion || after.ContentFingerprintVersion != worktreeFingerprintVersion || before.ContentFingerprint == "" || before.IndexFingerprint == "" || after.ContentFingerprint == "" || after.PreservedContentFingerprint == "" || after.PreservedIndexFingerprint == "" {
+		return false
+	}
+	// Path evidence is capped in checkpoints. If the baseline was truncated,
+	// the scoped digest cannot cover every predecessor path, so fail closed.
+	if before.ChangedFileCount != len(before.ChangedFileBytes) || before.StagedFileCount != len(before.StagedFileBytes) || before.UntrackedFileCount != len(before.UntrackedFileBytes) || before.ChangedFileCount != len(before.ChangedFiles) || before.StagedFileCount != len(before.StagedFiles) || before.UntrackedFileCount != len(before.UntrackedFiles) {
+		return false
+	}
+	if before.RenameSourceFiles != nil && len(before.RenameSourceFileBytes) != len(before.RenameSourceFiles) {
+		return false
+	}
+	return after.PreservedContentFingerprint == before.ContentFingerprint && after.PreservedIndexFingerprint == before.IndexFingerprint
 }
 
 func sameWorktreeProgress(before, after worktreeProgress) bool {

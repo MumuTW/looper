@@ -1818,7 +1818,7 @@ func (a workerGitAdapter) InspectHead(ctx context.Context, input worker.InspectH
 	if err != nil {
 		return worker.InspectHeadResult{}, err
 	}
-	return worker.InspectHeadResult{HeadSHA: result.HeadSHA, Branch: result.Branch, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles, StagedFiles: result.StagedFiles, UntrackedFiles: result.UntrackedFiles, UnstagedFileCount: result.UnstagedFileCount, RenameSourceFiles: result.RenameSourceFiles, DiffFingerprint: result.DiffFingerprint, ContentFingerprint: result.ContentFingerprint, ContentFingerprintVersion: result.ContentFingerprintVersion, IndexFingerprint: result.IndexFingerprint, WorktreeMatchesHead: result.WorktreeMatchesHead, HeadDescendsFromCompare: result.HeadDescendsFromCompare}, nil
+	return worker.InspectHeadResult{HeadSHA: result.HeadSHA, Branch: result.Branch, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles, StagedFiles: result.StagedFiles, UntrackedFiles: result.UntrackedFiles, UnstagedFileCount: result.UnstagedFileCount, RenameSourceFiles: result.RenameSourceFiles, DiffFingerprint: result.DiffFingerprint, ContentFingerprint: result.ContentFingerprint, ComparedContentFingerprint: result.ComparedContentFingerprint, ComparedIndexFingerprint: result.ComparedIndexFingerprint, ContentFingerprintVersion: result.ContentFingerprintVersion, IndexFingerprint: result.IndexFingerprint, WorktreeMatchesHead: result.WorktreeMatchesHead, HeadDescendsFromCompare: result.HeadDescendsFromCompare}, nil
 }
 
 func (a workerGitAdapter) VerifyWorktreeIdentity(ctx context.Context, input worker.VerifyWorktreeIdentityInput) error {
