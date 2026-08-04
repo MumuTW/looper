@@ -357,7 +357,7 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 		if ctx.Err() != nil {
 			return result, ctx.Err()
 		}
-		releaseMutation := worktreesafety.AcquireManagedMutationLock(candidate.Path)
+		releaseMutation := worktreesafety.AcquireManagedMutationLock(worktreesafety.NormalizePath(candidate.Path))
 		decided, eligible := revalidateContainerCandidate(candidate, options.RetentionCutoff)
 		if !eligible {
 			releaseMutation()

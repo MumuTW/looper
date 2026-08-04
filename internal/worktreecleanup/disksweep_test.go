@@ -998,6 +998,52 @@ func TestRunContainerSweepRechecksLiveContainerOwnershipBeforeRemoval(t *testing
 	}
 }
 
+func TestRunContainerSweepUsesResolvedContainerMutationLock(t *testing.T) {
+	root := t.TempDir()
+	realShared := filepath.Join(root, "real-worktrees")
+	if err := os.MkdirAll(realShared, 0o755); err != nil {
+		t.Fatalf("MkdirAll(realShared): %v", err)
+	}
+	aliasShared := filepath.Join(root, "alias-worktrees")
+	if err := os.Symlink(realShared, aliasShared); err != nil {
+		t.Skipf("Symlink() unsupported: %v", err)
+	}
+	realContainer := filepath.Join(realShared, "repo-alias")
+	mkdirAt(t, filepath.Join(realContainer, "project_1"), old())
+	if err := os.Chtimes(realContainer, old(), old()); err != nil {
+		t.Fatalf("Chtimes(realContainer): %v", err)
+	}
+
+	var removed []string
+	options := containerOptions(aliasShared, nil, stubSweepGit{}, &removed)
+	acquired := make(chan struct{})
+	options.RemoveAll = func(path string) error {
+		if path != filepath.Join(aliasShared, "repo-alias") {
+			t.Fatalf("RemoveAll path = %q, want lexical alias", path)
+		}
+		go func() {
+			unlock := worktreesafety.AcquireManagedMutationLock(worktreesafety.NormalizePath(realContainer))
+			close(acquired)
+			unlock()
+		}()
+		select {
+		case <-acquired:
+			t.Fatalf("resolved container lock was not held during RemoveAll")
+		case <-time.After(25 * time.Millisecond):
+		}
+		return nil
+	}
+
+	if _, err := RunContainerSweep(context.Background(), options); err != nil {
+		t.Fatalf("RunContainerSweep() error = %v", err)
+	}
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("mutation lock did not release after RemoveAll")
+	}
+}
+
 func TestRunContainerSweepSkipsNestedTraversalWhenContainerIsLiveProjectRoot(t *testing.T) {
 	sharedRoot := t.TempDir()
 	container := filepath.Join(sharedRoot, "project-root")
