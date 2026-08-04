@@ -1505,6 +1505,35 @@ func TestEventsListLatestByEventTypeDeduplicatesEntities(t *testing.T) {
 	}
 }
 
+func TestEventsListLatestByEventTypeZeroLimitReturnsAllEntities(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	projectID := "project_all"
+	entityType := "pull_request"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z"}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	for index := 0; index < 101; index++ {
+		entityID := fmt.Sprintf("acme/looper#%d", index+1)
+		if err := repos.Events.Append(ctx, EventLogRecord{
+			ID: fmt.Sprintf("all-verdict-%03d", index), EventType: "pull_request.merge_gate.evaluated",
+			ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+			PayloadJSON: `{}`, CreatedAt: fmt.Sprintf("2026-04-11T12:%02d:00.000Z", index/60),
+		}); err != nil {
+			t.Fatalf("Events.Append(%s) error = %v", entityID, err)
+		}
+	}
+	got, err := repos.Events.ListLatestByEventType(ctx, "pull_request.merge_gate.evaluated", projectID, 0)
+	if err != nil {
+		t.Fatalf("ListLatestByEventType() error = %v", err)
+	}
+	if len(got) != 101 {
+		t.Fatalf("ListLatestByEventType() returned %d entities, want 101", len(got))
+	}
+}
+
 func TestRunsListByStatusOrdersByStartedAtThenIDDesc(t *testing.T) {
 	t.Parallel()
 

@@ -124,16 +124,19 @@ func reportAwaitsConvergenceState(report Report) bool {
 }
 
 // latestGateReports returns the most recent gate report per pull request for one
-// project, keyed by the report's entity id (`repo#number`).
+// project, keyed by the report's entity id (`repo#number`). It intentionally
+// loads every entity: discovery uses this projection both to reconcile PRs that
+// departed the open set and to aggregate every report sharing a head SHA, so a
+// page-sized cap would make a missing older report look like a safe state.
 //
 // It is a single local query for the whole project rather than one per pull
 // request: the point of this path is to spend microseconds of SQLite to avoid
 // seconds of forge round trips, so it must not reintroduce per-PR work of its own.
-func latestGateReports(ctx context.Context, repos *storage.Repositories, projectID string, limit int64) (map[string]Report, error) {
+func latestGateReports(ctx context.Context, repos *storage.Repositories, projectID string) (map[string]Report, error) {
 	if repos == nil || repos.Events == nil {
 		return nil, nil
 	}
-	records, err := repos.Events.ListLatestByEventType(ctx, GateReportEventType, projectID, limit)
+	records, err := repos.Events.ListLatestByEventType(ctx, GateReportEventType, projectID, 0)
 	if err != nil {
 		return nil, fmt.Errorf("list gate reports: %w", err)
 	}

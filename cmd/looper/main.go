@@ -121,6 +121,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return reportError(stderr, runProject(ctx, parsed.Global, parsed.Operands, stdout))
 	case "gatekeeper":
 		return reportError(stderr, runGatekeeper(ctx, parsed.Global, parsed.Operands, stdout))
+	case "provider":
+		return reportError(stderr, runProvider(ctx, parsed.Global, parsed.Operands, stdout))
 	}
 
 	request, err := routeForVerb(parsed.Verb, parsed.Operands)

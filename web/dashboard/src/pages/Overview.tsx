@@ -23,7 +23,6 @@ import {
   type GatekeeperVerdict,
   type LoopRoleCounts,
   type StatusData,
-  type PostMergeDigestData,
 } from "@/lib/api";
 import { useDashboardData } from "@/lib/DashboardDataContext";
 import {
@@ -176,36 +175,6 @@ export function OverviewPage({
   const [statusLoading, setStatusLoading] = useState(true);
   const statusAbort = useRef<AbortController | null>(null);
   const statusInFlight = useRef(false);
-  const [postMergeDigest, setPostMergeDigest] = useState<PostMergeDigestData | null>(null);
-  const [postMergeDigestError, setPostMergeDigestError] = useState<string | null>(null);
-  const [postMergeDigestLoading, setPostMergeDigestLoading] = useState(true);
-  const digestAbort = useRef<AbortController | null>(null);
-  const digestInFlight = useRef(false);
-
-  const loadPostMergeDigest = useCallback(async () => {
-    if (digestInFlight.current) return;
-    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-    digestInFlight.current = true;
-    digestAbort.current?.abort();
-    const controller = new AbortController();
-    digestAbort.current = controller;
-    setPostMergeDigestLoading(true);
-    try {
-      const next = await fetchPostMergeDigest(controller.signal);
-      if (controller.signal.aborted) return;
-      setPostMergeDigest(next);
-      setPostMergeDigestError(null);
-    } catch (err) {
-      if (controller.signal.aborted) return;
-      if (err instanceof Error && err.name === "AbortError") return;
-      if (err instanceof DOMException && err.name === "AbortError") return;
-      setPostMergeDigestError(err instanceof Error ? err.message : String(err));
-      setPostMergeDigest(null);
-    } finally {
-      if (digestAbort.current === controller) digestInFlight.current = false;
-      if (!controller.signal.aborted) setPostMergeDigestLoading(false);
-    }
-  }, []);
 
   const loadStatus = useCallback(async () => {
     if (statusInFlight.current) return;
@@ -278,28 +247,6 @@ export function OverviewPage({
       statusAbort.current?.abort();
     };
   }, [loadStatus]);
-
-  useEffect(() => {
-    void loadPostMergeDigest();
-    const id = window.setInterval(() => {
-      void loadPostMergeDigest();
-    }, STATUS_SLOW_MS);
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") {
-        void loadPostMergeDigest();
-      } else {
-        digestAbort.current?.abort();
-        digestAbort.current = null;
-        digestInFlight.current = false;
-      }
-    };
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => {
-      window.clearInterval(id);
-      document.removeEventListener("visibilitychange", onVisibility);
-      digestAbort.current?.abort();
-    };
-  }, [loadPostMergeDigest]);
 
   useEffect(() => {
     onHealthChange?.(sharedHealthy, status?.service?.version);

@@ -454,6 +454,17 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 		h.writeSuccess(w, requestID, payload)
 		return
+	case apiBasePath + "/post-merge-digest":
+		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
+			return
+		}
+		payload, err := h.buildPostMergeDigestResponse(r.Context())
+		if err != nil {
+			h.writeError(w, requestID, internalServerError(err))
+			return
+		}
+		h.writeSuccess(w, requestID, payload)
+		return
 	case apiBasePath + "/gatekeeper/agreements":
 		payload, err := h.buildGatekeeperAgreementsRouteResponse(r)
 		if err != nil {
@@ -2608,6 +2619,30 @@ func (h *Handler) buildEventsRouteResponse(r *http.Request) (eventsListResponse,
 	}
 
 	return eventsListResponse{Items: responseItems}, nil
+}
+
+func (h *Handler) buildPostMergeDigestResponse(ctx context.Context) (postMergeDigestResponse, error) {
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil {
+		return postMergeDigestResponse{}, errors.New("repositories are not configured")
+	}
+	effective := h.effectiveConfig()
+	digestConfig := postmergedigest.ConfigFromRole(effective.Roles.Coordinator.PostMergeDigest)
+	response := postMergeDigestResponse{Enabled: digestConfig.Enabled, Schedule: digestConfig.Schedule, Timezone: digestConfig.Timezone}
+	if !digestConfig.Enabled {
+		now := h.now().UTC()
+		response.Digest = postmergedigest.Digest{
+			Date: now.Format("2006-01-02"), GeneratedAt: now.Format(time.RFC3339Nano), Empty: true,
+			Merged: []postmergedigest.MergedItem{}, ClosedAndRegenerated: []postmergedigest.RegeneratedItem{}, AwaitingHuman: []postmergedigest.AwaitingHumanItem{}, Anomalies: []postmergedigest.Anomaly{},
+		}
+		return response, nil
+	}
+	digest, err := postmergedigest.Assemble(ctx, services.Repositories, digestConfig, h.now())
+	if err != nil {
+		return postMergeDigestResponse{}, err
+	}
+	response.Digest = digest
+	return response, nil
 }
 
 const maxGatekeeperAgreementsLimit int64 = 200

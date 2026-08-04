@@ -684,13 +684,12 @@ func (r *EventsRepository) ListByEventType(ctx context.Context, eventType, proje
 // event family. The optional project filter is applied before the window so a
 // read-only projection can bound its scan without loading another project's
 // history. Entity identity includes project_id because the same pull request
-// can be observed by more than one registered project.
+// can be observed by more than one registered project. A positive limit caps
+// the newest entities; zero or negative means all entities for callers that
+// need a complete state projection.
 func (r *EventsRepository) ListLatestByEventType(ctx context.Context, eventType, projectID string, limit int64) ([]EventLogRecord, error) {
 	if strings.TrimSpace(eventType) == "" {
 		return []EventLogRecord{}, nil
-	}
-	if limit <= 0 {
-		limit = 100
 	}
 
 	query := `SELECT ` + eventLogColumns + `
@@ -710,9 +709,11 @@ func (r *EventsRepository) ListLatestByEventType(ctx context.Context, eventType,
 	query += `
 		) AS ranked
 		WHERE event_rank = 1
-		ORDER BY created_at DESC, event_rowid DESC
-		LIMIT ?`
-	args = append(args, limit)
+		ORDER BY created_at DESC, event_rowid DESC`
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
 
 	rows, err := r.q.QueryContext(ctx, query, args...)
 	if err != nil {

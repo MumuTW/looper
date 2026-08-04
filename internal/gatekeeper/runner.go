@@ -296,7 +296,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	// review-thread query each — so this lane was O(open PRs) in forge round trips
 	// every tick, and grew with the repo. Most of those pull requests are unchanged
 	// since their last evaluation, and the list call already made above can prove it.
-	previousReports, err := latestGateReports(ctx, r.repos, input.ProjectID, int64(len(pullRequests)))
+	previousReports, err := latestGateReports(ctx, r.repos, input.ProjectID)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -1011,7 +1011,7 @@ func (r *Runner) tryPublishAggregatedCommitStatus(ctx context.Context, report Re
 }
 
 func (r *Runner) openReportsForHeadSHA(ctx context.Context, projectID, repo, sha string, current Report) ([]Report, error) {
-	previousReports, err := latestGateReports(ctx, r.repos, projectID, 0)
+	previousReports, err := latestGateReports(ctx, r.repos, projectID)
 	if err != nil {
 		return nil, err
 	}
@@ -1128,8 +1128,16 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 		}); err != nil {
 			return fmt.Errorf("persist gate report: %w", err)
 		}
-		txRunner := *r
-		txRunner.repos = txRepos
+		txRunner := &Runner{
+			repos:                  txRepos,
+			github:                 r.github,
+			now:                    r.now,
+			policyPermitsTarget:    r.policyPermitsTarget,
+			trustForProject:        r.trustForProject,
+			diffBudgetForProject:   r.diffBudgetForProject,
+			configuredTargetBranch: r.configuredTargetBranch,
+			logWarn:                r.logWarn,
+		}
 		if err := txRunner.recordTerminalAdviceOutcomes(ctx, report, reportEventID); err != nil {
 			return err
 		}
