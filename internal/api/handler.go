@@ -3257,11 +3257,17 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 				return storage.LoopRecord{}, err
 			}
 		}
-
 		return updated, nil
 	})
 	if err != nil {
 		err = mapIssueClaimAdmissionError(err)
+		if errors.Is(err, loops.ErrLoopNotFound) {
+			err = apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+		} else if errors.Is(err, loops.ErrActiveLoopConflict) {
+			err = apiError{code: pkgapi.ErrorCodeLoopConflict, status: http.StatusConflict, message: err.Error()}
+		} else if errors.Is(err, loops.ErrInvalidQueueTarget) {
+			err = apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
+		}
 		if restoreErr := restoreStopGate(); restoreErr != nil {
 			var typed apiError
 			if asAPIError(err, &typed) {

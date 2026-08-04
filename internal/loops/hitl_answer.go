@@ -30,6 +30,10 @@ type HITLAnswerInput struct {
 type HITLAnswerResult struct {
 	Loop    storage.LoopRecord
 	Applied bool
+	// Replayed means the same answer was already durably recorded before a
+	// transport acknowledged the remote event. It is a successful idempotent
+	// replay for pollers, but not a new API answer application.
+	Replayed bool
 }
 
 // RecordHITLAnswer is transaction-local. It owns the durable answer metadata
@@ -55,6 +59,16 @@ func RecordHITLAnswer(ctx context.Context, repos *storage.Repositories, input HI
 	}
 	result := HITLAnswerResult{Loop: *loop}
 	if loop.Status != string(domain.LoopStatusAwaitingHuman) {
+		// Feishu inbox delivery is at-least-once. A daemon can commit the answer,
+		// crash before advancing the cursor, and then see the same card action
+		// after restart while the loop is already running. Recognize only the
+		// exact persisted answer as a replay; a different answer remains a stale
+		// no-op and must not reopen or mutate the loop.
+		ask, present := ReadHITLAsk(loop.MetadataJSON)
+		if present && ask.Status == "answered" && strings.TrimSpace(ask.Answer) == strings.TrimSpace(input.Answer) {
+			result.Replayed = true
+			return result, nil
+		}
 		return result, nil
 	}
 	ask, present := ReadHITLAsk(loop.MetadataJSON)

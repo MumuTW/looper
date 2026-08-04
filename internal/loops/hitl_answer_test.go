@@ -84,6 +84,26 @@ func TestRecordHITLAnswerCanResumeAndRequeueInSameTransaction(t *testing.T) {
 	}
 }
 
+func TestRecordHITLAnswerRecognizesExactReplayAfterResume(t *testing.T) {
+	ctx, db, repos, loop, nowISO := reactivationFixture(t)
+	metadata, err := WriteHITLAsk(loop.MetadataJSON, HITLAsk{Question: "continue?", Status: "answered", Answer: "yes", AnsweredAt: nowISO})
+	if err != nil {
+		t.Fatalf("WriteHITLAsk() error = %v", err)
+	}
+	loop.Status, loop.MetadataJSON = string(domain.LoopStatusRunning), &metadata
+	if err := repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	result, err := storage.WithTransactionValue(ctx, db, nil, func(tx *sql.Tx) (HITLAnswerResult, error) {
+		return RecordHITLAnswer(ctx, storage.NewRepositories(tx), HITLAnswerInput{
+			LoopID: loop.ID, Answer: "yes", NowISO: nowISO, RequireExistingAsk: true, Resume: true,
+		})
+	})
+	if err != nil || result.Applied || !result.Replayed || result.Loop.Status != string(domain.LoopStatusRunning) {
+		t.Fatalf("RecordHITLAnswer() replay = %#v, %v; want successful replay without a second apply", result, err)
+	}
+}
+
 func TestRecordHITLAnswerRollsBackLifecycleWhenTransactionIsInterrupted(t *testing.T) {
 	ctx, db, repos, loop, nowISO := reactivationFixture(t)
 	metadata, err := WriteHITLAsk(loop.MetadataJSON, HITLAsk{Question: "continue?", Status: "awaiting"})

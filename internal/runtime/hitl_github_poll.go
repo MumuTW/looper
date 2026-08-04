@@ -269,7 +269,7 @@ func deliverHITLAnswerToLoop(ctx context.Context, db *sql.DB, repos *storage.Rep
 	if err != nil {
 		return err
 	}
-	if loop == nil || loop.Status != "awaiting_human" {
+	if loop == nil {
 		return errHITLAnswerNotApplied
 	}
 	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*loop))
