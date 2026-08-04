@@ -65,6 +65,44 @@ func TestAutoTrustRoutesEligiblePullRequestThroughMergify(t *testing.T) {
 	}
 }
 
+type orderedRoutingGitHub struct {
+	*fakeGatekeeperGitHub
+	operations []string
+}
+
+func (g *orderedRoutingGitHub) AddPullRequestLabels(ctx context.Context, input githubinfra.PullRequestLabelsInput) error {
+	g.operations = append(g.operations, "add:"+strings.Join(input.Labels, ","))
+	return g.fakeGatekeeperGitHub.AddPullRequestLabels(ctx, input)
+}
+
+func (g *orderedRoutingGitHub) RemovePullRequestLabels(ctx context.Context, input githubinfra.PullRequestLabelsInput) error {
+	g.operations = append(g.operations, "remove:"+strings.Join(input.Labels, ","))
+	if slices.Equal(input.Labels, []string{labels.NeedsHumanReview}) {
+		return errors.New("needs-human-review removal failed")
+	}
+	return g.fakeGatekeeperGitHub.RemovePullRequestLabels(ctx, input)
+}
+
+func TestAutoRouteAddsBeforeRemovingQueueVeto(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	github := &orderedRoutingGitHub{fakeGatekeeperGitHub: fixture.github}
+	runner := New(Options{
+		Repos: fixture.repos, GitHub: github, Now: func() time.Time { return fixture.now },
+		PolicyPermitsTarget: func(string, string, string) bool { return fixture.policyPermits },
+		TrustForProject:     func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+	})
+	err := runner.applyRoutingLabelPlan(context.Background(), Report{Repo: "acme/looper", PRNumber: 42}, routingLabelPlan{autoMerge: true})
+	if err == nil {
+		t.Fatal("applyRoutingLabelPlan() error = nil, want veto-removal failure")
+	}
+	if !slices.Equal(github.operations, []string{"add:auto-merge", "remove:needs-human-review"}) {
+		t.Fatalf("label operation order = %#v, want auto-merge before veto removal", github.operations)
+	}
+	if len(fixture.github.labelAdds) != 1 || !slices.Equal(fixture.github.labelAdds[0].Labels, []string{labels.AutoMerge}) {
+		t.Fatalf("label adds = %#v, want auto-merge retained after veto-removal failure", fixture.github.labelAdds)
+	}
+}
+
 func TestAdviseTrustDoesNotRouteEligiblePullRequestToAutoMerge(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	report := evaluateRoutingReport(t, routingRunner(fixture, config.GatekeeperTrustAdvise))
@@ -182,6 +220,29 @@ func TestEligibleThenMechanicalBlockAddsVetoBeforeRemovingAutoMerge(t *testing.T
 	}
 	if len(fixture.github.labelRemoves) != 2 || !slices.Equal(fixture.github.labelRemoves[1].Labels, []string{labels.AutoMerge}) {
 		t.Fatalf("label removes = %#v, want auto-merge removed after queue veto", fixture.github.labelRemoves)
+	}
+}
+
+func TestEligibleThenAnyBlockingReasonAddsQueueVeto(t *testing.T) {
+	for _, reason := range []ReasonCode{ReasonProjectPolicyDenied, ReasonProviderStateUnavailable, ReasonDoNotMerge} {
+		t.Run(string(reason), func(t *testing.T) {
+			fixture := newGatekeeperFixture(t)
+			runner := routingRunner(fixture, config.GatekeeperTrustAuto)
+			eligible := Report{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ObservedHeadSHA: "head-1", Evidence: Evidence{
+				FinalObservedHeadSHA: "head-1", PullRequestState: "OPEN", BaseRefName: "main", ReviewDecision: "APPROVED", ProjectPolicyPermitsTarget: true,
+			}}
+			if _, err := runner.persist(context.Background(), eligible); err != nil {
+				t.Fatalf("eligible persist() error = %v", err)
+			}
+			blocked := eligible
+			blocked.Reasons = []Reason{{Code: reason}}
+			if _, err := runner.persist(context.Background(), blocked); err != nil {
+				t.Fatalf("blocked persist() error = %v", err)
+			}
+			if len(fixture.github.labelAdds) != 2 || !slices.Equal(fixture.github.labelAdds[1].Labels, []string{labels.NeedsHumanReview}) {
+				t.Fatalf("label adds = %#v, want queue veto for %s", fixture.github.labelAdds, reason)
+			}
+		})
 	}
 }
 
