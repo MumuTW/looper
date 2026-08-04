@@ -138,6 +138,22 @@ func TestGatekeeperProjectThresholdOverrideControlsCommentCompatibility(t *testi
 	}
 }
 
+func TestGatekeeperProjectThresholdOnlyOverrideControlsCommentCompatibility(t *testing.T) {
+	t.Parallel()
+	clean := ReviewerReviewEventComment
+	auto := GatekeeperTrustAuto
+	positive := 200
+	base := Config{
+		Roles:    RoleConfigs{Gatekeeper: GatekeeperRoleConfig{Trust: auto, RequiredReviewChangedLines: 0}, Reviewer: ReviewerRoleConfig{Behavior: ReviewerConfig{ReviewEvents: ReviewerReviewEventsConfig{Clean: clean}}}},
+		Projects: []ProjectRefConfig{{ID: "enabled", Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{RequiredReviewChangedLines: &positive}}}},
+	}
+	var issues []ValidationIssue
+	validateGatekeeperReviewEventCompatibility(base, &issues)
+	if len(issues) != 1 || issues[0].Path != "projects[0].roles.gatekeeper.requiredReviewChangedLines" {
+		t.Fatalf("issues = %+v, want threshold-only project override conflict", issues)
+	}
+}
+
 func TestGatekeeperRejectsNegativeProjectReviewThreshold(t *testing.T) {
 	t.Parallel()
 	negative := -1

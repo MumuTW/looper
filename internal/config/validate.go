@@ -395,7 +395,7 @@ func validateGatekeeperReviewEventCompatibility(config Config, issues *[]Validat
 		if project.Roles == nil {
 			continue
 		}
-		projectGatekeeperOverride := project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil
+		projectGatekeeperOverride := project.Roles.Gatekeeper != nil && (project.Roles.Gatekeeper.Trust != nil || project.Roles.Gatekeeper.RequiredReviewChangedLines != nil)
 		projectReviewerCleanOverride := project.Roles.Reviewer != nil && project.Roles.Reviewer.Behavior != nil && project.Roles.Reviewer.Behavior.ReviewEvents != nil && project.Roles.Reviewer.Behavior.ReviewEvents.Clean != nil
 		if !projectGatekeeperOverride && !projectReviewerCleanOverride {
 			continue
@@ -410,8 +410,10 @@ func validateGatekeeperReviewEventCompatibility(config Config, issues *[]Validat
 		}
 		if projectReviewerCleanOverride {
 			path = fmt.Sprintf("projects[%d].roles.reviewer.behavior.reviewEvents.clean", i)
-		} else if projectGatekeeperOverride {
+		} else if project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil {
 			path = fmt.Sprintf("projects[%d].roles.gatekeeper.trust", i)
+		} else if project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.RequiredReviewChangedLines != nil {
+			path = fmt.Sprintf("projects[%d].roles.gatekeeper.requiredReviewChangedLines", i)
 		}
 		*issues = append(*issues, ValidationIssue{Path: path, Message: gatekeeperAutoCleanCommentConflictMessage})
 	}

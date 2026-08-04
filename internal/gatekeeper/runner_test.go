@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/eventlog"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/storage"
@@ -574,6 +575,23 @@ func TestAutoGatekeeperSkipsMergedBacklogWhenReviewThresholdDisabled(t *testing.
 	}
 }
 
+func TestAutoGatekeeperPublishesStatusesBeforeMergedReviewBacklog(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{{
+		Number: 42, HeadSHA: "head-1", State: "OPEN", UpdatedAt: "2026-07-30T10:00:00Z", BaseRefName: "main", ReviewDecision: "APPROVED",
+	}}
+	fixture.github.mergedPullRequests = []githubinfra.PullRequestSummary{{
+		Number: 91, HeadSHA: "merged-head", MergedAt: "2026-07-30T12:00:00Z", Additions: 220,
+	}}
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{}
+	if _, err := fixture.autoRunner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(fixture.github.callSequence) < 2 || fixture.github.callSequence[0] != "commit-status" {
+		t.Fatalf("call sequence = %#v, want current status before historical backlog scan", fixture.github.callSequence)
+	}
+}
+
 func TestAutoGatekeeperRecordsUnreviewedMergedPullRequestOnce(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	fixture.github.openPullRequests = nil
@@ -604,6 +622,48 @@ func TestAutoGatekeeperRecordsUnreviewedMergedPullRequestOnce(t *testing.T) {
 	}
 	if second.UnreviewedMerged != 0 || len(fixture.github.reviewMarkerCalls) != markerCalls {
 		t.Fatalf("second discovery = %#v, marker calls=%d, want no duplicate lookup", second, len(fixture.github.reviewMarkerCalls))
+	}
+}
+
+func TestAutoGatekeeperBoundsRefusedMergedReviewReconciliation(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = nil
+	fixture.github.mergedPullRequests = []githubinfra.PullRequestSummary{{
+		Number: 92, HeadSHA: "refused-head", MergedAt: "2026-07-30T12:00:00Z", Additions: 180, Deletions: 40,
+	}}
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{}
+	projectID, entityType, entityID, actorType, actorID := "project_1", "pull_request", "acme/looper#92", "system", "reviewer"
+	if err := eventlog.Append(context.Background(), fixture.repos, eventlog.AppendInput{
+		ID: "refused-review-92", EventType: "pr.review.refused", ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+		ActorType: &actorType, ActorID: &actorID, Payload: map[string]any{"headSha": "refused-head", "reason": "rate_limit"}, CreatedAt: fixture.now,
+	}); err != nil {
+		t.Fatalf("append refusal evidence: %v", err)
+	}
+	runner := fixture.autoRunner()
+	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("first DiscoverPullRequests() error = %v", err)
+	}
+	if first.UnreviewedMerged != 1 || len(fixture.github.reviewMarkerCalls) != 1 {
+		t.Fatalf("first discovery = %#v, marker calls = %d, want one refusal reconciliation and durable negative evidence", first, len(fixture.github.reviewMarkerCalls))
+	}
+	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequests() error = %v", err)
+	}
+	if second.UnreviewedMerged != 0 || len(fixture.github.reviewMarkerCalls) != 1 {
+		t.Fatalf("second discovery = %#v, marker calls = %d, want bounded reconciliation", second, len(fixture.github.reviewMarkerCalls))
+	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), entityType, entityID)
+	if err != nil {
+		t.Fatalf("list review evidence: %v", err)
+	}
+	counts := map[string]int{}
+	for _, event := range events {
+		counts[event.EventType]++
+	}
+	if counts["pr.review.refused"] != 1 || counts["pr.review.unreviewed"] != 1 {
+		t.Fatalf("review evidence counts = %#v, want one refusal and one settled negative row", counts)
 	}
 }
 
@@ -687,6 +747,7 @@ type fakeGatekeeperGitHub struct {
 	reviewMarkerErr       error
 	reviewMarkerCalls     []githubinfra.VerifyReviewMarkerInput
 	statusCalls           []githubinfra.CommitStatusInput
+	callSequence          []string
 	statusErr             error
 	viewErr               error
 	mergedPullRequestsErr error
@@ -773,6 +834,7 @@ func (f *fakeGatekeeperGitHub) ListOpenPullRequests(context.Context, githubinfra
 }
 func (f *fakeGatekeeperGitHub) ListMergedPullRequests(context.Context, githubinfra.ListMergedPullRequestsInput) ([]githubinfra.PullRequestSummary, error) {
 	f.mergedListCalls++
+	f.callSequence = append(f.callSequence, "merged-review-backlog")
 	return f.mergedPullRequests, f.mergedPullRequestsErr
 }
 func (f *fakeGatekeeperGitHub) ViewPullRequestForGatekeeper(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
@@ -814,6 +876,7 @@ func (f *fakeGatekeeperGitHub) FindReviewMarker(_ context.Context, input githubi
 }
 func (f *fakeGatekeeperGitHub) SetCommitStatus(_ context.Context, input githubinfra.CommitStatusInput) error {
 	f.statusCalls = append(f.statusCalls, input)
+	f.callSequence = append(f.callSequence, "commit-status")
 	return f.statusErr
 }
 
