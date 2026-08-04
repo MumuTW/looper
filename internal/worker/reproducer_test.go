@@ -436,6 +436,21 @@ func TestWorkerCaptureReproductionRejectsNewUnscopedManifestForIssue(t *testing.
 	}
 }
 
+func TestWorkerCaptureReproductionIgnoresUntrustedManifestDuringRetry(t *testing.T) {
+	root, _ := writeWorkerReproductionFixtureWithIssue(t, 113, "MumuTW/looper")
+	checkpoint := workerCheckpoint{
+		Work:               &workerInput{Repo: "MumuTW/looper", IssueNumber: 113},
+		ReproductionAbsent: true,
+		Execution:          &checkpointExecution{Status: "timeout"},
+	}
+	if err := captureWorkerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("captureWorkerReproduction() error = %v, want retry to ignore untrusted file", err)
+	}
+	if checkpoint.Work.Reproduction != nil || !checkpoint.ReproductionAbsent {
+		t.Fatalf("checkpoint = %#v, want untrusted manifest ignored while absence remains", checkpoint)
+	}
+}
+
 func TestWorkerReproductionFirstCaptureWithPreparedWorktreeAdoptsManifest(t *testing.T) {
 	// Prepare-worktree always sets Worktree before the first capture call.
 	// That must not trip the legacy past-initial fail-closed path.

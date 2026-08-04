@@ -864,9 +864,14 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 		if checkpoint.ReproductionAbsent {
 			// Negative observation was durable. Only a completed agent execution
 			// may introduce the reproduction contract (worker-authored test).
-			// Pre-execution resume must not adopt a mid-crash agent file.
-			if checkpoint.Execution == nil || checkpoint.Execution.Status != "completed" {
+			// Pre-execution resume must not adopt a mid-crash agent file. During a
+			// retryable, non-completed execution, ignore the untrusted file and let
+			// the agent resume; the next completed capture may adopt it if scoped.
+			if checkpoint.Execution == nil {
 				return reproductionFailure(errors.New("reproduction manifest appeared before agent execution completed"))
+			}
+			if checkpoint.Execution.Status != "completed" {
+				return nil
 			}
 			if checkpoint.Work.IssueNumber > 0 && manifest.IssueNumber == 0 {
 				// An issue-target Worker may adopt a newly authored contract only
