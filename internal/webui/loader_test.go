@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/MumuTW/looper/internal/escalator"
 )
 
 // countingLoader records how often durable state was actually read.
@@ -37,6 +39,30 @@ func TestLoadCacheServesOneReadInsideTheWindow(t *testing.T) {
 	// Only the clock moves on: the ages the board renders stay honest.
 	if !second.Now.Equal(clock.UTC()) {
 		t.Fatalf("cached Now = %v, want %v", second.Now, clock.UTC())
+	}
+}
+
+func TestLoadCacheAdvancesEscalatorAgesInsideTheWindow(t *testing.T) {
+	t.Parallel()
+
+	clock := testNow
+	cache := NewLoadCache(RefreshInterval, func() time.Time { return clock })
+	load := cache.Wrap(func(context.Context) Input {
+		return Input{Now: clock, Escalator: escalator.Snapshot{
+			Items:   []escalator.Item{{ID: "item", AgeSeconds: 7}},
+			Backlog: []escalator.StageBacklog{{ProjectID: "project", OldestAgeSeconds: 11}},
+		}}
+	})
+
+	first := load(context.Background())
+	clock = clock.Add(5 * time.Second)
+	second := load(context.Background())
+
+	if first.Escalator.Items[0].AgeSeconds != 7 || first.Escalator.Backlog[0].OldestAgeSeconds != 11 {
+		t.Fatalf("cached source was mutated: %#v", first.Escalator)
+	}
+	if second.Escalator.Items[0].AgeSeconds != 12 || second.Escalator.Backlog[0].OldestAgeSeconds != 16 {
+		t.Fatalf("cached Escalator ages = %#v, want item 12s/backlog 16s", second.Escalator)
 	}
 }
 

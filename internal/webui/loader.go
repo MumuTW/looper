@@ -60,8 +60,9 @@ func (c *LoadCache) Wrap(inner Loader) Loader {
 		if c.loaded && now.Sub(c.loadedAt) < c.ttl {
 			cached := c.input
 			c.mu.Unlock()
-			// The state is the state that was read; only the clock moves on,
-			// so the ages the board renders stay honest about the wait.
+			// The state is the state that was read; advance relative Escalator
+			// ages by the cache wait so the board stays honest about the wait.
+			cached = advanceCachedAges(cached, now.Sub(c.loadedAt))
 			cached.Now = now
 			return cached
 		}
@@ -80,6 +81,28 @@ func (c *LoadCache) Wrap(inner Loader) Loader {
 		c.mu.Unlock()
 		return input
 	}
+}
+
+func advanceCachedAges(input Input, elapsed time.Duration) Input {
+	seconds := int64(elapsed / time.Second)
+	if seconds <= 0 {
+		return input
+	}
+	if len(input.Escalator.Items) > 0 {
+		items := append([]escalator.Item(nil), input.Escalator.Items...)
+		for index := range items {
+			items[index].AgeSeconds += seconds
+		}
+		input.Escalator.Items = items
+	}
+	if len(input.Escalator.Backlog) > 0 {
+		backlog := append([]escalator.StageBacklog(nil), input.Escalator.Backlog...)
+		for index := range backlog {
+			backlog[index].OldestAgeSeconds += seconds
+		}
+		input.Escalator.Backlog = backlog
+	}
+	return input
 }
 
 // NewRepositoryLoader reads triage input straight from durable state. Every
