@@ -1138,6 +1138,138 @@ func TestRunContainerSweepPropagatesNestedCancellation(t *testing.T) {
 	}
 }
 
+func TestRunContainerSweepReturnsNestedFinalBoundaryCancellation(t *testing.T) {
+	sharedRoot := t.TempDir()
+	container := filepath.Join(sharedRoot, "repo-live-final-cancel")
+	liveProject := filepath.Join(container, "project-live")
+	orphanProject := filepath.Join(container, "project-orphan")
+	mkdirAt(t, filepath.Join(liveProject, "checkout"), old())
+	mkdirAt(t, filepath.Join(orphanProject, "checkout"), old())
+	for _, path := range []string{liveProject, orphanProject, container} {
+		if err := os.Chtimes(path, old(), old()); err != nil {
+			t.Fatalf("Chtimes(%q): %v", path, err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var removed []string
+	options := containerOptions(sharedRoot, []string{"repo-live-final-cancel"}, stubSweepGit{}, &removed)
+	options.LiveProjectPaths = []string{liveProject}
+	projectReads := 0
+	options.ReadDir = func(path string) ([]DiskEntry, error) {
+		entries, err := readDirEntries(path)
+		if err == nil && path == orphanProject {
+			projectReads++
+			if projectReads == 2 {
+				cancel()
+			}
+		}
+		return entries, err
+	}
+
+	_, err := RunContainerSweep(ctx, options)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunContainerSweep() error = %v, want context.Canceled", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want no nested removal after final cancellation", removed)
+	}
+}
+
+func TestRunContainerSweepChecksNestedBudgetBeforeRevalidation(t *testing.T) {
+	sharedRoot := t.TempDir()
+	container := filepath.Join(sharedRoot, "repo-live-budget")
+	liveProject := filepath.Join(container, "project-live")
+	orphanProject := filepath.Join(container, "project-orphan")
+	mkdirAt(t, filepath.Join(liveProject, "checkout"), old())
+	recentFile := filepath.Join(orphanProject, "recent.txt")
+	if err := os.MkdirAll(orphanProject, 0o755); err != nil {
+		t.Fatalf("MkdirAll(orphanProject): %v", err)
+	}
+	if err := os.WriteFile(recentFile, []byte("recent\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(recentFile): %v", err)
+	}
+	if err := os.Chtimes(recentFile, recent(), recent()); err != nil {
+		t.Fatalf("Chtimes(recentFile): %v", err)
+	}
+	for _, path := range []string{liveProject, orphanProject, container} {
+		if err := os.Chtimes(path, old(), old()); err != nil {
+			t.Fatalf("Chtimes(%q): %v", path, err)
+		}
+	}
+	var removed []string
+	options := containerOptions(sharedRoot, []string{"repo-live-budget"}, stubSweepGit{}, &removed)
+	options.Budget = 0
+	options.LiveProjectPaths = []string{liveProject}
+	plan, err := RunContainerSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunContainerSweep() error = %v", err)
+	}
+	if action, reason := reasonFor(t, plan, orphanProject); action != ActionSkipped || reason != "budget_exhausted" {
+		t.Fatalf("orphan project = (%q, %q), want budget_exhausted before retention walk", action, reason)
+	}
+}
+
+func TestRunContainerSweepOrdersNestedOrphansByAge(t *testing.T) {
+	sharedRoot := t.TempDir()
+	container := filepath.Join(sharedRoot, "repo-live-age")
+	liveProject := filepath.Join(container, "project-live")
+	oldOrphan := filepath.Join(container, "project-z-old")
+	newOrphan := filepath.Join(container, "project-a-new")
+	for _, project := range []string{liveProject, oldOrphan, newOrphan} {
+		mkdirAt(t, filepath.Join(project, "checkout"), old())
+	}
+	if err := os.Chtimes(newOrphan, recent(), recent()); err != nil {
+		t.Fatalf("Chtimes(newOrphan): %v", err)
+	}
+	for _, path := range []string{liveProject, oldOrphan, container} {
+		if err := os.Chtimes(path, old(), old()); err != nil {
+			t.Fatalf("Chtimes(%q): %v", path, err)
+		}
+	}
+	var removed []string
+	options := containerOptions(sharedRoot, []string{"repo-live-age"}, stubSweepGit{}, &removed)
+	options.Budget = 1
+	options.LiveProjectPaths = []string{liveProject}
+	if _, err := RunContainerSweep(context.Background(), options); err != nil {
+		t.Fatalf("RunContainerSweep() error = %v", err)
+	}
+	if len(removed) != 1 || removed[0] != oldOrphan {
+		t.Fatalf("removed = %v, want oldest orphan %q", removed, oldOrphan)
+	}
+}
+
+func TestRunContainerSweepPreservesOrphanIdentityAfterRemovalFailure(t *testing.T) {
+	sharedRoot := t.TempDir()
+	container := filepath.Join(sharedRoot, "repo-live-failed")
+	liveProject := filepath.Join(container, "project-live")
+	orphanProject := filepath.Join(container, "project-orphan")
+	mkdirAt(t, filepath.Join(liveProject, "checkout"), old())
+	mkdirAt(t, filepath.Join(orphanProject, "checkout"), old())
+	for _, path := range []string{liveProject, orphanProject, container} {
+		if err := os.Chtimes(path, old(), old()); err != nil {
+			t.Fatalf("Chtimes(%q): %v", path, err)
+		}
+	}
+	var removed []string
+	options := containerOptions(sharedRoot, []string{"repo-live-failed"}, stubSweepGit{}, &removed)
+	options.LiveProjectPaths = []string{liveProject}
+	options.RemoveAll = func(path string) error {
+		removed = append(removed, path)
+		return errors.New("injected orphan removal failure")
+	}
+	plan, err := RunContainerSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunContainerSweep() error = %v", err)
+	}
+	if plan.Summary.WouldRemove != 1 || plan.Summary.Removed != 0 || plan.Summary.Errors != 1 {
+		t.Fatalf("summary = %#v, want one failed orphan candidate", plan.Summary)
+	}
+	if action, reason := reasonFor(t, plan, orphanProject); action != "error" || reason != "orphaned_project" {
+		t.Fatalf("orphan project = (%q, %q), want stable orphan identity with error action", action, reason)
+	}
+}
+
 func TestRunContainerSweepPreservesContainerWithRegularFiles(t *testing.T) {
 	tests := []struct {
 		name       string

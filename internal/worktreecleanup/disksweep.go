@@ -461,6 +461,9 @@ func sweepLiveContainerProjects(ctx context.Context, options ContainerSweepOptio
 		plan.Candidates = append(plan.Candidates, DiskCandidate{Path: containerPath, Action: "error", Reason: "read_container_failed", Error: err.Error()})
 		return plan, nil
 	}
+	sort.SliceStable(projects, func(a, b int) bool {
+		return projects[a].ModifiedAt.Before(projects[b].ModifiedAt)
+	})
 	for _, project := range projects {
 		if err := ctx.Err(); err != nil {
 			return plan, err
@@ -473,15 +476,15 @@ func sweepLiveContainerProjects(ctx context.Context, options ContainerSweepOptio
 			continue
 		}
 		plan.Summary.Unregistered++
+		if budget <= 0 {
+			plan.Summary.Skipped++
+			plan.Candidates = append(plan.Candidates, DiskCandidate{Path: project.Path, Action: ActionSkipped, Reason: "budget_exhausted"})
+			continue
+		}
 		freshProject, projectEligible := revalidateContainerCandidate(DiskCandidate{Path: project.Path}, options.RetentionCutoff)
 		if !projectEligible {
 			plan.Summary.Skipped++
 			plan.Candidates = append(plan.Candidates, freshProject)
-			continue
-		}
-		if budget <= 0 {
-			plan.Summary.Skipped++
-			plan.Candidates = append(plan.Candidates, DiskCandidate{Path: project.Path, Action: ActionSkipped, Reason: "budget_exhausted"})
 			continue
 		}
 		children, err := options.ReadDir(project.Path)
@@ -537,7 +540,7 @@ func sweepLiveContainerProjects(ctx context.Context, options ContainerSweepOptio
 			candidate.Reason = "context_canceled"
 			plan.Summary.Skipped++
 			plan.Candidates = append(plan.Candidates, candidate)
-			continue
+			return plan, err
 		}
 		plan.Summary.WouldRemove++
 		if options.DryRun {
@@ -549,7 +552,7 @@ func sweepLiveContainerProjects(ctx context.Context, options ContainerSweepOptio
 		if err := options.RemoveAll(project.Path); err != nil {
 			plan.Summary.Errors++
 			candidate.Action = "error"
-			candidate.Reason = "remove_failed"
+			candidate.Reason = "orphaned_project"
 			candidate.Error = err.Error()
 			plan.Candidates = append(plan.Candidates, candidate)
 			releaseMutation()

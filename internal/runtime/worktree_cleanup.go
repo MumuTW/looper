@@ -607,7 +607,7 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 		orphanProjectsRemoved := 0
 		orphanProjectsWouldRemove := 0
 		for _, candidate := range containers.Candidates {
-			if candidate.Action == worktreecleanup.DiskSweepActionRemove && candidate.Reason == "orphaned_project" {
+			if candidate.Reason == "orphaned_project" {
 				orphanProjectsWouldRemove++
 				if !cfg.Daemon.WorktreeCleanup.DryRun {
 					orphanProjectsRemoved++
