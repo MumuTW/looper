@@ -180,8 +180,20 @@ func Write(path string, input Input) error {
 	if err := os.Rename(tempPath, path); err != nil {
 		return fmt.Errorf("install trust manifest: %w", err)
 	}
+	if err := syncManifestDirectory(dir); err != nil {
+		return fmt.Errorf("sync trust manifest directory: %w", err)
+	}
 	removeTemp = false
 	return nil
+}
+
+func syncManifestDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 // VerifyRootOwnership checks the final manifest through a no-follow descriptor

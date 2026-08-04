@@ -201,6 +201,12 @@ func TestManifestPathSitsOutsideSealedNodeModulesTree(t *testing.T) {
 	}
 }
 
+func TestSyncManifestDirectory(t *testing.T) {
+	if err := syncManifestDirectory(t.TempDir()); err != nil {
+		t.Fatalf("syncManifestDirectory() error = %v", err)
+	}
+}
+
 func TestParseLDDOutputIncludesLibrariesAndInterpreter(t *testing.T) {
 	root := t.TempDir()
 	lib := filepath.Join(root, "libc.so.6")
