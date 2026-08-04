@@ -572,6 +572,29 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 				}
 				return false, nil
 			},
+			IsLiveContainerPath: func(ctx context.Context, path string) (bool, error) {
+				currentProjects, err := repos.Projects.List(ctx)
+				if err != nil {
+					return false, err
+				}
+				candidate := worktreesafety.NormalizePath(path)
+				for _, project := range currentProjects {
+					containerNames := []string{config.ToRepoWorktreeDirectoryName(project.RepoPath)}
+					root, rootErr := worktreeCleanupRoot(project)
+					if rootErr != nil {
+						return false, rootErr
+					}
+					if name, ok := containerNameUnder(sharedRoot, root); ok {
+						containerNames = append(containerNames, name)
+					}
+					for _, name := range containerNames {
+						if candidate == worktreesafety.NormalizePath(filepath.Join(sharedRoot, name)) {
+							return true, nil
+						}
+					}
+				}
+				return false, nil
+			},
 			Git:             gitGateway,
 			Budget:          available,
 			RetentionCutoff: retentionCutoff,
@@ -616,6 +639,8 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 		used := runContainers(containerBudget)
 		if used < rootBudget {
 			rootBudget -= used
+		} else {
+			rootBudget = 0
 		}
 	}
 	if len(roots) > 0 {

@@ -46,6 +46,53 @@ func TestWorktreeCleanupPassRemovesUnregisteredDirectories(t *testing.T) {
 	}
 }
 
+func TestWorktreeDiskSweepExhaustsBudgetAfterContainerRemoval(t *testing.T) {
+	fixture := newWorktreeCleanupFixture(t)
+	fixture.config.Daemon.WorktreeCleanup.RetentionDays = 7
+	fixture.config.Daemon.WorktreeCleanup.MaxDiskSweepPerTick = 1
+	// Make this fixture's explicit root the shared root as well, while keeping
+	// the managed repository outside it so the safety validators still apply.
+	t.Setenv("LOOPER_HOME", filepath.Dir(fixture.root))
+	repoPath := filepath.Join(filepath.Dir(fixture.root), "repo-source")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repoPath) error = %v", err)
+	}
+	liveContainer := filepath.Join(fixture.root, "repo-live")
+	liveRoot := filepath.Join(liveContainer, "project_1")
+	metadata := `{"worktreeRoot":"` + liveRoot + `"}`
+	fixture.project.RepoPath = repoPath
+	fixture.project.MetadataJSON = &metadata
+	if err := fixture.repos.Projects.Upsert(context.Background(), fixture.project); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	orphan := filepath.Join(liveContainer, "project-orphan", "checkout")
+	debris := filepath.Join(liveRoot, "root-debris")
+	for _, path := range []string{orphan, debris} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q) error = %v", path, err)
+		}
+		if err := os.Chtimes(path, fixture.now.Add(-30*24*time.Hour), fixture.now.Add(-30*24*time.Hour)); err != nil {
+			t.Fatalf("Chtimes(%q) error = %v", path, err)
+		}
+	}
+	for _, path := range []string{liveContainer, liveRoot, filepath.Dir(orphan)} {
+		if err := os.Chtimes(path, fixture.now.Add(-30*24*time.Hour), fixture.now.Add(-30*24*time.Hour)); err != nil {
+			t.Fatalf("Chtimes(%q) error = %v", path, err)
+		}
+	}
+
+	summary := fixture.runtime.runWorktreeDiskSweep(context.Background(), fixture.repos, &fakeWorktreeCleanupGit{}, fixture.config)
+	if summary.Removed != 1 || summary.ContainersRemoved != 0 {
+		t.Fatalf("summary = %#v, want one nested container-tier removal", summary)
+	}
+	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan project survived container tier: %v", err)
+	}
+	if _, err := os.Stat(debris); err != nil {
+		t.Fatalf("per-root debris stat = %v, want budget exhausted before root tier", err)
+	}
+}
+
 // The sweep must never touch a directory the worktrees table claims, even when
 // that row is already cleaned: the record pass owns those paths and its
 // provenance is the only thing distinguishing a failed removal from debris.

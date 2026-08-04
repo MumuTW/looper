@@ -261,12 +261,16 @@ type ContainerSweepOptions struct {
 	// IsLiveProjectPath refreshes project-root ownership at the final nested-
 	// project boundary. LiveProjectPaths is only the planning snapshot.
 	IsLiveProjectPath func(context.Context, string) (bool, error)
-	Git               DiskSweepGit
-	Budget            int
-	RetentionCutoff   time.Time
-	DryRun            bool
-	ReadDir           func(string) ([]DiskEntry, error)
-	RemoveAll         func(string) error
+	// IsLiveContainerPath refreshes container ownership at the final container
+	// deletion boundary. LiveContainerNames is only the planning snapshot; the
+	// callback is evaluated while the enclosing mutation fence is held.
+	IsLiveContainerPath func(context.Context, string) (bool, error)
+	Git                 DiskSweepGit
+	Budget              int
+	RetentionCutoff     time.Time
+	DryRun              bool
+	ReadDir             func(string) ([]DiskEntry, error)
+	RemoveAll           func(string) error
 }
 
 // RunContainerSweep removes unreachable repo containers. A container is only
@@ -321,7 +325,7 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 	for _, candidate := range plan.Candidates {
 		if candidate.Action != DiskSweepActionRemove {
 			if candidate.Reason == "live_project_container" && len(options.LiveProjectPaths) > 0 {
-				nested := sweepLiveContainerProjects(ctx, options, candidate.Path, liveProjects, registered, budget)
+				nested, nestedErr := sweepLiveContainerProjects(ctx, options, candidate.Path, liveProjects, registered, budget)
 				used := nested.Summary.Removed
 				if options.DryRun {
 					used = nested.Summary.WouldRemove
@@ -335,6 +339,9 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 				result.Summary.Skipped += nested.Summary.Skipped
 				result.Summary.Errors += nested.Summary.Errors
 				result.Candidates = append(result.Candidates, nested.Candidates...)
+				if nestedErr != nil {
+					return result, nestedErr
+				}
 			}
 			result.Summary.Skipped++
 			result.Candidates = append(result.Candidates, candidate)
@@ -397,6 +404,26 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 			result.Candidates = append(result.Candidates, decided)
 			continue
 		}
+		if options.IsLiveContainerPath != nil {
+			live, err := options.IsLiveContainerPath(ctx, decided.Path)
+			if err != nil {
+				decided.Action = "error"
+				decided.Reason = "live_container_refresh_failed"
+				decided.Error = err.Error()
+				result.Summary.Errors++
+				result.Candidates = append(result.Candidates, decided)
+				releaseMutation()
+				continue
+			}
+			if live {
+				decided.Action = ActionSkipped
+				decided.Reason = "container_live_at_removal"
+				result.Summary.Skipped++
+				result.Candidates = append(result.Candidates, decided)
+				releaseMutation()
+				continue
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			decided.Action = ActionSkipped
 			decided.Reason = "context_canceled"
@@ -426,17 +453,17 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 	return result, nil
 }
 
-func sweepLiveContainerProjects(ctx context.Context, options ContainerSweepOptions, containerPath string, liveProjects, registered map[string]bool, budget int) DiskSweepPlan {
+func sweepLiveContainerProjects(ctx context.Context, options ContainerSweepOptions, containerPath string, liveProjects, registered map[string]bool, budget int) (DiskSweepPlan, error) {
 	plan := DiskSweepPlan{}
 	projects, err := options.ReadDir(containerPath)
 	if err != nil {
 		plan.Summary.Errors++
 		plan.Candidates = append(plan.Candidates, DiskCandidate{Path: containerPath, Action: "error", Reason: "read_container_failed", Error: err.Error()})
-		return plan
+		return plan, nil
 	}
 	for _, project := range projects {
-		if ctx.Err() != nil {
-			return plan
+		if err := ctx.Err(); err != nil {
+			return plan, err
 		}
 		if !project.IsDir {
 			continue
@@ -533,7 +560,7 @@ func sweepLiveContainerProjects(ctx context.Context, options ContainerSweepOptio
 		plan.Candidates = append(plan.Candidates, candidate)
 		releaseMutation()
 	}
-	return plan
+	return plan, nil
 }
 
 // revalidateOrphanProject repeats the project and child admission checks while

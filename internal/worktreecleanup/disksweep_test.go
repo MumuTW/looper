@@ -945,6 +945,65 @@ func TestRunContainerSweepPreservesProjectCreatedDuringAdmission(t *testing.T) {
 	}
 }
 
+func TestRunContainerSweepRechecksLiveContainerOwnershipBeforeRemoval(t *testing.T) {
+	sharedRoot := t.TempDir()
+	container := mkContainer(t, sharedRoot, "repo-race", old())
+	var removed []string
+	options := containerOptions(sharedRoot, nil, stubSweepGit{}, &removed)
+	options.IsLiveContainerPath = func(_ context.Context, path string) (bool, error) {
+		return path == container, nil
+	}
+
+	plan, err := RunContainerSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunContainerSweep() error = %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want live container preserved", removed)
+	}
+	if action, reason := reasonFor(t, plan, container); action != ActionSkipped || reason != "container_live_at_removal" {
+		t.Fatalf("container = (%q, %q), want live-at-removal skip", action, reason)
+	}
+}
+
+func TestRunContainerSweepPropagatesNestedCancellation(t *testing.T) {
+	sharedRoot := t.TempDir()
+	container := filepath.Join(sharedRoot, "repo-live")
+	liveProject := filepath.Join(container, "project-live")
+	firstOrphan := filepath.Join(container, "project-first")
+	secondOrphan := filepath.Join(container, "project-second")
+	for _, project := range []string{liveProject, firstOrphan, secondOrphan} {
+		mkdirAt(t, filepath.Join(project, "checkout"), old())
+		if err := os.Chtimes(project, old(), old()); err != nil {
+			t.Fatalf("Chtimes(%q): %v", project, err)
+		}
+	}
+	if err := os.Chtimes(container, old(), old()); err != nil {
+		t.Fatalf("Chtimes(container): %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var removed []string
+	options := containerOptions(sharedRoot, []string{"repo-live"}, stubSweepGit{}, &removed)
+	options.LiveProjectPaths = []string{liveProject}
+	options.ReadDir = func(path string) ([]DiskEntry, error) {
+		entries, err := readDirEntries(path)
+		if err == nil && path == firstOrphan {
+			cancel()
+		}
+		return entries, err
+	}
+
+	_, err := RunContainerSweep(ctx, options)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunContainerSweep() error = %v, want context.Canceled", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want no nested removal after cancellation", removed)
+	}
+}
+
 func TestRunContainerSweepPreservesContainerWithRegularFiles(t *testing.T) {
 	tests := []struct {
 		name       string
