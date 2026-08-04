@@ -3,6 +3,7 @@ package fixer
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -146,8 +147,9 @@ func TestFixerReproductionMergePhaseDefersConflictUntilResolution(t *testing.T) 
 		t.Fatal(err)
 	}
 	checkpoint := fixerCheckpoint{
-		Reproduction:           expected,
-		ReproductionMergePhase: fixerReproductionMergeConflicted,
+		Reproduction:                expected,
+		ReproductionMergePhase:      fixerReproductionMergeConflicted,
+		ReproductionMergeUnresolved: true,
 	}
 	if err := captureFixerReproduction(&checkpoint, root); err != nil {
 		t.Fatalf("conflicted capture = %v, want deferred recovery", err)
@@ -165,6 +167,37 @@ func TestFixerReproductionMergePhaseDefersConflictUntilResolution(t *testing.T) 
 	}
 	if checkpoint.ReproductionMergePhase != "" {
 		t.Fatalf("phase after resolution = %q, want cleared", checkpoint.ReproductionMergePhase)
+	}
+	if checkpoint.ReproductionMergeUnresolved {
+		t.Fatal("ReproductionMergeUnresolved = true, want cleared after verified resolution")
+	}
+}
+
+func TestFixerReproductionDoesNotDeferLiteralConflictMarkersAfterGitResolution(t *testing.T) {
+	root, expected := writeFixerReproductionFixture(t)
+	literalContent := []byte("func TestBug(t *testing.T) { _ = \"<<<<<<<\"; _ = \"=======\"; _ = \">>>>>>>\" }\n")
+	if err := os.WriteFile(filepath.Join(root, expected.TestPath), literalContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(literalContent)
+	expected.TestSHA256 = hex.EncodeToString(hash[:])
+	data, err := json.Marshal(expected)
+	if err != nil {
+		t.Fatalf("json.Marshal(manifest) = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := fixerCheckpoint{
+		Reproduction:                expected,
+		ReproductionMergePhase:      fixerReproductionMergeConflicted,
+		ReproductionMergeUnresolved: false,
+	}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("captureFixerReproduction() = %v, want literal markers treated as valid content", err)
+	}
+	if checkpoint.ReproductionMergePhase != "" {
+		t.Fatalf("phase = %q, want cleared after Git reports resolution", checkpoint.ReproductionMergePhase)
 	}
 }
 

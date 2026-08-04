@@ -2258,6 +2258,10 @@ func TestGatewayMergeBaseResumesExistingConflictState(t *testing.T) {
 	if err != nil || !first.Conflicted {
 		t.Fatalf("first MergeBaseIntoWorktree() = (%#v, %v), want conflict state", first, err)
 	}
+	inspectConflict, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.WorktreePath})
+	if err != nil || !inspectConflict.HasUnresolvedConflicts {
+		t.Fatalf("InspectHead() after conflict = (%#v, %v), want Git unmerged-index authority", inspectConflict, err)
+	}
 	mergeHead := strings.TrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "--git-path", "MERGE_HEAD"))
 	if !filepath.IsAbs(mergeHead) {
 		mergeHead = filepath.Join(worktree.WorktreePath, mergeHead)
@@ -2274,6 +2278,10 @@ func TestGatewayMergeBaseResumesExistingConflictState(t *testing.T) {
 		t.Fatalf("README.md after resume = %q, want original conflict markers preserved", content)
 	}
 	runGit(t, worktree.WorktreePath, "merge", "--abort")
+	inspectResolved, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.WorktreePath})
+	if err != nil || inspectResolved.HasUnresolvedConflicts {
+		t.Fatalf("InspectHead() after abort = (%#v, %v), want no unresolved conflicts", inspectResolved, err)
+	}
 }
 
 func (f *fixture) createUnfetchedRemoteBranch(t *testing.T, branch string) {

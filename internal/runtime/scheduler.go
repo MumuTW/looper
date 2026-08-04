@@ -1526,7 +1526,7 @@ func (a fixerGitAdapter) InspectHead(ctx context.Context, input fixer.InspectHea
 	if err != nil {
 		return fixer.InspectHeadResult{}, err
 	}
-	return fixer.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles}, nil
+	return fixer.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles, HasUnresolvedConflicts: result.HasUnresolvedConflicts}, nil
 }
 
 func (a fixerGitAdapter) Commit(ctx context.Context, input fixer.CommitInput) (fixer.CommitResult, error) {

@@ -130,6 +130,10 @@ type InspectHeadResult struct {
 	// from a mixed staged/unstaged edit during a clean descendant transition.
 	WorktreeMatchesHead     bool
 	HeadDescendsFromCompare bool
+	// HasUnresolvedConflicts is derived from Git's unmerged index status, not
+	// conflict-marker text in files. Literal marker strings in a legitimate
+	// test therefore cannot masquerade as unresolved merge state.
+	HasUnresolvedConflicts bool
 }
 
 type VerifyWorktreeIdentityInput struct {
@@ -1005,6 +1009,7 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 		IndexFingerprint:           indexFingerprint,
 		WorktreeMatchesHead:        worktreeMatchesHead,
 		HeadDescendsFromCompare:    headDescendsFromCompare,
+		HasUnresolvedConflicts:     hasUnresolvedConflicts(status),
 	}, nil
 }
 
@@ -2230,6 +2235,15 @@ type statusEntry struct {
 	Code         string
 	Path         string
 	OriginalPath string
+}
+
+func hasUnresolvedConflicts(entries []statusEntry) bool {
+	for _, entry := range entries {
+		if strings.Contains(entry.Code, "U") {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntry, error) {
