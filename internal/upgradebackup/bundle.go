@@ -137,6 +137,21 @@ func Create(ctx context.Context, input Input) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	readIdentity := input.ReadIdentity
+	if readIdentity == nil {
+		readIdentity = readBinaryIdentity
+	}
+	cliIdentity, err := readIdentity(ctx, input.CLIBinaryPath, []string{"version", "--json"})
+	if err != nil {
+		return Result{}, fmt.Errorf("verify selected CLI identity: %w", err)
+	}
+	daemonIdentity, err := readIdentity(ctx, input.DaemonBinaryPath, []string{"--version-json"})
+	if err != nil {
+		return Result{}, fmt.Errorf("verify selected daemon identity: %w", err)
+	}
+	if !cliIdentity.SameBuild(daemonIdentity) {
+		return Result{}, fmt.Errorf("selected CLI and daemon build identities differ")
+	}
 	now := time.Now
 	if input.Now != nil {
 		now = input.Now

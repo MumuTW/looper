@@ -86,6 +86,13 @@ func latestCodexReviewForHead(ctx context.Context, repos *storage.Repositories, 
 		default:
 			continue
 		}
+		// COMMENT is policy-dependent: the same forge event is used for a
+		// clean no-op and for a blocking review. The durable Reviewer outcome is
+		// therefore required to distinguish them; marker verification alone is
+		// not clean evidence and must never authorize a blocked COMMENT.
+		if reviewEvent == "COMMENT" && !strings.EqualFold(strings.TrimSpace(payload.Outcome), "clean") {
+			continue
+		}
 		evidence.ReviewedHeadSHA = reviewedHead
 		evidence.Event = reviewEvent
 		evidence.Outcome = strings.ToLower(strings.TrimSpace(payload.Outcome))

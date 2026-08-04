@@ -146,6 +146,10 @@ func TestHandleTerminalExhaustionOrdersCommentCloseAndPlannerRoute(t *testing.T)
 	if len(gateway.issueLabelCalls) != 1 || gateway.issueLabelCalls[0].Labels[0] != labels.DefaultPlanTrigger {
 		t.Fatalf("issue labels = %#v, want planner trigger", gateway.issueLabelCalls)
 	}
+	events, err := fixture.repos.Events.ListByEntityAndEventTypes(context.Background(), "pull_request", "acme/looper#42", []string{eventlog.FixerCloseAndRegenerateEventType})
+	if err != nil || len(events) != 1 {
+		t.Fatalf("regeneration events = %#v, err=%v; want one durable success event", events, err)
+	}
 }
 
 func TestHandleTerminalExhaustionHonorsDeleteBranchPolicy(t *testing.T) {

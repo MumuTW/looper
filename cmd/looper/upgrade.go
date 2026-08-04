@@ -427,6 +427,12 @@ func upgradeStartDrainBlocks(report upgradePreflight) []string {
 	}
 	if !report.TargetIdentityValid {
 		blocks = append(blocks, "target build identity is incomplete")
+	} else if err := releaseCandidateAllowed(report.Target.CLI); err != nil {
+		// stage-release accepts only stable/beta, complete, clean identities.
+		// Preflight must surface that same admission rule before the operator
+		// drains the current daemon, otherwise cutover can fail after work is
+		// already unavailable.
+		blocks = append(blocks, "target release candidate is not stageable: "+err.Error())
 	}
 	if !report.TargetConfigCompatible {
 		blocks = append(blocks, "target daemon rejects the selected configuration")

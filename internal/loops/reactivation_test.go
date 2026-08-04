@@ -19,9 +19,10 @@ func TestReactivateQueueRevivesCancelledQueueWithoutDuplicate(t *testing.T) {
 	if err := repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: "queue_cancelled", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &pr, DedupeKey: "reviewer:project_1:" + loopID + ":acme/looper:42", Priority: storage.QueuePriorityReviewer, Status: "cancelled", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
-	result := reactivateForTest(t, ctx, db, repos, loop, nowISO)
-	if result.Outcome != QueueReactivationRevivedCancelled || result.QueueItem == nil || result.QueueItem.ID != "queue_cancelled" || result.QueueItem.Status != "queued" {
-		t.Fatalf("ReactivateQueue() = %#v, want cancelled queue revived", result)
+	_ = reactivateForTest(t, ctx, db, repos, loop, nowISO)
+	active, err := repos.Queue.FindActiveByLoopID(ctx, loop.ID)
+	if err != nil || active == nil || active.ID != "queue_cancelled" || active.Status != "queued" {
+		t.Fatalf("active queue = %#v, %v; want cancelled queue revived", active, err)
 	}
 	if count := countQueuesForLoop(t, ctx, repos, loop.ID); count != 1 {
 		t.Fatalf("queue count = %d, want one", count)
@@ -38,18 +39,20 @@ func TestReactivateQueueCreatesCleanReplacementForTerminalQueue(t *testing.T) {
 	if err := repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: "queue_failed", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &pr, DedupeKey: "reviewer:project_1:" + loopID + ":acme/looper:42", Priority: storage.QueuePriorityReviewer, Status: "failed", AvailableAt: nowISO, Attempts: 3, MaxAttempts: 3, ClaimedBy: &claimedBy, LastError: &lastError, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
-	result := reactivateForTest(t, ctx, db, repos, loop, nowISO)
-	if result.Outcome != QueueReactivationReplacement || result.QueueItem == nil || result.QueueItem.ID == "queue_failed" || result.QueueItem.Status != "queued" || result.QueueItem.Attempts != 0 || result.QueueItem.ClaimedBy != nil || result.QueueItem.LastError != nil {
-		t.Fatalf("ReactivateQueue() = %#v, want clean replacement", result)
+	_ = reactivateForTest(t, ctx, db, repos, loop, nowISO)
+	active, err := repos.Queue.FindActiveByLoopID(ctx, loop.ID)
+	if err != nil || active == nil || active.ID == "queue_failed" || active.Status != "queued" || active.Attempts != 0 || active.ClaimedBy != nil || active.LastError != nil {
+		t.Fatalf("active queue = %#v, %v; want clean replacement", active, err)
 	}
 }
 
 func TestReactivateQueueCreatesFirstReviewerQueueAndRejectsSiblingConflict(t *testing.T) {
 	t.Parallel()
 	ctx, db, repos, loop, nowISO := reactivationFixture(t)
-	result := reactivateForTest(t, ctx, db, repos, loop, nowISO)
-	if result.Outcome != QueueReactivationCreated || result.QueueItem == nil || result.QueueItem.Type != "reviewer" {
-		t.Fatalf("ReactivateQueue() = %#v, want first reviewer queue", result)
+	_ = reactivateForTest(t, ctx, db, repos, loop, nowISO)
+	active, err := repos.Queue.FindActiveByLoopID(ctx, loop.ID)
+	if err != nil || active == nil || active.Type != "reviewer" {
+		t.Fatalf("active queue = %#v, %v; want first reviewer queue", active, err)
 	}
 	otherID := "loop_conflict"
 	repo := "acme/looper"

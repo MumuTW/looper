@@ -10,6 +10,7 @@ import (
 	"github.com/MumuTW/looper/internal/eventlog"
 	"github.com/MumuTW/looper/internal/gatekeeper"
 	"github.com/MumuTW/looper/internal/infra/notify"
+	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -73,6 +74,33 @@ func TestAssembleUsesDurableEventsSnapshotsAndLoops(t *testing.T) {
 	}
 	if !strings.Contains(Format(digest), "### Merged (1)") || !strings.Contains(Format(digest), "### Closed-and-regenerated (1)") {
 		t.Fatalf("formatted digest = %q", Format(digest))
+	}
+}
+
+func TestAssembleProjectsLatestGatekeeperHumanBlockWithoutLoop(t *testing.T) {
+	repos := openDigestRepos(t)
+	projectID := "project_gate_block"
+	entityType, entityID := "pull_request", "acme/looper#88"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Gate block", RepoPath: t.TempDir(), CreatedAt: "2026-08-01T08:00:00.000Z", UpdatedAt: "2026-08-01T08:00:00.000Z"}); err != nil {
+		t.Fatalf("project upsert error = %v", err)
+	}
+	appendDigestEvent(t, repos, storage.EventLogRecord{
+		ID: "gate-block", EventType: gatekeeper.GateReportEventType, ProjectID: &projectID,
+		EntityType: &entityType, EntityID: &entityID,
+		PayloadJSON: `{"version":2,"status":"blocked","projectId":"project_gate_block","repo":"acme/looper","prNumber":88,"evaluatedAt":"2026-08-01T08:15:00Z","reasons":[{"code":"hold","subject":"` + labels.HoldGlobal + `"}]}`,
+		CreatedAt:   "2026-08-01T08:15:00.000Z",
+	})
+
+	digest, err := Assemble(context.Background(), repos, Config{Timezone: "UTC", MaxItems: 10}, time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	if len(digest.AwaitingHuman) != 1 {
+		t.Fatalf("awaiting human = %#v, want one Gatekeeper block", digest.AwaitingHuman)
+	}
+	item := digest.AwaitingHuman[0]
+	if item.Status != "gatekeeper_blocked" || item.ReasonCode != "hold" || item.Reason != labels.HoldGlobal || item.LoopID != "" || item.AgeSeconds != 2700 {
+		t.Fatalf("awaiting item = %#v, want latest Gatekeeper evidence and age", item)
 	}
 }
 

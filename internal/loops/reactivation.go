@@ -2,6 +2,7 @@ package loops
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,17 +23,6 @@ var (
 	ErrReactivationUnconfigured = errors.New("queue reactivation is not configured")
 )
 
-type QueueReactivationOutcome string
-
-const (
-	QueueReactivationRevivedCancelled QueueReactivationOutcome = "revived_cancelled"
-	QueueReactivationExistingActive   QueueReactivationOutcome = "existing_active"
-	QueueReactivationDedupeActive     QueueReactivationOutcome = "dedupe_active"
-	QueueReactivationReplacement      QueueReactivationOutcome = "replacement"
-	QueueReactivationCreated          QueueReactivationOutcome = "created"
-	QueueReactivationNoQueue          QueueReactivationOutcome = "no_queue"
-)
-
 // QueueReactivationInput is a transaction-local activation request. Callers
 // must acquire any process/worktree locks before opening their transaction and
 // pass the freshly read loop record from that transaction.
@@ -43,9 +33,7 @@ type QueueReactivationInput struct {
 }
 
 type QueueReactivationResult struct {
-	Loop      storage.LoopRecord
-	QueueItem *storage.QueueItemRecord
-	Outcome   QueueReactivationOutcome
+	Loop storage.LoopRecord
 }
 
 // ReactivateQueue moves a loop into running and ensures exactly one claimable
@@ -89,12 +77,6 @@ func ReactivateQueue(ctx context.Context, repos *storage.Repositories, input Que
 		return QueueReactivationResult{}, err
 	}
 	if requeued > 0 {
-		queue, err := repos.Queue.GetLatestByLoopID(ctx, updated.ID)
-		if err != nil {
-			return QueueReactivationResult{}, err
-		}
-		result.QueueItem = queue
-		result.Outcome = QueueReactivationRevivedCancelled
 		return result, nil
 	}
 
@@ -103,8 +85,6 @@ func ReactivateQueue(ctx context.Context, repos *storage.Repositories, input Que
 		return QueueReactivationResult{}, err
 	}
 	if activeQueue != nil {
-		result.QueueItem = activeQueue
-		result.Outcome = QueueReactivationExistingActive
 		return result, nil
 	}
 
@@ -114,8 +94,6 @@ func ReactivateQueue(ctx context.Context, repos *storage.Repositories, input Que
 	}
 	if latestQueue != nil {
 		if latestQueue.Status == "queued" || latestQueue.Status == "running" {
-			result.QueueItem = latestQueue
-			result.Outcome = QueueReactivationExistingActive
 			return result, nil
 		}
 		if latestQueue.DedupeKey != "" {
@@ -124,8 +102,6 @@ func ReactivateQueue(ctx context.Context, repos *storage.Repositories, input Que
 				return QueueReactivationResult{}, err
 			}
 			if activeDedupe != nil {
-				result.QueueItem = activeDedupe
-				result.Outcome = QueueReactivationDedupeActive
 				return result, nil
 			}
 		}
@@ -142,12 +118,10 @@ func ReactivateQueue(ctx context.Context, repos *storage.Repositories, input Que
 		replacement.LastErrorKind = nil
 		replacement.CreatedAt = input.NowISO
 		replacement.UpdatedAt = input.NowISO
-		persisted, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, replacement)
+		_, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, replacement)
 		if err != nil {
 			return QueueReactivationResult{}, err
 		}
-		result.QueueItem = &persisted
-		result.Outcome = QueueReactivationReplacement
 		return result, nil
 	}
 
@@ -156,15 +130,12 @@ func ReactivateQueue(ctx context.Context, repos *storage.Repositories, input Que
 		return QueueReactivationResult{}, err
 	}
 	if !ok {
-		result.Outcome = QueueReactivationNoQueue
 		return result, nil
 	}
-	persisted, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queue)
+	_, _, err = repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queue)
 	if err != nil {
 		return QueueReactivationResult{}, err
 	}
-	result.QueueItem = &persisted
-	result.Outcome = QueueReactivationCreated
 	return result, nil
 }
 
@@ -216,8 +187,12 @@ func BuildQueuedLoopQueueRecord(record storage.LoopRecord, target domain.LoopTar
 	if queueType != domain.LoopTypeReviewer && queueType != domain.LoopTypeFixer && queueType != domain.LoopTypeWorker && queueType != domain.LoopTypePlanner {
 		return storage.QueueItemRecord{}, false, nil
 	}
+	queueID, err := newUUID()
+	if err != nil {
+		return storage.QueueItemRecord{}, false, fmt.Errorf("generate queue item id: %w", err)
+	}
 	projectID, loopID := record.ProjectID, record.ID
-	queue := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: record.Type, TargetType: record.TargetType, TargetID: stringOrEmpty(record.TargetID), Repo: record.Repo, PRNumber: record.PRNumber, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: maxAttempts, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: queueID, ProjectID: &projectID, LoopID: &loopID, Type: record.Type, TargetType: record.TargetType, TargetID: stringOrEmpty(record.TargetID), Repo: record.Repo, PRNumber: record.PRNumber, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: maxAttempts, CreatedAt: nowISO, UpdatedAt: nowISO}
 	switch queueType {
 	case domain.LoopTypePlanner:
 		repo := strings.TrimSpace(stringOrEmpty(record.Repo))
@@ -278,6 +253,19 @@ func BuildQueuedLoopQueueRecord(record storage.LoopRecord, target domain.LoopTar
 		queue.LockKey = &lockKey
 	}
 	return queue, true, nil
+}
+
+// newUUID keeps queue IDs compatible with the frozen API retry/handback
+// response contract. Internal event IDs use a prefixed opaque format, but a
+// queue item can cross the HTTP boundary when it is first created by retry.
+func newUUID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	raw[6] = (raw[6] & 0x0f) | 0x40
+	raw[8] = (raw[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16]), nil
 }
 
 func workerPayloadJSON(metadataJSON *string) *string {

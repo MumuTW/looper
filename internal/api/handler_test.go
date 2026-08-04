@@ -41,6 +41,13 @@ type stopLoopResponse struct {
 	LoopID  string `json:"loopId"`
 }
 
+func TestLoopConflictTransportMessagePreservesLegacyTargetKey(t *testing.T) {
+	err := fmt.Errorf("%w: active loop already exists for project_1:reviewer:pr:acme/looper:42", loops.ErrActiveLoopConflict)
+	if got, want := loopConflictTransportMessage(err), "active loop already exists for project_1:reviewer:pull_request:acme/looper:42"; got != want {
+		t.Fatalf("loopConflictTransportMessage() = %q, want %q", got, want)
+	}
+}
+
 func TestHandlerHealthzSuccessAndRequestIDEcho(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})

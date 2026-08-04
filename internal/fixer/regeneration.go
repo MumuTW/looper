@@ -145,6 +145,9 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 		state = fixerRegenerationState{Authority: "fixer-exhaustion:" + current.ID}
 	}
 	if state.Routed {
+		if err := r.ensureRegenerationEvent(ctx, current, queueItem, state); err != nil {
+			return regenerationNone, err
+		}
 		return regenerationCompleted, nil
 	}
 	if state.Escalated {
@@ -391,6 +394,9 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 	}
 	state.Routed = true
 	if _, err := r.mergeLoopMetadata(ctx, current, map[string]any{"fixerRegeneration": state}); err != nil {
+		return regenerationNone, err
+	}
+	if err := r.ensureRegenerationEvent(ctx, current, queueItem, state); err != nil {
 		return regenerationNone, err
 	}
 	return regenerationCompleted, nil

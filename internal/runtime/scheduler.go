@@ -2332,6 +2332,13 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	var fixerRunner fixerScheduler
 	var fixerRoleRunner *fixer.Runner
 	var workerRunner workerScheduler
+	stopLoop := func(ctx context.Context, loopID, reason string) error {
+		if activeExecutions == nil {
+			return nil
+		}
+		_, err := activeExecutions.BeginLoopStop(loopID, reason)
+		return err
+	}
 
 	looperCLIPath := resolveTrustedLooperCLIPath(cfg, logger)
 	// Keep LOOPER_TRUSTED_REVIEW_SOCK out of shared agent executor env so
@@ -2454,6 +2461,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			},
 			RetryBaseDelay:      retryBaseDelay,
 			RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
+			StopLoop:            stopLoop,
 			OnQueueItemEnqueued: requestWake,
 			StopWorkGraphLoop: func(ctx context.Context, loopID, reason string) error {
 				if activeExecutions == nil {
