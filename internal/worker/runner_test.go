@@ -1861,7 +1861,7 @@ func TestVerifyTimeoutProgressBeforeReplacementReobservesAfterFailedRetry(t *tes
 	}
 }
 
-func TestVerifyTimeoutProgressBeforeReplacementAcceptsFailedReplacementEdits(t *testing.T) {
+func TestVerifyTimeoutProgressBeforeReplacementFailsClosedForUnprovenReplacementEdits(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
@@ -1888,11 +1888,13 @@ func TestVerifyTimeoutProgressBeforeReplacementAcceptsFailedReplacementEdits(t *
 		},
 	}
 	worktree := checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "worktree"), Branch: "feature/test", BaseBranch: "main"}
-	if err := runner.verifyTimeoutProgressBeforeReplacement(context.Background(), *project, run.ID, workerInput{BaseBranch: "main"}, worktree, &checkpoint); err != nil {
-		t.Fatalf("verifyTimeoutProgressBeforeReplacement() error = %v, want additive replacement edits accepted", err)
+	err = runner.verifyTimeoutProgressBeforeReplacement(context.Background(), *project, run.ID, workerInput{BaseBranch: "main"}, worktree, &checkpoint)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureManualIntervention {
+		t.Fatalf("verifyTimeoutProgressBeforeReplacement() error = %v, want manual intervention for unproven replacement edits", err)
 	}
-	if checkpoint.Continuation == nil || checkpoint.Continuation.Outcome != "preserved" || checkpoint.Continuation.AfterRestart == nil || len(checkpoint.Continuation.AfterRestart.ChangedFiles) != 2 {
-		t.Fatalf("checkpoint.Continuation = %#v, want updated preserved evidence", checkpoint.Continuation)
+	if checkpoint.Continuation == nil || checkpoint.Continuation.Outcome != "changed" || checkpoint.Continuation.AfterRestart == nil || len(checkpoint.Continuation.AfterRestart.ChangedFiles) != 2 || checkpoint.Execution == nil || checkpoint.Execution.ProgressSnapshotError == "" {
+		t.Fatalf("checkpoint.Continuation = %#v, execution = %#v, want fail-closed changed evidence", checkpoint.Continuation, checkpoint.Execution)
 	}
 }
 
