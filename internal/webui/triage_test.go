@@ -522,6 +522,30 @@ func TestClassifyMarksSameHeadSnapshotEvidenceAsStale(t *testing.T) {
 	}
 }
 
+func TestClassifyMarksMissingChecksAsStaleEvidence(t *testing.T) {
+	t.Parallel()
+
+	current := snapshot(t, 1, payloadOptions{})
+	report := report(1, true)
+	report.ObservedHeadSHA = current.HeadSHA
+	report.SourceFingerprint = "source-fingerprint"
+	report.Evidence.Checks = []gatekeeper.CheckEvidence{{Name: "CI", Status: "COMPLETED", Conclusion: "SUCCESS"}}
+
+	board := Classify(Input{
+		Now:       testNow,
+		Snapshots: []storage.PullRequestSnapshotRecord{current},
+		Reports:   []gatekeeper.Report{report},
+		Links:     testLinker{},
+	})
+	row, group := rowFor(t, board, 1)
+	if row.Blocker.Code != string(gatekeeper.ReasonHeadStale) || row.Blocker.Label != "evidence refreshing" {
+		t.Fatalf("missing-check evidence blocker = %#v, want stale evidence", row.Blocker)
+	}
+	if group != GroupMachine {
+		t.Fatalf("missing-check evidence group = %v, want machine", group)
+	}
+}
+
 func TestClassifyDropsRowWhenGatekeeperSaysPullRequestIsClosed(t *testing.T) {
 	t.Parallel()
 

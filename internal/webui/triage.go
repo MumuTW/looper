@@ -444,8 +444,14 @@ func reportSnapshotEvidenceChanged(report gatekeeper.Report, payload snapshotPay
 }
 
 func requiredChecksChanged(expected []gatekeeper.CheckEvidence, observed []map[string]any) bool {
-	if len(expected) == 0 || len(observed) == 0 {
+	if len(expected) == 0 {
 		return false
+	}
+	if len(observed) == 0 {
+		// A report that recorded required-check evidence must be invalidated
+		// when the fresh snapshot observes no checks at all. An empty list is
+		// not proof that the old check remains successful.
+		return true
 	}
 	for _, want := range expected {
 		found := false
