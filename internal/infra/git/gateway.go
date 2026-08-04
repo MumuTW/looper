@@ -134,6 +134,11 @@ type InspectHeadResult struct {
 	// conflict-marker text in files. Literal marker strings in a legitimate
 	// test therefore cannot masquerade as unresolved merge state.
 	HasUnresolvedConflicts bool
+	// UnresolvedConflictFiles lists repository-relative paths whose index status
+	// is unmerged. Callers can scope merge authority to the reproduction
+	// manifest/test instead of treating an unrelated conflict as a contract
+	// conflict.
+	UnresolvedConflictFiles []string
 }
 
 type VerifyWorktreeIdentityInput struct {
@@ -991,7 +996,7 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 		}
 	}
 
-	return InspectHeadResult{
+	unresolvedConflictFiles := unresolvedConflictFiles(status)	return InspectHeadResult{
 		HeadSHA:                    headSHA,
 		Branch:                     branch,
 		NewCommitSHAs:              newCommitSHAs,
@@ -1009,8 +1014,8 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 		IndexFingerprint:           indexFingerprint,
 		WorktreeMatchesHead:        worktreeMatchesHead,
 		HeadDescendsFromCompare:    headDescendsFromCompare,
-		HasUnresolvedConflicts:     hasUnresolvedConflicts(status),
-	}, nil
+		HasUnresolvedConflicts:     len(unresolvedConflictFiles) > 0,
+		UnresolvedConflictFiles:    unresolvedConflictFiles,	}, nil
 }
 
 func (g *Gateway) worktreeMatchesHead(ctx context.Context, worktreePath string, paths []string) (bool, error) {
@@ -2237,13 +2242,14 @@ type statusEntry struct {
 	OriginalPath string
 }
 
-func hasUnresolvedConflicts(entries []statusEntry) bool {
+func unresolvedConflictFiles(entries []statusEntry) []string {
+	paths := make([]string, 0)
 	for _, entry := range entries {
 		if strings.Contains(entry.Code, "U") {
-			return true
+			paths = append(paths, entry.Path)
 		}
 	}
-	return false
+	return paths
 }
 
 func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntry, error) {

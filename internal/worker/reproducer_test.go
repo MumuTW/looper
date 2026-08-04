@@ -545,6 +545,22 @@ func TestWorkerCaptureReproductionIgnoresInvalidCompletedExecutionDuringRetry(t 
 	}
 }
 
+func TestWorkerCaptureReproductionRequiresRetryAttestationForInheritedManifest(t *testing.T) {
+	root, _ := writeWorkerReproductionFixtureWithIssue(t, 113, "MumuTW/looper")
+	checkpoint := workerCheckpoint{
+		Work:               &workerInput{Repo: "MumuTW/looper", IssueNumber: 113},
+		ReproductionAbsent: true,
+		Execution:          &checkpointExecution{Status: "completed", ParseStatus: "parsed", CompletionPayload: `{"summary":"finished retry","reproduction":null}`},
+	}
+	err := captureWorkerReproduction(&checkpoint, root)
+	if err == nil || !strings.Contains(err.Error(), "missing reproduction") {
+		t.Fatalf("captureWorkerReproduction() = %v, want inherited manifest attestation refusal", err)
+	}
+	if checkpoint.Work.Reproduction != nil || !checkpoint.ReproductionAbsent {
+		t.Fatalf("checkpoint = %#v, want inherited file unadopted and absence retained", checkpoint)
+	}
+}
+
 func TestWorkerInvalidCompletedExecutionReplaysExecute(t *testing.T) {
 	checkpoint := workerCheckpoint{Execution: &checkpointExecution{Status: "completed", ParseStatus: "missing"}}
 	if !shouldReplayExecuteOnResume("failed", stepExecute, checkpoint) {

@@ -408,11 +408,12 @@ type InspectHeadInput struct {
 }
 
 type InspectHeadResult struct {
-	HeadSHA                string
-	NewCommitSHAs          []string
-	HasUncommittedChanges  bool
-	ChangedFiles           []string
-	HasUnresolvedConflicts bool
+	HeadSHA                 string
+	NewCommitSHAs           []string
+	HasUncommittedChanges   bool
+	ChangedFiles            []string
+	HasUnresolvedConflicts  bool
+	UnresolvedConflictFiles []string
 }
 
 type CommitInput struct {
@@ -829,8 +830,9 @@ type fixerCheckpoint struct {
 	// while the merge phase is conflicted. It is deliberately separate from
 	// file contents: conflict-marker literals in a valid test are not merge
 	// authority.
-	ReproductionMergeUnresolved bool   `json:"reproductionMergeUnresolved,omitempty"`
-	SkipReason                  string `json:"skipReason,omitempty"`
+	ReproductionMergeUnresolved    bool     `json:"reproductionMergeUnresolved,omitempty"`
+	ReproductionMergeConflictFiles []string `json:"reproductionMergeConflictFiles,omitempty"`
+	SkipReason                     string   `json:"skipReason,omitempty"`
 }
 
 type fixerReproductionMergePhase string
@@ -1060,6 +1062,9 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 		}
 		return fixerReproductionFailure(err)
 	}
+	if (checkpoint.ReproductionMergePhase == fixerReproductionMergePending || checkpoint.ReproductionMergePhase == fixerReproductionMergeConflicted) && len(checkpoint.ReproductionMergeConflictFiles) > 0 {
+		checkpoint.ReproductionMergeUnresolved = fixerReproductionConflictAffectsContract(*checkpoint, manifest, checkpoint.ReproductionMergeConflictFiles)
+	}
 	if checkpoint.Reproduction != nil {
 		if manifest == nil {
 			return fixerReproductionFailure(errors.New("reproduction manifest is missing"))
@@ -1076,6 +1081,7 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 				checkpoint.ReproductionAbsent = false
 				checkpoint.ReproductionMergePhase = ""
 				checkpoint.ReproductionMergeUnresolved = false
+				checkpoint.ReproductionMergeConflictFiles = nil
 				return nil
 			}
 			return fixerReproductionFailure(errors.New("reproduction manifest changed during run"))
@@ -1089,6 +1095,7 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 		if checkpoint.ReproductionMergePhase == fixerReproductionMergeConflicted {
 			checkpoint.ReproductionMergePhase = ""
 			checkpoint.ReproductionMergeUnresolved = false
+			checkpoint.ReproductionMergeConflictFiles = nil
 		}
 		return nil
 	}
@@ -1113,6 +1120,7 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 				checkpoint.ReproductionAbsent = false
 				checkpoint.ReproductionMergePhase = ""
 				checkpoint.ReproductionMergeUnresolved = false
+				checkpoint.ReproductionMergeConflictFiles = nil
 				return nil
 			}
 			// The Fixer started without a committed reproduction contract. An
@@ -1136,6 +1144,7 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 	// newly written manifest as the original contract.
 	if checkpoint.ReproductionMergePhase == fixerReproductionMergeConflicted && !checkpoint.ReproductionMergeUnresolved {
 		checkpoint.ReproductionMergePhase = ""
+		checkpoint.ReproductionMergeConflictFiles = nil
 	}
 	checkpoint.ReproductionAbsent = true
 	return nil
@@ -1166,8 +1175,29 @@ func (r *Runner) refreshFixerMergeConflictState(ctx context.Context, input stepI
 	if err != nil {
 		return err
 	}
-	checkpoint.ReproductionMergeUnresolved = inspect.HasUnresolvedConflicts
+	checkpoint.ReproductionMergeConflictFiles = append([]string(nil), inspect.UnresolvedConflictFiles...)
+	checkpoint.ReproductionMergeUnresolved = fixerReproductionConflictAffectsContract(*checkpoint, nil, checkpoint.ReproductionMergeConflictFiles)
 	return nil
+}
+
+func fixerReproductionConflictAffectsContract(checkpoint fixerCheckpoint, manifest *reproducer.Manifest, paths []string) bool {
+	if len(paths) == 0 {
+		return false
+	}
+	wanted := map[string]struct{}{filepath.Clean(reproducer.ManifestPath): {}}
+	contract := manifest
+	if contract == nil {
+		contract = checkpoint.Reproduction
+	}
+	if contract != nil && strings.TrimSpace(contract.TestPath) != "" {
+		wanted[filepath.Clean(contract.TestPath)] = struct{}{}
+	}
+	for _, path := range paths {
+		if _, ok := wanted[filepath.Clean(path)]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // fixerPastInitialReproductionCapture reports whether the run already advanced
@@ -3788,16 +3818,20 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 			if mergeConflicted {
 				checkpoint.ReproductionMergePhase = fixerReproductionMergeConflicted
 				checkpoint.ReproductionMergeUnresolved = true
+				if err := r.refreshFixerMergeConflictState(ctx, input, &checkpoint, worktree.Path, worktreeRoot); err != nil {
+					return checkpoint, err
+				}
 			} else {
 				checkpoint.ReproductionMergePhase = fixerReproductionMergeCompleted
 				checkpoint.ReproductionMergeUnresolved = false
+				checkpoint.ReproductionMergeConflictFiles = nil
 			}
 			if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
 				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 			}
 		}
 	}
-	if !mergeConflicted {
+	if !mergeConflicted || !checkpoint.ReproductionMergeUnresolved {
 		// Capture after a clean daemon merge so a base-introduced or updated
 		// contract is adopted under the merge phase; ordinary later
 		// agent-authored files remain fenced by ReproductionAbsent.
@@ -3937,6 +3971,9 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if outcomeErr != nil {
 		checkpoint.Repair = fixerRetryPendingRepair(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 		checkpoint.ResumePolicy = "retry_from_timeout_context"
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		}
 		return checkpoint, outcomeErr
 	}
 	if blocked {
@@ -3945,6 +3982,9 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		if blockedKind != runpipe.FailureManualIntervention {
 			checkpoint.Repair = fixerRetryPendingRepair(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 			checkpoint.ResumePolicy = "retry_from_timeout_context"
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+			}
 		}
 		return checkpoint, &runpipe.LoopError{Message: blockedMessage, Kind: blockedKind}
 	}

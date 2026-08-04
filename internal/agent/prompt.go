@@ -51,7 +51,7 @@ func AppendWorkerCompletionInstruction(prompt string, reproductionOptional bool)
 		prompt,
 		"When finished, print exactly one final line to stdout in this format:",
 		CompletionMarkerPrefix + `{"summary":"<one-sentence summary>","reproduction":null}`,
-		`If you created .looper/reproducer.json because no reproduction contract was present when this run started, replace null with a "reproduction" object that exactly matches the committed manifest, including testPath, testName, testCommand, testSha256, and any issue scope. Leave it null when you did not create a new reproduction contract.`,
+		`If no reproduction contract was present when this run started and .looper/reproducer.json is present at completion — whether you created it this turn or inherited it from a retry — replace null with a "reproduction" object that exactly matches the committed manifest, including testPath, testName, testCommand, testSha256, and any issue scope. Leave it null only when no manifest is present.`,
 		"Do not wrap that line in markdown.",
 		"Do not print anything after that line.",
 	}, "\n\n")

@@ -23,6 +23,7 @@ import (
 	"github.com/MumuTW/looper/internal/lifecycle"
 	"github.com/MumuTW/looper/internal/loops"
 	"github.com/MumuTW/looper/internal/loops/runpipe"
+	"github.com/MumuTW/looper/internal/reproducer"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/validation"
 )
@@ -6705,6 +6706,66 @@ func TestRunRepairStepClearsCompletedMergePhaseBeforeAgent(t *testing.T) {
 	}
 	if len(agent.starts) != 1 {
 		t.Fatalf("len(agent.starts) = %d, want one repair agent", len(agent.starts))
+	}
+}
+
+type unrelatedConflictManifestGateway struct {
+	*fakeGitGateway
+	manifestPath string
+	manifestData []byte
+}
+
+func (g *unrelatedConflictManifestGateway) MergeBaseIntoWorktree(ctx context.Context, input MergeBaseInput) (MergeBaseResult, error) {
+	result, err := g.fakeGitGateway.MergeBaseIntoWorktree(ctx, input)
+	if err == nil && len(g.manifestData) > 0 {
+		if writeErr := os.WriteFile(g.manifestPath, g.manifestData, 0o644); writeErr != nil {
+			return MergeBaseResult{}, writeErr
+		}
+	}
+	return result, err
+}
+
+func TestRunRepairStepCapturesCleanContractWhenConflictIsUnrelated(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	worktreeRoot, manifest := writeFixerReproductionFixture(t)
+	manifestData, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("json.Marshal(manifest) = %v", err)
+	}
+	if err := os.Remove(filepath.Join(worktreeRoot, reproducer.ManifestPath)); err != nil {
+		t.Fatalf("remove initial manifest = %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, filepath.Dir(worktreeRoot))
+	git := &unrelatedConflictManifestGateway{
+		fakeGitGateway: &fakeGitGateway{
+			mergeBaseResult: MergeBaseResult{Conflicted: true},
+			inspectResults:  []InspectHeadResult{{UnresolvedConflictFiles: []string{"internal/other.go"}}},
+		},
+		manifestPath: filepath.Join(worktreeRoot, reproducer.ManifestPath), manifestData: manifestData,
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", ParseStatus: "parsed", CompletionPayload: `{"outcome":"completed","summary":"resolved unrelated conflict"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint, err := runner.runRepairStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir(), MetadataJSON: &metadata},
+		Loop:    storage.LoopRecord{ID: "loop_unrelated_conflict", Type: "fixer"},
+		Run:     storage.RunRecord{ID: "run_unrelated_conflict"},
+		Repo:    "acme/looper", PRNumber: 42,
+		Checkpoint: fixerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/fix-42", BaseRefName: "main", HeadSHA: "head-1"},
+			FixItems: []FixItem{{ID: "fix-1", Type: "conflict", Summary: "merge conflict"}}, FixItemsHash: "hash-1",
+			Worktree: &checkpointWorktree{Path: worktreeRoot, Branch: "feature/fix-42", HeadSHA: "head-1", PreparedAt: fixture.nowISO()},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runRepairStep() error = %v", err)
+	}
+	if checkpoint.Reproduction == nil || !checkpoint.Reproduction.Equal(*manifest) {
+		t.Fatalf("Reproduction = %#v, want clean base contract captured despite unrelated conflict", checkpoint.Reproduction)
+	}
+	if checkpoint.ReproductionMergePhase != "" || checkpoint.ReproductionMergeUnresolved {
+		t.Fatalf("merge authority = (%q, %v), want cleared after unaffected capture", checkpoint.ReproductionMergePhase, checkpoint.ReproductionMergeUnresolved)
 	}
 }
 

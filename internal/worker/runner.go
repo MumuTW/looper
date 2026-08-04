@@ -2710,6 +2710,13 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		checkpoint.recordContinuationResumeMode(result)
 		checkpoint.Execution = checkpointExecutionFromAgentResult(result, input.Run.ID, executionID)
 		checkpoint.Execution.ProgressBeforeTimeout = preTimeoutProgress
+		// Persist the completed-turn evidence before the parse gate. A malformed
+		// result may still leave a manifest in the worktree; the durable
+		// execution boundary is what lets resume defer that file for a retry
+		// instead of treating it as pre-execution state.
+		if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		}
 		if err := validateCompletedExecutionCheckpoint(checkpoint.Execution); err != nil {
 			if persistErr := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); persistErr != nil {
 				return checkpoint, &runpipe.LoopError{Message: persistErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
