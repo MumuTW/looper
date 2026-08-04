@@ -99,6 +99,9 @@ func TestWorkerReproductionAbsentBlocksPreExecutionAdoption(t *testing.T) {
 	if checkpoint.Work.Reproduction == nil || !checkpoint.Work.Reproduction.Equal(*expected) {
 		t.Fatalf("captured = %#v, want %#v", checkpoint.Work.Reproduction, expected)
 	}
+	if !checkpoint.ReproductionAuthored {
+		t.Fatal("ReproductionAuthored = false, want authored provenance after post-execution adoption")
+	}
 }
 
 func workerReproductionCompletionPayload(t *testing.T, manifest *reproducer.Manifest) string {
@@ -270,6 +273,26 @@ func TestWorkerReproductionBaselineReuseOnlyFailsClosed(t *testing.T) {
 	}
 	if checkpoint.ReproductionBaseline != nil {
 		t.Fatalf("ReproductionBaseline = %#v, want nil (no manufactured evidence)", checkpoint.ReproductionBaseline)
+	}
+}
+
+func TestWorkerReproductionBaselineReuseOnlyAllowsAuthoredManifest(t *testing.T) {
+	root, manifest := writeWorkerReproductionFixture(t)
+	checkpoint := workerCheckpoint{
+		Work:                 &workerInput{Reproduction: manifest},
+		ReproductionAuthored: true,
+	}
+	called := false
+	runner := New(Options{ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+		called = true
+		return ValidationResult{Passed: false, FailureCategory: validation.FailureNonZeroExit}, nil
+	}})
+
+	if err := runner.ensureWorkerReproductionBaseline(context.Background(), &checkpoint, root, "", "", reproductionBaselineScopeReuseOnly); err != nil {
+		t.Fatalf("ensureWorkerReproductionBaseline() error = %v, want authored contract to skip impossible baseline", err)
+	}
+	if called {
+		t.Fatal("ensureWorkerReproductionBaseline() manufactured red evidence after authored execution")
 	}
 }
 

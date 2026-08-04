@@ -676,6 +676,11 @@ type workerCheckpoint struct {
 	// execution (intentional worker-authored reproduction); pre-execution
 	// resume must not treat a mid-crash agent file as the contract.
 	ReproductionAbsent bool `json:"reproductionAbsent,omitempty"`
+	// ReproductionAuthored marks a reproduction adopted only after a completed
+	// Worker execution. Such a contract has no pre-agent red baseline by
+	// definition; post-agent validation must execute the named test but must
+	// not manufacture baseline evidence from the mutated checkout.
+	ReproductionAuthored bool `json:"reproductionAuthored,omitempty"`
 	// ReproductionBaseline is the durable red evidence captured before the
 	// Worker agent is allowed to edit the worktree. It is separate from
 	// Validation because a non-zero reproduction test is expected here while
@@ -902,6 +907,9 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 			return reproductionFailure(err)
 		}
 		checkpoint.Work.Reproduction = manifest
+		if checkpoint.ReproductionAbsent {
+			checkpoint.ReproductionAuthored = true
+		}
 		checkpoint.ReproductionAbsent = false
 		return nil
 	}
@@ -1048,6 +1056,13 @@ func (r *Runner) ensureWorkerReproductionBaseline(ctx context.Context, checkpoin
 		// captured against a different checkout. Discard it so a retry
 		// re-derives instead of accepting rejected or stale evidence.
 		checkpoint.ReproductionBaseline = nil
+	}
+	if checkpoint.ReproductionAuthored {
+		// A Worker-authored contract was introduced after the agent started,
+		// so no red baseline can exist for its pre-agent state. Later retries
+		// and HITL turns must validate the manifest itself without trying to
+		// manufacture a baseline from the already-mutated checkout.
+		return nil
 	}
 	if scope == reproductionBaselineScopeReuseOnly {
 		return &runpipe.LoopError{Message: "Reproduction baseline evidence is absent after Worker execution; refusing to manufacture red evidence from a possibly mutated worktree. Resume the run from the prepare step so the baseline is captured before the agent edits the checkout.", Kind: runpipe.FailureManualIntervention}
@@ -3766,7 +3781,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		resumedCheckpoint = rewindCheckpointForExecuteRetry(checkpoint)
 	}
 	nowISO := r.nowISO()
-	encoded := runpipe.MustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Continuation: resumedCheckpoint.Continuation, Lifecycle: resumedCheckpoint.Lifecycle, ReproductionBaseline: resumedCheckpoint.ReproductionBaseline, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
+	encoded := runpipe.MustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Continuation: resumedCheckpoint.Continuation, Lifecycle: resumedCheckpoint.Lifecycle, ReproductionAbsent: resumedCheckpoint.ReproductionAbsent, ReproductionAuthored: resumedCheckpoint.ReproductionAuthored, ReproductionBaseline: resumedCheckpoint.ReproductionBaseline, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	// replaysAgentStep must reflect whether an agent process will actually
 	// run under the gate, not just whether the workflow reaches execute. A
@@ -4015,6 +4030,9 @@ func (r *Runner) getLatestCheckpoint(ctx context.Context, run storage.RunRecord,
 	}
 	if fallback.ReproductionBaseline != nil {
 		checkpoint.ReproductionBaseline = fallback.ReproductionBaseline
+	}
+	if fallback.ReproductionAuthored {
+		checkpoint.ReproductionAuthored = true
 	}
 	if fallback.PullRequest != nil {
 		checkpoint.PullRequest = fallback.PullRequest
