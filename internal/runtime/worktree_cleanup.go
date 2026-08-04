@@ -435,6 +435,7 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 	liveContainers := make([]string, 0, 2*len(projects))
 	liveProjectPaths := make([]string, 0, len(projects))
 	sharedRoot, sharedRootErr := worktreeSharedRoot()
+	sharedRootFailureCounted := false
 	for _, project := range projects {
 		liveContainers = append(liveContainers, config.ToRepoWorktreeDirectoryName(project.RepoPath))
 		root, rootErr := worktreeCleanupRoot(project)
@@ -451,6 +452,9 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 		if rootErr := validateDiskSweepRoot(root, managedRepoPaths, sharedRoot, sharedRootErr); rootErr != nil {
 			status.Failed++
 			status.LastError = rootErr.Error()
+			if sharedRootErr != nil {
+				sharedRootFailureCounted = true
+			}
 			continue
 		}
 		rootKey := worktreesafety.NormalizePath(root)
@@ -491,11 +495,16 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 		if sharedRootErr != nil {
 			status.Failed++
 			status.LastError = sharedRootErr.Error()
+			sharedRootFailureCounted = true
 			// A shared-root alias can overlap a configured project root even when
 			// the per-root pass accepted its lexical spelling. Do not run either
 			// destructive tier until the shared identity is safe.
 			roots = nil
 		}
+	}
+	if sharedRootErr != nil && !sharedRootFailureCounted {
+		status.Failed++
+		status.LastError = sharedRootErr.Error()
 	}
 	roots, overlapErrs := rejectOverlappingDiskSweepRoots(roots, allRoots)
 	if len(overlapErrs) > 0 {
@@ -534,7 +543,7 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 
 	runContainers := func(available int) int {
 		if sharedRootErr != nil {
-			status.Failed++
+			status.ContainersFailed++
 			status.LastError = sharedRootErr.Error()
 			return 0
 		}
@@ -546,6 +555,22 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 			IsRegisteredPath: func(ctx context.Context, path string) (bool, error) {
 				record, err := repos.Worktrees.GetByPath(ctx, path)
 				return record != nil, err
+			},
+			IsLiveProjectPath: func(ctx context.Context, path string) (bool, error) {
+				currentProjects, err := repos.Projects.List(ctx)
+				if err != nil {
+					return false, err
+				}
+				for _, project := range currentProjects {
+					projectRoot, err := worktreeCleanupRoot(project)
+					if err != nil {
+						return false, err
+					}
+					if worktreesafety.NormalizePath(projectRoot) == worktreesafety.NormalizePath(path) {
+						return true, nil
+					}
+				}
+				return false, nil
 			},
 			Git:             gitGateway,
 			Budget:          available,

@@ -1237,3 +1237,30 @@ func TestRunContainerSweepRevalidatesOrphanProjectBeforeRemoval(t *testing.T) {
 		t.Fatalf("orphan project = (%q, %q), want non_directory_inside skip", action, reason)
 	}
 }
+
+func TestRunContainerSweepRevalidatesLiveProjectOwnershipBeforeRemoval(t *testing.T) {
+	sharedRoot := t.TempDir()
+	container := filepath.Join(sharedRoot, "repo-live")
+	orphanProject := filepath.Join(container, "project-orphan")
+	mkdirAt(t, filepath.Join(orphanProject, "checkout"), old())
+	for _, path := range []string{orphanProject, container} {
+		if err := os.Chtimes(path, old(), old()); err != nil {
+			t.Fatalf("Chtimes(%s): %v", path, err)
+		}
+	}
+
+	var removed []string
+	options := containerOptions(sharedRoot, []string{"repo-live"}, stubSweepGit{}, &removed)
+	options.LiveProjectPaths = []string{filepath.Join(container, "project-live")}
+	options.IsLiveProjectPath = func(context.Context, string) (bool, error) { return true, nil }
+	plan, err := RunContainerSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunContainerSweep() error = %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want live project preserved", removed)
+	}
+	if action, reason := reasonFor(t, plan, orphanProject); action != ActionSkipped || reason != "project_live_at_removal" {
+		t.Fatalf("orphan project = (%q, %q), want project_live_at_removal skip", action, reason)
+	}
+}

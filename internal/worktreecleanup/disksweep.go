@@ -258,12 +258,15 @@ type ContainerSweepOptions struct {
 	// IsRegisteredPath refreshes the worktrees table at the final nested-project
 	// boundary. RegisteredPaths is only the planning snapshot.
 	IsRegisteredPath func(context.Context, string) (bool, error)
-	Git              DiskSweepGit
-	Budget           int
-	RetentionCutoff  time.Time
-	DryRun           bool
-	ReadDir          func(string) ([]DiskEntry, error)
-	RemoveAll        func(string) error
+	// IsLiveProjectPath refreshes project-root ownership at the final nested-
+	// project boundary. LiveProjectPaths is only the planning snapshot.
+	IsLiveProjectPath func(context.Context, string) (bool, error)
+	Git               DiskSweepGit
+	Budget            int
+	RetentionCutoff   time.Time
+	DryRun            bool
+	ReadDir           func(string) ([]DiskEntry, error)
+	RemoveAll         func(string) error
 }
 
 // RunContainerSweep removes unreachable repo containers. A container is only
@@ -540,6 +543,20 @@ func sweepLiveContainerProjects(ctx context.Context, options ContainerSweepOptio
 // child set again.
 func revalidateOrphanProject(ctx context.Context, options ContainerSweepOptions, projectPath string, registered map[string]bool) (DiskCandidate, bool) {
 	candidate := DiskCandidate{Path: projectPath, Action: DiskSweepActionRemove, Reason: "orphaned_project"}
+	if options.IsLiveProjectPath != nil {
+		live, err := options.IsLiveProjectPath(ctx, projectPath)
+		if err != nil {
+			candidate.Action = "error"
+			candidate.Reason = "project_path_refresh_failed"
+			candidate.Error = err.Error()
+			return candidate, false
+		}
+		if live {
+			candidate.Action = ActionSkipped
+			candidate.Reason = "project_live_at_removal"
+			return candidate, false
+		}
+	}
 	var eligible bool
 	candidate, eligible = revalidateContainerCandidate(candidate, options.RetentionCutoff)
 	if !eligible {
