@@ -97,6 +97,7 @@ func TestRecordPostMergeEventPreservesForgeMergedAtAndIsIdempotent(t *testing.T)
 
 func TestApplyMergeWatchRecordsMergifyMergeEvidence(t *testing.T) {
 	fixture := newCoordinatorFixture(t)
+	seedCoordinatorGatekeeperRoute(t, fixture, 42, "head-42")
 	fixture.github.prDetails[42] = githubinfra.PullRequestDetail{
 		Number: 42, Body: "Closes #7", State: "closed", HeadSHA: "head-42", BaseRefName: "main",
 		Labels: []string{labels.DefaultPlanTrigger, labels.AutoMerge}, MergedAt: "2026-05-14T11:58:07.000Z", MergedBy: "mergify[bot]",
@@ -110,8 +111,42 @@ func TestApplyMergeWatchRecordsMergifyMergeEvidence(t *testing.T) {
 		t.Fatalf("applyMergeWatch() error = %v", err)
 	}
 	events, err := fixture.runner.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
-	if err != nil || len(events) != 1 || events[0].EventType != eventlog.CoordinatorPullRequestMergedEventType {
+	coordinatorMerges := 0
+	for _, event := range events {
+		if event.EventType == eventlog.CoordinatorPullRequestMergedEventType {
+			coordinatorMerges++
+		}
+	}
+	if err != nil || coordinatorMerges != 1 {
 		t.Fatalf("merge events = %#v, %v, want one Coordinator merge event", events, err)
+	}
+}
+
+func TestApplyMergeWatchRejectsUnbackedMergifyLabel(t *testing.T) {
+	fixture := newCoordinatorFixture(t)
+	// The PR carries a Looper-owned issue label and a manually-added Mergify
+	// route, but there is no successful Gatekeeper route report for this head.
+	// The label alone must not make the issue-lane watcher attribute a merge to
+	// Looper.
+	fixture.github.prDetails[42] = githubinfra.PullRequestDetail{
+		Number: 42, Body: "Closes #7", State: "closed", HeadSHA: "head-42", BaseRefName: "main",
+		Labels: []string{labels.DefaultPlanTrigger, labels.AutoMerge}, MergedAt: "2026-05-14T11:58:07.000Z", MergedBy: "mergify[bot]",
+	}
+	loaded := []loadedIssue{{
+		detail:      githubinfra.IssueDetail{Number: 7, Labels: []string{"triaged"}},
+		rawTimeline: []map[string]any{{"source": map[string]any{"issue": map[string]any{"pull_request": map[string]any{"number": 42}}}}},
+	}}
+	if _, err := fixture.runner.applyMergeWatch(context.Background(), fixture.projectID, "acme/looper", t.TempDir(), loaded, fixture.cfg.Roles); err != nil {
+		t.Fatalf("applyMergeWatch() error = %v", err)
+	}
+	events, err := fixture.runner.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("ListByEntity() error = %v", err)
+	}
+	for _, event := range events {
+		if event.EventType == eventlog.CoordinatorPullRequestMergedEventType {
+			t.Fatalf("unbacked Mergify label recorded as Looper merge evidence: %#v", event)
+		}
 	}
 }
 

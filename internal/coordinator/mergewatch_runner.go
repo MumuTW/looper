@@ -78,7 +78,7 @@ func (r *Runner) applyMergeWatch(ctx context.Context, projectID, repo, cwd strin
 
 func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd string, issue loadedIssue, roles config.RoleConfigs, namespace labels.Namespace, triagedLabel, currentLogin string, maxIndeterminateDuration time.Duration) (bool, error) {
 	marker := findMergeWatchComment(issue.detail.Comments, currentLogin)
-	watchedPR, ok, err := r.resolveWatchedPR(ctx, repo, cwd, issue, marker, namespace, currentLogin)
+	watchedPR, ok, err := r.resolveWatchedPR(ctx, projectID, repo, cwd, issue, marker, namespace, currentLogin)
 	if err != nil || !ok {
 		return false, err
 	}
@@ -522,13 +522,18 @@ func (r *Runner) recordPostMergeEvent(ctx context.Context, projectID, repo strin
 	return nil
 }
 
-func (r *Runner) resolveWatchedPR(ctx context.Context, repo, cwd string, issue loadedIssue, marker *mergeWatchComment, namespace labels.Namespace, currentLogin string) (int64, bool, error) {
+func (r *Runner) resolveWatchedPR(ctx context.Context, projectID, repo, cwd string, issue loadedIssue, marker *mergeWatchComment, namespace labels.Namespace, currentLogin string) (int64, bool, error) {
 	linked := linkedPullRequestNumbers(issue.rawTimeline)
 	if marker != nil && marker.Marker.PRNumber > 0 {
 		for _, linkedPR := range linked {
 			if linkedPR == marker.Marker.PRNumber {
 				detail, err := r.github.ViewPullRequestMergeWatch(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: linkedPR, CWD: cwd})
 				if err == nil && prLinksIssue(repo, issue.detail.Number, detail.Body) {
+					// An existing marker is the durable authority that this PR was
+					// previously admitted. Keep resolving it after a human disables
+					// the route so the snapshot can classify and retire the marker;
+					// the Gatekeeper-route check below applies to new label-based
+					// admissions, not cleanup of an already-owned watch.
 					return marker.Marker.PRNumber, true, nil
 				}
 			}
@@ -542,7 +547,14 @@ func (r *Runner) resolveWatchedPR(ctx context.Context, repo, cwd string, issue l
 		}
 		autoMergeOwnedByLooper := detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin))
 		mergifyRouteEnabled := labels.Has(detail.Labels, labels.AutoMerge)
+		authorized, authErr := r.mergeWatchRouteAuthorized(ctx, projectID, repo, prNumber, detail, currentLogin)
+		if authErr != nil {
+			return 0, false, authErr
+		}
 		if (!autoMergeOwnedByLooper && !mergifyRouteEnabled) || !namespace.AnyOwned(detail.Labels) || !prLinksIssue(repo, issue.detail.Number, detail.Body) {
+			continue
+		}
+		if !authorized {
 			continue
 		}
 		eligible = append(eligible, prNumber)
@@ -554,6 +566,28 @@ func (r *Runner) resolveWatchedPR(ctx context.Context, repo, cwd string, issue l
 		return 0, false, nil
 	}
 	return eligible[0], true, nil
+}
+
+// mergeWatchRouteAuthorized separates the native compatibility route from the
+// Mergify label route. A static auto-merge label is only a forge projection; it
+// becomes an issue-lane merge-watch authority when the durable Gatekeeper
+// report for this project, repository, PR, and current head says the route was
+// established. Without that check a maintainer can add the label next to any
+// Looper-owned issue label and make Coordinator attribute a human merge to
+// Looper.
+func (r *Runner) mergeWatchRouteAuthorized(ctx context.Context, projectID, repo string, prNumber int64, detail githubinfra.PullRequestDetail, currentLogin string) (bool, error) {
+	autoMergeOwnedByLooper := detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin))
+	if autoMergeOwnedByLooper {
+		return true, nil
+	}
+	if !labels.Has(detail.Labels, labels.AutoMerge) {
+		return false, nil
+	}
+	active, _, err := routedGatekeeperRoute(ctx, r.repos, projectID, repo, prNumber, detail.HeadSHA)
+	if err != nil {
+		return false, err
+	}
+	return active, nil
 }
 
 func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issueNumber, prNumber int64, namespace labels.Namespace, currentLogin string) (mergewatch.PRSnapshot, *mergewatch.TemporaryError, error) {
