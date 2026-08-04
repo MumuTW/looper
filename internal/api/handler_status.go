@@ -358,6 +358,7 @@ func (h *Handler) buildResourceGuardStatusResponse() any {
 		Admit:   true,
 	}
 }
+
 type storageState struct {
 	OK                  bool
 	LatestAvailableID   string

@@ -200,7 +200,7 @@ func applyLoopLogsSingleSnapshot(response *loopLogsResponse, cursor loopLogsFile
 }
 
 func (h *Handler) updateLoopLogsSingleCursor(w io.Writer, flusher http.Flusher, response loopLogsResponse, output agentOutputPayload, cursor *loopLogsFileCursor, stderr bool, executionID string) error {
-	if response.Agent == nil || cursor == nil {
+	if cursor == nil {
 		return nil
 	}
 	path, inline := singleLoopLogsOutput(output, stderr)
@@ -312,7 +312,10 @@ func (cursor loopLogsFileCursor) snapshotContent() string {
 }
 
 func (h *Handler) updateLoopLogsCombinedCursor(w io.Writer, flusher http.Flusher, previous loopLogsResponse, state loopLogsCombinedState, cursor *loopLogsCombinedCursor) error {
-	nextExecutionID := ""
+	// Keep the previous execution identity when the terminal projection has no
+	// Agent row. Its durable inline output still belongs to the same cursor and
+	// must be emitted before the stream ends.
+	nextExecutionID := cursor.executionID
 	if state.response.Agent != nil {
 		nextExecutionID = state.response.Agent.ExecutionID
 	}
@@ -338,9 +341,6 @@ func (h *Handler) updateLoopLogsCombinedCursor(w io.Writer, flusher http.Flusher
 		return nil
 	}
 
-	if state.response.Agent == nil {
-		return nil
-	}
 	for _, update := range []struct {
 		stream string
 		cursor *loopLogsFileCursor

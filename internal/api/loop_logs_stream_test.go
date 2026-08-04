@@ -796,6 +796,51 @@ func TestLoopLogsSingleCursorReconcilesInlineFallbackBeforeTerminalEnd(t *testin
 	}
 }
 
+func TestLoopLogsSingleCursorReconcilesInlineFallbackWhenTerminalAgentMissing(t *testing.T) {
+	fixture := newTestFixture(t)
+	handler := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	logDir := filepath.Join(fixture.config.Daemon.LogDir, "loops")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(log dir): %v", err)
+	}
+	path := filepath.Join(logDir, "terminal_inline_missing_agent.log")
+	if err := os.WriteFile(path, []byte("file line\n"), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	cursor, err := handler.newLoopLogsFileCursor(path, "file line\n")
+	if err != nil {
+		t.Fatalf("new cursor: %v", err)
+	}
+	running := loopLogsResponse{
+		Run:   &loopLogsRunResponse{RunID: "run_terminal_missing_agent", Status: "running"},
+		Agent: &loopLogsAgentPayload{ExecutionID: "exec_terminal_missing_agent", Vendor: "codex", Status: "running"},
+	}
+	output := agentOutputPayload{Stdout: "file line\ninline terminal\n", StdoutLogPath: path}
+	first := httptest.NewRecorder()
+	if err := handler.updateLoopLogsSingleCursor(first, first, running, output, &cursor, false, "exec_terminal_missing_agent"); err != nil {
+		t.Fatalf("stage terminal inline output: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove log: %v", err)
+	}
+	if err := handler.emitLoopLogsSingleChunks(first, first, running, &cursor, false); err != nil {
+		t.Fatalf("observe disappeared terminal log: %v", err)
+	}
+
+	// The terminal run can be visible after its Agent row has already been
+	// cleaned up. The durable output still belongs to the observed execution;
+	// the cursor must emit its inline suffix before the end event closes the
+	// stream.
+	terminal := loopLogsResponse{Run: &loopLogsRunResponse{RunID: "run_terminal_missing_agent", Status: "success"}}
+	second := httptest.NewRecorder()
+	if err := handler.updateLoopLogsSingleCursor(second, second, terminal, output, &cursor, false, "exec_terminal_missing_agent"); err != nil {
+		t.Fatalf("reconcile terminal inline output without agent: %v", err)
+	}
+	if !strings.Contains(second.Body.String(), "inline terminal") {
+		t.Fatalf("terminal fallback body = %q, want inline terminal output", second.Body.String())
+	}
+}
+
 // TestSingleLoopLogsStreamDrainsRemainingBytesBeforeEnding verifies that when
 // a run becomes terminal while the file cursor has more than one chunk unread,
 // the stream drains all remaining bytes before sending the end event.

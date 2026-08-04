@@ -179,7 +179,11 @@ func (h *Handler) streamLoopLogs(w http.ResponseWriter, r *http.Request, request
 			return nil
 		}
 
-		nextExecutionID := ""
+		// A terminal state may briefly have no latest Agent record even though
+		// the same execution's durable output is still present. Keep the cursor
+		// bound to the observed execution so the terminal inline fallback is
+		// reconciled instead of being treated as a brand-new empty stream.
+		nextExecutionID := executionID
 		if next.Agent != nil {
 			nextExecutionID = next.Agent.ExecutionID
 		}
