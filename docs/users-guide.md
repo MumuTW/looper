@@ -321,10 +321,11 @@ If reviewer considers the spec review clean, it will:
 ### Gatekeeper auto route
 
 Gatekeeper is Looper's only merge authority. Set `roles.gatekeeper.trust =
-"auto"` and choose `roles.gatekeeper.strategy` (`squash`, `merge`, or
-`rebase`) when eligible pull requests should enter the repository's Mergify
-queue. Reviewer still publishes the Codex review; it never enables GitHub's
-native auto-merge path.
+"auto"` when eligible pull requests should enter the repository's Mergify
+queue. Choose the merge method in the repository-owned `.mergify.yml`
+`queue_rules[].merge_method`; there is no `roles.gatekeeper.strategy` setting.
+Reviewer still publishes the Codex review; it never enables GitHub's native
+auto-merge path.
 
 The route is label-based: Gatekeeper adds the exact `auto-merge` label only
 after a fresh current-head evaluation and removes it whenever a hold, review
