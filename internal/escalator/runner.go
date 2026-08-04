@@ -76,6 +76,12 @@ func (r *Runner) Run(ctx context.Context) (RunResult, error) {
 	if len(snapshot.Items) > r.maxItems {
 		return RunResult{}, fmt.Errorf("escalator digest has %d items, exceeds bounded baseline limit %d", len(snapshot.Items), r.maxItems)
 	}
+	if snapshot.Partial {
+		// A rotating source window is a useful read projection, but omitted rows
+		// are not resolution evidence. Wait for the collector to complete its
+		// cycle before comparing or persisting the digest baseline.
+		return RunResult{Snapshot: snapshot, Suppressed: true}, nil
+	}
 	previous, err := r.loadPrevious(ctx)
 	if err != nil {
 		return RunResult{}, err

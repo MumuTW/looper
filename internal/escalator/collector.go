@@ -41,6 +41,7 @@ type Collector struct {
 	staleAfter    time.Duration
 	triageMu      sync.Mutex
 	triageCursor  map[string]string
+	triageStates  map[string]map[string]storage.TriageSourceStateRecord
 }
 
 const triageSourceScanLimit = 64
@@ -62,7 +63,7 @@ func NewCollector(repositories *storage.Repositories, links Linker, options Coll
 	if staleAfter <= 0 {
 		staleAfter = 24 * time.Hour
 	}
-	return &Collector{repositories: repositories, links: links, now: now, retryAfter: retryAfter, unroutedAfter: unroutedAfter, staleAfter: staleAfter, triageCursor: map[string]string{}}
+	return &Collector{repositories: repositories, links: links, now: now, retryAfter: retryAfter, unroutedAfter: unroutedAfter, staleAfter: staleAfter, triageCursor: map[string]string{}, triageStates: map[string]map[string]storage.TriageSourceStateRecord{}}
 }
 
 func (c *Collector) Collect(ctx context.Context) (Snapshot, error) {
@@ -221,11 +222,37 @@ func (c *Collector) collectQueue(now time.Time, records []storage.QueueItemRecor
 
 func (c *Collector) collectUnroutedTriage(ctx context.Context, now time.Time, activeProjects map[string]struct{}, snapshot *Snapshot) error {
 	for projectID := range activeProjects {
-		records, err := c.nextTriageSourceWindow(ctx, projectID)
+		records, complete, err := c.nextTriageSourceWindow(ctx, projectID)
 		if err != nil {
 			return fmt.Errorf("list triage routing lifecycle: %w", err)
 		}
+		c.triageMu.Lock()
+		if c.triageStates == nil {
+			c.triageStates = map[string]map[string]storage.TriageSourceStateRecord{}
+		}
+		states := c.triageStates[projectID]
+		if states == nil {
+			states = map[string]storage.TriageSourceStateRecord{}
+			c.triageStates[projectID] = states
+		}
 		for _, record := range records {
+			if record.Projected || record.Retired {
+				// Terminal lifecycle rows remain in the SQL projection to consume
+				// bounded scan slots, but do not need a durable in-memory entry.
+				delete(states, record.SourceKey)
+				continue
+			}
+			states[record.SourceKey] = record
+		}
+		stable := make([]storage.TriageSourceStateRecord, 0, len(states))
+		for _, record := range states {
+			stable = append(stable, record)
+		}
+		c.triageMu.Unlock()
+		if !complete {
+			snapshot.Partial = true
+		}
+		for _, record := range stable {
 			if record.EnrollmentJSON == nil {
 				continue
 			}
@@ -273,8 +300,9 @@ func (c *Collector) collectUnroutedTriage(ctx context.Context, now time.Time, ac
 // nextTriageSourceWindow rotates through the current triage projection. The
 // SQL aggregation retains only the enrollment/report payload and terminal
 // flags needed by this collector, so a busy repository cannot make every
-// Escalator poll reread an ever-growing event history.
-func (c *Collector) nextTriageSourceWindow(ctx context.Context, projectID string) ([]storage.TriageSourceStateRecord, error) {
+// Escalator poll reread an ever-growing event history. complete is true only
+// after the cursor has covered the full projection at least once.
+func (c *Collector) nextTriageSourceWindow(ctx context.Context, projectID string) ([]storage.TriageSourceStateRecord, bool, error) {
 	c.triageMu.Lock()
 	if c.triageCursor == nil {
 		c.triageCursor = map[string]string{}
@@ -283,14 +311,33 @@ func (c *Collector) nextTriageSourceWindow(ctx context.Context, projectID string
 	c.triageMu.Unlock()
 	records, err := c.repositories.Events.ListTriageSourceStateWindow(ctx, projectID, cursor, triageSourceScanLimit)
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	complete := false
+	if cursor == "" {
+		// A short first window contains the whole current projection. Exactly a
+		// full window remains ambiguous until the next call proves a wrap.
+		complete = len(records) < triageSourceScanLimit
+	} else {
+		wrapped := len(records) == 0
+		for _, record := range records {
+			if record.SourceKey <= cursor {
+				wrapped = true
+				break
+			}
+		}
+		complete = wrapped
 	}
 	if len(records) > 0 {
 		c.triageMu.Lock()
 		c.triageCursor[projectID] = records[len(records)-1].SourceKey
 		c.triageMu.Unlock()
+	} else if cursor != "" {
+		c.triageMu.Lock()
+		c.triageCursor[projectID] = ""
+		c.triageMu.Unlock()
 	}
-	return records, nil
+	return records, complete, nil
 }
 
 func (c *Collector) collectEligibleAdvise(ctx context.Context, now time.Time, activeProjects map[string]struct{}, snapshot *Snapshot) error {

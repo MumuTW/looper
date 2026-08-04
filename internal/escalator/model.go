@@ -56,6 +56,11 @@ type Snapshot struct {
 	GeneratedAt string         `json:"generatedAt"`
 	Items       []Item         `json:"items"`
 	Backlog     []StageBacklog `json:"backlog"`
+	// Partial is true while a bounded collector is still rotating through a
+	// larger source projection. Partial censuses are useful for read surfaces,
+	// but must not become a complete digest baseline because omitted items are
+	// not evidence that work resolved.
+	Partial bool `json:"partial,omitempty"`
 }
 
 // Normalize pins deterministic ordering for rendering, persistence, and delta
