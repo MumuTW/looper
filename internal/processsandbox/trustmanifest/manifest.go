@@ -1052,7 +1052,7 @@ func resolveMachOLibraryFrom(binaryPath, executablePath, library string, rpaths 
 		}
 		candidates = append(candidates, filepath.Join("/usr/lib", relative), filepath.Join("/System/Library", relative))
 	default:
-		candidates = append(candidates, filepath.Join(loaderDir, library), filepath.Join("/usr/lib", library), filepath.Join("/System/Library/Frameworks", library))
+		return "", fmt.Errorf("Mach-O %s has an unsupported relative library dependency %q", binaryPath, library)
 	}
 	for _, candidate := range candidates {
 		resolved, err := resolveExistingPath(candidate)

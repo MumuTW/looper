@@ -214,6 +214,17 @@ func TestParseLDDOutputRejectsUnresolvedRelativeCandidates(t *testing.T) {
 	}
 }
 
+func TestResolveMachOLibraryRejectsCWDRelativeNames(t *testing.T) {
+	for _, library := range []string{"libfoo.dylib", "./libfoo.dylib", "../libfoo.dylib"} {
+		t.Run(library, func(t *testing.T) {
+			_, err := resolveMachOLibraryFrom("/opt/runtime/bin/tool", "/opt/runtime/bin/tool", library, nil)
+			if err == nil || !strings.Contains(err.Error(), "unsupported relative library dependency") {
+				t.Fatalf("resolveMachOLibraryFrom(%q) error = %v, want relative dependency rejection", library, err)
+			}
+		})
+	}
+}
+
 func TestParseResolverCredentialRequiresUnprivilegedIdentity(t *testing.T) {
 	if credential, ok := parseResolverCredential(0, "501", "20"); !ok || credential.Uid != 501 || credential.Gid != 20 {
 		t.Fatalf("parseResolverCredential(valid) = (%#v, %t), want uid/gid 501/20", credential, ok)
