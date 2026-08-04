@@ -7393,6 +7393,15 @@ func (r *Runner) siblingHumanTakeoverOwnsWorktree(ctx context.Context, loop stor
 		if sibling.ProjectID != loop.ProjectID {
 			continue
 		}
+		// PR-target Workers use the branch checkout path
+		// (looper-fix-<project>-pr-N), while Fixer and Reviewer use the
+		// detached path (looper-fix-<project>-pr-N-detached). A Worker
+		// takeover therefore cannot own the path this terminal Fixer is
+		// cleaning; treating its status as ownership would strand the
+		// detached checkout until some unrelated retry happens.
+		if sibling.Type == string(domain.LoopTypeWorker) {
+			continue
+		}
 		if sibling.Status == string(domain.LoopStatusHumanTakeover) {
 			return true, fmt.Sprintf("sibling loop %s is human_takeover for the same PR worktree", sibling.ID)
 		}

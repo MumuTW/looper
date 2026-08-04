@@ -142,6 +142,39 @@ func TestTerminalCleanupSkipsSiblingHumanTakeoverOnSamePR(t *testing.T) {
 	}
 }
 
+func TestTerminalCleanupDoesNotSkipSiblingWorkerTakeover(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_worker_sibling", filepath.Join(t.TempDir(), "wt-worker-sibling"))
+
+	// A PR-target Worker uses the branch-mode checkout, not the detached
+	// Fixer/Reviewer path. Its takeover must not strand this Fixer worktree.
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	target := "pr:acme/looper:42"
+	if err := fixture.repos.Loops.UpsertChangingHumanHold(context.Background(), storage.LoopRecord{
+		ID: "loop_worker_takeover", Seq: 99, ProjectID: "project_1", Type: "worker",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+		Status: "human_takeover", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(sibling) error = %v", err)
+	}
+
+	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
+	}, "run_cleanup_worker_sibling", &checkpoint)
+
+	if len(git.cleanupCalls) != 1 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 1 because Worker owns a separate branch checkout", len(git.cleanupCalls))
+	}
+	if checkpoint.Outcome != nil && len(checkpoint.Outcome.SecondaryIssues) != 0 {
+		t.Fatalf("Outcome = %#v, want no sibling-ownership skip", checkpoint.Outcome)
+	}
+}
+
 func TestTerminalCleanupPersistsSuccessTimestamps(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
