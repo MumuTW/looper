@@ -113,13 +113,8 @@ func hermesSuggestionAllowed(cfg config.Config) bool {
 	if cfg.Agent.Vendor != nil || cfg.Agent.Model != nil || cfg.Agent.ReasoningEffort != nil || len(cfg.Agent.Profiles) > 0 || len(cfg.Agent.Params) > 0 || len(cfg.Agent.Env) > 0 {
 		return false
 	}
-	for _, binding := range []*config.RoleAgentConfig{
-		cfg.Roles.Planner.Agent,
-		cfg.Roles.Worker.Agent,
-		cfg.Roles.Reviewer.Agent,
-		cfg.Roles.Fixer.Agent,
-	} {
-		if binding != nil {
+	for _, role := range config.EffectiveCodingRoles(cfg.Roles) {
+		if role.Agent != nil {
 			return false
 		}
 	}

@@ -72,6 +72,12 @@ func TestHermesSuggestionNeverOverridesExplicitAgentAuthority(t *testing.T) {
 			cfg.Agent.Profiles = map[string]config.AgentBindingConfig{"fast": {Vendor: &profileVendor}}
 		}},
 		{name: "role", configure: func(cfg *config.Config) { cfg.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &roleVendor} }},
+		{name: "canonical role reasoning effort", configure: func(cfg *config.Config) {
+			effort := config.ReasoningEffortHigh
+			cfg.Roles.Coding = map[string]config.CodingRoleConfig{
+				config.CodingRoleWorker: {Agent: &config.RoleAgentConfig{ReasoningEffort: &effort}},
+			}
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := config.CloneConfig(base)
