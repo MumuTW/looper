@@ -18,14 +18,14 @@ type MergeOutcome struct {
 	PRNumber  int64  `json:"prNumber"`
 	// HeadSHA is the commit the decision was made about and, on success, the
 	// commit that was merged.
-	HeadSHA string `json:"headSha"`
-	MergeCommitSHA string `json:"mergeCommitSha,omitempty"`
-	SourceIssue *githubinfra.IssueReference `json:"sourceIssue,omitempty"`
+	HeadSHA        string                      `json:"headSha"`
+	MergeCommitSHA string                      `json:"mergeCommitSha,omitempty"`
+	SourceIssue    *githubinfra.IssueReference `json:"sourceIssue,omitempty"`
 	// TouchedFiles is GitHub's authoritative pull-request file list captured
 	// after a successful merge. Auditor may use it as attribution evidence.
-	TouchedFiles []string `json:"touchedFiles,omitempty"`
-	TouchedFilesAvailable bool `json:"touchedFilesAvailable,omitempty"`
-	Merged  bool   `json:"merged"`
+	TouchedFiles          []string `json:"touchedFiles,omitempty"`
+	TouchedFilesAvailable bool     `json:"touchedFilesAvailable,omitempty"`
+	Merged                bool     `json:"merged"`
 	// Reason explains a refusal. Empty on success.
 	Reason string `json:"reason,omitempty"`
 	// ConfirmingReasons are the gates that blocked the confirming evaluation, when
