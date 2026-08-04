@@ -2,12 +2,14 @@ package gatekeeper
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/MumuTW/looper/internal/config"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func openPullRequestFixture() githubinfra.PullRequestSummary {
@@ -89,6 +91,31 @@ func TestDiscoverPullRequestsReevaluatesSmallAutoChangeAfterReviewEvent(t *testi
 	}
 	if third.Evaluated != 1 || third.Skipped != 0 {
 		t.Fatalf("third discovery = %#v, want re-evaluation after review event", third)
+	}
+}
+
+func TestDiscoverPullRequestsReevaluatesAfterReviewEvidenceLookupFailure(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	fixture.github.detail.Additions = 1
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{}
+	runner := fixture.autoRunner()
+	runner.reviewEvidenceLookup = func(context.Context, *storage.Repositories, string, string, int64, string, string, string) (bool, error) {
+		return false, errors.New("transient event-store read failure")
+	}
+
+	first := discoverWithRunner(t, runner)
+	if first.Evaluated != 1 || !first.Reports[0].Eligible {
+		t.Fatalf("first discovery = %#v, want eligible success", first)
+	}
+	callsAfterFirst := fixture.github.perPullRequestCalls
+
+	second := discoverWithRunner(t, runner)
+	if second.Evaluated != 1 || second.Skipped != 0 {
+		t.Fatalf("second discovery = %#v, want full reevaluation after evidence lookup failure", second)
+	}
+	if fixture.github.perPullRequestCalls <= callsAfterFirst {
+		t.Fatalf("per-pull-request calls = %d, want increase after evidence lookup failure", fixture.github.perPullRequestCalls)
 	}
 }
 
@@ -231,6 +258,19 @@ func TestDiscoverPullRequestsReevaluatesAfterMaxSkipAge(t *testing.T) {
 	third := discover(t, fixture)
 	if third.Evaluated != 1 || third.Skipped != 0 {
 		t.Fatalf("31 minutes after evaluation: %d evaluated / %d skipped, want 1 / 0", third.Evaluated, third.Skipped)
+	}
+}
+
+func TestSkipUnchangedReevaluatesWhenReviewEvidenceLookupFails(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.July, 30, 10, 0, 0, 0, time.UTC)
+	previous := Report{
+		SourceFingerprint: "same",
+		EvaluatedAt:       now.Add(-time.Minute).Format(time.RFC3339Nano),
+		Eligible:          true,
+	}
+	if _, reused := skipUnchanged(previous, true, "same", now, "", true); reused {
+		t.Fatal("skipUnchanged() reused a cached success when review-evidence refresh was required")
 	}
 }
 

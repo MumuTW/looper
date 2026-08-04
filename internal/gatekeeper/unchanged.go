@@ -194,12 +194,13 @@ func latestGateReports(ctx context.Context, repos *storage.Repositories, project
 // enough — and re-evaluated only when it advances, instead of re-polling the
 // forge on every tick while a PR awaits human or reviewer progress.
 //
-// reviewEvidenceAppeared is the result of a cheap local event-log check made by
-// the caller for reports awaiting a current-head review. When the review event
-// has not appeared, the PR is skipped because re-evaluating would reach the same
-// conclusion without the event and would pay forge round trips every tick; when
-// it has appeared, the PR is re-evaluated so the new evidence is observed.
-func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now time.Time, currentConvergenceRevision string, reviewEvidenceAppeared bool) (Report, bool) {
+// reviewEvidenceRefreshRequired is the result of a cheap local event-log check
+// made by the caller for reports awaiting a current-head review. When no new
+// evidence is observed, the PR is skipped because re-evaluating would reach the
+// same conclusion without the event and would pay forge round trips every tick;
+// when evidence appears — or the lookup fails — it is re-evaluated so a stale
+// success is never reused while the evidence source is uncertain.
+func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now time.Time, currentConvergenceRevision string, reviewEvidenceRefreshRequired bool) (Report, bool) {
 	if !hasPrevious || strings.TrimSpace(previous.SourceFingerprint) == "" {
 		return Report{}, false
 	}
@@ -219,7 +220,7 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now ti
 			return Report{}, false
 		}
 	}
-	if reviewEvidenceAppeared {
+	if reviewEvidenceRefreshRequired {
 		return Report{}, false
 	}
 	evaluatedAt, err := time.Parse(time.RFC3339Nano, previous.EvaluatedAt)

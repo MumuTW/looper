@@ -432,6 +432,28 @@ func TestAutoGatekeeperAcceptsCleanCurrentHeadCodexReview(t *testing.T) {
 	}
 }
 
+func TestAutoGatekeeperDoesNotDuplicateMissingReviewReason(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	fixture.requireReviewBySize()
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{}
+	fixture.github.protection.RequiredChecks = []string{"ci", RequiredStatusContext}
+	fixture.github.protection.RequiredCheckRules = append(fixture.github.protection.RequiredCheckRules, githubinfra.RequiredCheckRule{Context: RequiredStatusContext})
+
+	report, err := fixture.autoRunner().EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	missingCount := 0
+	for _, reason := range report.Reasons {
+		if reason.Code == ReasonCodexReviewMissing {
+			missingCount++
+		}
+	}
+	if missingCount != 1 {
+		t.Fatalf("reasons = %#v, want exactly one codex_review_missing entry", report.Reasons)
+	}
+}
+
 func TestAutoGatekeeperAllowsSmallChangeWithoutCleanReview(t *testing.T) {
 	fixture := newGatekeeperFixtureWithoutReview(t)
 	fixture.github.detail.Additions = DefaultRequiredReviewChangedLines - 1
@@ -507,6 +529,48 @@ func TestAutoGatekeeperExplicitZeroDisablesReviewThreshold(t *testing.T) {
 	}
 	if !report.Eligible || report.Evidence.ReviewRequiredByPolicy || hasReason(report, ReasonCodexReviewMissing) {
 		t.Fatalf("report = %#v, want explicit zero to disable review requirement", report)
+	}
+}
+
+func TestAutoGatekeeperUsesEffectiveReviewThreshold(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	fixture.github.detail.Additions = 120
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{}
+	fixture.github.protection.RequiredChecks = []string{"ci", RequiredStatusContext}
+	fixture.github.protection.RequiredCheckRules = append(fixture.github.protection.RequiredCheckRules, githubinfra.RequiredCheckRule{Context: RequiredStatusContext})
+	runner := New(Options{
+		Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now },
+		PolicyPermitsTarget:                  func(string, string, string) bool { return fixture.policyPermits },
+		TrustForProject:                      func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+		RequiredReviewChangedLinesForProject: func(string) int { return 100 },
+	})
+
+	report, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !report.Evidence.ReviewRequiredByPolicy || report.Evidence.ChangedLines != 120 || !hasReason(report, ReasonCodexReviewRequired) {
+		t.Fatalf("report = %#v, want effective threshold 100 to require a review", report)
+	}
+}
+
+func TestAutoGatekeeperSkipsMergedBacklogWhenReviewThresholdDisabled(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = nil
+	fixture.github.mergedPullRequests = []githubinfra.PullRequestSummary{{Number: 91, HeadSHA: "merged-head", Additions: 200}}
+	runner := New(Options{
+		Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now },
+		PolicyPermitsTarget:                  func(string, string, string) bool { return fixture.policyPermits },
+		TrustForProject:                      func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+		RequiredReviewChangedLinesForProject: func(string) int { return 0 },
+	})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if result.UnreviewedMerged != 0 || fixture.github.mergedListCalls != 0 {
+		t.Fatalf("result = %#v, merged list calls = %d, want disabled backlog scan with no provider request", result, fixture.github.mergedListCalls)
 	}
 }
 
@@ -595,6 +659,7 @@ func TestAutoGatekeeperRefusesToReportSuccessWithoutProtectedContext(t *testing.
 type fakeGatekeeperGitHub struct {
 	openPullRequests   []githubinfra.PullRequestSummary
 	mergedPullRequests []githubinfra.PullRequestSummary
+	mergedListCalls    int
 	detail             githubinfra.PullRequestDetail
 	mergeable          githubinfra.PullRequestDetail
 	protection         githubinfra.BranchProtection
@@ -707,6 +772,7 @@ func (f *fakeGatekeeperGitHub) ListOpenPullRequests(context.Context, githubinfra
 	return f.openPullRequests, nil
 }
 func (f *fakeGatekeeperGitHub) ListMergedPullRequests(context.Context, githubinfra.ListMergedPullRequestsInput) ([]githubinfra.PullRequestSummary, error) {
+	f.mergedListCalls++
 	return f.mergedPullRequests, f.mergedPullRequestsErr
 }
 func (f *fakeGatekeeperGitHub) ViewPullRequestForGatekeeper(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {

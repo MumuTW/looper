@@ -388,7 +388,7 @@ func gatekeeperTrustIsAuto(trust GatekeeperTrustLevel) bool {
 const gatekeeperAutoCleanCommentConflictMessage = "requires a verified current-head review marker; set roles.reviewer.behavior.reviewEvents.clean to APPROVE or use gatekeeper trust observe/advise"
 
 func validateGatekeeperReviewEventCompatibility(config Config, issues *[]ValidationIssue) {
-	if gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust) && config.Roles.Reviewer.Behavior.ReviewEvents.Clean == ReviewerReviewEventComment {
+	if gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust) && config.Roles.Gatekeeper.RequiredReviewChangedLines > 0 && config.Roles.Reviewer.Behavior.ReviewEvents.Clean == ReviewerReviewEventComment {
 		*issues = append(*issues, ValidationIssue{Path: "roles.reviewer.behavior.reviewEvents.clean", Message: gatekeeperAutoCleanCommentConflictMessage})
 	}
 	for i, project := range config.Projects {
@@ -401,7 +401,7 @@ func validateGatekeeperReviewEventCompatibility(config Config, issues *[]Validat
 			continue
 		}
 		roles := ProjectRoleConfigs(config, project.ID)
-		if !gatekeeperTrustIsAuto(roles.Gatekeeper.Trust) || roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment {
+		if !gatekeeperTrustIsAuto(roles.Gatekeeper.Trust) || roles.Gatekeeper.RequiredReviewChangedLines <= 0 || roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment {
 			continue
 		}
 		path := fmt.Sprintf("projects[%d].roles.reviewer.behavior.reviewEvents.clean", i)

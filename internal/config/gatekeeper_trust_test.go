@@ -82,7 +82,7 @@ func TestGatekeeperAutoRejectsMarkerlessCommentCleanPolicy(t *testing.T) {
 	t.Parallel()
 	clean := ReviewerReviewEventComment
 	cfg := Config{Roles: RoleConfigs{
-		Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto},
+		Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto, RequiredReviewChangedLines: 200},
 		Reviewer:   ReviewerRoleConfig{Behavior: ReviewerConfig{ReviewEvents: ReviewerReviewEventsConfig{Clean: clean}}},
 	}}
 	var issues []ValidationIssue
@@ -97,13 +97,44 @@ func TestGatekeeperProjectAutoRejectsInheritedMarkerlessCommentCleanPolicy(t *te
 	clean := ReviewerReviewEventComment
 	auto := GatekeeperTrustAuto
 	cfg := Config{
-		Roles:    RoleConfigs{Reviewer: ReviewerRoleConfig{Behavior: ReviewerConfig{ReviewEvents: ReviewerReviewEventsConfig{Clean: clean}}}},
+		Roles:    RoleConfigs{Gatekeeper: GatekeeperRoleConfig{RequiredReviewChangedLines: 200}, Reviewer: ReviewerRoleConfig{Behavior: ReviewerConfig{ReviewEvents: ReviewerReviewEventsConfig{Clean: clean}}}},
 		Projects: []ProjectRefConfig{{ID: "demo", Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto}}}},
 	}
 	var issues []ValidationIssue
 	validateGatekeeperReviewEventCompatibility(cfg, &issues)
 	if len(issues) != 1 || issues[0].Path != "projects[0].roles.gatekeeper.trust" {
 		t.Fatalf("issues = %+v, want one project trust conflict", issues)
+	}
+}
+
+func TestGatekeeperAutoAllowsMarkerlessCommentWhenReviewThresholdDisabled(t *testing.T) {
+	t.Parallel()
+	clean := ReviewerReviewEventComment
+	cfg := Config{Roles: RoleConfigs{
+		Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto, RequiredReviewChangedLines: 0},
+		Reviewer:   ReviewerRoleConfig{Behavior: ReviewerConfig{ReviewEvents: ReviewerReviewEventsConfig{Clean: clean}}},
+	}}
+	var issues []ValidationIssue
+	validateGatekeeperReviewEventCompatibility(cfg, &issues)
+	if len(issues) != 0 {
+		t.Fatalf("issues = %+v, want markerless COMMENT allowed when threshold is disabled", issues)
+	}
+}
+
+func TestGatekeeperProjectThresholdOverrideControlsCommentCompatibility(t *testing.T) {
+	t.Parallel()
+	clean := ReviewerReviewEventComment
+	auto := GatekeeperTrustAuto
+	zero := 0
+	positive := 200
+	base := Config{
+		Roles:    RoleConfigs{Gatekeeper: GatekeeperRoleConfig{RequiredReviewChangedLines: 0}, Reviewer: ReviewerRoleConfig{Behavior: ReviewerConfig{ReviewEvents: ReviewerReviewEventsConfig{Clean: clean}}}},
+		Projects: []ProjectRefConfig{{ID: "disabled", Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto, RequiredReviewChangedLines: &zero}}}, {ID: "enabled", Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto, RequiredReviewChangedLines: &positive}}}},
+	}
+	var issues []ValidationIssue
+	validateGatekeeperReviewEventCompatibility(base, &issues)
+	if len(issues) != 1 || issues[0].Path != "projects[1].roles.gatekeeper.trust" {
+		t.Fatalf("issues = %+v, want only positive project threshold conflict", issues)
 	}
 }
 
