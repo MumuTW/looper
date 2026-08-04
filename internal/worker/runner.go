@@ -679,6 +679,12 @@ type workerCheckpoint struct {
 	// definition; post-agent validation must execute the named test but must
 	// not manufacture baseline evidence from the mutated checkout.
 	ReproductionAuthored bool `json:"reproductionAuthored,omitempty"`
+	// ReproductionHistorical preserves the exact manifest observed during the
+	// initial capture when it was scoped to another issue. It lets a completed
+	// retry distinguish unchanged already-fixed history from a newly authored
+	// wrong-scope manifest without treating the historical file as this task's
+	// reproduction authority.
+	ReproductionHistorical *reproducer.Manifest `json:"reproductionHistorical,omitempty"`
 	// ReproductionBaseline is the durable red evidence captured before the
 	// Worker agent is allowed to edit the worktree. It is separate from
 	// Validation because a non-zero reproduction test is expected here while
@@ -870,6 +876,13 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 		return nil
 	}
 	if manifest != nil {
+		if checkpoint.ReproductionAbsent && checkpoint.ReproductionHistorical != nil && manifest.Equal(*checkpoint.ReproductionHistorical) {
+			// The unchanged out-of-scope manifest was already recorded as
+			// historical during initial capture. It remains ignored after a
+			// successful execution; only a changed file can be newly authored
+			// evidence that needs the scope/contract gate below.
+			return nil
+		}
 		if checkpoint.ReproductionAbsent && checkpoint.Execution != nil && checkpoint.Execution.Status == "completed" && !workerAuthoredManifestScopeMatchesTask(*manifest, *checkpoint.Work) {
 			return reproductionFailure(errors.New("worker-authored reproduction manifest does not match the current issue scope"))
 		}
@@ -879,6 +892,10 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 			// agent file is not adopted on pre-execution resume.
 			if checkpoint.Work.Reproduction == nil {
 				checkpoint.ReproductionAbsent = true
+				if checkpoint.ReproductionHistorical == nil {
+					historical := *manifest
+					checkpoint.ReproductionHistorical = &historical
+				}
 			}
 			return nil
 		}
@@ -912,6 +929,7 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 			checkpoint.ReproductionAuthored = true
 		}
 		checkpoint.ReproductionAbsent = false
+		checkpoint.ReproductionHistorical = nil
 		return nil
 	}
 	// Durable negative observation so crash-resume cannot treat a later
@@ -3792,7 +3810,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		resumedCheckpoint = rewindCheckpointForExecuteRetry(checkpoint)
 	}
 	nowISO := r.nowISO()
-	encoded := runpipe.MustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Continuation: resumedCheckpoint.Continuation, Lifecycle: resumedCheckpoint.Lifecycle, ReproductionAbsent: resumedCheckpoint.ReproductionAbsent, ReproductionAuthored: resumedCheckpoint.ReproductionAuthored, ReproductionBaseline: resumedCheckpoint.ReproductionBaseline, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
+	encoded := runpipe.MustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Continuation: resumedCheckpoint.Continuation, Lifecycle: resumedCheckpoint.Lifecycle, ReproductionAbsent: resumedCheckpoint.ReproductionAbsent, ReproductionAuthored: resumedCheckpoint.ReproductionAuthored, ReproductionHistorical: resumedCheckpoint.ReproductionHistorical, ReproductionBaseline: resumedCheckpoint.ReproductionBaseline, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	// replaysAgentStep must reflect whether an agent process will actually
 	// run under the gate, not just whether the workflow reaches execute. A
@@ -4044,6 +4062,9 @@ func (r *Runner) getLatestCheckpoint(ctx context.Context, run storage.RunRecord,
 	}
 	if fallback.ReproductionAuthored {
 		checkpoint.ReproductionAuthored = true
+	}
+	if fallback.ReproductionHistorical != nil {
+		checkpoint.ReproductionHistorical = fallback.ReproductionHistorical
 	}
 	if fallback.PullRequest != nil {
 		checkpoint.PullRequest = fallback.PullRequest

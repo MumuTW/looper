@@ -431,6 +431,26 @@ func TestWorkerCaptureReproductionSkipsManifestScopedToOtherIssue(t *testing.T) 
 	}
 }
 
+func TestWorkerCaptureReproductionPreservesHistoricalManifestAcrossCompletion(t *testing.T) {
+	root, historical := writeWorkerReproductionFixtureWithIssue(t, 999, "MumuTW/looper")
+	checkpoint := workerCheckpoint{Work: &workerInput{Repo: "MumuTW/looper", IssueNumber: 113}}
+
+	if err := captureWorkerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("initial capture = %v, want historical manifest ignored", err)
+	}
+	if !checkpoint.ReproductionAbsent || checkpoint.ReproductionHistorical == nil || !checkpoint.ReproductionHistorical.Equal(*historical) {
+		t.Fatalf("checkpoint after initial capture = %#v, want historical identity and absence", checkpoint)
+	}
+
+	checkpoint.Execution = &checkpointExecution{Status: "completed", ParseStatus: "parsed"}
+	if err := captureWorkerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("post-completion capture = %v, want unchanged historical manifest preserved", err)
+	}
+	if checkpoint.Work.Reproduction != nil || !checkpoint.ReproductionAbsent {
+		t.Fatalf("checkpoint after completion = %#v, want historical manifest still ignored", checkpoint)
+	}
+}
+
 // TestWorkerCaptureReproductionAdoptsManifestScopedToSameIssue ensures a
 // manifest declaring the current task's issue is still adopted.
 func TestWorkerCaptureReproductionAdoptsManifestScopedToSameIssue(t *testing.T) {
