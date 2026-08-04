@@ -327,13 +327,16 @@ queue. Choose the merge method in the repository-owned `.mergify.yml`
 Reviewer still publishes the Codex review; it never enables GitHub's native
 auto-merge path.
 
-The route is label-based: Gatekeeper adds the exact `auto-merge` label only
-after a fresh current-head evaluation and removes it whenever a hold, review
-change, unresolved thread, policy change, provider failure, or other blocker is
-observed. A queued PR also receives `needs-human-review` before the trigger is
-removed, so a partial label failure cannot leave an accepted queue entry
-without a veto. Mergify's repository-owned `.mergify.yml` and GitHub branch
-protection are the external authorities that serialize and perform the merge.
+The route is label-based with a head-bound status guard: Gatekeeper adds the
+exact `auto-merge` label and publishes a `Looper Gatekeeper` success status for
+the same commit only after a fresh current-head evaluation. Mergify requires
+both, so a later push cannot inherit the prior route decision. Gatekeeper
+removes the label whenever a hold, review change, unresolved thread, policy
+change, provider failure, or other blocker is observed. A queued PR also
+receives `needs-human-review` before the trigger is removed, so a partial label
+failure cannot leave an accepted queue entry without a veto. Mergify's
+repository-owned `.mergify.yml` and GitHub branch protection are the external
+authorities that serialize and perform the merge.
 
 `roles.reviewer.autoMerge.*` remains parse-only migration input. An enabled
 legacy block cannot coexist with effective Gatekeeper `auto`; disable it and
@@ -343,8 +346,9 @@ merge events produced by the route (see [configuration](configuration.md#merge-g
 
 Reviewer still publishes its review outcome and never invokes `gh pr merge --auto`.
 
-Gatekeeper's current-head review is part of the route evaluation; a push must
-pass a new full evaluation before the label can be applied again.
+Gatekeeper's current-head review and `Looper Gatekeeper` status are part of the
+route evaluation; a push must pass a new full evaluation before the label and
+status can be applied again.
 
 Review capacity defaults to 200 changed lines (additions plus deletions). Set
 `roles.gatekeeper.requiredReviewChangedLines` or the project override to tune

@@ -156,6 +156,23 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 	if strings.TrimSpace(currentHead) != expectedHead {
 		return r.retireRoutingLabels(ctx, report, previous, fmt.Errorf("skip routing labels because pull request head moved from %s to %s", expectedHead, strings.TrimSpace(currentHead)))
 	}
+	// Mergify consumes both the label and this commit status. Publish the
+	// success status only after every final authority read above has passed, so
+	// it is bound to the exact head that the following label mutation will
+	// route. A status publication failure must fail closed: without the
+	// current-head status, the label alone is not an authorized route.
+	if plan.autoMerge {
+		if err := r.github.SetCommitStatus(ctx, githubinfra.CommitStatusInput{
+			Repo:        reportRepositoryTarget(report),
+			SHA:         strings.TrimSpace(currentHead),
+			Context:     RequiredStatusContext,
+			State:       "success",
+			Description: "Current-head Gatekeeper route passed",
+			CWD:         r.projectCWD(ctx, report.ProjectID),
+		}); err != nil {
+			return r.retireRoutingLabels(ctx, report, previous, fmt.Errorf("publish Gatekeeper status before routing labels: %w", err))
+		}
+	}
 	return r.applyRoutingLabelPlan(ctx, report, plan)
 }
 

@@ -54,6 +54,13 @@ func TestAutoTrustRoutesEligiblePullRequestThroughMergify(t *testing.T) {
 	if len(fixture.github.labelRemoves) != 1 || !slices.Equal(fixture.github.labelRemoves[0].Labels, []string{labels.NeedsHumanReview}) {
 		t.Fatalf("label removes = %#v, want stale %s removal", fixture.github.labelRemoves, labels.NeedsHumanReview)
 	}
+	if len(fixture.github.commitStatuses) != 1 {
+		t.Fatalf("commit statuses = %#v, want one current-head status", fixture.github.commitStatuses)
+	}
+	status := fixture.github.commitStatuses[0]
+	if status.SHA != "head-1" || status.Context != RequiredStatusContext || status.State != "success" {
+		t.Fatalf("commit status = %#v, want success for head-1 in %q context", status, RequiredStatusContext)
+	}
 	if events, err := fixture.repos.Events.List(context.Background(), 50); err != nil {
 		t.Fatalf("Events.List() error = %v", err)
 	} else {
@@ -62,6 +69,25 @@ func TestAutoTrustRoutesEligiblePullRequestThroughMergify(t *testing.T) {
 				t.Fatalf("auto trust emitted obsolete direct-merge outcome: %#v", event)
 			}
 		}
+	}
+}
+
+func TestRoutingLabelsSkipWhenStatusPublicationFails(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.statusErr = errors.New("status permission denied")
+	if _, err := routingRunner(fixture, config.GatekeeperTrustAuto).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	}); err == nil {
+		t.Fatal("EvaluatePullRequest() succeeded after current-head status publication failed")
+	}
+	if len(fixture.github.commitStatuses) != 0 {
+		t.Fatalf("commit statuses = %#v, want no recorded status after publication failure", fixture.github.commitStatuses)
+	}
+	if len(fixture.github.labelAdds) != 0 {
+		t.Fatalf("label adds = %#v, want no route when status publication fails", fixture.github.labelAdds)
+	}
+	if len(fixture.github.labelRemoves) != 2 || !slices.Equal(fixture.github.labelRemoves[0].Labels, []string{labels.AutoMerge}) || !slices.Equal(fixture.github.labelRemoves[1].Labels, []string{labels.NeedsHumanReview}) {
+		t.Fatalf("label removals = %#v, want stale routes retired after status failure", fixture.github.labelRemoves)
 	}
 }
 

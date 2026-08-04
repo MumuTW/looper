@@ -755,6 +755,9 @@ type fakeGatekeeperGitHub struct {
 	labelAdds             []githubinfra.PullRequestLabelsInput
 	labelRemoves          []githubinfra.PullRequestLabelsInput
 	labelErr              error
+	commitStatuses        []githubinfra.CommitStatusInput
+	statusCalls           []githubinfra.CommitStatusInput
+	statusErr             error
 	validateMergifyErr    error
 	validateMergifyCalls  int
 	listCalls             int
@@ -767,6 +770,8 @@ type fakeGatekeeperGitHub struct {
 	reviewMarkerCalls     []githubinfra.VerifyReviewMarkerInput
 	statusCalls           []githubinfra.CommitStatusInput
 	callSequence          []string
+	statusErr             error
+	statusCalls           []githubinfra.CommitStatusInput
 	statusErr             error
 	viewErr               error
 	mergedPullRequestsErr error
@@ -928,6 +933,14 @@ func (f *fakeGatekeeperGitHub) SetCommitStatus(_ context.Context, input githubin
 	f.statusCalls = append(f.statusCalls, input)
 	f.callSequence = append(f.callSequence, "commit-status")
 	return f.statusErr
+}
+
+func (f *fakeGatekeeperGitHub) SetCommitStatus(_ context.Context, input githubinfra.CommitStatusInput) error {
+	if f.statusErr != nil {
+		return f.statusErr
+	}
+	f.commitStatuses = append(f.commitStatuses, input)
+	return nil
 }
 
 func (f *fakeGatekeeperGitHub) ValidateMergifyRouting(context.Context, githubinfra.ValidateMergifyRoutingInput) error {

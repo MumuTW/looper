@@ -45,6 +45,7 @@ merge_protections:
 merge_protections_settings:
   auto_merge_conditions:
     - label = auto-merge
+    - check-success = "Looper Gatekeeper"
 `
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
@@ -69,6 +70,7 @@ func TestValidateMergifyRoutingRejectsMissingQueueVeto(t *testing.T) {
 merge_protections_settings:
   auto_merge_conditions:
     - label = auto-merge
+    - check-success = "Looper Gatekeeper"
 `
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
@@ -78,6 +80,31 @@ merge_protections_settings:
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
 	if err := gateway.ValidateMergifyRouting(context.Background(), ValidateMergifyRoutingInput{Repo: "acme/looper"}); err == nil {
 		t.Fatal("ValidateMergifyRouting() error = nil, want missing queue veto to fail closed")
+	}
+}
+
+func TestValidateMergifyRoutingRequiresCurrentHeadStatus(t *testing.T) {
+	t.Parallel()
+	content := `queue_rules:
+  - name: default
+    queue_conditions:
+      - base = main
+      - label != needs-human-review
+      - label != do-not-merge
+merge_protections:
+  - name: mergeable shape
+merge_protections_settings:
+  auto_merge_conditions:
+    - label = auto-merge
+`
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		return shell.Result{Stdout: base64.StdEncoding.EncodeToString([]byte(content))}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.ValidateMergifyRouting(context.Background(), ValidateMergifyRoutingInput{Repo: "acme/looper"}); err == nil {
+		t.Fatal("ValidateMergifyRouting() error = nil, want missing current-head status to fail closed")
 	}
 }
 
@@ -95,6 +122,7 @@ unrelated:
 merge_protections_settings:
   auto_merge_conditions:
     - label = auto-merge
+    - check-success = "Looper Gatekeeper"
 `
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
@@ -120,6 +148,7 @@ func TestValidateMergifyRoutingChecksEveryQueueRule(t *testing.T) {
 merge_protections_settings:
   auto_merge_conditions:
     - label = auto-merge
+    - check-success = "Looper Gatekeeper"
 `
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
@@ -146,6 +175,7 @@ func TestValidateMergifyRoutingRejectsMissingMergeProtections(t *testing.T) {
 merge_protections_settings:
   auto_merge_conditions:
     - label = auto-merge
+    - check-success = "Looper Gatekeeper"
 `
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {

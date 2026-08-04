@@ -35,7 +35,12 @@ const (
 	GateReportEventType = "pull_request.merge_gate.evaluated"
 	StatusEligible      = "eligible"
 	StatusBlocked       = "blocked"
-	reportVersion       = 2
+	// RequiredStatusContext is the current-head status consumed by the
+	// repository's Mergify auto-merge contract. The status is written only
+	// after the final Gatekeeper authority reads have passed, and is attached
+	// to exactly that observed commit SHA.
+	RequiredStatusContext = "Looper Gatekeeper"
+	reportVersion         = 2
 
 	// DefaultDiscoveryPullRequestLimit is how many open pull requests this lane
 	// lists when the caller sets no limit. Exported because the scheduler sizes its
@@ -241,6 +246,7 @@ type GitHubGateway interface {
 	SetCommitStatus(context.Context, githubinfra.CommitStatusInput) error
 	AddPullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
 	RemovePullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
+	SetCommitStatus(context.Context, githubinfra.CommitStatusInput) error
 	ValidateMergifyRouting(context.Context, githubinfra.ValidateMergifyRoutingInput) error
 }
 

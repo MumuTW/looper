@@ -2508,6 +2508,9 @@ func (g *Gateway) ValidateMergifyRouting(ctx context.Context, input ValidateMerg
 	if !hasMergifyCondition(contract.MergeProtectionsSettings.AutoMergeConditions, "label = "+labels.AutoMerge) {
 		return fmt.Errorf(".mergify.yml has no auto-merge label contract")
 	}
+	if !hasMergifyCondition(contract.MergeProtectionsSettings.AutoMergeConditions, `check-success = "Looper Gatekeeper"`) {
+		return fmt.Errorf(`.mergify.yml has no current-head Gatekeeper status contract`)
+	}
 	return nil
 }
 

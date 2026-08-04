@@ -934,7 +934,7 @@ decides what it may do with that judgement.
 | --- | --- |
 | `observe` (default) | Gate report only. Nothing is published, nothing is merged. |
 | `advise` | Publishes the verdict and reconciles the human-review route. Escalations receive `needs-human-review`; eligible PRs do not receive the queue-activating `auto-merge` label, so a human still decides whether to queue them. |
-| `auto` | Publishes the `Looper Gatekeeper` status for the exact **pull request head SHA** and routes through the same Mergify labels without a daemon-side merge call. GitHub branch protection consumes the status; Mergify's serialized queue rechecks branch protection and performs the merge. |
+| `auto` | Publishes the `Looper Gatekeeper` status for the exact **pull request head SHA** and routes through the same Mergify labels without a daemon-side merge call. Gatekeeper publishes the required success status for the evaluated head; Mergify's serialized queue rechecks that status and branch protection before performing the merge. |
 
 ### How `auto` reaches the merge queue
 
@@ -954,10 +954,12 @@ whichever wins the race decides, and Reviewer's path checks a strictly narrower
 set of gates.
 
 At `auto`, Gatekeeper revalidates the observed head before each routing-label
-mutation. An eligible report gets `auto-merge`, which is the sole opt-in signal
-under `.mergify.yml`; the queue then re-tests the PR against the current `main`
-and GitHub branch protection before merging. If the head changes before the
-label projection, Gatekeeper skips the write and retries on the next evaluation.
+mutation. An eligible report gets `auto-merge` plus a `Looper Gatekeeper`
+success status attached to that exact head; `.mergify.yml` requires both for
+automatic queue entry. The queue then re-tests the PR against the current
+`main` and GitHub branch protection before merging. If the head changes before
+the label or status projection, Gatekeeper skips the write and retries on the
+next evaluation.
 `needs-human-review` and `do-not-merge` are explicit Mergify vetoes, so an
 escalation removes `auto-merge` before applying the human-review route.
 
@@ -1003,8 +1005,9 @@ when a published project is demoted to `observe`):
 - neither label for mechanical blockers such as pending checks or conflicts.
 
 The labels are defined in `internal/labels` and are the exact host-repository
-contract consumed by Mergify. Gatekeeper never rewrites or removes unrelated
-labels.
+contract consumed by Mergify. The `Looper Gatekeeper` commit status is bound by
+GitHub to one immutable commit, so a later push cannot inherit an old eligible
+decision. Gatekeeper never rewrites or removes unrelated labels.
 
 ### The owned comment and its lifecycle
 
@@ -1110,9 +1113,15 @@ Reviewers should weigh these blind spots before relying on it:
   the head does not. The discovery fingerprint includes the base SHA so a
   rewritten merge base invalidates a reused verdict rather than serving a stale
   one for up to the skip window.
-- At the `auto` trust level Gatekeeper publishes commit status only; it never
-  merges. The diff-budget gate still runs on each evaluation and fails closed when
-  the enabled stats cannot be read or the merge base advances between reads.
+- At the `auto` trust level Gatekeeper publishes a route label and a
+  head-bound success status; it never merges. The diff-budget gate still runs
+  on each evaluation and fails closed when the enabled stats cannot be read or
+  the merge base advances between reads. Mergify performs the eventual merge
+  from its serialized queue. The base branch can advance after Gatekeeper's
+  evaluation and before Mergify evaluates the queued item, so the final merge
+  may use a recomputed diff that exceeds the observed budget. Mergify's queue
+  and branch-protection checks remain the merge authority; the Gatekeeper route
+  is evidence, not an atomic merge guarantee.
 
 ## Pipeline digest (`roles.escalator`)
 
