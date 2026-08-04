@@ -461,9 +461,11 @@ func TestClassifyMarksGateReportForOlderHeadAsStale(t *testing.T) {
 	t.Parallel()
 
 	current := snapshot(t, 1, payloadOptions{})
+	current.CapturedAt = iso(testNow.Add(-3 * time.Second))
 	current.HeadSHA = "new-head"
 	older := report(1, true)
 	older.ObservedHeadSHA = "old-head"
+	older.EvaluatedAt = iso(testNow.Add(-2 * time.Hour))
 
 	board := Classify(Input{
 		Now:       testNow,
@@ -477,6 +479,9 @@ func TestClassifyMarksGateReportForOlderHeadAsStale(t *testing.T) {
 	}
 	if group != GroupMachine {
 		t.Fatalf("stale report group = %v, want machine", group)
+	}
+	if !row.ChangedAt.Equal(parseTimestamp(current.CapturedAt)) || !row.Changed {
+		t.Fatalf("stale report age = (%v, changed=%v), want snapshot capture time and fresh highlight", row.ChangedAt, row.Changed)
 	}
 }
 

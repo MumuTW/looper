@@ -394,7 +394,7 @@ func reportForSnapshot(report *gatekeeper.Report, snapshot storage.PullRequestSn
 	}
 	observed, current := strings.TrimSpace(report.ObservedHeadSHA), strings.TrimSpace(snapshot.HeadSHA)
 	if observed != "" && current != "" && !strings.EqualFold(observed, current) {
-		return staleSnapshotReport(report)
+		return staleSnapshotReport(report, snapshot)
 	}
 
 	// A snapshot can keep the same head while reviews, holds, checks, or
@@ -403,16 +403,19 @@ func reportForSnapshot(report *gatekeeper.Report, snapshot storage.PullRequestSn
 	// below so an equal-head report cannot make an unevaluated state look ready.
 	payload := decodeSnapshotPayload(snapshot.PayloadJSON)
 	if reportSnapshotFingerprintChanged(*report, payload) || reportSnapshotEvidenceChanged(*report, payload, snapshot) {
-		return staleSnapshotReport(report)
+		return staleSnapshotReport(report, snapshot)
 	}
 	return report
 }
 
-func staleSnapshotReport(report *gatekeeper.Report) *gatekeeper.Report {
+func staleSnapshotReport(report *gatekeeper.Report, snapshot storage.PullRequestSnapshotRecord) *gatekeeper.Report {
 	stale := *report
 	stale.Status = gatekeeper.StatusBlocked
 	stale.Eligible = false
 	stale.Reasons = []gatekeeper.Reason{{Code: gatekeeper.ReasonHeadStale}}
+	if capturedAt := strings.TrimSpace(snapshot.CapturedAt); capturedAt != "" {
+		stale.EvaluatedAt = capturedAt
+	}
 	return &stale
 }
 
