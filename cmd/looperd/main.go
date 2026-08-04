@@ -461,21 +461,26 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	// looper-fix-<project>-pr-N). Empty target key is a no-op.
 	unlockLoop := looperdruntime.LockLoopRequeue(loopID)
 	var unlockTarget func() = func() {}
+	var releaseOnce sync.Once
 	releaseLocks := func() {
-		unlockTarget()
-		unlockLoop()
+		releaseOnce.Do(func() {
+			unlockTarget()
+			unlockLoop()
+		})
 	}
+	// Keep one cleanup path for every abortable read below. The locks must be
+	// released before the post-Hold halt drain, but the deferred cleanup covers
+	// future returns added before that explicit release as well.
+	defer releaseLocks()
 	if services.Repositories != nil && services.Repositories.Loops != nil {
 		loop, err := services.Repositories.Loops.GetByID(ctx, loopID)
 		if err != nil {
 			// Fail closed: a transient storage error must not proceed without
 			// the shared PR fence while sibling cleanup can still delete the
 			// checkout.
-			releaseLocks()
 			return result, fmt.Errorf("load loop before takeover target fence: %w", err)
 		}
 		if loop == nil {
-			releaseLocks()
 			return result, fmt.Errorf("loop not found before takeover target fence: %s", loopID)
 		}
 		unlockTarget = loops.LockLoopTarget(loops.LoopTargetGuardKeyFromRecord(*loop))
@@ -489,7 +494,6 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 			// needs to resume the exact session. Abort before any lifecycle
 			// mutation; a genuinely absent execution (nil, no error) still
 			// takes over with empty ownership fields.
-			releaseLocks()
 			return result, fmt.Errorf("load latest agent execution before takeover: %w", err)
 		}
 		if execution != nil {
@@ -518,7 +522,6 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 			run, err = services.Repositories.Runs.GetLatestByLoopID(ctx, loopID)
 		}
 		if err != nil {
-			releaseLocks()
 			return result, fmt.Errorf("load agent run before takeover: %w", err)
 		}
 		if run != nil && run.AgentSnapshotJSON != nil && strings.TrimSpace(*run.AgentSnapshotJSON) != "" {
@@ -538,7 +541,6 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	// tick; Hold commits human_takeover and cancellation together.
 	preflight, err := loadHaltPreflight(ctx, services, loopID)
 	if err != nil {
-		releaseLocks()
 		return result, err
 	}
 	reasonCopy := reason

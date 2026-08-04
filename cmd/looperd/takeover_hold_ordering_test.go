@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -121,6 +122,42 @@ func TestTakeoverLoopSurvivesMalformedReasoningSnapshot(t *testing.T) {
 	if result.ReasoningEffort != nil {
 		t.Fatalf("ReasoningEffort = %v, want omitted for malformed snapshot", result.ReasoningEffort)
 	}
+}
+
+func TestTakeoverLoopReleasesLocksWhenRunLookupFails(t *testing.T) {
+	ctx := context.Background()
+	f := newTakeoverFixture(t)
+	// Keep the loop and execution rows readable, but make the correlated run
+	// lookup fail after takeover has acquired both guards.
+	if _, err := f.services.Coordinator.DB().ExecContext(ctx, "ALTER TABLE runs RENAME TO runs_missing"); err != nil {
+		t.Fatalf("rename runs table error = %v", err)
+	}
+
+	_, err := takeoverLoop(ctx, f.services, f.loopID, "Taken over by test", func() time.Time { return f.now }, func(int, syscall.Signal) error { return nil }, nil)
+	if err == nil || !strings.Contains(err.Error(), "load agent run before takeover") {
+		t.Fatalf("takeoverLoop() error = %v, want correlated run lookup failure", err)
+	}
+
+	assertGuardAvailable := func(name string, acquire func() func()) {
+		t.Helper()
+		done := make(chan struct{})
+		go func() {
+			release := acquire()
+			release()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatalf("%s remained held after takeover lookup failure", name)
+		}
+	}
+	assertGuardAvailable("loop requeue lock", func() func() {
+		return looperdruntime.LockLoopRequeue(f.loopID)
+	})
+	assertGuardAvailable("target lock", func() func() {
+		return loops.LockLoopTarget(loops.LoopTargetGuardKey("project_1", "fixer", "pull_request", "pull_request:acme/looper:41"))
+	})
 }
 
 func TestTakeoverLoopCorrelatesReasoningEffortWithSelectedExecutionRun(t *testing.T) {
