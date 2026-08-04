@@ -71,6 +71,33 @@ type Manifest struct {
 	Entries     []Entry `json:"entries"`
 }
 
+// ClosureDirectories returns the minimal directory roots containing the
+// verified closure entries. Callers should use this only after VerifyManifest
+// succeeds; the root-owned manifest remains the authority for these paths.
+func (m Manifest) ClosureDirectories() []string {
+	seen := make(map[string]struct{}, len(m.Entries))
+	result := make([]string, 0, len(m.Entries))
+	for _, entry := range m.Entries {
+		dir := filepath.Dir(entry.Path)
+		if dir == string(filepath.Separator) {
+			continue
+		}
+		if m.PackageRoot != "" && pathContains(m.PackageRoot, dir) {
+			// The package tree is already exposed as one sealed module root;
+			// avoid expanding the settings payload with every nested package
+			// directory.
+			continue
+		}
+		if _, ok := seen[dir]; ok {
+			continue
+		}
+		seen[dir] = struct{}{}
+		result = append(result, dir)
+	}
+	sort.Strings(result)
+	return result
+}
+
 // Input names the complete runtime node_modules tree and every executable root
 // the sandbox spawn path can use. Roots must include srt and all
 // platform-required support tools.
@@ -229,27 +256,35 @@ func VerifyRootOwnership(path string) error {
 // verify-to-exec TOCTOU window. On hosts where the daemon user has passwordless
 // sudo, root ownership is also not a hard boundary; that user is root-equivalent.
 func Verify(path string, input Input) error {
+	_, err := VerifyManifest(path, input)
+	return err
+}
+
+// VerifyManifest is Verify with the validated root-owned manifest returned to
+// the caller so runtime setup can project its already-authorized closure paths
+// into the sandbox namespace without reparsing a second authority.
+func VerifyManifest(path string, input Input) (Manifest, error) {
 	if os.Geteuid() == 0 {
-		return fmt.Errorf("sandboxed execution is not supported as root")
+		return Manifest{}, fmt.Errorf("sandboxed execution is not supported as root")
 	}
 	manifest, err := loadRootSealed(path)
 	if err != nil {
-		return err
+		return Manifest{}, err
 	}
 	if err := verifyRecordedContent(manifest); err != nil {
-		return err
+		return Manifest{}, err
 	}
 	if err := verifyInputRoots(manifest, input); err != nil {
-		return err
+		return Manifest{}, err
 	}
 	current, err := Build(input)
 	if err != nil {
-		return fmt.Errorf("rebuild executable closure: %w", err)
+		return Manifest{}, fmt.Errorf("rebuild executable closure: %w", err)
 	}
 	if err := compareManifests(manifest, current); err != nil {
-		return err
+		return Manifest{}, err
 	}
-	return nil
+	return manifest, nil
 }
 
 func verifyInputRoots(manifest Manifest, input Input) error {

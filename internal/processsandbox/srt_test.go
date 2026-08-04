@@ -29,6 +29,16 @@ func TestRuntimePathsAllowReadSealedModuleRoot(t *testing.T) {
 	}
 }
 
+func TestRuntimePathsAllowReadVerifiedClosureDirectories(t *testing.T) {
+	paths := runtimePaths{closureDirectories: []string{"/opt/runtime/lib", "/nix/store/hash/lib"}}
+	got := paths.directories()
+	for _, want := range []string{"/opt/runtime/lib", "/nix/store/hash/lib"} {
+		if !contains(got, want) {
+			t.Fatalf("directories() = %#v, want verified closure directory %s", got, want)
+		}
+	}
+}
+
 func TestRunSuppliesReviewedPolicyAndIsolatedEnvironment(t *testing.T) {
 	root := t.TempDir()
 	resolvedRoot, err := filepath.EvalSymlinks(root)

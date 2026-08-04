@@ -207,6 +207,20 @@ func TestSyncManifestDirectory(t *testing.T) {
 	}
 }
 
+func TestManifestClosureDirectoriesDeduplicatesAndSorts(t *testing.T) {
+	manifest := Manifest{PackageRoot: "/opt/runtime/lib/node_modules", Entries: []Entry{
+		{Path: "/opt/runtime/lib/libfoo.dylib"},
+		{Path: "/opt/runtime/lib/libbar.dylib"},
+		{Path: "/opt/runtime/bin/node"},
+		{Path: "/opt/runtime/lib/node_modules/pkg/index.js"},
+		{Path: "/lib/system-loader"},
+	}}
+	want := []string{"/lib", "/opt/runtime/bin", "/opt/runtime/lib"}
+	if got := manifest.ClosureDirectories(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ClosureDirectories() = %#v, want %#v", got, want)
+	}
+}
+
 func TestParseLDDOutputIncludesLibrariesAndInterpreter(t *testing.T) {
 	root := t.TempDir()
 	lib := filepath.Join(root, "libc.so.6")

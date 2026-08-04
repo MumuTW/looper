@@ -246,16 +246,17 @@ const (
 )
 
 type runtimePaths struct {
-	command    string
-	moduleRoot string
-	node       string
-	ripgrep    string
-	bwrap      string
-	socat      string
+	command            string
+	moduleRoot         string
+	closureDirectories []string
+	node               string
+	ripgrep            string
+	bwrap              string
+	socat              string
 }
 
 func (p runtimePaths) directories() []string {
-	result := make([]string, 0, 6)
+	result := make([]string, 0, 6+len(p.closureDirectories))
 	for _, path := range []string{p.command, p.node, p.ripgrep, p.bwrap, p.socat} {
 		if path != "" {
 			result = append(result, filepath.Dir(path))
@@ -264,6 +265,7 @@ func (p runtimePaths) directories() []string {
 	if p.moduleRoot != "" {
 		result = append(result, p.moduleRoot)
 	}
+	result = append(result, p.closureDirectories...)
 	return compact(result)
 }
 
@@ -377,13 +379,15 @@ func installedRuntime(cwd string, prependPath []string) (runtimePaths, error) {
 	}
 	launchPath := append([]string(nil), prependPath...)
 	launchPath = append(launchPath, filepath.SplitList(os.Getenv("PATH"))...)
-	if err := trustmanifest.Verify(trustmanifest.ManifestPath(moduleRoot), trustmanifest.Input{
+	manifest, err := trustmanifest.VerifyManifest(trustmanifest.ManifestPath(moduleRoot), trustmanifest.Input{
 		PackageRoot: moduleRoot,
 		Roots:       resolvedRoots,
 		LaunchPath:  launchPath,
-	}); err != nil {
+	})
+	if err != nil {
 		return runtimePaths{}, fmt.Errorf("process sandbox: untrusted srt installation: %w", err)
 	}
+	paths.closureDirectories = manifest.ClosureDirectories()
 	return paths, nil
 }
 
