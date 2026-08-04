@@ -3756,15 +3756,27 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// adopted only after the merge completes.
 	mergeConflicted := false
 	if hasConflict {
-		if checkpoint.ReproductionMergePhase == fixerReproductionMergeConflicted {
+		switch checkpoint.ReproductionMergePhase {
+		case fixerReproductionMergeConflicted:
 			mergeConflicted = true
-		} else {
-			if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
-				return checkpoint, err
-			}
-			checkpoint.ReproductionMergePhase = fixerReproductionMergePending
-			if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
-				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		case fixerReproductionMergeCompleted:
+			// The daemon already completed the merge and persisted that
+			// authority. Resume directly at post-merge capture; re-running
+			// merge here would either duplicate a clean merge or discard a
+			// recovered conflict.
+		default:
+			// An empty phase is the first attempt and must capture before the
+			// merge. A pending phase means that capture and the pending
+			// boundary were already persisted before a crash; resume the
+			// gateway directly so it can recover MERGE_HEAD or a clean merge.
+			if checkpoint.ReproductionMergePhase != fixerReproductionMergePending {
+				if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
+					return checkpoint, err
+				}
+				checkpoint.ReproductionMergePhase = fixerReproductionMergePending
+				if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
+					return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+				}
 			}
 			base := strings.TrimSpace(checkpoint.Detail.BaseRefName)
 			if base == "" {
@@ -3793,6 +3805,12 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		// agent-authored files remain fenced by ReproductionAbsent.
 		if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
 			return checkpoint, err
+		}
+		// The completed phase authorizes only this immediate post-merge
+		// observation. Clear it before the agent starts so a later file is
+		// never mistaken for daemon-introduced authority after a retry.
+		if checkpoint.ReproductionMergePhase == fixerReproductionMergeCompleted {
+			checkpoint.ReproductionMergePhase = ""
 		}
 	}
 	validationCommands = fixerValidationCommands(validationCommands, checkpoint)

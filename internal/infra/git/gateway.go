@@ -1877,8 +1877,30 @@ func (g *Gateway) MergeBaseIntoWorktree(ctx context.Context, input MergeBaseInpu
 	if base == "" {
 		return MergeBaseResult{}, fmt.Errorf("base branch is required")
 	}
+	// A daemon can die after Git has left conflict state but before the
+	// checkpoint records Conflicted. MERGE_HEAD is Git's durable authority for
+	// that state; re-running an ordinary merge would fail and the gateway's
+	// non-conflict error path would abort the very markers the agent needs.
+	mergeInProgress, err := g.mergeInProgress(ctx, input.WorktreePath)
+	if err != nil {
+		return MergeBaseResult{}, fmt.Errorf("inspect in-progress merge: %w", err)
+	}
+	if mergeInProgress {
+		return MergeBaseResult{Conflicted: true}, nil
+	}
 	if err := g.FetchBranch(ctx, input.WorktreePath, remote, base); err != nil {
 		return MergeBaseResult{}, err
+	}
+	// A clean merge can complete before the daemon persists its completed
+	// phase. On resume, the fetched base being an ancestor of HEAD is Git's
+	// durable proof that no second merge is needed; this also covers a
+	// fast-forward or an already-up-to-date worktree.
+	alreadyUpToDate, err := g.IsAncestor(ctx, input.WorktreePath, remote+"/"+base, "HEAD")
+	if err != nil {
+		return MergeBaseResult{}, err
+	}
+	if alreadyUpToDate {
+		return MergeBaseResult{AlreadyUpToDate: true}, nil
 	}
 	res, err := g.runGitResult(ctx, input.WorktreePath, nil, "merge", "--no-edit", remote+"/"+base)
 	out := res.Stdout + res.Stderr
@@ -1891,6 +1913,40 @@ func (g *Gateway) MergeBaseIntoWorktree(ctx context.Context, input MergeBaseInpu
 	// Some other merge failure — abort so the worktree isn't left half-merged.
 	_, _ = g.runGitResult(ctx, input.WorktreePath, nil, "merge", "--abort")
 	return MergeBaseResult{}, err
+}
+
+func (g *Gateway) mergeInProgress(ctx context.Context, worktreePath string) (bool, error) {
+	result, err := g.runGitResult(ctx, worktreePath, nil, "rev-parse", "--git-path", "MERGE_HEAD")
+	if err != nil {
+		return false, err
+	}
+	mergeHeadPath := strings.TrimSpace(result.Stdout)
+	if mergeHeadPath == "" {
+		return false, nil
+	}
+	if !filepath.IsAbs(mergeHeadPath) {
+		mergeHeadPath = filepath.Join(worktreePath, mergeHeadPath)
+	}
+	info, err := os.Stat(filepath.Clean(mergeHeadPath))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !info.IsDir(), nil
+}
+
+func (g *Gateway) isAncestor(ctx context.Context, repoPath, ancestor, descendant string) (bool, error) {
+	_, err := g.runGitResult(ctx, repoPath, nil, "merge-base", "--is-ancestor", ancestor, descendant)
+	if err == nil {
+		return true, nil
+	}
+	var commandErr *shell.CommandExecutionError
+	if errors.As(err, &commandErr) && commandErr.Result.ExitCode == 1 {
+		return false, nil
+	}
+	return false, err
 }
 
 func (g *Gateway) isHealthyWorktree(ctx context.Context, worktreePath string) (bool, error) {

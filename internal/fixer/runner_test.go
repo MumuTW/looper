@@ -6633,6 +6633,81 @@ func TestRunRepairStepSkipsWhenFixerHoldAppliedBeforeAgentStart(t *testing.T) {
 	}
 }
 
+func TestRunRepairStepRecoversPendingMergeBeforeCapture(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	worktreeRoot, manifest := writeFixerReproductionFixture(t)
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, filepath.Dir(worktreeRoot))
+	git := &fakeGitGateway{mergeBaseResult: MergeBaseResult{AlreadyUpToDate: true}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", ParseStatus: "parsed", CompletionPayload: `{"outcome":"completed","summary":"resolved fixes"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint := fixerCheckpoint{
+		Detail:                 &checkpointDetail{HeadRefName: "feature/fix-42", BaseRefName: "main", HeadSHA: "head-1"},
+		FixItems:               []FixItem{{ID: "fix-1", Type: "conflict", Summary: "merge conflict"}},
+		FixItemsHash:           "hash-1",
+		Worktree:               &checkpointWorktree{Path: worktreeRoot, Branch: "feature/fix-42", HeadSHA: "head-1", PreparedAt: fixture.nowISO()},
+		ReproductionAbsent:     true,
+		ReproductionMergePhase: fixerReproductionMergePending,
+	}
+	checkpoint, err := runner.runRepairStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir(), MetadataJSON: &metadata},
+		Loop:    storage.LoopRecord{ID: "loop_pending_merge", Type: "fixer"},
+		Run:     storage.RunRecord{ID: "run_pending_merge"},
+		Repo:    "acme/looper", PRNumber: 42, Checkpoint: checkpoint,
+	})
+	if err != nil {
+		t.Fatalf("runRepairStep() error = %v", err)
+	}
+	if len(git.mergeBaseCalls) != 1 {
+		t.Fatalf("len(git.mergeBaseCalls) = %d, want one resumed merge", len(git.mergeBaseCalls))
+	}
+	if checkpoint.Reproduction == nil || !checkpoint.Reproduction.Equal(*manifest) {
+		t.Fatalf("Reproduction = %#v, want base-authored manifest adopted after resumed clean merge", checkpoint.Reproduction)
+	}
+	if checkpoint.ReproductionMergePhase != "" {
+		t.Fatalf("ReproductionMergePhase = %q, want cleared after post-merge capture", checkpoint.ReproductionMergePhase)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) = %d, want one repair agent", len(agent.starts))
+	}
+}
+
+func TestRunRepairStepClearsCompletedMergePhaseBeforeAgent(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	worktreeRoot := t.TempDir()
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, filepath.Dir(worktreeRoot))
+	git := &fakeGitGateway{}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", ParseStatus: "parsed", CompletionPayload: `{"outcome":"completed","summary":"resolved fixes"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint, err := runner.runRepairStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir(), MetadataJSON: &metadata},
+		Loop:    storage.LoopRecord{ID: "loop_completed_merge", Type: "fixer"},
+		Run:     storage.RunRecord{ID: "run_completed_merge"},
+		Repo:    "acme/looper", PRNumber: 42,
+		Checkpoint: fixerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/fix-42", BaseRefName: "main", HeadSHA: "head-1"},
+			FixItems: []FixItem{{ID: "fix-1", Type: "conflict", Summary: "merge conflict"}}, FixItemsHash: "hash-1",
+			Worktree:           &checkpointWorktree{Path: worktreeRoot, Branch: "feature/fix-42", HeadSHA: "head-1", PreparedAt: fixture.nowISO()},
+			ReproductionAbsent: true, ReproductionMergePhase: fixerReproductionMergeCompleted,
+		},
+	})
+	if err != nil {
+		t.Fatalf("runRepairStep() error = %v", err)
+	}
+	if len(git.mergeBaseCalls) != 0 {
+		t.Fatalf("len(git.mergeBaseCalls) = %d, want no second merge", len(git.mergeBaseCalls))
+	}
+	if checkpoint.ReproductionMergePhase != "" {
+		t.Fatalf("ReproductionMergePhase = %q, want cleared before agent start", checkpoint.ReproductionMergePhase)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) = %d, want one repair agent", len(agent.starts))
+	}
+}
+
 func TestRunRepairStepRecreatesCheckpointOutsideWorktreeRootAndRunsAgent(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
