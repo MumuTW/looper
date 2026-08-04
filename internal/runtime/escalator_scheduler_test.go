@@ -96,6 +96,39 @@ func TestRuntimeEscalatorLinks(t *testing.T) {
 	}
 }
 
+func TestRuntimeEscalatorLinksUseConfiguredProvider(t *testing.T) {
+	provider := config.ProviderConfig{ID: "enterprise", Kind: config.ProviderKindGitHub, BaseURL: "https://ghe.example.test/api/v3"}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Providers = []config.ProviderConfig{provider}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "enterprise-project", Provider: provider.ID, Repo: "acme/looper", RepoPath: t.TempDir()}}
+
+	links := newRuntimeEscalatorLinker(cfg)
+	if got := links.PullRequest("enterprise-project", "acme/looper", 42); got != "https://ghe.example.test/acme/looper/pull/42" {
+		t.Fatalf("PullRequest() = %q, want configured provider browser URL", got)
+	}
+	if got := links.Issue("enterprise-project", "acme/looper", 7); got != "https://ghe.example.test/acme/looper/issues/7" {
+		t.Fatalf("Issue() = %q, want configured provider browser URL", got)
+	}
+}
+
+func TestRuntimeEscalatorLinksNormalizeGitHubAPIProvider(t *testing.T) {
+	provider := config.ProviderConfig{ID: "github-api", Kind: config.ProviderKindGitHub, BaseURL: "https://api.github.com"}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Providers = []config.ProviderConfig{provider}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "cloud-project", Provider: provider.ID, Repo: "acme/looper", RepoPath: t.TempDir()}}
+
+	links := newRuntimeEscalatorLinker(cfg)
+	if got := links.PullRequest("cloud-project", "acme/looper", 42); got != "https://github.com/acme/looper/pull/42" {
+		t.Fatalf("PullRequest() = %q, want public GitHub browser URL", got)
+	}
+}
+
 func TestBuildDefaultSchedulerWiresEscalatorOnlyWhenEnabled(t *testing.T) {
 	cfg, err := config.DefaultConfig(t.TempDir())
 	if err != nil {

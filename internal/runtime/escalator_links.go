@@ -15,6 +15,7 @@ import (
 
 type runtimeEscalatorLinker struct {
 	dashboardBase string
+	projectBases  map[string]string
 }
 
 // NewEscalatorLinker builds the action links every Escalator projection points
@@ -51,19 +52,75 @@ func newRuntimeEscalatorLinker(cfg config.Config) runtimeEscalatorLinker {
 		}
 		base = "http://" + net.JoinHostPort(host, strconv.Itoa(cfg.Server.Port))
 	}
-	return runtimeEscalatorLinker{dashboardBase: base + "/dashboard"}
+	projectBases := make(map[string]string, len(cfg.Projects))
+	for _, project := range cfg.Projects {
+		identity, ok := config.ProjectRepositoryIdentity(cfg, project)
+		if !ok {
+			continue
+		}
+		if browserBase := repositoryBrowserOrigin(identity.BaseURL); browserBase != "" {
+			projectBases[strings.TrimSpace(project.ID)] = browserBase
+		}
+	}
+	return runtimeEscalatorLinker{dashboardBase: base + "/dashboard", projectBases: projectBases}
 }
 
-func (l runtimeEscalatorLinker) Issue(_ string, repo string, number int64) string {
-	return fmt.Sprintf("%s/issues/%d", repositoryBrowserBase(repo), number)
+func (l runtimeEscalatorLinker) Issue(projectID, repo string, number int64) string {
+	return fmt.Sprintf("%s/issues/%d", l.projectRepositoryBase(projectID, repo), number)
 }
 
-func (l runtimeEscalatorLinker) PullRequest(_ string, repo string, number int64) string {
-	return fmt.Sprintf("%s/pull/%d", repositoryBrowserBase(repo), number)
+func (l runtimeEscalatorLinker) PullRequest(projectID, repo string, number int64) string {
+	return fmt.Sprintf("%s/pull/%d", l.projectRepositoryBase(projectID, repo), number)
 }
 
 func (l runtimeEscalatorLinker) Loop(_ string, seq int64) string {
 	return fmt.Sprintf("%s/loops/%d", l.dashboardBase, seq)
+}
+
+func (l runtimeEscalatorLinker) projectRepositoryBase(projectID, repo string) string {
+	if browserOrigin := l.projectBases[strings.TrimSpace(projectID)]; browserOrigin != "" {
+		if slug := repositorySlug(repo); slug != "" {
+			return browserOrigin + "/" + slug
+		}
+	}
+	return repositoryBrowserBase(repo)
+}
+
+func repositorySlug(repo string) string {
+	repo = strings.Trim(strings.TrimSpace(repo), "/")
+	if parsed, err := url.Parse(repo); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		repo = strings.Trim(parsed.Path, "/")
+	}
+	parts := strings.Split(repo, "/")
+	if len(parts) >= 3 && strings.Contains(parts[0], ".") {
+		repo = strings.Join(parts[1:], "/")
+	}
+	return strings.Trim(repo, "/")
+}
+
+// repositoryBrowserOrigin converts the configured GitHub API endpoint into
+// the browser origin used by pull-request and issue links. GitHub Enterprise
+// commonly exposes its API at /api/v3 while the web UI lives at the origin;
+// public GitHub's api.github.com likewise has a different API hostname.
+func repositoryBrowserOrigin(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	parsed.RawPath = ""
+	if strings.EqualFold(parsed.Hostname(), "api.github.com") || strings.EqualFold(parsed.Hostname(), "www.github.com") {
+		parsed.Host = "github.com"
+		parsed.Path = ""
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	if strings.HasSuffix(strings.ToLower(path), "/api/v3") {
+		path = strings.TrimSuffix(path, "/api/v3")
+	}
+	parsed.Path = path
+	return strings.TrimRight(parsed.String(), "/")
 }
 
 func repositoryBrowserBase(repo string) string {
