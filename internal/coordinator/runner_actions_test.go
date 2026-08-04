@@ -1912,12 +1912,18 @@ func (s *stubCoordinatorGitHub) GetBranchProtection(_ context.Context, input git
 
 type stubCoordinatorNetwork struct {
 	status             protocol.NodeStatusResponse
+	statusSequence     []protocol.NodeStatusResponse
 	statusErr          error
 	revalidateErrs     []error
 	revalidateRequests []protocol.CoordinatorLeaseRevalidateRequest
 }
 
 func (s *stubCoordinatorNetwork) Status(context.Context) (protocol.NodeStatusResponse, error) {
+	if len(s.statusSequence) > 0 {
+		status := s.statusSequence[0]
+		s.statusSequence = s.statusSequence[1:]
+		return status, nil
+	}
 	return s.status, s.statusErr
 }
 

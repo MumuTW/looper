@@ -1038,6 +1038,11 @@ func (r *Runner) applyDecisionWithPolicy(ctx context.Context, repo string, cwd s
 		return err
 	}
 	remainingLabels = removeMatchingLabels(remainingLabels, removeNow)
+	// Classification labels are deterministic, evidence-derived state and are
+	// intentionally retained when backfill's comment veto fires. Only the
+	// proposed narrative and triaged authority marker are suppressed; this
+	// keeps the partial-application contract explicit instead of pretending the
+	// whole decision was rolled back without a compensating transaction.
 	applyNow := removeExactLabels(decision.ApplyLabels, cfg.TriagedLabel)
 	if len(applyNow) > 0 {
 		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: applyNow, LabelNamespace: cfg.Namespace, CWD: cwd}); err != nil {

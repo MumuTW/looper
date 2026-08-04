@@ -106,8 +106,14 @@ func TestBackfillIssuesPreservesPreAnalysisCommentSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BackfillIssues() error = %v", err)
 	}
+	// Backfill preserves the existing partial-application contract: deterministic
+	// classification labels are written, while the stale comment and triaged
+	// marker are vetoed by the new human evidence.
 	if result.Triaged != 1 || len(fixture.github.createdBodies) != 0 || countAddedIssueOperations(fixture.github.addedLabels, 1, "triaged") != 0 {
-		t.Fatalf("result = %#v ops=%v addedLabels=%v, want human comment to veto stale triage comment", result, fixture.github.ops, fixture.github.addedLabels)
+		t.Fatalf("result = %#v ops=%v addedLabels=%v, want human comment and triaged marker veto", result, fixture.github.ops, fixture.github.addedLabels)
+	}
+	if countAddedIssueOperations(fixture.github.addedLabels, 1, "kind/bug", "area/coordinator", "complexity/m", "dispatch/plan") != 1 {
+		t.Fatalf("addedLabels = %v, want the documented partial classification application", fixture.github.addedLabels)
 	}
 }
 
@@ -133,6 +139,34 @@ func TestBackfillIssuesRequiresCurrentCoordinatorLeaseInRoutedMode(t *testing.T)
 	}
 	if len(fixture.github.createdBodies) != 0 || len(fixture.github.addedLabels) != 0 {
 		t.Fatalf("routed non-holder mutated GitHub: created=%v added=%v", fixture.github.createdBodies, fixture.github.addedLabels)
+	}
+}
+
+func TestBackfillIssuesRefusesLeaseLossBeforeMutation(t *testing.T) {
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.BackfillEnabled = true
+		cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	})
+	holder := protocol.NodeStatusResponse{
+		Membership: protocol.Membership{NodeID: "coord-1", NodeName: "coord-1"},
+		Lease:      protocol.CoordinatorLease{HolderNodeID: "coord-1", FencingToken: 12, ExpiresAt: timePtr(fixture.now.Add(time.Minute))},
+	}
+	lost := holder
+	lost.Lease = protocol.CoordinatorLease{HolderNodeID: "other-node", FencingToken: 13, ExpiresAt: timePtr(fixture.now.Add(time.Minute))}
+	fixture.network.statusSequence = []protocol.NodeStatusResponse{holder, lost}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1}}
+	fixture.github.details[1] = githubinfra.IssueDetail{
+		Number: 1, Title: "lease race", Author: "octo", State: "open",
+		CreatedAt: fixture.now.Add(-24 * time.Hour).Format(time.RFC3339),
+	}
+
+	_, err := fixture.runner.BackfillIssues(context.Background(), BackfillInput{ProjectID: fixture.projectID, Repo: "acme/looper", SkipTriaged: true})
+	if !errors.Is(err, ErrBackfillUnavailable) {
+		t.Fatalf("BackfillIssues() error = %v, want ErrBackfillUnavailable after lease loss", err)
+	}
+	if len(fixture.github.createdBodies) != 0 || len(fixture.github.addedLabels) != 0 || len(fixture.github.removedLabels) != 0 {
+		t.Fatalf("lease-lost backfill mutated GitHub: created=%v added=%v removed=%v", fixture.github.createdBodies, fixture.github.addedLabels, fixture.github.removedLabels)
 	}
 }
 
