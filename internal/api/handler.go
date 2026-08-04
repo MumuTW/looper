@@ -33,7 +33,6 @@ import (
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/shell"
 	"github.com/MumuTW/looper/internal/loops"
-	networkclient "github.com/MumuTW/looper/internal/network/client"
 	"github.com/MumuTW/looper/internal/postmergedigest"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/reviewer/convergence"
@@ -1046,7 +1045,6 @@ type statusResponse struct {
 	ResourceGuard   any                 `json:"resourceGuard"`
 	Webhook         statusWebhook       `json:"webhook"`
 	Loops           statusLoops         `json:"loops"`
-	Network         any                 `json:"network,omitempty"`
 	Safety          statusSafety        `json:"safety"`
 	Notifications   statusNotifications `json:"notifications"`
 	Tools           statusTools         `json:"tools"`
@@ -1274,7 +1272,6 @@ type configResponse struct {
 	Storage       config.StorageConfig      `json:"storage"`
 	Scheduler     config.SchedulerConfig    `json:"scheduler"`
 	Webhook       config.WebhookConfig      `json:"webhook"`
-	Network       config.NetworkConfig      `json:"network"`
 	Agent         configAgentResponse       `json:"agent"`
 	Logging       config.LoggingConfig      `json:"logging"`
 	Notifications config.NotificationConfig `json:"notifications"`
@@ -1353,7 +1350,6 @@ func (h *Handler) buildConfigResponse() configResponse {
 		Storage:   cfg.Storage,
 		Scheduler: cfg.Scheduler,
 		Webhook:   cfg.Webhook,
-		Network:   cfg.Network,
 		Agent: configAgentResponse{
 			Vendor:       cfg.Agent.Vendor,
 			Model:        cfg.Agent.Model,
@@ -1597,7 +1593,6 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 		ResourceGuard:   h.buildResourceGuardStatusResponse(),
 		Webhook:         summarizeWebhookStatus(h.buildWebhookStatusResponse()),
 		Loops:           loopCounts,
-		Network:         h.buildNetworkStatusResponse(),
 		Safety: statusSafety{
 			AllowAutoCommit:    h.context.Config.Defaults.AllowAutoCommit,
 			AllowAutoPush:      h.context.Config.Defaults.AllowAutoPush,
@@ -1633,9 +1628,6 @@ func (h *Handler) buildWorktreeCleanupStatusResponse() any {
 	}
 }
 
-// buildResourceGuardStatusResponse surfaces the last host reading. A scheduler
-// that is withholding slots must be able to say so: without this, a guarded
-// daemon and an idle one look identical from the outside.
 func (h *Handler) buildResourceGuardStatusResponse() any {
 	if runtimeWithGuard, ok := any(h.context.Runtime).(interface {
 		HostAdmissionStatus() looperdruntime.HostAdmissionStatus
@@ -1646,13 +1638,6 @@ func (h *Handler) buildResourceGuardStatusResponse() any {
 		Enabled: h.context.Config.Daemon.ResourceGuard.Enabled,
 		Admit:   true,
 	}
-}
-
-func (h *Handler) buildNetworkStatusResponse() any {
-	if runtimeWithNetwork, ok := any(h.context.Runtime).(interface{ NetworkStatus() networkclient.Status }); ok {
-		return runtimeWithNetwork.NetworkStatus()
-	}
-	return nil
 }
 
 type storageState struct {

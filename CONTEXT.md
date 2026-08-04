@@ -250,6 +250,9 @@ A Role-specific HTML comment marker (e.g. `<!-- looper:coordinator:triage -->`) 
 
 ### Network
 
+> Product status: withdrawn by #84. The terms below describe dormant code and
+> historical ADRs; supported configuration and runtime behavior are local-only.
+
 **Network**:
 (Prose-only: a system-of-instances concept; its code-defined parts — Node,
 Lease, Target label — are anchored in this section.)

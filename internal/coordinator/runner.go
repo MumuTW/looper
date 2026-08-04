@@ -69,6 +69,7 @@ type GitHubGateway interface {
 	ListLinkedPullRequests(context.Context, githubinfra.LinkedPullRequestsInput) ([]githubinfra.LinkedPullRequest, error)
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
 	ViewPullRequest(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
+	ViewPullRequestForDiscovery(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
 	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
 	ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error)
 	ListIssueBlockedBy(context.Context, githubinfra.ListIssueBlockedByInput) ([]githubinfra.IssueDependency, error)
@@ -1356,7 +1357,7 @@ func (r *Runner) applyReviewAssignments(ctx context.Context, projectID, repo, cw
 	}
 	sort.Slice(prNumbers, func(i, j int) bool { return prNumbers[i] < prNumbers[j] })
 	for _, prNumber := range prNumbers {
-		detail, err := r.github.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+		detail, err := r.github.ViewPullRequestForDiscovery(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 		if err != nil {
 			return err
 		}

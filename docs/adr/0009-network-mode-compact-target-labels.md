@@ -1,5 +1,7 @@
 # Network mode v1 avoids Role×Node labels and uses compact target labels
 
+> Status: withdrawn from the supported product by #84. This ADR is retained as historical design context; Routed configuration and runtime maintenance are unavailable.
+
 ## Context
 
 Looper's reactive Roles support configurable Trigger labels via `roles.<role>.triggers.labels` plus `LabelMode` (`Any` or `All`). The first Network design considered suffixing every Role trigger with the Node Name (for example, `looper:worker-ready:red`). That would create a Role×Node label matrix and would still not solve the "one human GitHub account, multiple Nodes" case without making labels the exact target Authority.

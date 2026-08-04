@@ -1797,6 +1797,25 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 	return g.viewPullRequestWithFields(ctx, input, prViewMetadataJSONFields, false, false)
 }
 
+// ViewPullRequestForDiscovery returns the lightweight metadata tier of a
+// pull request (no statusCheckRollup, no reviews, no review threads, no
+// issue comments) for discovery-path callers that only need
+// IsDraft/Author/ReviewRequests/Labels/State. During scheduler ticks it
+// shares the per-tick discovery snapshot's metadata cache so the whole
+// tick costs one thin view per PR; outside a snapshot it falls back to a
+// direct thin query.
+//
+// Callers that consume detail.Checks or detail.Reviews must keep using
+// ViewPullRequestForFixer / ViewPullRequestForReviewer (or ViewPullRequest
+// when the snapshot's full tier is required); this method deliberately
+// omits statusCheckRollup, the most expensive GraphQL field per tick.
+func (g *Gateway) ViewPullRequestForDiscovery(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
+		return snapshot.viewPullRequestMetadata(ctx, input)
+	}
+	return g.viewPullRequestWithFields(ctx, input, prViewMetadataJSONFields, false, false)
+}
+
 func (g *Gateway) ViewPullRequestForFixer(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
 	return g.viewPullRequestWithFields(ctx, input, prViewFixerJSONFields, true, true)
 }
