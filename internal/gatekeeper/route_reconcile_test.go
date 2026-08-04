@@ -35,7 +35,7 @@ func TestReconcileRecordsMergeEvidenceForOutOfPageMergedRoute(t *testing.T) {
 	// timestamp.
 	fixture.github.openPullRequests = nil
 	fixture.github.mergeWatch = githubinfra.PullRequestDetail{
-		Number: 42, State: "closed", MergedAt: "2026-07-30T10:05:00.000Z",
+		Number: 42, State: "closed", MergedAt: "2026-07-30T10:05:00.000Z", MergedBy: "mergify[bot]",
 	}
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
 		t.Fatalf("reconcile discovery() error = %v", err)
@@ -88,6 +88,36 @@ func TestReconcileRecordsMergeEvidenceForOutOfPageMergedRoute(t *testing.T) {
 	}
 	if refreshed := mergeOutcomes(); len(refreshed) != 1 {
 		t.Fatalf("merge outcome events = %d after second tick, want still exactly one (no duplicate evidence)", len(refreshed))
+	}
+}
+
+func TestReconcileDoesNotRecordEvidenceForHumanMerge(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	runner := trustRunner(fixture, config.GatekeeperTrustAuto)
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("initial discovery() error = %v", err)
+	}
+
+	fixture.github.openPullRequests = nil
+	fixture.github.mergeWatch = githubinfra.PullRequestDetail{
+		Number: 42, State: "closed", MergedAt: "2026-07-30T10:05:00.000Z", MergedBy: "maintainer",
+	}
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("human-merge reconcile discovery() error = %v", err)
+	}
+
+	events, err := fixture.repos.Events.List(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("Events.List() error = %v", err)
+	}
+	for _, event := range events {
+		if event.EventType == MergeOutcomeEventType {
+			t.Fatalf("human merge produced Looper merge evidence: %#v", event)
+		}
+	}
+	if !slices.Equal(fixture.github.labelRemoves[len(fixture.github.labelRemoves)-1].Labels, []string{labels.AutoMerge}) {
+		t.Fatalf("last label removal = %#v, want human-merged auto route retired", fixture.github.labelRemoves)
 	}
 }
 

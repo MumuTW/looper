@@ -40,6 +40,23 @@ func TestSourceFingerprintIncludesExactDiffBudgetBounds(t *testing.T) {
 	}
 }
 
+func TestMergifyContractFingerprintUsesProviderQualifiedRepository(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	github := &fingerprintGatekeeperGitHub{fakeGatekeeperGitHub: fixture.github}
+	runner := New(Options{
+		Repos: fixture.repos, GitHub: github, Now: func() time.Time { return fixture.now },
+		TrustForProject:    func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+		RepositoryIdentity: func(string) string { return "ghe.example.test/acme/looper" },
+	})
+
+	if got := runner.mergifyContractFingerprint(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); got != "contract-digest" {
+		t.Fatalf("mergifyContractFingerprint() = %q, want contract-digest", got)
+	}
+	if github.fingerprintRepo != "ghe.example.test/acme/looper" {
+		t.Fatalf("fingerprint repository = %q, want provider-qualified target", github.fingerprintRepo)
+	}
+}
+
 func discover(t *testing.T, fixture *gatekeeperFixture) DiscoveryResult {
 	t.Helper()
 	result, err := fixture.runner().DiscoverPullRequests(context.Background(), DiscoveryInput{

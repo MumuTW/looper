@@ -24,15 +24,6 @@ import (
 var mergeWatchPRURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
 var mergeWatchClosingReferencePattern = regexp.MustCompile(`(?i)(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+((?:https?://[^\s)]+/issues/\d+)|(?:[\w.-]+/[\w.-]+#\d+)|#\d+)`)
 
-func isMergifyMergeActor(login string) bool {
-	switch strings.ToLower(strings.TrimSpace(login)) {
-	case "mergify", "mergify[bot]", "mergifyio", "mergifyio[bot]":
-		return true
-	default:
-		return false
-	}
-}
-
 type mergeWatchComment struct {
 	ID      int64
 	Summary string
@@ -108,7 +99,7 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 	switch action.Kind {
 	case mergewatch.ActionMerged, mergewatch.ActionHumanDisabledAutoMerge:
 		if action.Kind == mergewatch.ActionMerged {
-			if snapshot.AutoMergeOwnedByLooper || isMergifyMergeActor(snapshot.MergedBy) {
+			if snapshot.AutoMergeOwnedByLooper || githubinfra.IsMergifyMergeActor(snapshot.MergedBy) {
 				if err := r.recordPostMergeEvent(ctx, projectID, repo, issue.detail.Number, snapshot); err != nil {
 					return false, err
 				}
@@ -301,7 +292,7 @@ func (r *Runner) applyRoutedMergeWatch(ctx context.Context, projectID, repo, cwd
 			if routeErr != nil {
 				return routeErr
 			}
-			if !humanOwned && active && (detail.AutoMerge != nil || isMergifyMergeActor(detail.MergedBy)) {
+			if !humanOwned && active && (detail.AutoMerge != nil || githubinfra.IsMergifyMergeActor(detail.MergedBy)) {
 				if err := r.recordPostMergeEvent(ctx, projectID, repo, 0, mergewatch.PRSnapshot{
 					Repo: repo, PRNumber: prNumber, HeadSHA: firstNonEmpty(detail.HeadSHA, headSHA),
 					MergedAt: detail.MergedAt, MergedBy: detail.MergedBy, Merged: true,

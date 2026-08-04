@@ -854,6 +854,31 @@ func (r *Runner) sourceFingerprintForProject(pullRequest githubinfra.PullRequest
 	reviewThreshold := r.requiredReviewChangedLinesFor(projectID)
 	reviewPolicyEnabled := trust == config.GatekeeperTrustAuto && reviewThreshold > 0
 	return sourceFingerprint(pullRequest, budgetEnabled, reviewPolicyEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions) + fmt.Sprintf("\x1fgatekeeper-trust=%s", string(trust)) + fmt.Sprintf("\x1fconfigured-target=%s", configuredTarget) + fmt.Sprintf("\x1fpolicy-permits-target=%t", permitsTarget) + fmt.Sprintf("\x1freview-threshold=%d", reviewThreshold)
+	return sourceFingerprint(pullRequest, budgetEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions) + fmt.Sprintf("\x1fgatekeeper-trust=%s", string(r.trustFor(projectID))) + fmt.Sprintf("\x1fconfigured-target=%s", configuredTarget) + fmt.Sprintf("\x1fpolicy-permits-target=%t", permitsTarget)
+
+func (r *Runner) mergifyContractFingerprint(ctx context.Context, input DiscoveryInput) string {
+	if r == nil || r.trustFor(input.ProjectID) != config.GatekeeperTrustAuto {
+		return ""
+	}
+	fingerprinter, ok := r.github.(mergifyContractFingerprinter)
+	if !ok {
+		return "contract-fingerprint-unavailable"
+	}
+	fingerprint, err := fingerprinter.MergifyRoutingContractFingerprint(ctx, githubinfra.ValidateMergifyRoutingInput{Repo: input.Repo, CWD: input.CWD})
+	if err != nil {
+		if r.logWarn != nil {
+			r.logWarn("gatekeeper: could not fingerprint Mergify routing contract", map[string]any{"repo": input.Repo, "error": err.Error()})
+		}
+		return "contract-fingerprint-unavailable"
+	}
+	return strings.TrimSpace(fingerprint)
+}
+
+func (r *Runner) configuredTarget(projectID string) string {
+	if r == nil || r.configuredTargetBranch == nil {
+		return ""
+	}
+	return strings.TrimSpace(r.configuredTargetBranch(projectID))
 }
 
 func (r *Runner) repositoryTarget(projectID string) string {

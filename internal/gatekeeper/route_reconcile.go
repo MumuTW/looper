@@ -135,11 +135,16 @@ func (r *Runner) reconcileRoutedReportsOutsideDiscoveryPage(ctx context.Context,
 		var replacementReport *Report
 		switch {
 		case mergedAt != "":
-			// A routed pull request that merged is durable evidence the Auditor
-			// needs: record the merge outcome before retiring the route.
-			if err := r.recordMergeEvidence(ctx, previous, mergedAt); err != nil {
-				errs = append(errs, fmt.Errorf("record merge evidence %s: %w", entityID, err))
-				continue
+			// A timestamp alone does not identify the merge authority: a
+			// maintainer can use GitHub's ordinary Merge button while the
+			// Mergify label remains present. Attribute the outcome only when
+			// the forge reports a recognized Mergify actor, matching
+			// Coordinator's route-authority check.
+			if githubinfra.IsMergifyMergeActor(detail.MergedBy) {
+				if err := r.recordMergeEvidence(ctx, previous, mergedAt); err != nil {
+					errs = append(errs, fmt.Errorf("record merge evidence %s: %w", entityID, err))
+					continue
+				}
 			}
 			if err := r.clearRoutingLabelsForReport(ctx, previous); err != nil {
 				errs = append(errs, fmt.Errorf("retire merged route %s: %w", entityID, err))

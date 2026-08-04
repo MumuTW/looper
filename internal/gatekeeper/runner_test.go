@@ -783,6 +783,16 @@ type fakeGatekeeperGitHub struct {
 }
 }
 
+type fingerprintGatekeeperGitHub struct {
+	*fakeGatekeeperGitHub
+	fingerprintRepo string
+}
+
+func (f *fingerprintGatekeeperGitHub) MergifyRoutingContractFingerprint(_ context.Context, input githubinfra.ValidateMergifyRoutingInput) (string, error) {
+	f.fingerprintRepo = input.Repo
+	return "contract-digest", nil
+}
+
 func (f *fakeGatekeeperGitHub) GetCurrentUserLoginForRepo(context.Context, string, string) (string, error) {
 	f.loginCalls++
 	if f.currentLogin == "" {

@@ -11,6 +11,26 @@ import (
 	"github.com/MumuTW/looper/internal/infra/shell"
 )
 
+func TestIsMergifyMergeActor(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		login string
+		want  bool
+	}{
+		{login: "mergify", want: true},
+		{login: "mergify[bot]", want: true},
+		{login: "MERGIFYIO[bot]", want: true},
+		{login: "maintainer", want: false},
+		{login: "", want: false},
+	} {
+		t.Run(tc.login, func(t *testing.T) {
+			if got := IsMergifyMergeActor(tc.login); got != tc.want {
+				t.Fatalf("IsMergifyMergeActor(%q) = %t, want %t", tc.login, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestMergifyRoutingContractFingerprintTracksRepositoryContent(t *testing.T) {
 	t.Parallel()
 	content := []byte("queue_rules:\n  - name: default\n")
