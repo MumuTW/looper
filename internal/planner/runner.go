@@ -254,6 +254,10 @@ type AgentRunInput struct {
 	HeartbeatTimeout time.Duration
 	Metadata         map[string]any
 	IdempotencyKey   string
+	// Assessment selects the daemon-owned read-only pre-authorization profile.
+	// It is only set for the suitability assessment step; normal Planner work
+	// remains a writable coding-agent execution.
+	Assessment bool
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
 	UseSnapshot    bool
@@ -318,6 +322,7 @@ type Options struct {
 	OnAgentExecutionStarted AgentExecutionStartedFunc
 	OnQueueItemEnqueued     func()
 	DiscoveryPolicy         DiscoveryPolicy
+	StopLoop                func(context.Context, string, string) error
 }
 
 type DiscoveryPolicy struct {
@@ -509,7 +514,7 @@ func New(options Options) *Runner {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultPlanTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
 	runner := &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), agentProfileID: strings.TrimSpace(options.AgentProfileID), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: cloneStringPtr(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
-	runner.workGraphs = workgraphdispatch.New(workgraphdispatch.Options{DB: options.DB, Repositories: options.Repos, Now: now, RetryMaxAttempts: retryMax, OnEnqueued: options.OnQueueItemEnqueued})
+	runner.workGraphs = workgraphdispatch.New(workgraphdispatch.Options{DB: options.DB, Repositories: options.Repos, Now: now, RetryMaxAttempts: retryMax, OnEnqueued: options.OnQueueItemEnqueued, StopLoop: options.StopLoop})
 	return runner
 }
 

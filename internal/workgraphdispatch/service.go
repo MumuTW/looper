@@ -22,6 +22,10 @@ type Options struct {
 	Now              func() time.Time
 	RetryMaxAttempts int64
 	OnEnqueued       func()
+	// StopLoop is the runtime-owned process/operation stop authority. It is
+	// invoked before a failed graph is retired so a live sibling cannot continue
+	// mutating its worktree after the replacement graph is published.
+	StopLoop func(context.Context, string, string) error
 }
 
 type Service struct {
@@ -30,6 +34,7 @@ type Service struct {
 	now              func() time.Time
 	retryMaxAttempts int64
 	onEnqueued       func()
+	stopLoop         func(context.Context, string, string) error
 }
 
 func New(options Options) *Service {
@@ -41,7 +46,7 @@ func New(options Options) *Service {
 	if retries == 0 {
 		retries = 3
 	}
-	return &Service{db: options.DB, repos: options.Repositories, now: now, retryMaxAttempts: retries, onEnqueued: options.OnEnqueued}
+	return &Service{db: options.DB, repos: options.Repositories, now: now, retryMaxAttempts: retries, onEnqueued: options.OnEnqueued, stopLoop: options.StopLoop}
 }
 
 type CreateInput struct {
@@ -224,6 +229,11 @@ func (s *Service) retireGraph(ctx context.Context, repos *storage.Repositories, 
 	}
 	reason := "work graph superseded"
 	for _, node := range nodes {
+		if s.stopLoop != nil {
+			if err := s.stopLoop(ctx, node.WorkerLoopID, reason); err != nil {
+				return err
+			}
+		}
 		if _, err := repos.Queue.CancelByLoop(ctx, node.WorkerLoopID, nowISO, &reason); err != nil {
 			return err
 		}

@@ -10,10 +10,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/MumuTW/looper/internal/version"
 )
 
 const ManifestVersion = 1
@@ -25,6 +28,10 @@ type Input struct {
 	DaemonBinaryPath string
 	Now              func() time.Time
 	Snapshot         func(context.Context) (string, error)
+	// ReadIdentity is injectable for unit tests; production uses the selected
+	// binaries' own identity commands, so a stale executable cannot be hidden by
+	// a clean checksum-only bundle.
+	ReadIdentity func(context.Context, string, []string) (version.Info, error)
 }
 
 type File struct {
@@ -57,6 +64,21 @@ func Create(ctx context.Context, input Input) (Result, error) {
 	}
 	if strings.TrimSpace(input.ConfigPath) == "" || strings.TrimSpace(input.CLIBinaryPath) == "" || strings.TrimSpace(input.DaemonBinaryPath) == "" {
 		return Result{}, fmt.Errorf("config, CLI binary, and daemon binary paths are required")
+	}
+	readIdentity := input.ReadIdentity
+	if readIdentity == nil {
+		readIdentity = readBinaryIdentity
+	}
+	cliIdentity, err := readIdentity(ctx, input.CLIBinaryPath, []string{"version", "--json"})
+	if err != nil {
+		return Result{}, fmt.Errorf("verify selected CLI identity: %w", err)
+	}
+	daemonIdentity, err := readIdentity(ctx, input.DaemonBinaryPath, []string{"--version-json"})
+	if err != nil {
+		return Result{}, fmt.Errorf("verify selected daemon identity: %w", err)
+	}
+	if !cliIdentity.SameBuild(daemonIdentity) {
+		return Result{}, fmt.Errorf("selected CLI and daemon build identities differ")
 	}
 	now := time.Now
 	if input.Now != nil {
@@ -92,6 +114,21 @@ func Create(ctx context.Context, input Input) (Result, error) {
 		return fail(fmt.Errorf("write backup manifest: %w", err))
 	}
 	return Result{Directory: bundle, Manifest: manifest}, nil
+}
+
+func readBinaryIdentity(ctx context.Context, binary string, args []string) (version.Info, error) {
+	out, err := exec.CommandContext(ctx, binary, args...).Output()
+	if err != nil {
+		return version.Info{}, fmt.Errorf("run %s %s: %w", binary, strings.Join(args, " "), err)
+	}
+	var identity version.Info
+	if err := json.Unmarshal(out, &identity); err != nil {
+		return version.Info{}, fmt.Errorf("decode %s identity: %w", binary, err)
+	}
+	if !identity.Complete() {
+		return version.Info{}, fmt.Errorf("%s identity is incomplete", binary)
+	}
+	return identity, nil
 }
 
 func moveAndRecord(source, destination string, files map[string]File, name string) error {

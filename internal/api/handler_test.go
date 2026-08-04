@@ -26,6 +26,7 @@ import (
 	"github.com/MumuTW/looper/internal/gatekeeper"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/loops"
 	"github.com/MumuTW/looper/internal/projects"
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/storage"
@@ -38,6 +39,13 @@ import (
 type stopLoopResponse struct {
 	Stopped bool   `json:"stopped"`
 	LoopID  string `json:"loopId"`
+}
+
+func TestLoopConflictTransportMessagePreservesLegacyTargetKey(t *testing.T) {
+	err := fmt.Errorf("%w: active loop already exists for project_1:reviewer:pr:acme/looper:42", loops.ErrActiveLoopConflict)
+	if got, want := loopConflictTransportMessage(err), "active loop already exists for project_1:reviewer:pull_request:acme/looper:42"; got != want {
+		t.Fatalf("loopConflictTransportMessage() = %q, want %q", got, want)
+	}
 }
 
 func TestHandlerHealthzSuccessAndRequestIDEcho(t *testing.T) {

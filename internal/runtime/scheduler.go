@@ -596,7 +596,7 @@ func (a plannerAgentExecutorAdapter) Start(ctx context.Context, input planner.Ag
 	execution, err := a.executor.Start(ctx, agent.RunInput{
 		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
 		Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
-		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
+		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey, Assessment: input.Assessment,
 		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
 	})
 	if err != nil {
@@ -2120,6 +2120,13 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	var reviewerRunner reviewerScheduler
 	var fixerRunner fixerScheduler
 	var workerRunner workerScheduler
+	stopLoop := func(ctx context.Context, loopID, reason string) error {
+		if activeExecutions == nil {
+			return nil
+		}
+		_, err := activeExecutions.BeginLoopStop(loopID, reason)
+		return err
+	}
 
 	looperCLIPath := resolveTrustedLooperCLIPath(cfg, logger)
 	// Keep LOOPER_TRUSTED_REVIEW_SOCK out of shared agent executor env so
@@ -2231,6 +2238,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			},
 			RetryBaseDelay:      retryBaseDelay,
 			RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
+			StopLoop:            stopLoop,
 			OnQueueItemEnqueued: requestWake,
 			OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
@@ -2512,6 +2520,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.WorkerIdleTimeoutSeconds) * time.Second,
 			RetryBaseDelay:      retryBaseDelay,
 			RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
+			StopLoop:            stopLoop,
 			OnQueueItemEnqueued: requestWake,
 			OnRunCompleted: func(ctx context.Context, input worker.RunCompletedInput) error {
 				return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})

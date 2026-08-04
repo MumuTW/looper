@@ -124,7 +124,7 @@ func (r *Runner) runAssessSuitabilityStep(ctx context.Context, input stepInput) 
 		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 		Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 		Metadata:       map[string]any{"loopType": "planner", "phase": "suitability-assessment", "repo": issue.Repo, "issueNumber": issue.IssueNumber},
-		IdempotencyKey: fmt.Sprintf("planner-assessment:%s", input.Loop.ID), UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+		IdempotencyKey: fmt.Sprintf("planner-assessment:%s", input.Loop.ID), Assessment: true, UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
 	})
 	if err != nil {
 		return checkpoint, err

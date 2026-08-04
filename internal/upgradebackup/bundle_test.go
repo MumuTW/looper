@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/MumuTW/looper/internal/version"
 )
 
 func TestCreateBundlesOneSnapshotWithManifestedInputs(t *testing.T) {
@@ -16,7 +18,7 @@ func TestCreateBundlesOneSnapshotWithManifestedInputs(t *testing.T) {
 	cli := writeBundleFile(t, root, "looper-bin", "cli")
 	daemon := writeBundleFile(t, root, "looperd-bin", "daemon")
 	snapshots := 0
-	result, err := Create(context.Background(), Input{RootDir: filepath.Join(root, "backups"), ConfigPath: config, CLIBinaryPath: cli, DaemonBinaryPath: daemon, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 2, 3, 0, time.UTC) }, Snapshot: func(context.Context) (string, error) {
+	result, err := Create(context.Background(), Input{RootDir: filepath.Join(root, "backups"), ConfigPath: config, CLIBinaryPath: cli, DaemonBinaryPath: daemon, ReadIdentity: matchingBackupIdentity, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 2, 3, 0, time.UTC) }, Snapshot: func(context.Context) (string, error) {
 		snapshots++
 		return writeBundleFile(t, root, "snapshot.sqlite", "sqlite-consistent"), nil
 	}})
@@ -47,7 +49,7 @@ func TestCreateBundlesOneSnapshotWithManifestedInputs(t *testing.T) {
 func TestCreateRemovesPartialBundleOnCopyFailure(t *testing.T) {
 	root := t.TempDir()
 	snapshot := writeBundleFile(t, root, "snapshot.sqlite", "sqlite")
-	_, err := Create(context.Background(), Input{RootDir: filepath.Join(root, "backups"), ConfigPath: filepath.Join(root, "missing.toml"), CLIBinaryPath: "/missing/looper", DaemonBinaryPath: "/missing/looperd", Now: time.Now, Snapshot: func(context.Context) (string, error) { return snapshot, nil }})
+	_, err := Create(context.Background(), Input{RootDir: filepath.Join(root, "backups"), ConfigPath: filepath.Join(root, "missing.toml"), CLIBinaryPath: "/missing/looper", DaemonBinaryPath: "/missing/looperd", ReadIdentity: matchingBackupIdentity, Now: time.Now, Snapshot: func(context.Context) (string, error) { return snapshot, nil }})
 	if err == nil {
 		t.Fatal("Create() error = nil")
 	}
@@ -65,7 +67,7 @@ func TestVerifyAcceptsCreatedBundleAndRejectsChangedLayoutOrContent(t *testing.T
 	config := writeBundleFile(t, root, "config.toml", "[server]\n")
 	cli := writeBundleFile(t, root, "looper-bin", "cli")
 	daemon := writeBundleFile(t, root, "looperd-bin", "daemon")
-	result, err := Create(context.Background(), Input{RootDir: filepath.Join(root, "backups"), ConfigPath: config, CLIBinaryPath: cli, DaemonBinaryPath: daemon, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 2, 3, 0, time.UTC) }, Snapshot: func(context.Context) (string, error) {
+	result, err := Create(context.Background(), Input{RootDir: filepath.Join(root, "backups"), ConfigPath: config, CLIBinaryPath: cli, DaemonBinaryPath: daemon, ReadIdentity: matchingBackupIdentity, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 2, 3, 0, time.UTC) }, Snapshot: func(context.Context) (string, error) {
 		return writeBundleFile(t, root, "snapshot.sqlite", "sqlite-consistent"), nil
 	}})
 	if err != nil {
@@ -96,4 +98,10 @@ func writeBundleFile(t *testing.T, dir, name, contents string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func matchingBackupIdentity(context.Context, string, []string) (version.Info, error) {
+	commit, timestamp := "backup-commit", "2026-07-31T01:02:03Z"
+	dirty := false
+	return version.Info{Version: "1.0.0", Metadata: version.BuildMetadata{VersionSource: "test", Channel: "stable", APIVersion: "v1", GitCommitSHA: &commit, BuildTimestamp: &timestamp, Dirty: &dirty}}, nil
 }

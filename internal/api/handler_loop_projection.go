@@ -2,10 +2,13 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/MumuTW/looper/internal/fixer"
+	"github.com/MumuTW/looper/internal/reviewer/convergence"
 	"github.com/MumuTW/looper/internal/storage"
 	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
@@ -116,11 +119,34 @@ func serializeLoop(loop storage.LoopRecord) loopResponse {
 		Status:       loop.Status,
 		ConfigJSON:   loop.ConfigJSON,
 		MetadataJSON: loop.MetadataJSON,
+		Convergence:  reviewerConvergenceFromMetadata(loop.MetadataJSON),
 		LastRunAt:    loop.LastRunAt,
 		NextRunAt:    loop.NextRunAt,
 		CreatedAt:    loop.CreatedAt,
 		UpdatedAt:    loop.UpdatedAt,
 	}
+}
+
+func reviewerConvergenceFromMetadata(raw *string) *reviewerConvergenceProjection {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return nil
+	}
+	var metadata map[string]json.RawMessage
+	if json.Unmarshal([]byte(*raw), &metadata) != nil {
+		return nil
+	}
+	convergenceRaw, ok := metadata["convergence"]
+	if !ok {
+		return nil
+	}
+	var projection reviewerConvergenceProjection
+	if json.Unmarshal(convergenceRaw, &projection) != nil {
+		return nil
+	}
+	if err := projection.Policy.Validate(); err != nil || projection.State.Validate() != nil || !projection.Action.Valid() || !projection.Reason.Valid() || !convergence.ValidStatus(projection.Status) {
+		return nil
+	}
+	return &projection
 }
 
 // serializeLoopWithDiagnostics loads latest queue/run and attaches attempt/error fields.

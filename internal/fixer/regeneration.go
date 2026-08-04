@@ -133,6 +133,9 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 		state = fixerRegenerationState{Authority: "fixer-exhaustion:" + current.ID}
 	}
 	if state.Routed {
+		if err := r.ensureRegenerationEvent(ctx, current, queueItem, state); err != nil {
+			return regenerationNone, err
+		}
 		return regenerationCompleted, nil
 	}
 	if state.Escalated {
@@ -325,7 +328,64 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 	if _, err := r.mergeLoopMetadata(ctx, current, map[string]any{"fixerRegeneration": state}); err != nil {
 		return regenerationNone, err
 	}
+	if err := r.ensureRegenerationEvent(ctx, current, queueItem, state); err != nil {
+		return regenerationNone, err
+	}
 	return regenerationCompleted, nil
+}
+
+// ensureRegenerationEvent records the close-and-regenerate observation only
+// after the remote close, Planner route, and durable replay ledger have all
+// succeeded. A deterministic event ID plus the existence check makes replay
+// after a crash idempotent, so the digest cannot miss a successful handoff or
+// accumulate duplicate rows.
+func (r *Runner) ensureRegenerationEvent(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord, state fixerRegenerationState) error {
+	if r.repos == nil || r.repos.Events == nil {
+		return fmt.Errorf("record fixer regeneration event: events repository is not configured")
+	}
+	repo := strings.TrimSpace(derefString(queueItem.Repo))
+	prNumber := derefInt64(queueItem.PRNumber)
+	if repo == "" || prNumber <= 0 {
+		return fmt.Errorf("record fixer regeneration event: pull request target is missing")
+	}
+	entityType := "pull_request"
+	entityID := fmt.Sprintf("%s#%d", repo, prNumber)
+	eventID := "fixer-close-regenerate:" + loop.ID
+	events, err := r.repos.Events.ListByEntityAndEventTypes(ctx, entityType, entityID, []string{eventlog.FixerCloseAndRegenerateEventType})
+	if err != nil {
+		return fmt.Errorf("inspect fixer regeneration event: %w", err)
+	}
+	for _, event := range events {
+		if event.ID == eventID || event.LoopID != nil && *event.LoopID == loop.ID {
+			return nil
+		}
+	}
+	projectID := loop.ProjectID
+	loopID := loop.ID
+	err = eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		ID: eventID, EventType: eventlog.FixerCloseAndRegenerateEventType,
+		ProjectID: &projectID, LoopID: &loopID, EntityType: &entityType, EntityID: &entityID,
+		ActorType: runpipe.StringPtr("system"), ActorID: runpipe.StringPtr("fixer-loop"), ActorDisplayName: runpipe.StringPtr("fixer-loop"),
+		Payload: map[string]any{
+			"repo": repo, "prNumber": prNumber, "issueRepo": state.IssueRepo, "issueNumber": state.IssueNumber,
+			"authority": state.Authority, "failureFingerprint": state.Authority, "retrySuccess": true,
+			"summary": state.FailureSummary,
+		}, CreatedAt: r.now(),
+	})
+	if err == nil {
+		return nil
+	}
+	// A concurrent replay may have won the deterministic insert. Re-read the
+	// authority row before surfacing the error to the queue retry path.
+	events, checkErr := r.repos.Events.ListByEntityAndEventTypes(ctx, entityType, entityID, []string{eventlog.FixerCloseAndRegenerateEventType})
+	if checkErr == nil {
+		for _, event := range events {
+			if event.ID == eventID || event.LoopID != nil && *event.LoopID == loop.ID {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("record fixer regeneration event: %w", err)
 }
 
 func (r *Runner) regenerationHumanCommitGuard(ctx context.Context, project storage.ProjectRecord, repo string, pr PullRequestDetail) (string, error) {

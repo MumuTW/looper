@@ -153,10 +153,6 @@
             "skipped": 0,
             "failed": 0
           },
-          "resourceGuard": {
-            "enabled": true,
-            "admit": true
-          },
           "webhook": {
             "enabled": false,
             "endpointUrl": "http://127.0.0.1:17310/webhook/forward",
@@ -363,12 +359,6 @@
               "maxPerTick": 10,
               "includeOrphans": true,
               "dryRun": false
-            },
-            "resourceGuard": {
-              "enabled": true,
-              "minDiskFreePercent": 5,
-              "minDiskFreeGb": 10,
-              "maxLoadPerCpu": 2
             }
           },
           "package": {
@@ -587,14 +577,6 @@
                 "enabled": false,
                 "scope": "looper-only"
               }
-            },
-            "escalator": {
-              "enabled": false,
-              "cadenceSeconds": 3600,
-              "retryAttemptThreshold": 2,
-              "unroutedAfterSeconds": 3600,
-              "staleHeadAfterSeconds": 86400,
-              "maxItems": 500
             }
           },
           "providers": [],
@@ -726,12 +708,6 @@
               "maxPerTick": 10,
               "includeOrphans": true,
               "dryRun": false
-            },
-            "resourceGuard": {
-              "enabled": true,
-              "minDiskFreePercent": 5,
-              "minDiskFreeGb": 10,
-              "maxLoadPerCpu": 2
             }
           },
           "package": {
@@ -950,14 +926,6 @@
                 "enabled": false,
                 "scope": "looper-only"
               }
-            },
-            "escalator": {
-              "enabled": false,
-              "cadenceSeconds": 3600,
-              "retryAttemptThreshold": 2,
-              "unroutedAfterSeconds": 3600,
-              "staleHeadAfterSeconds": 86400,
-              "maxItems": 500
             }
           },
           "providers": [],

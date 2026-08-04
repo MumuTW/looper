@@ -119,6 +119,12 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	if err != nil {
 		return loopResponse{}, err
 	}
+	if domain.LoopType(loopType) == domain.LoopTypeWorker && target.TargetType != domain.LoopTargetTypeProject {
+		metadataJSON, err = manualWorkerMetadataJSONCompat(metadataJSON, target, derefBool(body.Force))
+		if err != nil {
+			return loopResponse{}, err
+		}
+	}
 	if domain.LoopType(loopType) == domain.LoopTypePlanner {
 		metadataJSON, err = manualPlannerMetadataJSON(metadataJSON, target.IssueNumber)
 		if err != nil {
@@ -147,6 +153,9 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 		return loopResponse{}, err
 	}
 	if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
+		return loopResponse{}, err
+	}
+	if err := h.validateCodingProjectRunnable(*project, domain.LoopType(loopType)); err != nil {
 		return loopResponse{}, err
 	}
 	if err := h.validateManualHoldBypassForLoopTarget(r.Context(), projectID, domain.LoopType(loopType), target, derefBool(body.Force)); err != nil {
@@ -208,7 +217,11 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			record.NextRunAt = &nowISO
 		}
 
-		if err := transactionRepos.Loops.Upsert(r.Context(), record); err != nil {
+		upsertLoop := transactionRepos.Loops.Upsert
+		if domain.LoopType(loopType) == domain.LoopTypeWorker && target.TargetType == domain.LoopTargetTypeIssue && derefBool(body.Force) {
+			upsertLoop = transactionRepos.Loops.UpsertForcingIssueClaimAdmission
+		}
+		if err := upsertLoop(r.Context(), record); err != nil {
 			return storage.LoopRecord{}, err
 		}
 
@@ -364,6 +377,9 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
 		return workerCreateResponse{}, err
 	}
+	if err := h.validateCodingProjectRunnable(project, domain.LoopTypeWorker); err != nil {
+		return workerCreateResponse{}, err
+	}
 	if requestedIssueTarget != nil {
 		if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), *requestedIssueTarget); err != nil {
 			return workerCreateResponse{}, err
@@ -390,21 +406,23 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	}
 
 	workerPayload := struct {
-		Title       string  `json:"title"`
-		Prompt      *string `json:"prompt"`
-		SpecPath    *string `json:"specPath"`
-		Repo        string  `json:"repo"`
-		BaseBranch  string  `json:"baseBranch"`
-		IssueNumber *int64  `json:"issueNumber,omitempty"`
-		PRNumber    *int64  `json:"prNumber,omitempty"`
+		Title              string  `json:"title"`
+		Prompt             *string `json:"prompt"`
+		SpecPath           *string `json:"specPath"`
+		Repo               string  `json:"repo"`
+		BaseBranch         string  `json:"baseBranch"`
+		IssueNumber        *int64  `json:"issueNumber,omitempty"`
+		PRNumber           *int64  `json:"prNumber,omitempty"`
+		IssueClaimOverride bool    `json:"issueClaimOverride,omitempty"`
 	}{
-		Title:       title,
-		Prompt:      prompt,
-		SpecPath:    effectiveSpecPath,
-		Repo:        *repo,
-		BaseBranch:  *baseBranch,
-		IssueNumber: issueNumber,
-		PRNumber:    effectivePRNumber,
+		Title:              title,
+		Prompt:             prompt,
+		SpecPath:           effectiveSpecPath,
+		Repo:               *repo,
+		BaseBranch:         *baseBranch,
+		IssueNumber:        issueNumber,
+		PRNumber:           effectivePRNumber,
+		IssueClaimOverride: derefBool(body.Force) && issueNumber != nil,
 	}
 	payloadJSONBytes, err := json.Marshal(struct {
 		Worker any `json:"worker"`
@@ -458,6 +476,9 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 					// Clear and sample under one lock so a concurrent BeginLoopStop
 					// cannot insert a gate that we delete without recording for restore.
 					reuseGateWasActive = services.ActiveExecutions.ClearLoopStop(existingLoop.ID)
+				}
+				if h.workerReuseAfterClearStopGateHook != nil {
+					h.workerReuseAfterClearStopGateHook(existingLoop.ID)
 				}
 			}
 		}
@@ -525,7 +546,11 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 			CreatedAt:    nowISO,
 			UpdatedAt:    nowISO,
 		}
-		if upsertErr := repos.Loops.Upsert(r.Context(), record); upsertErr != nil {
+		upsertLoop := repos.Loops.Upsert
+		if derefBool(body.Force) && issueNumber != nil {
+			upsertLoop = repos.Loops.UpsertForcingIssueClaimAdmission
+		}
+		if upsertErr := upsertLoop(r.Context(), record); upsertErr != nil {
 			return storage.LoopRecord{}, upsertErr
 		}
 
@@ -568,6 +593,7 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		return record, nil
 	})
 	if err != nil {
+		err = mapIssueClaimAdmissionError(err)
 		if restoreErr := restoreReuseStopGate(); restoreErr != nil {
 			var typed apiError
 			if asAPIError(err, &typed) {
@@ -626,6 +652,16 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	// Hold preflight is best-effort at create time: when we cannot reliably talk to
 	// GitHub from this handler context (missing repo path, missing gh path, etc.) we
 	// skip validation rather than blocking manual creation for unrelated local setup.
+	if target.TargetType != domain.LoopTargetTypeProject && h.context.RefreshTargetLabels != nil {
+		liveLabels, err := h.context.RefreshTargetLabels(ctx, target, project.RepoPath)
+		if err != nil {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
+		}
+		if !domain.IsAutoLaneHeld(loopType, liveLabels) {
+			return nil
+		}
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}
+	}
 	if strings.TrimSpace(project.RepoPath) == "" {
 		return nil
 	}
@@ -705,6 +741,33 @@ func derefBool(value *bool) bool {
 	return value != nil && *value
 }
 
+func manualWorkerMetadataJSONCompat(metadataJSON *string, target domain.LoopTarget, force bool) (*string, error) {
+	metadata := parseJSONObject(metadataJSON)
+	worker, _ := metadata["worker"].(map[string]any)
+	if worker == nil {
+		worker = map[string]any{}
+	}
+	worker["repo"] = target.Repo
+	switch target.TargetType {
+	case domain.LoopTargetTypeIssue:
+		worker["issueNumber"] = target.IssueNumber
+	case domain.LoopTargetTypePullRequest:
+		worker["prNumber"] = target.PRNumber
+	}
+	if force && target.TargetType == domain.LoopTargetTypeIssue {
+		worker["issueClaimOverride"] = true
+	} else {
+		delete(worker, "issueClaimOverride")
+	}
+	metadata["worker"] = worker
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("encode worker metadata: %w", err)
+	}
+	text := string(encoded)
+	return &text, nil
+}
+
 func reusableWorkerLoopForIssueRequestCompat(existing []storage.LoopRecord, projectID string, issueTarget, effectiveTarget domain.LoopTarget) (storage.LoopRecord, domain.LoopTarget, bool, error) {
 	for _, loop := range existing {
 		if loop.ProjectID != projectID || loop.Type != string(domain.LoopTypeWorker) {
@@ -748,6 +811,13 @@ func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *sto
 		loop.Status = string(domain.LoopStatusQueued)
 		loop.NextRunAt = &nowISO
 		loop.UpdatedAt = nowISO
+		// Reuse keeps the same source-issue claim as the paused loop, so the
+		// repository's change-detection guard would otherwise skip admission.
+		// Re-check the live claim set at the publication point to catch a
+		// competing fixer/reviewer that arrived after the loop was paused.
+		if err := repos.Loops.AssertIssueClaimAdmission(ctx, loop, force); err != nil {
+			return storage.LoopRecord{}, err
+		}
 		if err := repos.Loops.Upsert(ctx, loop); err != nil {
 			return storage.LoopRecord{}, err
 		}

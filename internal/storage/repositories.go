@@ -871,6 +871,12 @@ type ProjectsRepository struct{ q sqliteQuerier }
 
 type PlannerWorkGraphsRepository struct{ q sqliteQuerier }
 
+// Keep these projections next to the scanners. The persisted tables may gain
+// columns through later migrations; fixed projections keep the positional
+// scanner contract stable instead of making SELECT * arity-dependent.
+const plannerWorkGraphProjection = `id, project_id, parent_repo, parent_issue_number, planner_loop_id, base_branch, status, replan_reason, created_at, updated_at`
+const plannerWorkGraphNodeProjection = `graph_id, node_key, goal, acceptance_criteria_json, expected_pr_scope, worker_loop_id, branch, state, blocked_reason, created_at, updated_at`
+
 func (r *PlannerWorkGraphsRepository) Create(ctx context.Context, record PlannerWorkGraphRecord) error {
 	_, err := r.q.ExecContext(ctx, `
 		INSERT INTO planner_work_graphs (
@@ -887,7 +893,7 @@ func (r *PlannerWorkGraphsRepository) Create(ctx context.Context, record Planner
 }
 
 func (r *PlannerWorkGraphsRepository) GetByPlannerLoopID(ctx context.Context, plannerLoopID string) (*PlannerWorkGraphRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM planner_work_graphs WHERE planner_loop_id = ?`, plannerLoopID)
+	row := r.q.QueryRowContext(ctx, `SELECT `+plannerWorkGraphProjection+` FROM planner_work_graphs WHERE planner_loop_id = ?`, plannerLoopID)
 	record, err := scanPlannerWorkGraph(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -899,7 +905,7 @@ func (r *PlannerWorkGraphsRepository) GetByPlannerLoopID(ctx context.Context, pl
 }
 
 func (r *PlannerWorkGraphsRepository) GetByID(ctx context.Context, graphID string) (*PlannerWorkGraphRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM planner_work_graphs WHERE id = ?`, graphID)
+	row := r.q.QueryRowContext(ctx, `SELECT `+plannerWorkGraphProjection+` FROM planner_work_graphs WHERE id = ?`, graphID)
 	record, err := scanPlannerWorkGraph(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -961,7 +967,7 @@ func (r *PlannerWorkGraphsRepository) CreateDependency(ctx context.Context, grap
 }
 
 func (r *PlannerWorkGraphsRepository) ListNodes(ctx context.Context, graphID string) ([]PlannerWorkGraphNodeRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM planner_work_graph_nodes WHERE graph_id = ? ORDER BY node_key ASC`, graphID)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+plannerWorkGraphNodeProjection+` FROM planner_work_graph_nodes WHERE graph_id = ? ORDER BY node_key ASC`, graphID)
 	if err != nil {
 		return nil, fmt.Errorf("list planner work graph nodes: %w", err)
 	}
@@ -990,7 +996,7 @@ func (r *PlannerWorkGraphsRepository) ListDependencies(ctx context.Context, grap
 }
 
 func (r *PlannerWorkGraphsRepository) GetNodeByWorkerLoopID(ctx context.Context, workerLoopID string) (*PlannerWorkGraphNodeRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM planner_work_graph_nodes WHERE worker_loop_id = ?`, workerLoopID)
+	row := r.q.QueryRowContext(ctx, `SELECT `+plannerWorkGraphNodeProjection+` FROM planner_work_graph_nodes WHERE worker_loop_id = ?`, workerLoopID)
 	record, err := scanPlannerWorkGraphNode(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil

@@ -3841,7 +3841,11 @@ func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepIn
 	// that a failed write leaves lastPublishedHeadSha unset: the next run
 	// retries the publish step, which finds the already-posted review marker
 	// and re-emits the event rather than silently stranding the head.
-	if err := r.appendEventChecked(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA, "markerVerified": markerVerified}}); err != nil {
+	outcome := strings.ToLower(strings.TrimSpace(pending.Outcome))
+	if outcome == "" && reviewEvent == ReviewEventApprove {
+		outcome = "clean"
+	}
+	if err := r.appendEventChecked(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "outcome": outcome, "headSha": pending.HeadSHA, "markerVerified": markerVerified}}); err != nil {
 		return fmt.Errorf("record published review progress: append pr.review.posted: %w", err)
 	}
 	// A markerless event (markerVerified=false) records that the Reviewer

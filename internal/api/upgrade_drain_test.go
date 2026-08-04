@@ -27,6 +27,15 @@ func TestUpgradeDrainClosesAdmissionAndReportsSupervisorSnapshot(t *testing.T) {
 		t.Fatalf("POST response = %#v", started.Data)
 	}
 
+	// BeginDrain is idempotent, and the route must remain reachable after the
+	// first state transition so a client that lost the response can resume its
+	// polling command instead of being rejected by the outer mutation gate.
+	retried := httptest.NewRecorder()
+	handler.ServeHTTP(retried, httptest.NewRequest(http.MethodPost, "/api/v1/upgrade/drain", nil))
+	if retried.Code != http.StatusOK {
+		t.Fatalf("POST after drain status = %d body=%s, want 200", retried.Code, retried.Body.String())
+	}
+
 	blocked := httptest.NewRecorder()
 	handler.ServeHTTP(blocked, httptest.NewRequest(http.MethodPost, "/api/v1/loops", nil))
 	if blocked.Code != http.StatusServiceUnavailable {

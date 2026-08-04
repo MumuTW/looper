@@ -743,7 +743,7 @@ func isMutatingHTTPMethod(method string) bool {
 // before admission is ready (dashboard bootstrap) or are not work-producing.
 func isAdmissionExemptMutationPath(path string) bool {
 	switch path {
-	case dashboardBootstrapCodePath, dashboardBootstrapExchangePath:
+	case dashboardBootstrapCodePath, dashboardBootstrapExchangePath, apiBasePath + "/upgrade/drain":
 		return true
 	default:
 		return false
@@ -3076,12 +3076,24 @@ func mapLoopReactivationError(err error, loopID string) error {
 	case errors.Is(err, loops.ErrLoopNotFound):
 		return apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 	case errors.Is(err, loops.ErrActiveLoopConflict):
-		return apiError{code: pkgapi.ErrorCodeLoopConflict, status: http.StatusConflict, message: err.Error()}
+		return apiError{code: pkgapi.ErrorCodeLoopConflict, status: http.StatusConflict, message: loopConflictTransportMessage(err)}
 	case errors.Is(err, loops.ErrInvalidQueueTarget):
 		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
 	default:
 		return err
 	}
+}
+
+// loopConflictTransportMessage preserves the public conflict wording while
+// keeping the loops service's sentinel/wrapping details internal. The legacy
+// HTTP contract spells pull-request targets as "pull_request"; the domain
+// target key intentionally uses the shorter lock-oriented "pr" spelling.
+func loopConflictTransportMessage(err error) string {
+	message := strings.TrimSpace(err.Error())
+	message = strings.TrimPrefix(message, loops.ErrActiveLoopConflict.Error()+":")
+	message = strings.TrimSpace(message)
+	message = strings.Replace(message, ":pr:", ":pull_request:", 1)
+	return message
 }
 
 func buildLoopTarget(targetType string, body createLoopRequest) (domain.LoopTarget, error) {
@@ -3980,13 +3992,27 @@ func validateLoopTargetProjectCompatibility(projectID string, projectMetadata ma
 	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("project %s is configured for repo %s, not %s", projectID, configuredRepo, targetRepo)}
 }
 
+func stringMetadataPtr(metadata map[string]any, key string) *string {
+	value, ok := metadata[key]
+	if !ok {
+		return nil
+	}
+
+	text, ok := value.(string)
+	if !ok || strings.TrimSpace(text) == "" {
+		return nil
+	}
+
+	result := text
+	return &result
+}
+
 func (h *Handler) validateCodingProjectRunnable(project storage.ProjectRecord, loopType domain.LoopType) error {
 	if loopType != domain.LoopTypeWorker && loopType != domain.LoopTypeFixer {
 		return nil
 	}
-	cfg := h.context.Config
+	cfg := h.effectiveConfig()
 	if h.context.ConfigSnapshot != nil {
-		cfg, _ = h.context.ConfigSnapshot()
 		for _, catalogProject := range cfg.Projects {
 			if catalogProject.ID == project.ID {
 				return nil
@@ -4001,21 +4027,6 @@ func (h *Handler) validateCodingProjectRunnable(project storage.ProjectRecord, l
 		return nil
 	}
 	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("project %s is unavailable for coding work until its validation policy is repaired", project.ID)}
-}
-
-func stringMetadataPtr(metadata map[string]any, key string) *string {
-	value, ok := metadata[key]
-	if !ok {
-		return nil
-	}
-
-	text, ok := value.(string)
-	if !ok || strings.TrimSpace(text) == "" {
-		return nil
-	}
-
-	result := text
-	return &result
 }
 
 func normalizeOptionalString(value *string) *string {

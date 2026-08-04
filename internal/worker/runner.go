@@ -487,6 +487,7 @@ type Options struct {
 	OnRunCompleted          RunCompletedFunc
 	DiscoveryPolicy         DiscoveryPolicy
 	OnQueueItemEnqueued     func()
+	StopLoop                func(context.Context, string, string) error
 	Network                 NetworkStatusGateway
 	// HITLEnabled gates the mid-run human-in-the-loop feature. When false (the
 	// default) none of the HITL code paths run and the worker behaves exactly as
@@ -1163,7 +1164,7 @@ func New(options Options) *Runner {
 		hitlAnswerTransport:         options.HITLAnswerTransport,
 		hitlGitHub:                  options.HITLGitHub,
 	}
-	runner.workGraphs = workgraphdispatch.New(workgraphdispatch.Options{DB: options.DB, Repositories: options.Repos, Now: now, RetryMaxAttempts: retryMaxAttempts, OnEnqueued: options.OnQueueItemEnqueued})
+	runner.workGraphs = workgraphdispatch.New(workgraphdispatch.Options{DB: options.DB, Repositories: options.Repos, Now: now, RetryMaxAttempts: retryMaxAttempts, OnEnqueued: options.OnQueueItemEnqueued, StopLoop: options.StopLoop})
 	return runner
 }
 
