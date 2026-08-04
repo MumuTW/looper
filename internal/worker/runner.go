@@ -868,6 +868,13 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 			if checkpoint.Execution == nil || checkpoint.Execution.Status != "completed" {
 				return reproductionFailure(errors.New("reproduction manifest appeared before agent execution completed"))
 			}
+			if checkpoint.Work.IssueNumber > 0 && manifest.IssueNumber == 0 {
+				// An issue-target Worker may adopt a newly authored contract only
+				// when it names the issue it reproduces. Unscoped manifests remain
+				// valid legacy base-branch contracts at the first capture, but a
+				// new unscoped file would become authority for unrelated issues.
+				return reproductionFailure(errors.New("worker-authored reproduction manifest must identify the current issue"))
+			}
 		} else if checkpoint.Work.Reproduction == nil && workerPastInitialReproductionCapture(*checkpoint) {
 			// Legacy checkpoint without ReproductionAbsent after upgrade:
 			// fail closed rather than adopt a mid-run agent file as authority.

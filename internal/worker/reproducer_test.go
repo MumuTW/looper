@@ -75,7 +75,7 @@ func TestWorkerValidationCommandsIncludeReproductionCommand(t *testing.T) {
 }
 
 func TestWorkerReproductionAbsentBlocksPreExecutionAdoption(t *testing.T) {
-	root, expected := writeWorkerReproductionFixture(t)
+	root, expected := writeWorkerReproductionFixtureWithIssue(t, 1, "acme/app")
 	// First empty capture records absence.
 	emptyRoot := t.TempDir()
 	checkpoint := workerCheckpoint{Work: &workerInput{IssueNumber: 1, Repo: "acme/app"}}
@@ -418,6 +418,21 @@ func TestWorkerCaptureReproductionAdoptsUnscopedManifest(t *testing.T) {
 	}
 	if checkpoint.Work.Reproduction == nil || !checkpoint.Work.Reproduction.Equal(*manifest) {
 		t.Fatalf("Reproduction = %#v, want adopted unscoped manifest", checkpoint.Work.Reproduction)
+	}
+}
+
+func TestWorkerCaptureReproductionRejectsNewUnscopedManifestForIssue(t *testing.T) {
+	root, _ := writeWorkerReproductionFixture(t)
+	checkpoint := workerCheckpoint{
+		Work:               &workerInput{Repo: "MumuTW/looper", IssueNumber: 113},
+		ReproductionAbsent: true,
+		Execution:          &checkpointExecution{Status: "completed"},
+	}
+	if err := captureWorkerReproduction(&checkpoint, root); err == nil || !strings.Contains(err.Error(), "must identify the current issue") {
+		t.Fatalf("captureWorkerReproduction() = %v, want issue-scoped worker-authored rejection", err)
+	}
+	if checkpoint.Work.Reproduction != nil {
+		t.Fatalf("Reproduction = %#v, want no authority adopted", checkpoint.Work.Reproduction)
 	}
 }
 
