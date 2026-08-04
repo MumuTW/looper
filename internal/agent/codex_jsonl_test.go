@@ -119,6 +119,22 @@ func TestResolveCodexArgs_ReasoningEffortNone(t *testing.T) {
 	}
 }
 
+func TestResolveCodexArgs_ReasoningEffortNoneStripsInheritedConfig(t *testing.T) {
+	effort := config.ReasoningEffortNone
+	got := resolveCodexArgs(ExecutorConfig{Vendor: "codex", ReasoningEffort: &effort}, []string{
+		"-c", "model_reasoning_effort=high", "--sandbox", "workspace-write",
+		"--config=model_reasoning_effort=low", "-cfoo=bar",
+	}, "do it")
+	for _, arg := range got {
+		if strings.HasPrefix(arg, "model_reasoning_effort=") || strings.Contains(arg, "-c=model_reasoning_effort=") || strings.Contains(arg, "--config=model_reasoning_effort=") {
+			t.Fatalf("resolveCodexArgs() = %v, want inherited reasoning config stripped", got)
+		}
+	}
+	if !containsArg(got, "--sandbox") || !containsArg(got, "workspace-write") || !containsArg(got, "-cfoo=bar") {
+		t.Fatalf("resolveCodexArgs() = %v, want unrelated args preserved", got)
+	}
+}
+
 func TestResolveCodexArgs_ReasoningEffortUnset(t *testing.T) {
 	base := ExecutorConfig{Vendor: "codex"}
 	got := resolveCodexArgs(base, []string{}, "do it")

@@ -2372,8 +2372,11 @@ func resolveCodexArgs(cfg ExecutorConfig, args []string, prompt string) []string
 // overlay sentinel that suppresses an inherited setting; it is not a value
 // accepted by the Codex CLI, so it must never be forwarded as a literal.
 func appendReasoningEffortFlag(args []string, effort *config.ReasoningEffort) []string {
-	if effort == nil || *effort == config.ReasoningEffortNone {
+	if effort == nil {
 		return args
+	}
+	if *effort == config.ReasoningEffortNone {
+		return stripReasoningEffortFlags(args)
 	}
 	flag := []string{"-c", fmt.Sprintf("model_reasoning_effort=%s", string(*effort))}
 	for i, arg := range args {
@@ -2385,6 +2388,43 @@ func appendReasoningEffortFlag(args []string, effort *config.ReasoningEffort) []
 		}
 	}
 	return append(args, flag...)
+}
+
+// stripReasoningEffortFlags removes inherited Codex config assignments when
+// the Looper overlay explicitly suppresses reasoning effort. It accepts the
+// separate and equals forms supported by Codex without treating unrelated -c
+// settings as identity-bearing.
+func stripReasoningEffortFlags(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "-c" || arg == "--config" {
+			if i+1 < len(args) && isReasoningEffortConfig(args[i+1]) {
+				i++
+				continue
+			}
+			out = append(out, arg)
+			continue
+		}
+		if strings.HasPrefix(arg, "-c=") && isReasoningEffortConfig(strings.TrimPrefix(arg, "-c=")) {
+			continue
+		}
+		if strings.HasPrefix(arg, "--config=") && isReasoningEffortConfig(strings.TrimPrefix(arg, "--config=")) {
+			continue
+		}
+		if strings.HasPrefix(arg, "-c") && isReasoningEffortConfig(strings.TrimPrefix(arg, "-c")) {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
+func isReasoningEffortConfig(arg string) bool {
+	return strings.HasPrefix(strings.TrimSpace(arg), "model_reasoning_effort=")
 }
 
 // enforceCodexToolNetworkDenied overrides all operator-supplied Codex sandbox
