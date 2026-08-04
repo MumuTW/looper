@@ -176,6 +176,7 @@ type PullRequestDetail struct {
 	Mergeable          *bool
 	MergeableState     MergeabilityState
 	MergedAt           string
+	MergedBy           string
 	AutoMerge          *PullRequestAutoMerge
 }
 
@@ -1967,6 +1968,7 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		IsDraft:        asBool(row["draft"]),
 		Author:         extractAuthor(row["user"]),
 		MergedAt:       firstNonEmpty(asString(row["merged_at"]), asString(row["mergedAt"])),
+		MergedBy:       extractAuthor(row["merged_by"]),
 		Labels:         extractLabelNames(row["labels"]),
 		HeadRefName:    nestedString(row, "head", "ref"),
 		BaseRefName:    nestedString(row, "base", "ref"),

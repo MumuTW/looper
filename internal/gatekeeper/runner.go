@@ -131,15 +131,21 @@ type Evidence struct {
 }
 
 type Report struct {
-	Version         int    `json:"version"`
-	Mode            string `json:"mode"`
-	Status          string `json:"status"`
-	Eligible        bool   `json:"eligible"`
-	ProjectID       string `json:"projectId"`
-	Repo            string `json:"repo"`
-	PRNumber        int64  `json:"prNumber"`
-	ExpectedHeadSHA string `json:"expectedHeadSha,omitempty"`
-	ObservedHeadSHA string `json:"observedHeadSha,omitempty"`
+	Version   int    `json:"version"`
+	Mode      string `json:"mode"`
+	Status    string `json:"status"`
+	Eligible  bool   `json:"eligible"`
+	ProjectID string `json:"projectId"`
+	Repo      string `json:"repo"`
+	// RepositoryIdentity is the provider-qualified repository target observed
+	// for this report (for example, "ghe.example.test/acme/looper"). Repo is
+	// intentionally kept as the owner/slug used by the event and forge APIs;
+	// this separate value lets a project move providers without mistaking the
+	// same slug on two hosts for the same merge route.
+	RepositoryIdentity string `json:"repositoryIdentity,omitempty"`
+	PRNumber           int64  `json:"prNumber"`
+	ExpectedHeadSHA    string `json:"expectedHeadSha,omitempty"`
+	ObservedHeadSHA    string `json:"observedHeadSha,omitempty"`
 	// RequiresFreshRevalidation means a future merge path must rerun the full
 	// evaluation immediately before merging. Comparing ObservedHeadSHA alone
 	// is insufficient because holds, reviews, threads, and project policy can
@@ -239,7 +245,11 @@ type Options struct {
 	// ConfiguredTargetBranch is folded into the discovery fingerprint so a
 	// project policy generation change cannot leave a stale route reusable.
 	ConfiguredTargetBranch func(projectID string) string
-	LogWarn                func(msg string, fields map[string]any)
+	// RepositoryIdentity returns the provider-qualified repository target for a
+	// project. It is persisted in each report and folded into discovery reuse so
+	// a provider move retires the old route before the new binding is evaluated.
+	RepositoryIdentity func(projectID string) string
+	LogWarn            func(msg string, fields map[string]any)
 }
 
 func boolPointer(value bool) *bool { return &value }
@@ -258,6 +268,7 @@ type Runner struct {
 	trustForProject        func(projectID string) config.GatekeeperTrustLevel
 	diffBudgetForProject   func(projectID string) config.GatekeeperDiffBudget
 	configuredTargetBranch func(projectID string) string
+	repositoryIdentity     func(projectID string) string
 	logWarn                func(msg string, fields map[string]any)
 	outOfPageRouteMu       sync.Mutex
 	outOfPageRouteChecks   map[string]time.Time
@@ -277,6 +288,7 @@ func New(options Options) *Runner {
 		trustForProject:        options.TrustForProject,
 		diffBudgetForProject:   options.DiffBudgetForProject,
 		configuredTargetBranch: options.ConfiguredTargetBranch,
+		repositoryIdentity:     options.RepositoryIdentity,
 		logWarn:                options.LogWarn,
 		outOfPageRouteChecks:   make(map[string]time.Time),
 	}
@@ -368,7 +380,13 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	pageIDs := pageEntityIDs(input.Repo, pullRequests)
 	for _, entityID := range r.departedFromOpenSet(input.Repo, pullRequests, limit, previousReports, pageIDs) {
 		previous := previousReports[entityID]
-		if previousPublished(previous) {
+		if hasReasonCode(previous.Reasons, ReasonRouteRevoked) {
+			continue
+		}
+		// Routed reports have their own out-of-page lifecycle below. Published
+		// advice and blocked/non-routed reports still need a terminal evaluation
+		// when they leave the open set so their verdict and labels cannot linger.
+		if previousPublished(previous) && reportRouteEstablished(previous) {
 			continue
 		}
 		report, err := r.EvaluatePullRequest(ctx, EvaluationInput{
@@ -455,6 +473,7 @@ func (r *Runner) sourceFingerprintForProjectWithContract(pullRequest githubinfra
 		fmt.Sprintf("%d", budget.MaxChangedFiles),
 		fmt.Sprintf("%d", budget.MaxDeletions),
 		r.configuredTarget(projectID),
+		r.repositoryTarget(projectID),
 		strings.TrimSpace(contractFingerprint),
 	}, "\x1f")
 }
@@ -482,6 +501,13 @@ func (r *Runner) configuredTarget(projectID string) string {
 		return ""
 	}
 	return strings.TrimSpace(r.configuredTargetBranch(projectID))
+}
+
+func (r *Runner) repositoryTarget(projectID string) string {
+	if r == nil || r.repositoryIdentity == nil {
+		return ""
+	}
+	return strings.TrimSpace(r.repositoryIdentity(projectID))
 }
 
 func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput) (Report, error) {
@@ -512,7 +538,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 
 	report := Report{
 		Version: reportVersion, Status: StatusBlocked,
-		ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber,
+		ProjectID: input.ProjectID, Repo: input.Repo, RepositoryIdentity: r.repositoryTarget(input.ProjectID), PRNumber: input.PRNumber,
 		ExpectedHeadSHA: input.ExpectedHeadSHA, RequiresFreshRevalidation: true,
 		Reasons: []Reason{}, Evidence: Evidence{
 			RequiredChecks: []string{}, Checks: []CheckEvidence{}, UnresolvedReviewThreadIDs: []string{}, HoldLabels: []string{},

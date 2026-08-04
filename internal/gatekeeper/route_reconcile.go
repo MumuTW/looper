@@ -39,6 +39,19 @@ func reportRouteEstablished(report Report) bool {
 	return config.GatekeeperTrustLevel(strings.TrimSpace(report.Mode)) == config.GatekeeperTrustAuto && report.Eligible && !hasReasonCode(report.Reasons, ReasonRoutingProjectionFailed)
 }
 
+// reportNeedsRouteRecovery identifies the crash boundary where the durable
+// pending report was written and the auto-merge label mutation may have
+// succeeded, but the final RouteEstablished report was not appended. It is
+// intentionally narrower than reportRouteEstablished: a projection-failure
+// marker means the label write was known to fail and must be retried through
+// the normal discovery path rather than treated as a live route here.
+func reportNeedsRouteRecovery(report Report) bool {
+	return report.RouteEstablished != nil && !*report.RouteEstablished &&
+		config.GatekeeperTrustLevel(strings.TrimSpace(report.Mode)) == config.GatekeeperTrustAuto &&
+		report.Eligible && report.SourceFingerprint == "" &&
+		!hasReasonCode(report.Reasons, ReasonRoutingProjectionFailed)
+}
+
 // reconcileRoutedReportsOutsideDiscoveryPage reconciles previously published
 // routes whose pull requests are absent from the bounded discovery page.
 // Discovery is not paginated, so a routed pull request beyond
@@ -62,7 +75,7 @@ func (r *Runner) reconcileRoutedReportsOutsideDiscoveryPage(ctx context.Context,
 		if _, inPage := pageEntityIDs[entityID]; inPage {
 			continue
 		}
-		if !reportRouteEstablished(previous) {
+		if !reportRouteEstablished(previous) && !reportNeedsRouteRecovery(previous) {
 			continue
 		}
 		if hasReasonCode(previous.Reasons, ReasonRouteRevoked) {
@@ -71,17 +84,32 @@ func (r *Runner) reconcileRoutedReportsOutsideDiscoveryPage(ctx context.Context,
 		if checks >= maxOutOfPageRouteChecksPerTick {
 			break
 		}
-		if !r.allowOutOfPageRouteCheck(input.ProjectID + "\x1f" + entityID) {
+		routeCheckKey := input.ProjectID + "\x1f" + entityID
+		if !r.allowOutOfPageRouteCheck(routeCheckKey) {
 			continue
 		}
 		checks++
-		if strings.TrimSpace(previous.Repo) != strings.TrimSpace(input.Repo) {
+		currentRepositoryIdentity := r.repositoryTarget(input.ProjectID)
+		previousRepositoryIdentity := strings.TrimSpace(previous.RepositoryIdentity)
+		repositoryChanged := false
+		if currentRepositoryIdentity != "" || previousRepositoryIdentity != "" {
+			// An identity missing from a legacy report is deliberately treated as
+			// different once the runtime has an explicit provider binding. This
+			// retires the old route before trusting a report whose forge host was
+			// never recorded.
+			repositoryChanged = !strings.EqualFold(previousRepositoryIdentity, currentRepositoryIdentity)
+		} else {
+			repositoryChanged = !strings.EqualFold(strings.TrimSpace(previous.Repo), strings.TrimSpace(input.Repo))
+		}
+		if repositoryChanged {
 			if err := r.retireRoutingLabelsForReport(ctx, previous); err != nil {
 				errs = append(errs, fmt.Errorf("revoke route for repository change %s: %w", entityID, err))
 				continue
 			}
 			if err := r.markRouteRevoked(ctx, previous); err != nil {
 				errs = append(errs, fmt.Errorf("mark repository-changed route %s revoked: %w", entityID, err))
+			} else {
+				r.forgetOutOfPageRouteCheck(routeCheckKey)
 			}
 			continue
 		}
@@ -104,6 +132,7 @@ func (r *Runner) reconcileRoutedReportsOutsideDiscoveryPage(ctx context.Context,
 		// timestamp rather than the state string.
 		mergedAt := strings.TrimSpace(detail.MergedAt)
 		state := strings.ToUpper(strings.TrimSpace(detail.State))
+		var replacementReport *Report
 		switch {
 		case mergedAt != "":
 			// A routed pull request that merged is durable evidence the Auditor
@@ -122,34 +151,53 @@ func (r *Runner) reconcileRoutedReportsOutsideDiscoveryPage(ctx context.Context,
 				continue
 			}
 		default:
-			if liveHead := strings.TrimSpace(detail.HeadSHA); liveHead != "" && liveHead != strings.TrimSpace(previous.ObservedHeadSHA) && liveHead != strings.TrimSpace(previous.ExpectedHeadSHA) {
-				if err := r.retireRoutingLabelsForReport(ctx, previous); err != nil {
-					errs = append(errs, fmt.Errorf("retire head-drifted route %s: %w", entityID, err))
-					continue
-				}
-				if err := r.markRouteRevoked(ctx, previous); err != nil {
-					errs = append(errs, fmt.Errorf("mark head-drifted route %s revoked: %w", entityID, err))
-				}
+			// An open route outside the bounded list still needs the complete
+			// Gatekeeper evaluation. The list page cannot prove current-head review,
+			// diff-budget, thread, hold, or provider state, and a local trust check
+			// would leave a pushed commit queued under stale authority. The pass is
+			// cadence- and count-bounded above, so this is a bounded safety read.
+			expectedHead := strings.TrimSpace(previous.Evidence.FinalObservedHeadSHA)
+			if expectedHead == "" {
+				expectedHead = strings.TrimSpace(previous.ObservedHeadSHA)
+			}
+			revalidated, evalErr := r.EvaluatePullRequest(ctx, EvaluationInput{
+				ProjectID: input.ProjectID, Repo: previous.Repo, PRNumber: previous.PRNumber,
+				CWD: r.projectCWD(ctx, input.ProjectID), ExpectedHeadSHA: expectedHead,
+			})
+			if evalErr != nil {
+				errs = append(errs, fmt.Errorf("re-evaluate out-of-page routed pull request %s: %w", entityID, evalErr))
 				continue
 			}
-			// Still open outside the page. Retire the route only when the current
-			// routing inputs no longer permit it (observe demotion or policy
-			// denial); a route under inputs that still permit it is not stale and
-			// stays in place until the pull request re-enters the page.
-			if !r.routingInputsStillPermit(previous) {
-				if err := r.retireRoutingLabelsForReport(ctx, previous); err != nil {
-					errs = append(errs, fmt.Errorf("retire out-of-page route %s: %w", entityID, err))
-					continue
-				}
-			} else {
+			if revalidated.Eligible && revalidated.RouteEstablished != nil && *revalidated.RouteEstablished {
 				continue
 			}
+			if hasReasonCode(revalidated.Reasons, ReasonRoutingProjectionFailed) {
+				// The failed projection has its own empty-fingerprint retry marker;
+				// do not append a terminal revoke that would suppress that retry.
+				continue
+			}
+			if !revalidated.Eligible && r.trustFor(input.ProjectID) == config.GatekeeperTrustObserve {
+				// Observe demotion is still a queue-authority transition. The full
+				// evaluation safely removes the trigger, then retain the explicit
+				// veto until the external queue has observed the withdrawal.
+				if err := r.retireRoutingLabelsForReport(ctx, previous); err != nil {
+					errs = append(errs, fmt.Errorf("retain demotion veto for %s: %w", entityID, err))
+					continue
+				}
+			}
+			replacementReport = &revalidated
 		}
 		// Mark revoked only after the retirement succeeded: marking first would
 		// make the next reconcile pass skip the entity (ReasonRouteRevoked) and
 		// never retry a failed label removal.
-		if err := r.markRouteRevoked(ctx, previous); err != nil {
+		markerReport := previous
+		if replacementReport != nil {
+			markerReport = *replacementReport
+		}
+		if err := r.markRouteRevoked(ctx, markerReport); err != nil {
 			errs = append(errs, fmt.Errorf("mark out-of-page route %s revoked: %w", entityID, err))
+		} else {
+			r.forgetOutOfPageRouteCheck(routeCheckKey)
 		}
 	}
 	return errors.Join(errs...)
@@ -165,6 +213,15 @@ func (r *Runner) allowOutOfPageRouteCheck(key string) bool {
 	if r.outOfPageRouteChecks == nil {
 		r.outOfPageRouteChecks = make(map[string]time.Time)
 	}
+	// Cadence entries are an in-memory admission cache, not route state. Evict
+	// timestamps that could no longer suppress a check; terminal routes also
+	// call forgetOutOfPageRouteCheck immediately after their revoke marker is
+	// durable. This keeps a long-lived daemon bounded by live/recent routes.
+	for key, last := range r.outOfPageRouteChecks {
+		if !now.Before(last.Add(outOfPageRouteReconcileInterval)) {
+			delete(r.outOfPageRouteChecks, key)
+		}
+	}
 	if last, ok := r.outOfPageRouteChecks[key]; ok && now.Before(last.Add(outOfPageRouteReconcileInterval)) {
 		return false
 	}
@@ -172,19 +229,23 @@ func (r *Runner) allowOutOfPageRouteCheck(key string) bool {
 	return true
 }
 
-// routingInputsStillPermit reports whether the routing inputs that published a
-// report (trust level and target policy) still permit the route it carried.
-// This is the local check that replaces the page evaluation for a pull request
-// outside the bounded discovery page: it costs no forge round trip.
-func (r *Runner) routingInputsStillPermit(report Report) bool {
-	if r.trustFor(report.ProjectID) != config.GatekeeperTrustAuto {
-		return false
+func (r *Runner) forgetOutOfPageRouteCheck(key string) {
+	if r == nil {
+		return
 	}
-	base := strings.TrimSpace(report.Evidence.BaseRefName)
-	if base != "" && !r.policyPermitsTarget(report.ProjectID, report.Repo, base) {
-		return false
+	r.outOfPageRouteMu.Lock()
+	defer r.outOfPageRouteMu.Unlock()
+	delete(r.outOfPageRouteChecks, key)
+}
+
+// reportRepositoryTarget returns the forge-qualified target captured when the
+// report was evaluated. Reports from before provider-qualified identities were
+// persisted fall back to the legacy owner/slug representation.
+func reportRepositoryTarget(report Report) string {
+	if target := strings.TrimSpace(report.RepositoryIdentity); target != "" {
+		return target
 	}
-	return true
+	return strings.TrimSpace(report.Repo)
 }
 
 // retireRoutingLabelsForReport retires both routing labels for a previously
@@ -204,7 +265,7 @@ func (r *Runner) retireRoutingLabelsForReport(ctx context.Context, report Report
 }
 
 func (r *Runner) clearRoutingLabelsForReport(ctx context.Context, report Report) error {
-	input := githubinfra.PullRequestLabelsInput{Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID)}
+	input := githubinfra.PullRequestLabelsInput{Repo: reportRepositoryTarget(report), PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID)}
 	// Terminal PRs cannot be queued, but clear both labels so a closed route
 	// does not trigger external human-review automation. Keep auto-merge last
 	// for deterministic audit logs shared with the historical cleanup order.

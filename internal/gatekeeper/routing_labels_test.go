@@ -159,7 +159,7 @@ func TestRepeatedReviewChangesEscalatesOnSecondEvaluation(t *testing.T) {
 	}
 }
 
-func TestEligibleThenMechanicalBlockRemovesAutoMergeWithoutEscalation(t *testing.T) {
+func TestEligibleThenMechanicalBlockAddsVetoBeforeRemovingAutoMerge(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	runner := routingRunner(fixture, config.GatekeeperTrustAuto)
 	eligible := Report{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ObservedHeadSHA: "head-1", Evidence: Evidence{
@@ -177,11 +177,11 @@ func TestEligibleThenMechanicalBlockRemovesAutoMergeWithoutEscalation(t *testing
 	if _, err := runner.persist(context.Background(), blocked); err != nil {
 		t.Fatalf("blocked persist() error = %v", err)
 	}
-	if len(fixture.github.labelAdds) != 1 || !slices.Equal(fixture.github.labelAdds[0].Labels, []string{labels.AutoMerge}) {
-		t.Fatalf("label adds = %#v, want only the initial auto route", fixture.github.labelAdds)
+	if len(fixture.github.labelAdds) != 2 || !slices.Equal(fixture.github.labelAdds[0].Labels, []string{labels.AutoMerge}) || !slices.Equal(fixture.github.labelAdds[1].Labels, []string{labels.NeedsHumanReview}) {
+		t.Fatalf("label adds = %#v, want initial route plus queue veto", fixture.github.labelAdds)
 	}
-	if len(fixture.github.labelRemoves) != 3 || !slices.Equal(fixture.github.labelRemoves[1].Labels, []string{labels.AutoMerge}) {
-		t.Fatalf("label removes = %#v, want auto-merge removed on verdict flip", fixture.github.labelRemoves)
+	if len(fixture.github.labelRemoves) != 2 || !slices.Equal(fixture.github.labelRemoves[1].Labels, []string{labels.AutoMerge}) {
+		t.Fatalf("label removes = %#v, want auto-merge removed after queue veto", fixture.github.labelRemoves)
 	}
 }
 

@@ -760,6 +760,25 @@ Project-level overrides use the same shape under `projects[].roles.reviewer.auto
 
 When `roles.reviewer.autoMerge.enabled = true`, Looper performs a repo-aware startup validation pass: the project must have a known GitHub repo, GitHub auto-merge must be enabled for that repo, the configured strategy must be allowed, and — if `requireBranchProtection=true` — the effective base branch must exist with required checks enabled.
 
+### Post-merge digest
+
+The optional `roles.coordinator.postMergeDigest` lane sends one timezone-aware
+daily audit from durable local merge, loop, and failure evidence. It is global-
+only and disabled by default; it never asks an agent to reconstruct history or
+uses a live GitHub read to fill missing evidence.
+
+| Path | Purpose | Default | Validation |
+| --- | --- | --- | --- |
+| `roles.coordinator.postMergeDigest.enabled` | Enable the daily digest lane | `false` | — |
+| `roles.coordinator.postMergeDigest.schedule` | Local `HH:MM` delivery time | — | required when enabled |
+| `roles.coordinator.postMergeDigest.timezone` | IANA timezone for day boundaries | — | required/known timezone when enabled |
+| `roles.coordinator.postMergeDigest.includeEmpty` | Send a quiet-day digest | `false` | — |
+| `roles.coordinator.postMergeDigest.maxItems` | Maximum entries per section | — | `1..200` when enabled |
+
+The digest reports merged, closed/regenerated, awaiting-human, and anomaly
+sections. Project-level `projects[].roles.coordinator.postMergeDigest` overrides
+are rejected because one process owns one global daily schedule.
+
 ## Telegram intake
 
 Telegram intake lets you open work from a chat instead of the forge UI. A message

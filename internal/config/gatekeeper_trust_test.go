@@ -95,6 +95,28 @@ func TestGatekeeperTrustRejectsProjectAutoOverrideWithReviewerAutoMerge(t *testi
 	}
 }
 
+func TestGatekeeperTrustRejectsInheritedProjectReviewerAutoMerge(t *testing.T) {
+	t.Parallel()
+	auto := GatekeeperTrustAuto
+	enabled := true
+	cfg := Config{
+		Roles: RoleConfigs{Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto}},
+		Projects: []ProjectRefConfig{{
+			ID:    "looper",
+			Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{AutoMerge: &PartialReviewerAutoMergeConfig{Enabled: &enabled}}, Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto}},
+		}},
+	}
+
+	var issues []ValidationIssue
+	validateCoreConfig(cfg, &issues)
+	for _, issue := range issues {
+		if issue.Path == "projects[0].roles.reviewer.autoMerge.enabled" {
+			return
+		}
+	}
+	t.Fatalf("issues = %+v, want inherited project merge-authority conflict", issues)
+}
+
 func TestMergePartialGatekeeperTrust(t *testing.T) {
 	t.Parallel()
 

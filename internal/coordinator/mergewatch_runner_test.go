@@ -88,7 +88,7 @@ func TestApplyMergeWatchRecordsMergifyMergeEvidence(t *testing.T) {
 	fixture := newCoordinatorFixture(t)
 	fixture.github.prDetails[42] = githubinfra.PullRequestDetail{
 		Number: 42, Body: "Closes #7", State: "closed", HeadSHA: "head-42", BaseRefName: "main",
-		Labels: []string{labels.DefaultPlanTrigger, labels.AutoMerge}, MergedAt: "2026-05-14T11:58:07.000Z",
+		Labels: []string{labels.DefaultPlanTrigger, labels.AutoMerge}, MergedAt: "2026-05-14T11:58:07.000Z", MergedBy: "mergify[bot]",
 		Mergeable: boolPtr(true), MergeableState: "clean",
 	}
 	loaded := []loadedIssue{{
@@ -112,7 +112,7 @@ func TestApplyMergeWatchShortCircuitsMergedSnapshotBeforeCheckRuns(t *testing.T)
 	// short-circuit before the check/protection reads so a coincident outage
 	// cannot erase Auditor merge evidence.
 	fixture.github.prDetails[42] = githubinfra.PullRequestDetail{
-		Number: 42, State: "closed", HeadSHA: "head-42", BaseRefName: "main", MergedAt: "2026-05-14T11:58:07.000Z",
+		Number: 42, State: "closed", HeadSHA: "head-42", BaseRefName: "main", MergedAt: "2026-05-14T11:58:07.000Z", MergedBy: "mergify[bot]",
 	}
 	fixture.github.failPRCheckRuns = map[string]error{"head-42": errors.New("HTTP 504 gateway timeout")}
 	snapshot, tempErr, err := fixture.runner.mergeWatchSnapshot(context.Background(), "acme/looper", cwd, 7, 42, "looper")
@@ -177,7 +177,7 @@ func TestApplyRoutedMergeWatchRecordsMergeEvidenceOutsideIssueDiscovery(t *testi
 	}
 	fixture.github.prDetails[42] = githubinfra.PullRequestDetail{
 		Number: 42, State: "closed", HeadSHA: "head-42", BaseRefName: "main", MergedAt: "2026-05-14T11:58:07.000Z",
-		Labels: []string{labels.DefaultPlanTrigger, labels.AutoMerge},
+		Labels: []string{labels.DefaultPlanTrigger, labels.AutoMerge}, MergedBy: "mergify[bot]",
 	}
 	if err := fixture.runner.applyRoutedMergeWatch(context.Background(), fixture.projectID, "acme/looper", cwd); err != nil {
 		t.Fatalf("applyRoutedMergeWatch() settle error = %v", err)

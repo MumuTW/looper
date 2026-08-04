@@ -2035,6 +2035,17 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				}
 				return strings.TrimSpace(configuredBase)
 			},
+			RepositoryIdentity: func(projectID string) string {
+				project, ok := runtimeProjectBinding(cfg, projectID)
+				if !ok {
+					return ""
+				}
+				qualified, err := qualifyProjectRepo(cfg, project, project.Repo)
+				if err != nil {
+					return ""
+				}
+				return strings.TrimSpace(qualified)
+			},
 		})
 	}
 	// refreshFeishuAnchor re-renders a loop's thread-anchor card to reflect its
