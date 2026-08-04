@@ -103,6 +103,7 @@ func Build(input Input) (Manifest, error) {
 		visitedELF:          make(map[string]struct{}),
 		visitedInterpreters: make(map[string]struct{}),
 		interpreterPaths:    executableSearchPaths(normalized.Roots, normalized.LaunchPath),
+		elfContextPath:      normalized.Roots["node"],
 		visitedMachO:        make(map[string]struct{}),
 	}
 	if err := collector.addPackageTree(normalized.PackageRoot, normalized.Roots["srt"]); err != nil {
@@ -519,7 +520,12 @@ type closureCollector struct {
 	visitedELF          map[string]struct{}
 	visitedInterpreters map[string]struct{}
 	interpreterPaths    []string
-	visitedMachO        map[string]struct{}
+	// elfContextPath is the executable whose loader resolves ELF shared
+	// objects discovered in the package tree. Native Node addons are loaded
+	// with Node's loader context, but unlike an executable they do not carry a
+	// PT_INTERP segment of their own.
+	elfContextPath string
+	visitedMachO   map[string]struct{}
 }
 
 func (c *closureCollector) addPackageTree(root, runtimePath string) error {
@@ -628,11 +634,20 @@ func (c *closureCollector) addExecutable(path string, runtimeScript bool) error 
 }
 
 func (c *closureCollector) addELFClosure(path string) error {
-	if _, ok := c.visitedELF[path]; ok {
+	executablePath := c.elfContextPath
+	if executablePath == "" || executablePath == path {
+		executablePath = path
+	}
+	return c.addELFClosureFrom(path, executablePath)
+}
+
+func (c *closureCollector) addELFClosureFrom(path, executablePath string) error {
+	visitKey := path + "\x00" + executablePath
+	if _, ok := c.visitedELF[visitKey]; ok {
 		return nil
 	}
-	c.visitedELF[path] = struct{}{}
-	interpreter, ok, err := elfInterpreter(path)
+	c.visitedELF[visitKey] = struct{}{}
+	interpreter, ok, err := elfLoaderFor(path, executablePath)
 	if err != nil {
 		return err
 	}
@@ -641,7 +656,7 @@ func (c *closureCollector) addELFClosure(path string) error {
 			return err
 		}
 	}
-	dependencies, err := lddDependencies(path)
+	dependencies, err := lddDependencies(path, executablePath)
 	if err != nil {
 		return err
 	}
@@ -1126,8 +1141,56 @@ func validateExecutablePath(path string) (string, error) {
 	return path, nil
 }
 
-func lddDependencies(path string) ([]string, error) {
+// elfLoaderFor returns the loader that would resolve path's ELF closure. A
+// normal executable names its loader in PT_INTERP. Shared objects do not, so
+// their DT_NEEDED entries must be resolved with the loader of the executable
+// that will load them (Node for package-native addons).
+func elfLoaderFor(path, executablePath string) (string, bool, error) {
 	interpreter, ok, err := elfInterpreter(path)
+	if err != nil {
+		return "", false, err
+	}
+	if ok {
+		return interpreter, true, nil
+	}
+	needed, err := elfNeededLibraries(path)
+	if err != nil {
+		return "", false, fmt.Errorf("read ELF dependencies for %s: %w", path, err)
+	}
+	if len(needed) == 0 {
+		// An ELF without PT_INTERP and DT_NEEDED is genuinely static (or a
+		// data-only ELF object), so there is no loader to execute or record.
+		return "", false, nil
+	}
+	executablePath = strings.TrimSpace(executablePath)
+	if executablePath == "" || executablePath == path {
+		return "", false, fmt.Errorf("ELF shared object %s has DT_NEEDED dependencies but no loading executable context", path)
+	}
+	interpreter, ok, err = elfInterpreter(executablePath)
+	if err != nil {
+		return "", false, fmt.Errorf("resolve loading executable for %s: %w", path, err)
+	}
+	if !ok {
+		return "", false, fmt.Errorf("loading executable %s has no PT_INTERP for ELF shared object %s", executablePath, path)
+	}
+	return interpreter, true, nil
+}
+
+func elfNeededLibraries(path string) ([]string, error) {
+	file, err := elf.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return file.ImportedLibraries()
+}
+
+func lddDependencies(path string, loadingExecutable ...string) ([]string, error) {
+	executablePath := ""
+	if len(loadingExecutable) > 0 {
+		executablePath = loadingExecutable[0]
+	}
+	interpreter, ok, err := elfLoaderFor(path, executablePath)
 	if err != nil {
 		return nil, err
 	}
