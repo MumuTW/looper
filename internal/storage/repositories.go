@@ -762,6 +762,37 @@ func (r *EventsRepository) ListTriageSourceStates(ctx context.Context, projectID
 	return records, nil
 }
 
+// ListAwaitingTriageSourceStates returns one current lifecycle row per source
+// that has not reached confirmation, routing, or retirement. The event log is
+// append-only, so status readers must aggregate by source key in SQLite rather
+// than reread every historical event on each poll. The returned projection is
+// still authoritative only for the report and terminal-event evidence it
+// contains; it does not create a second lifecycle record.
+func (r *EventsRepository) ListAwaitingTriageSourceStates(ctx context.Context, projectID string) ([]TriageSourceStateRecord, error) {
+	args := []any{}
+	projectFilter := ""
+	if strings.TrimSpace(projectID) != "" {
+		projectFilter = " AND project_id = ?"
+		args = append(args, projectID)
+	}
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT `+triageSourceKeySQL+` AS source_key,
+			MIN(CASE WHEN event_type = 'triage.enrolled' THEN payload_json END),
+			MIN(CASE WHEN event_type = 'triage.report' THEN payload_json END),
+			MAX(event_type = 'triage.routed'),
+			MAX(event_type = 'triage.retired')
+		FROM event_logs INDEXED BY idx_event_logs_triage_source_key
+		WHERE `+triageLifecyclePredicateSQL+projectFilter+`
+		GROUP BY source_key
+		HAVING MAX(CASE WHEN event_type IN ('triage.confirmed', 'triage.routed', 'triage.retired') THEN 1 ELSE 0 END) = 0
+		ORDER BY source_key
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list awaiting triage source states: %w", err)
+	}
+	return scanTriageSourceStates(rows)
+}
+
 // ListTriageSourceStateWindow returns at most limit source lifecycles, rotating
 // after afterSourceKey and wrapping once. Terminal sources intentionally count
 // against the window: asking SQL to skip unbounded terminal history until it

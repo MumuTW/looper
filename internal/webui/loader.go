@@ -22,9 +22,9 @@ type Loader func(context.Context) Input
 // board a single tab would have shown anyway.
 //
 // It is deliberately not single-flight: two concurrent misses both load, and
-// the second one wins. Loading twice is the cost this exists to bound, not to
-// eliminate, and a coalescing barrier would make a slow collect block every
-// other request behind it.
+// the later load generation wins publication. Loading twice is the cost this
+// exists to bound, not to eliminate, and a coalescing barrier would make a
+// slow collect block every other request behind it.
 type LoadCache struct {
 	ttl time.Duration
 	now func() time.Time
@@ -33,6 +33,9 @@ type LoadCache struct {
 	input    Input
 	loadedAt time.Time
 	loaded   bool
+	// generation is incremented when a miss starts. A slower older miss must
+	// not overwrite the result of a newer miss merely because it finished last.
+	generation uint64
 }
 
 // NewLoadCache returns a cache that serves a stored input for ttl. A ttl of
@@ -73,6 +76,8 @@ func (c *LoadCache) Wrap(inner Loader) Loader {
 			cached.Now = now
 			return cached
 		}
+		c.generation++
+		generation := c.generation
 		c.mu.Unlock()
 
 		input := inner(ctx)
@@ -83,8 +88,13 @@ func (c *LoadCache) Wrap(inner Loader) Loader {
 		if ctx != nil && ctx.Err() != nil {
 			return input
 		}
+		publishedAt := c.now().UTC()
 		c.mu.Lock()
-		c.input, c.loadedAt, c.loaded = input, now, true
+		if generation != c.generation {
+			c.mu.Unlock()
+			return input
+		}
+		c.input, c.loadedAt, c.loaded = input, publishedAt, true
 		c.mu.Unlock()
 		return input
 	}
@@ -120,6 +130,9 @@ func NewRepositoryLoader(repos *storage.Repositories, collector *escalator.Colle
 	if now == nil {
 		now = time.Now
 	}
+	var escalatorStateMu sync.Mutex
+	var lastCompleteEscalator escalator.Snapshot
+	haveCompleteEscalator := false
 	return func(ctx context.Context) Input {
 		input := Input{Now: now().UTC(), Links: links}
 		if repos == nil {
@@ -179,11 +192,35 @@ func NewRepositoryLoader(repos *storage.Repositories, collector *escalator.Colle
 			if err != nil {
 				input.Notices = append(input.Notices, "Escalator digest could not be collected.")
 			} else {
+				escalatorStateMu.Lock()
+				if snapshot.Partial {
+					if haveCompleteEscalator {
+						// A rotating census is not resolution evidence. Keep the last
+						// complete projection and age it from its durable generation
+						// timestamp while the collector finishes its cycle.
+						elapsed := input.Now.Sub(parseTimestamp(lastCompleteEscalator.GeneratedAt))
+						snapshot = advanceCachedAges(Input{Escalator: lastCompleteEscalator}, elapsed).Escalator
+						snapshot.Partial = false
+						input.Notices = append(input.Notices, "Escalator census is incomplete; showing the last complete projection.")
+					} else {
+						input.Notices = append(input.Notices, "Escalator census is incomplete; board counts may be provisional.")
+					}
+				} else {
+					lastCompleteEscalator = cloneEscalatorSnapshot(snapshot)
+					haveCompleteEscalator = true
+				}
+				escalatorStateMu.Unlock()
 				input.Escalator = snapshot
 			}
 		}
 		return input
 	}
+}
+
+func cloneEscalatorSnapshot(snapshot escalator.Snapshot) escalator.Snapshot {
+	snapshot.Items = append([]escalator.Item(nil), snapshot.Items...)
+	snapshot.Backlog = append([]escalator.StageBacklog(nil), snapshot.Backlog...)
+	return snapshot
 }
 
 // projectRepository is the durable Project binding, not a value copied from a

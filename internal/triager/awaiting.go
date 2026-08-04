@@ -156,17 +156,10 @@ type AwaitingConfirmationSummary struct {
 	Sources []AwaitingConfirmationSource `json:"sources"`
 }
 
-type awaitingConfirmationState struct {
-	report    *Report
-	confirmed bool
-	projected bool
-	retired   bool
-}
-
 // AwaitingConfirmationStatus derives the outstanding human-confirmation roster
-// from the existing triage lifecycle events. It is intentionally read-only:
-// the report is the authority, while this projection only tells an operator
-// which reports need attention.
+// from the current triage lifecycle projection. The report is the authority,
+// while this read-only projection only tells an operator which reports need
+// attention; it never scans the append-only event history directly.
 func AwaitingConfirmationStatus(ctx context.Context, repositories *storage.Repositories, now time.Time) (AwaitingConfirmationSummary, error) {
 	summary := AwaitingConfirmationSummary{Sources: []AwaitingConfirmationSource{}}
 	if repositories == nil || repositories.Events == nil || repositories.Projects == nil {
@@ -182,85 +175,42 @@ func AwaitingConfirmationStatus(ctx context.Context, repositories *storage.Repos
 			activeProjectIDs[project.ID] = struct{}{}
 		}
 	}
-	events, err := repositories.Events.ListByEntityTypeAndEventTypes(ctx, reportEntityType, []string{
-		ReportEventType,
-		ConfirmationEventType,
-		ProjectionEventType,
-		RetirementEventType,
-	})
-	if err != nil {
-		return summary, fmt.Errorf("list triage lifecycle events: %w", err)
-	}
-	states := map[string]*awaitingConfirmationState{}
-	stateFor := func(key string) *awaitingConfirmationState {
-		state := states[key]
-		if state == nil {
-			state = &awaitingConfirmationState{}
-			states[key] = state
+	for projectID := range activeProjectIDs {
+		records, err := repositories.Events.ListAwaitingTriageSourceStates(ctx, projectID)
+		if err != nil {
+			return summary, fmt.Errorf("list awaiting triage source states: %w", err)
 		}
-		return state
-	}
-	for _, event := range events {
-		switch event.EventType {
-		case ReportEventType:
+		for _, record := range records {
+			if record.ReportJSON == nil {
+				continue
+			}
 			var report Report
-			if err := json.Unmarshal([]byte(event.PayloadJSON), &report); err != nil {
-				return summary, fmt.Errorf("decode triage report for status: %w", err)
+			if err := json.Unmarshal([]byte(*record.ReportJSON), &report); err != nil {
+				return summary, fmt.Errorf("decode awaiting triage report: %w", err)
 			}
 			if report.IdempotencyKey == "" {
-				return summary, fmt.Errorf("decode triage report for status: missing idempotency key")
+				return summary, fmt.Errorf("decode awaiting triage report: missing idempotency key")
 			}
-			copy := report
-			stateFor(report.IdempotencyKey).report = &copy
-		case ConfirmationEventType:
-			var confirmation Confirmation
-			if err := json.Unmarshal([]byte(event.PayloadJSON), &confirmation); err != nil {
-				return summary, fmt.Errorf("decode triage confirmation for status: %w", err)
+			if report.Policy.Action != ActionAwaitHuman {
+				continue
 			}
-			if confirmation.ReportKey != "" {
-				stateFor(confirmation.ReportKey).confirmed = true
+			createdAt, err := time.Parse(time.RFC3339Nano, report.CreatedAt)
+			if err != nil {
+				return summary, fmt.Errorf("parse awaiting triage report %s createdAt: %w", report.IdempotencyKey, err)
 			}
-		case ProjectionEventType:
-			var projection Projection
-			if err := json.Unmarshal([]byte(event.PayloadJSON), &projection); err != nil {
-				return summary, fmt.Errorf("decode triage projection for status: %w", err)
+			age := now.UTC().Sub(createdAt.UTC())
+			if age < 0 {
+				age = 0
 			}
-			if projection.ReportKey != "" {
-				stateFor(projection.ReportKey).projected = true
+			source := AwaitingConfirmationSource{
+				ProjectID: report.ProjectID, Repo: report.Repo, IssueNumber: report.IssueNumber,
+				CreatedAt: report.CreatedAt, AgeSeconds: int64(age / time.Second),
 			}
-		case RetirementEventType:
-			var retirement Retirement
-			if err := json.Unmarshal([]byte(event.PayloadJSON), &retirement); err != nil {
-				return summary, fmt.Errorf("decode triage retirement for status: %w", err)
+			if token := strings.TrimSpace(report.ConfirmationToken); token != "" {
+				source.Command = confirmationCommand(token)
 			}
-			if retirement.EnrollmentKey != "" {
-				stateFor(retirement.EnrollmentKey).retired = true
-			}
+			summary.Sources = append(summary.Sources, source)
 		}
-	}
-	for _, state := range states {
-		if state.report == nil || state.confirmed || state.projected || state.retired || state.report.Policy.Action != ActionAwaitHuman {
-			continue
-		}
-		if _, active := activeProjectIDs[state.report.ProjectID]; !active {
-			continue
-		}
-		createdAt, err := time.Parse(time.RFC3339Nano, state.report.CreatedAt)
-		if err != nil {
-			return summary, fmt.Errorf("parse awaiting triage report %s createdAt: %w", state.report.IdempotencyKey, err)
-		}
-		age := now.UTC().Sub(createdAt.UTC())
-		if age < 0 {
-			age = 0
-		}
-		source := AwaitingConfirmationSource{
-			ProjectID: state.report.ProjectID, Repo: state.report.Repo, IssueNumber: state.report.IssueNumber,
-			CreatedAt: state.report.CreatedAt, AgeSeconds: int64(age / time.Second),
-		}
-		if token := strings.TrimSpace(state.report.ConfirmationToken); token != "" {
-			source.Command = confirmationCommand(token)
-		}
-		summary.Sources = append(summary.Sources, source)
 	}
 	sort.Slice(summary.Sources, func(i, j int) bool {
 		if summary.Sources[i].CreatedAt != summary.Sources[j].CreatedAt {

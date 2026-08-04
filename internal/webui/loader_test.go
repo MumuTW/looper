@@ -160,6 +160,43 @@ func TestLoadCacheIsSafeForConcurrentPolls(t *testing.T) {
 	}
 }
 
+func TestLoadCacheDoesNotLetAnOlderMissOverwriteANewerOne(t *testing.T) {
+	t.Parallel()
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
+	inner := Loader(func(context.Context) Input {
+		mu.Lock()
+		calls++
+		call := calls
+		mu.Unlock()
+		if call == 1 {
+			close(firstStarted)
+			<-releaseFirst
+			return Input{Notices: []string{"older"}}
+		}
+		return Input{Notices: []string{"newer"}}
+	})
+	load := NewLoadCache(RefreshInterval, func() time.Time { return testNow }).Wrap(inner)
+
+	firstDone := make(chan Input, 1)
+	go func() { firstDone <- load(context.Background()) }()
+	<-firstStarted
+	second := load(context.Background())
+	close(releaseFirst)
+	<-firstDone
+
+	if len(second.Notices) != 1 || second.Notices[0] != "newer" {
+		t.Fatalf("newer load = %#v, want newer result", second)
+	}
+	current := load(context.Background())
+	if len(current.Notices) != 1 || current.Notices[0] != "newer" {
+		t.Fatalf("cached load = %#v, want newer result after older completion", current)
+	}
+}
+
 func TestUnreadableGateReportBecomesBlockedEvidence(t *testing.T) {
 	t.Parallel()
 

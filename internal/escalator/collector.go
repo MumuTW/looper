@@ -148,7 +148,7 @@ func (c *Collector) collectTriageConfirmations(ctx context.Context, now time.Tim
 			return fmt.Errorf("triage confirmation %s#%d: %w", source.Repo, source.IssueNumber, err)
 		}
 		id := itemID(ReasonTriageConfirmation, source.ProjectID, source.Repo, source.IssueNumber)
-		snapshot.Items = append(snapshot.Items, newItem(id, KindWaiting, ReasonTriageConfirmation, source.ProjectID, "triager", fmt.Sprintf("Confirm triage for %s#%d", source.Repo, source.IssueNumber), source.Command, link, source.AgeSeconds, 1, source.Command))
+		snapshot.Items = append(snapshot.Items, newItem(id, KindWaiting, ReasonTriageConfirmation, source.ProjectID, source.Repo, "triager", fmt.Sprintf("Confirm triage for %s#%d", source.Repo, source.IssueNumber), source.Command, link, source.AgeSeconds, 1, source.Command))
 	}
 	return nil
 }
@@ -165,6 +165,10 @@ func (c *Collector) collectLoops(now time.Time, active map[string]storage.LoopRe
 		}
 		blockedWork := 1 + blocked[loop.ID]
 		if loop.Status == string(domain.LoopStatusAwaitingHuman) {
+			repo := ""
+			if loop.Repo != nil {
+				repo = *loop.Repo
+			}
 			reason, detail := ReasonPlannerEscalation, "Planner needs an operator decision"
 			if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && ask.Status == "awaiting" {
 				reason, detail = ReasonHITLQuestion, ask.Question
@@ -175,15 +179,23 @@ func (c *Collector) collectLoops(now time.Time, active map[string]storage.LoopRe
 					}
 				}
 			}
-			snapshot.Items = append(snapshot.Items, newItem(itemID(reason, loop.ProjectID, loop.ID), KindWaiting, reason, loop.ProjectID, loop.Type, fmt.Sprintf("%s loop #%d is waiting on a human", loop.Type, loop.Seq), detail, link, age, blockedWork, loop.Status, detail))
+			snapshot.Items = append(snapshot.Items, newItem(itemID(reason, loop.ProjectID, loop.ID), KindWaiting, reason, loop.ProjectID, repo, loop.Type, fmt.Sprintf("%s loop #%d is waiting on a human", loop.Type, loop.Seq), detail, link, age, blockedWork, loop.Status, detail))
 			continue
 		}
 		if loop.Status == string(domain.LoopStatusPaused) && metadataString(loop.MetadataJSON, "pauseReason") == "agent_failure_streak" {
-			snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonCircuitBreaker, loop.ProjectID, loop.ID), KindStuck, ReasonCircuitBreaker, loop.ProjectID, loop.Type, fmt.Sprintf("%s loop #%d tripped its circuit breaker", loop.Type, loop.Seq), "Repeated agent failures paused this loop", link, age, blockedWork, loop.Status, "agent_failure_streak"))
+			repo := ""
+			if loop.Repo != nil {
+				repo = *loop.Repo
+			}
+			snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonCircuitBreaker, loop.ProjectID, loop.ID), KindStuck, ReasonCircuitBreaker, loop.ProjectID, repo, loop.Type, fmt.Sprintf("%s loop #%d tripped its circuit breaker", loop.Type, loop.Seq), "Repeated agent failures paused this loop", link, age, blockedWork, loop.Status, "agent_failure_streak"))
 			continue
 		}
 		if loop.Type == string(domain.LoopTypeReviewer) && loop.Status == string(domain.LoopStatusPaused) {
-			snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonReviewStall, loop.ProjectID, loop.ID), KindWaiting, ReasonReviewStall, loop.ProjectID, loop.Type, fmt.Sprintf("Reviewer loop #%d is stalled", loop.Seq), "Review is paused or waiting", link, age, blockedWork, loop.Status))
+			repo := ""
+			if loop.Repo != nil {
+				repo = *loop.Repo
+			}
+			snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonReviewStall, loop.ProjectID, loop.ID), KindWaiting, ReasonReviewStall, loop.ProjectID, repo, loop.Type, fmt.Sprintf("Reviewer loop #%d is stalled", loop.Seq), "Review is paused or waiting", link, age, blockedWork, loop.Status))
 		}
 	}
 	return nil
@@ -215,7 +227,11 @@ func (c *Collector) collectQueue(now time.Time, records []storage.QueueItemRecor
 			return fmt.Errorf("queue item %s: %w", item.ID, err)
 		}
 		detail := fmt.Sprintf("%d/%d attempts; status %s", item.Attempts, item.MaxAttempts, item.Status)
-		snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonQueueRetries, *item.ProjectID, item.ID), KindStuck, ReasonQueueRetries, *item.ProjectID, item.Type, fmt.Sprintf("%s queue item has repeated retries", item.Type), detail, link, age, 1, strconv.FormatInt(item.Attempts, 10), strconv.FormatInt(item.MaxAttempts, 10), item.Status, value(item.LastErrorKind), value(item.LastError)))
+		repo := ""
+		if item.Repo != nil {
+			repo = *item.Repo
+		}
+		snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonQueueRetries, *item.ProjectID, item.ID), KindStuck, ReasonQueueRetries, *item.ProjectID, repo, item.Type, fmt.Sprintf("%s queue item has repeated retries", item.Type), detail, link, age, 1, strconv.FormatInt(item.Attempts, 10), strconv.FormatInt(item.MaxAttempts, 10), item.Status, value(item.LastErrorKind), value(item.LastError)))
 	}
 	return nil
 }
@@ -291,7 +307,7 @@ func (c *Collector) collectUnroutedTriage(ctx context.Context, now time.Time, ac
 			if report != nil {
 				detail = "A Triage report exists, but no Planner route was persisted"
 			}
-			snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonTriageNotRouted, enrollment.ProjectID, enrollment.IdempotencyKey), KindStuck, ReasonTriageNotRouted, enrollment.ProjectID, "triager", fmt.Sprintf("%s#%d was enrolled but never routed", enrollment.Repo, enrollment.IssueNumber), detail, link, age, 1, enrollment.EnrolledAt, detail))
+			snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonTriageNotRouted, enrollment.ProjectID, enrollment.IdempotencyKey), KindStuck, ReasonTriageNotRouted, enrollment.ProjectID, enrollment.Repo, "triager", fmt.Sprintf("%s#%d was enrolled but never routed", enrollment.Repo, enrollment.IssueNumber), detail, link, age, 1, enrollment.EnrolledAt, detail))
 		}
 	}
 	return nil
@@ -365,7 +381,7 @@ func (c *Collector) collectEligibleAdvise(ctx context.Context, now time.Time, ac
 		if err != nil {
 			return fmt.Errorf("Gatekeeper report %s#%d: %w", report.Repo, report.PRNumber, err)
 		}
-		snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonEligibleAdvisePR, report.ProjectID, report.Repo, report.PRNumber), KindWaiting, ReasonEligibleAdvisePR, report.ProjectID, "gatekeeper", fmt.Sprintf("%s#%d is eligible to merge", report.Repo, report.PRNumber), "Gatekeeper advise is waiting for a human merge decision", link, age, 1, report.ObservedHeadSHA, report.Status))
+		snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonEligibleAdvisePR, report.ProjectID, report.Repo, report.PRNumber), KindWaiting, ReasonEligibleAdvisePR, report.ProjectID, report.Repo, "gatekeeper", fmt.Sprintf("%s#%d is eligible to merge", report.Repo, report.PRNumber), "Gatekeeper advise is waiting for a human merge decision", link, age, 1, report.ObservedHeadSHA, report.Status))
 	}
 	return nil
 }
@@ -407,7 +423,7 @@ func (c *Collector) collectStaleHeads(ctx context.Context, now time.Time, active
 		if err != nil {
 			return fmt.Errorf("PR snapshot %s#%d: %w", record.Repo, record.PRNumber, err)
 		}
-		snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonStalePRHead, key.project, key.repo, key.number), KindStuck, ReasonStalePRHead, record.ProjectID, "pull_request", fmt.Sprintf("%s#%d has stale head evidence", record.Repo, record.PRNumber), "No current-head snapshot has been captured within the threshold", link, age, 1, record.HeadSHA, record.CapturedAt))
+		snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonStalePRHead, key.project, key.repo, key.number), KindStuck, ReasonStalePRHead, record.ProjectID, record.Repo, "pull_request", fmt.Sprintf("%s#%d has stale head evidence", record.Repo, record.PRNumber), "No current-head snapshot has been captured within the threshold", link, age, 1, record.HeadSHA, record.CapturedAt))
 	}
 	return nil
 }
@@ -436,8 +452,8 @@ func buildBacklog(now time.Time, loopsByID map[string]storage.LoopRecord) ([]Sta
 	return result, nil
 }
 
-func newItem(id string, kind Kind, reason Reason, projectID, stage, title, detail, link string, age int64, blocked int, fingerprintParts ...string) Item {
-	return Item{ID: id, Kind: kind, Reason: reason, ProjectID: projectID, Stage: stage, Title: title, Detail: detail, Link: link, AgeSeconds: age, BlockedWork: blocked, Fingerprint: fingerprint(fingerprintParts...)}
+func newItem(id string, kind Kind, reason Reason, projectID, repo, stage, title, detail, link string, age int64, blocked int, fingerprintParts ...string) Item {
+	return Item{ID: id, Kind: kind, Reason: reason, ProjectID: projectID, Repo: strings.ToLower(strings.TrimSpace(repo)), Stage: stage, Title: title, Detail: detail, Link: link, AgeSeconds: age, BlockedWork: blocked, Fingerprint: fingerprint(fingerprintParts...)}
 }
 
 func itemID(reason Reason, parts ...any) string {

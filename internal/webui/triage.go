@@ -117,6 +117,10 @@ type Blocker struct {
 	// rank is the triage ladder. Lower wins when a row has several reasons.
 	rank  int
 	owner ownership
+	// changedAt belongs to the source that won the ladder. It is kept separate
+	// from the rendered row so a newer, lower-ranked digest item cannot make an
+	// older primary blocker look freshly changed.
+	changedAt time.Time
 }
 
 // The ladder, top-down. Gaps leave room for reason codes that arrive later
@@ -354,6 +358,12 @@ func Classify(in Input) Board {
 			itemsByPR[key] = append(itemsByPR[key], item)
 			continue
 		}
+		if !standaloneItemMatchesCurrentRepository(in.ActiveProjectRepositories, item) {
+			// The digest is append-only, while the project binding is current
+			// durable state. An unmatched item from a former repository must not
+			// survive as an actionable standalone row after a supported rebind.
+			continue
+		}
 		standalone = append(standalone, item)
 	}
 
@@ -388,7 +398,20 @@ func Classify(in Input) Board {
 		sections = append(sections, section)
 	}
 
-	return Board{GeneratedAt: now, Sections: sections, Notices: in.Notices}
+	notices := append([]string(nil), in.Notices...)
+	if in.Escalator.Partial && !containsNotice(notices, "Escalator census is incomplete; board counts may be provisional.") {
+		notices = append(notices, "Escalator census is incomplete; board counts may be provisional.")
+	}
+	return Board{GeneratedAt: now, Sections: sections, Notices: notices}
+}
+
+func containsNotice(notices []string, want string) bool {
+	for _, notice := range notices {
+		if notice == want {
+			return true
+		}
+	}
+	return false
 }
 
 // reportForSnapshot prevents a verdict about an older head from being applied
@@ -673,7 +696,13 @@ func pullRequestRow(now time.Time, key PRKey, snapshot storage.PullRequestSnapsh
 			changedAt = later(changedAt, parseTimestamp(item.UpdatedAt))
 		}
 	}
-	blocker := primaryBlocker(report, payload, snapshot, items)
+	blocker := primaryBlocker(report, payload, snapshot, items, now)
+	if !blocker.changedAt.IsZero() {
+		// The ladder winner is the state the chip describes. Queue/loop activity
+		// remains the fallback for a clear row, but must not refresh a higher
+		// ranked blocker that is still old.
+		changedAt = blocker.changedAt
+	}
 	if (blocker.Code == "draft" || blocker.Code == string(gatekeeper.ReasonPullRequestDraft)) && !working {
 		// A draft without a live queued/running loop is an unattended human
 		// decision, not machine progress. Keep draft's reason/label, but move
@@ -682,16 +711,18 @@ func pullRequestRow(now time.Time, key PRKey, snapshot storage.PullRequestSnapsh
 	}
 	group := groupFor(blocker, working)
 	stuck := false
+	var stuckChangedAt time.Time
 	for _, item := range items {
-		changedAt = later(changedAt, now.Add(-time.Duration(item.AgeSeconds)*time.Second))
 		if item.Kind == escalator.KindStuck {
 			stuck = true
+			stuckChangedAt = later(stuckChangedAt, now.Add(-time.Duration(item.AgeSeconds)*time.Second))
 		}
 	}
 	// A stuck digest item means the machine has already given up on this pull
 	// request. That outranks whichever reason the chip names.
 	if stuck {
 		group = GroupStuck
+		changedAt = later(changedAt, stuckChangedAt)
 	}
 
 	title := strings.TrimSpace(derefString(snapshot.Title))
@@ -810,7 +841,7 @@ func toneFor(blocker Blocker, group Group) Tone {
 
 // primaryBlocker walks the triage ladder over every source that can name a
 // reason and keeps the highest-ranked one.
-func primaryBlocker(report *gatekeeper.Report, payload snapshotPayload, snapshot storage.PullRequestSnapshotRecord, items []escalator.Item) Blocker {
+func primaryBlocker(report *gatekeeper.Report, payload snapshotPayload, snapshot storage.PullRequestSnapshotRecord, items []escalator.Item, now time.Time) Blocker {
 	best := Blocker{Code: "clear", Label: "ready", rank: rankClear, owner: ownerHuman}
 	consider := func(candidate Blocker) {
 		if candidate.rank < best.rank {
@@ -821,45 +852,52 @@ func primaryBlocker(report *gatekeeper.Report, payload snapshotPayload, snapshot
 	if report != nil {
 		if report.Eligible {
 			if strings.EqualFold(strings.TrimSpace(report.Mode), "auto") {
-				consider(Blocker{Code: "eligible_auto", Label: "auto merge pending", rank: rankEligible, owner: ownerMachine})
+				consider(Blocker{Code: "eligible_auto", Label: "auto merge pending", rank: rankEligible, owner: ownerMachine, changedAt: parseTimestamp(report.EvaluatedAt)})
 			} else {
-				consider(Blocker{Code: "eligible", Label: "awaiting merge OK", rank: rankEligible, owner: ownerHuman})
+				consider(Blocker{Code: "eligible", Label: "awaiting merge OK", rank: rankEligible, owner: ownerHuman, changedAt: parseTimestamp(report.EvaluatedAt)})
 			}
 		}
 		for _, reason := range report.Reasons {
 			if candidate, ok := gatekeeperBlocker(reason.Code); ok {
+				candidate.changedAt = parseTimestamp(report.EvaluatedAt)
 				consider(candidate)
 			}
 		}
 	} else {
 		// No gate report yet: read what the snapshot itself already proves.
 		if payload.conflicts {
-			consider(blockerConflict())
+			candidate := blockerConflict()
+			candidate.changedAt = parseTimestamp(snapshot.CapturedAt)
+			consider(candidate)
 		}
 		if checksFailing(snapshot.ChecksSummary) {
-			consider(blockerCheckFailed())
+			candidate := blockerCheckFailed()
+			candidate.changedAt = parseTimestamp(snapshot.CapturedAt)
+			consider(candidate)
 		}
 		if snapshot.UnresolvedThreadCount != nil && *snapshot.UnresolvedThreadCount > 0 {
-			consider(Blocker{Code: "unresolved_review_thread", Label: "review debt", rank: rankReviewDebt, owner: ownerContested})
+			consider(Blocker{Code: "unresolved_review_thread", Label: "review debt", rank: rankReviewDebt, owner: ownerContested, changedAt: parseTimestamp(snapshot.CapturedAt)})
 		}
 		if strings.EqualFold(derefString(snapshot.ReviewState), "CHANGES_REQUESTED") {
-			consider(Blocker{Code: "review_changes_requested", Label: "changes requested", rank: rankReviewDebt, owner: ownerContested})
+			consider(Blocker{Code: "review_changes_requested", Label: "changes requested", rank: rankReviewDebt, owner: ownerContested, changedAt: parseTimestamp(snapshot.CapturedAt)})
 		}
 		if strings.EqualFold(derefString(snapshot.ReviewState), "REVIEW_REQUIRED") {
-			consider(Blocker{Code: string(gatekeeper.ReasonReviewRequired), Label: "needs review", rank: rankReviewMiss, owner: ownerHuman})
+			consider(Blocker{Code: string(gatekeeper.ReasonReviewRequired), Label: "needs review", rank: rankReviewMiss, owner: ownerHuman, changedAt: parseTimestamp(snapshot.CapturedAt)})
 		}
 		if checksPending(snapshot.ChecksSummary) {
-			consider(Blocker{Code: "required_check_pending", Label: "CI running", rank: rankCheckWait, owner: ownerMachine})
+			consider(Blocker{Code: "required_check_pending", Label: "CI running", rank: rankCheckWait, owner: ownerMachine, changedAt: parseTimestamp(snapshot.CapturedAt)})
 		}
 		if strings.EqualFold(derefString(snapshot.ReviewState), "APPROVED") {
-			consider(Blocker{Code: "review_approved", Label: "review approved", rank: rankEligible, owner: ownerHuman})
+			consider(Blocker{Code: "review_approved", Label: "review approved", rank: rankEligible, owner: ownerHuman, changedAt: parseTimestamp(snapshot.CapturedAt)})
 		}
 	}
 	if payload.draft {
-		consider(Blocker{Code: "draft", Label: "draft", rank: rankDraft, owner: ownerMachine})
+		consider(Blocker{Code: "draft", Label: "draft", rank: rankDraft, owner: ownerMachine, changedAt: parseTimestamp(snapshot.CapturedAt)})
 	}
 	for _, item := range items {
-		consider(escalatorBlocker(item))
+		candidate := escalatorBlocker(item)
+		candidate.changedAt = now.Add(-time.Duration(item.AgeSeconds) * time.Second)
+		consider(candidate)
 	}
 	return best
 }
@@ -1221,6 +1259,24 @@ func projectRepositoryMatches(activeProjectRepositories map[string]string, proje
 		return true
 	}
 	return strings.EqualFold(strings.TrimSpace(configured), strings.TrimSpace(repo))
+}
+
+func standaloneItemMatchesCurrentRepository(activeProjectRepositories map[string]string, item escalator.Item) bool {
+	if activeProjectRepositories == nil || strings.TrimSpace(item.ProjectID) == "" {
+		return true
+	}
+	configured, known := activeProjectRepositories[item.ProjectID]
+	if !known || strings.TrimSpace(configured) == "" {
+		return true
+	}
+	// Items written before Repo became part of the digest wire projection have
+	// no lossless repository identity. Once a current binding is known, keeping
+	// such an unmatched item would be a false positive; matched rows are handled
+	// above by the current link identity.
+	if strings.TrimSpace(item.Repo) == "" {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(configured), strings.TrimSpace(item.Repo))
 }
 
 func activeLoops(records []storage.LoopRecord, activeProjects map[string]bool, activeProjectRepositories map[string]string) []storage.LoopRecord {

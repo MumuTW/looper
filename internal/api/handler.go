@@ -949,7 +949,9 @@ func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 	authenticatedToken := r.Header.Get("Authorization")
 	if strings.TrimSpace(authenticatedToken) == "" {
 		if cookie, err := r.Cookie(dashboardSessionCookieName); err == nil {
-			authenticatedToken = "Bearer " + cookie.Value
+			if token, ok := dashboardSessionTokenFromCookie(cookie.Value); ok {
+				authenticatedToken = "Bearer " + token
+			}
 		}
 	}
 	if authenticatedToken != fmt.Sprintf("Bearer %s", *cfg.Server.LocalToken) {

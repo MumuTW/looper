@@ -32,10 +32,15 @@ const (
 // changes only when operator-relevant source state changes, not as AgeSeconds
 // advances.
 type Item struct {
-	ID          string `json:"id"`
-	Kind        Kind   `json:"kind"`
-	Reason      Reason `json:"reason"`
-	ProjectID   string `json:"projectId"`
+	ID        string `json:"id"`
+	Kind      Kind   `json:"kind"`
+	Reason    Reason `json:"reason"`
+	ProjectID string `json:"projectId"`
+	// Repo is the source repository identity used to reject stale standalone
+	// items after a project is rebound. It is optional for legacy digest rows;
+	// a read surface with a known current binding must not admit such an
+	// unscoped item as current standalone work.
+	Repo        string `json:"repo,omitempty"`
 	Stage       string `json:"stage"`
 	Title       string `json:"title"`
 	Detail      string `json:"detail,omitempty"`

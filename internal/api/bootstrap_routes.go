@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -29,6 +30,23 @@ type bootstrapExchangeRequest struct {
 
 type bootstrapExchangeResponse struct {
 	Token string `json:"token"`
+}
+
+// dashboardSessionCookieValue is an encoded transport representation. A
+// configured local token is an opaque secret and may contain bytes that the
+// Set-Cookie grammar rejects; putting it in a cookie verbatim would silently
+// corrupt the browser session while the authorization path still compares the
+// original token.
+func dashboardSessionCookieValue(token string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(token))
+}
+
+func dashboardSessionTokenFromCookie(value string) (string, bool) {
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return "", false
+	}
+	return string(decoded), true
 }
 
 // dashboardSessionCookieAttributes follows the externally advertised server
@@ -156,7 +174,7 @@ func (h *Handler) handleBootstrapExchange(w http.ResponseWriter, r *http.Request
 	// in-memory client.
 	http.SetCookie(w, &http.Cookie{
 		Name:     dashboardSessionCookieName,
-		Value:    token,
+		Value:    dashboardSessionCookieValue(token),
 		Path:     cookiePath,
 		HttpOnly: true,
 		Secure:   secure,

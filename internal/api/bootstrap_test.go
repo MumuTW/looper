@@ -37,7 +37,7 @@ func TestBootstrapMintRequiresAuth(t *testing.T) {
 func TestBootstrapExchangeOnceWorksSecondFails(t *testing.T) {
 	t.Parallel()
 
-	token := "secret-token"
+	token := "secret;\"\\é-token"
 	h := NewHandler(Context{Config: config.Config{
 		Server: config.ServerConfig{
 			AuthMode:   config.AuthModeLocalToken,
@@ -60,7 +60,7 @@ func TestBootstrapExchangeOnceWorksSecondFails(t *testing.T) {
 		t.Fatalf("token = %#v, want %q", data["token"], token)
 	}
 	cookies := rec1.Result().Cookies()
-	if len(cookies) != 1 || cookies[0].Name != dashboardSessionCookieName || cookies[0].Value != token || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteLaxMode {
+	if len(cookies) != 1 || cookies[0].Name != dashboardSessionCookieName || cookies[0].Value != dashboardSessionCookieValue(token) || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteLaxMode {
 		t.Fatalf("bootstrap session cookie = %#v, want HttpOnly Lax browser session", cookies)
 	}
 

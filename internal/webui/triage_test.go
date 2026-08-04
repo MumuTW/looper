@@ -590,6 +590,30 @@ func TestClassifyDatesWaitingBlockerFromEscalatorItem(t *testing.T) {
 	}
 }
 
+func TestClassifyDatesRowFromTheWinningBlocker(t *testing.T) {
+	t.Parallel()
+
+	current := snapshot(t, 1, payloadOptions{})
+	gate := report(1, false, gatekeeper.ReasonMergeConflict)
+	gate.EvaluatedAt = iso(testNow.Add(-2 * time.Hour))
+	item := escalator.Item{
+		ID: "hitl_question:proj:loop-1", ProjectID: "proj", Kind: escalator.KindWaiting,
+		Reason: escalator.ReasonHITLQuestion, Link: testLinker{}.PullRequest("proj", current.Repo, current.PRNumber), AgeSeconds: 5,
+	}
+	board := Classify(Input{
+		Now: testNow, Snapshots: []storage.PullRequestSnapshotRecord{current},
+		Reports: []gatekeeper.Report{gate}, Escalator: escalator.Snapshot{Items: []escalator.Item{item}}, Links: testLinker{},
+	})
+	row, _ := rowFor(t, board, 1)
+	if row.Blocker.Code != string(gatekeeper.ReasonMergeConflict) {
+		t.Fatalf("blocker = %#v, want merge conflict to win", row.Blocker)
+	}
+	want := testNow.Add(-2 * time.Hour)
+	if !row.ChangedAt.Equal(want) || row.Changed {
+		t.Fatalf("ChangedAt = %v changed=%v, want winning blocker at %v", row.ChangedAt, row.Changed, want)
+	}
+}
+
 func TestClassifyKeepsUnattendedDraftActionable(t *testing.T) {
 	t.Parallel()
 
@@ -648,6 +672,24 @@ func TestClassifyScopesRowsToCurrentProjectRepository(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("current repository pull request row is missing")
+	}
+}
+
+func TestClassifyDropsUnmatchedDigestFromFormerProjectRepository(t *testing.T) {
+	t.Parallel()
+
+	item := escalator.Item{
+		ID: "eligible_advise_pr:proj:acme/old:7", ProjectID: "proj", Repo: "acme/old",
+		Kind: escalator.KindWaiting, Reason: escalator.ReasonEligibleAdvisePR,
+		Title: "acme/old#7 is eligible", Link: "https://github.com/acme/old/pull/7", AgeSeconds: 10,
+	}
+	board := Classify(Input{
+		Now: testNow, ActiveProjects: map[string]bool{"proj": true},
+		ActiveProjectRepositories: map[string]string{"proj": "acme/current"},
+		Escalator:                 escalator.Snapshot{Items: []escalator.Item{item}}, Links: testLinker{},
+	})
+	if board.Total() != 0 {
+		t.Fatalf("board total = %d, want former-repository standalone item dropped", board.Total())
 	}
 }
 
@@ -956,6 +998,15 @@ func TestClassifyEmptyInputRendersThreeEmptyGroups(t *testing.T) {
 	}
 	if board.GeneratedAt.IsZero() {
 		t.Fatalf("GeneratedAt must be stamped even for an empty board")
+	}
+}
+
+func TestClassifySurfacesPartialEscalatorCensus(t *testing.T) {
+	t.Parallel()
+
+	board := Classify(Input{Now: testNow, Escalator: escalator.Snapshot{Partial: true}})
+	if !containsNotice(board.Notices, "Escalator census is incomplete; board counts may be provisional.") {
+		t.Fatalf("notices = %#v, want incomplete census notice", board.Notices)
 	}
 }
 
