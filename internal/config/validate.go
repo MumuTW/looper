@@ -315,6 +315,22 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 			roles.Gatekeeper,
 			fmt.Sprintf("projects[%d].roles.gatekeeper", i), reviewerAutoMerge, issues)
 	}
+	// Validate the effective role pair, not only projects that also override
+	// Gatekeeper. A project Reviewer override can enable the retired native
+	// merge path while the global Reviewer setting is disabled.
+	for i, project := range config.Projects {
+		if project.Roles == nil || project.Roles.Reviewer == nil || project.Roles.Reviewer.AutoMerge == nil || project.Roles.Reviewer.AutoMerge.Enabled == nil {
+			continue
+		}
+		roles := ProjectRoleConfigs(config, project.ID)
+		if !gatekeeperTrustIsAuto(roles.Gatekeeper.Trust) || !roles.Reviewer.AutoMerge.Enabled {
+			continue
+		}
+		*issues = append(*issues, ValidationIssue{
+			Path:    fmt.Sprintf("projects[%d].roles.reviewer.autoMerge.enabled", i),
+			Message: "cannot be enabled while effective Gatekeeper trust is auto; choose one merge authority",
+		})
+	}
 	validateIntakeConfig(config, issues)
 	validateDaemonConfig(config.Daemon, issues)
 	validatePackageAndDefaultsConfig(config, issues)

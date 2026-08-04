@@ -109,11 +109,102 @@ func TestReconcileRetiresOutOfPageRouteOnDemotion(t *testing.T) {
 	if _, err := demoted.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
 		t.Fatalf("demoted reconcile discovery() error = %v", err)
 	}
-	if !slices.Equal(fixture.github.labelRemoves[len(fixture.github.labelRemoves)-1].Labels, []string{labels.AutoMerge}) {
-		t.Fatalf("last label removal = %#v, want auto-merge route retired on demotion", fixture.github.labelRemoves)
+	removedAuto := false
+	for _, removal := range fixture.github.labelRemoves {
+		if slices.Equal(removal.Labels, []string{labels.AutoMerge}) {
+			removedAuto = true
+			break
+		}
+	}
+	if !removedAuto {
+		t.Fatalf("label removals = %#v, want auto-merge route retired on demotion", fixture.github.labelRemoves)
 	}
 	if !slices.Equal(fixture.github.labelAdds[len(fixture.github.labelAdds)-1].Labels, []string{labels.NeedsHumanReview}) {
 		t.Fatalf("last label add = %#v, want durable needs-human-review veto on demotion", fixture.github.labelAdds)
+	}
+}
+
+func TestReconcileReevaluatesOutOfPageRouteAfterHeadChange(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	runner := trustRunner(fixture, config.GatekeeperTrustAuto)
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("initial discovery() error = %v", err)
+	}
+
+	fixture.github.openPullRequests = nil
+	fixture.now = fixture.now.Add(outOfPageRouteReconcileInterval)
+	fixture.github.mergeWatch = githubinfra.PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-2"}
+	fixture.github.detail.HeadSHA = "head-2"
+	fixture.github.detail.BaseRefName = "main"
+	fixture.policyPermits = true
+	fixture.github.finalHeadSHA = "head-2"
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("head-change reconcile discovery() error = %v", err)
+	}
+	_ = result // out-of-page reconciliation is reported through label/evidence state
+	if len(fixture.github.labelAdds) < 2 || !slices.Equal(fixture.github.labelAdds[len(fixture.github.labelAdds)-1].Labels, []string{labels.NeedsHumanReview}) {
+		t.Fatalf("label adds = %#v, want durable veto after head change", fixture.github.labelAdds)
+	}
+	removedAuto := false
+	for _, removal := range fixture.github.labelRemoves {
+		if slices.Equal(removal.Labels, []string{labels.AutoMerge}) {
+			removedAuto = true
+			break
+		}
+	}
+	if !removedAuto {
+		t.Fatalf("label removals = %#v, want stale auto-merge route removed", fixture.github.labelRemoves)
+	}
+}
+
+func TestReconcileRetiresOutOfPageRouteAfterProviderMove(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	oldProvider := "github.com/acme/looper"
+	newProvider := "ghe.example.test/acme/looper"
+	oldRunner := New(Options{
+		Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now },
+		PolicyPermitsTarget: func(string, string, string) bool { return fixture.policyPermits },
+		TrustForProject:     func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+		RepositoryIdentity:  func(string) string { return oldProvider },
+	})
+	if _, err := oldRunner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("initial provider discovery() error = %v", err)
+	}
+
+	// Keep the same owner/slug while moving the project to another forge. The
+	// durable route must be retired before the new provider can reuse the PR
+	// number; comparing Repo alone would leave the old host authorized.
+	fixture.github.openPullRequests = nil
+	fixture.github.mergeWatch = githubinfra.PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-1"}
+	fixture.now = fixture.now.Add(outOfPageRouteReconcileInterval)
+	newRunner := New(Options{
+		Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now },
+		PolicyPermitsTarget: func(string, string, string) bool { return fixture.policyPermits },
+		TrustForProject:     func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+		RepositoryIdentity:  func(string) string { return newProvider },
+	})
+	if _, err := newRunner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("provider-move reconcile discovery() error = %v", err)
+	}
+	removedAuto := false
+	for _, removal := range fixture.github.labelRemoves {
+		if slices.Equal(removal.Labels, []string{labels.AutoMerge}) {
+			removedAuto = true
+			break
+		}
+	}
+	if !removedAuto {
+		t.Fatalf("label removals = %#v, want old-provider auto-merge route retired", fixture.github.labelRemoves)
+	}
+	reports, err := latestGateReports(context.Background(), fixture.repos, "project_1")
+	if err != nil {
+		t.Fatalf("latestGateReports() error = %v", err)
+	}
+	if report := reports["acme/looper#42"]; !hasReason(report, ReasonRouteRevoked) {
+		t.Fatalf("provider-move report = %#v, want ReasonRouteRevoked marker", report)
 	}
 }
 

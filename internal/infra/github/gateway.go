@@ -188,6 +188,7 @@ type PullRequestDetail struct {
 	MergedAt           string
 	MergeCommitSHA     string
 	ClosingIssues      []IssueReference
+	MergedBy           string
 	AutoMerge          *PullRequestAutoMerge
 }
 
@@ -2098,6 +2099,7 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		Author:         extractAuthor(row["user"]),
 		MergedAt:       firstNonEmpty(asString(row["merged_at"]), asString(row["mergedAt"])),
 		MergeCommitSHA: firstNonEmpty(asString(row["merge_commit_sha"]), nestedString(row, "mergeCommit", "oid")),
+		MergedBy:       extractAuthor(row["merged_by"]),
 		Labels:         extractLabelNames(row["labels"]),
 		HeadRefName:    nestedString(row, "head", "ref"),
 		BaseRefName:    nestedString(row, "base", "ref"),

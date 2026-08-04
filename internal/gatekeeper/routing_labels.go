@@ -46,6 +46,14 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 	if !plan.autoMerge && !plan.needsHumanReview {
 		return r.applyRoutingLabelPlan(ctx, report, plan)
 	}
+	// A human-review veto is a fail-safe projection: it can only block an
+	// already accepted queue entry and never authorizes a merge. Do not require
+	// another provider read for this path, especially when the report itself
+	// records a head/provider failure and therefore cannot carry complete state
+	// evidence for the revalidation comparison.
+	if !plan.autoMerge && plan.needsHumanReview {
+		return r.applyRoutingLabelPlan(ctx, report, plan)
+	}
 
 	expectedHead := strings.TrimSpace(report.Evidence.FinalObservedHeadSHA)
 	if expectedHead == "" {
@@ -62,7 +70,7 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 	}
 	if plan.autoMerge {
 		if err := r.github.ValidateMergifyRouting(ctx, githubinfra.ValidateMergifyRoutingInput{
-			Repo: report.Repo, CWD: r.projectCWD(ctx, report.ProjectID),
+			Repo: reportRepositoryTarget(report), CWD: r.projectCWD(ctx, report.ProjectID),
 		}); err != nil {
 			// A repository contract failure must retire an already-published
 			// route before returning. Leaving auto-merge in place while the
@@ -113,7 +121,7 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 	// persisted base SHA, so a changed base fails closed before projection.
 	var currentHead, currentBase string
 	viewInput := githubinfra.ViewPullRequestInput{
-		Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID),
+		Repo: reportRepositoryTarget(report), PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID),
 	}
 	if report.Evidence.DiffBudget != nil {
 		expectedBase := strings.TrimSpace(report.Evidence.DiffBudget.BaseSHA)
@@ -164,7 +172,7 @@ func (r *Runner) revalidateReviewerConvergence(ctx context.Context, report Repor
 
 func (r *Runner) revalidateUnresolvedReviewThreads(ctx context.Context, report Report) error {
 	threads, err := r.github.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{
-		Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID), Limit: 1000,
+		Repo: reportRepositoryTarget(report), PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID), Limit: 1000,
 	})
 	if err != nil {
 		return fmt.Errorf("revalidate review threads before routing labels: %w", err)
@@ -182,7 +190,7 @@ func (r *Runner) revalidateUnresolvedReviewThreads(ctx context.Context, report R
 
 func (r *Runner) revalidateRoutingState(ctx context.Context, report Report, expectedHead string) error {
 	input := githubinfra.ViewPullRequestInput{
-		Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID),
+		Repo: reportRepositoryTarget(report), PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID),
 	}
 	detail, err := r.github.ViewPullRequestForGatekeeper(ctx, input)
 	if err != nil {
@@ -260,7 +268,7 @@ func (r *Runner) retireRoutingLabels(ctx context.Context, report Report, previou
 
 func (r *Runner) applyRoutingLabelPlan(ctx context.Context, report Report, plan routingLabelPlan) error {
 	input := githubinfra.PullRequestLabelsInput{
-		Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID),
+		Repo: reportRepositoryTarget(report), PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID),
 	}
 	switch {
 	case plan.autoMerge:
@@ -275,14 +283,15 @@ func (r *Runner) applyRoutingLabelPlan(ctx context.Context, report Report, plan 
 			return fmt.Errorf("add %s label: %w", labels.AutoMerge, err)
 		}
 	case plan.needsHumanReview:
-		// Stop the queue first. Adding the human route after removal is
-		// fail-safe if the second operation is rejected by the forge.
-		if err := r.github.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Labels: []string{labels.AutoMerge}}); err != nil {
-			return fmt.Errorf("remove stale %s label: %w", labels.AutoMerge, err)
-		}
+		// Add the durable queue veto before removing the trigger. If the second
+		// mutation fails, the accepted queue entry remains blocked rather than
+		// becoming an unvetoed stale authorization between mutations.
 		input.Labels = []string{labels.NeedsHumanReview}
 		if err := r.github.AddPullRequestLabels(ctx, input); err != nil {
 			return fmt.Errorf("add %s label: %w", labels.NeedsHumanReview, err)
+		}
+		if err := r.github.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Labels: []string{labels.AutoMerge}}); err != nil {
+			return fmt.Errorf("remove stale %s label: %w", labels.AutoMerge, err)
 		}
 	default:
 		// Mechanical blockers and observe demotions intentionally leave no
@@ -301,6 +310,11 @@ func (r *Runner) applyRoutingLabelPlan(ctx context.Context, report Report, plan 
 func reportNeedsHumanReview(previous *Report, report Report) bool {
 	hasRepeatedReviewChanges := previous != nil && hasReasonCode(previous.Reasons, ReasonReviewChangesRequested) && hasReasonCode(report.Reasons, ReasonReviewChangesRequested)
 	if previous != nil && reportRouteEstablished(*previous) {
+		// Every newly ineligible report needs the explicit queue veto. Removing
+		// only auto-merge cannot dequeue an entry Mergify already accepted.
+		if !report.Eligible {
+			return true
+		}
 		// These blockers can arrive after Mergify accepted the queue entry. Keep
 		// the explicit veto until a fresh eligible evaluation replaces it; merely
 		// removing auto-merge does not dequeue an already accepted PR.

@@ -19,7 +19,7 @@ func CandidatesFromMergeOutcomes(events []storage.EventLogRecord) ([]MergeCandid
 	for _, event := range events {
 		var projectID, repo, headSHA string
 		var prNumber int64
-		mergedAtText := event.CreatedAt
+		var mergedAtText string
 		switch event.EventType {
 		case gatekeeper.MergeOutcomeEventType:
 			var outcome gatekeeper.MergeOutcome
@@ -29,7 +29,10 @@ func CandidatesFromMergeOutcomes(events []storage.EventLogRecord) ([]MergeCandid
 			if !outcome.Merged {
 				continue
 			}
-			projectID, repo, prNumber, headSHA = outcome.ProjectID, outcome.Repo, outcome.PRNumber, outcome.HeadSHA
+			projectID, repo, prNumber, headSHA, mergedAtText = outcome.ProjectID, outcome.Repo, outcome.PRNumber, outcome.HeadSHA, outcome.AttemptedAt
+			if strings.TrimSpace(mergedAtText) == "" {
+				mergedAtText = event.CreatedAt
+			}
 		case eventlog.CoordinatorPullRequestMergedEventType:
 			var outcome eventlog.CoordinatorPullRequestMerged
 			if err := json.Unmarshal([]byte(event.PayloadJSON), &outcome); err != nil {
