@@ -850,6 +850,13 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 	}
 	manifest, err := reproducer.Load(worktreePath)
 	if err != nil {
+		if checkpoint.ReproductionAbsent && checkpoint.Execution != nil && checkpoint.Execution.Status != "completed" {
+			// A retry may observe a partially written or otherwise malformed
+			// manifest from the interrupted agent. The durable negative
+			// observation keeps it untrusted; let the retry remove or finish
+			// the file instead of converting transient dirt into MI.
+			return nil
+		}
 		return reproductionFailure(err)
 	}
 	if checkpoint.Work.Reproduction != nil {
@@ -865,6 +872,9 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 		return nil
 	}
 	if manifest != nil {
+		if checkpoint.ReproductionAbsent && checkpoint.Execution != nil && checkpoint.Execution.Status == "completed" && !workerAuthoredManifestScopeMatchesTask(*manifest, *checkpoint.Work) {
+			return reproductionFailure(errors.New("worker-authored reproduction manifest does not match the current issue scope"))
+		}
 		if !workerReproductionManifestAppliesToTask(*manifest, *checkpoint.Work) {
 			// No applicable contract for this task (e.g. scoped to another
 			// issue). Record the negative observation so a later same-issue
@@ -885,13 +895,6 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 			}
 			if checkpoint.Execution.Status != "completed" {
 				return nil
-			}
-			if checkpoint.Work.IssueNumber > 0 && manifest.IssueNumber == 0 {
-				// An issue-target Worker may adopt a newly authored contract only
-				// when it names the issue it reproduces. Unscoped manifests remain
-				// valid legacy base-branch contracts at the first capture, but a
-				// new unscoped file would become authority for unrelated issues.
-				return reproductionFailure(errors.New("worker-authored reproduction manifest must identify the current issue"))
 			}
 			if err := verifyWorkerAuthoredReproductionContract(checkpoint.Execution, *manifest); err != nil {
 				return reproductionFailure(err)
@@ -996,6 +999,14 @@ func workerPastInitialReproductionCapture(checkpoint workerCheckpoint) bool {
 // manifest scoped to a different issue is treated as already-fixed history.
 func workerReproductionManifestAppliesToTask(manifest reproducer.Manifest, work workerInput) bool {
 	return manifest.AppliesToIssue(work.IssueNumber, firstNonEmpty(work.IssueRepo, work.Repo))
+}
+
+func workerAuthoredManifestScopeMatchesTask(manifest reproducer.Manifest, work workerInput) bool {
+	if work.IssueNumber <= 0 {
+		return manifest.IssueNumber == 0
+	}
+	expectedRepo := strings.TrimSpace(firstNonEmpty(work.IssueRepo, work.Repo))
+	return manifest.IssueNumber == work.IssueNumber && expectedRepo != "" && strings.EqualFold(strings.TrimSpace(manifest.IssueRepo), expectedRepo)
 }
 
 func verifyWorkerReproduction(checkpoint workerCheckpoint, worktreePath string) error {

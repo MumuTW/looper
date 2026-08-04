@@ -466,7 +466,7 @@ func TestWorkerCaptureReproductionRejectsNewUnscopedManifestForIssue(t *testing.
 		ReproductionAbsent: true,
 		Execution:          &checkpointExecution{Status: "completed"},
 	}
-	if err := captureWorkerReproduction(&checkpoint, root); err == nil || !strings.Contains(err.Error(), "must identify the current issue") {
+	if err := captureWorkerReproduction(&checkpoint, root); err == nil || !strings.Contains(err.Error(), "does not match the current issue scope") {
 		t.Fatalf("captureWorkerReproduction() = %v, want issue-scoped worker-authored rejection", err)
 	}
 	if checkpoint.Work.Reproduction != nil {
@@ -486,6 +486,58 @@ func TestWorkerCaptureReproductionIgnoresUntrustedManifestDuringRetry(t *testing
 	}
 	if checkpoint.Work.Reproduction != nil || !checkpoint.ReproductionAbsent {
 		t.Fatalf("checkpoint = %#v, want untrusted manifest ignored while absence remains", checkpoint)
+	}
+}
+
+func TestWorkerCaptureReproductionDefersMalformedManifestDuringRetry(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".looper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), []byte(`{"version":`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := workerCheckpoint{
+		Work:               &workerInput{Repo: "MumuTW/looper", IssueNumber: 113},
+		ReproductionAbsent: true,
+		Execution:          &checkpointExecution{Status: "timeout"},
+	}
+	if err := captureWorkerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("captureWorkerReproduction() = %v, want malformed retry file deferred", err)
+	}
+	if !checkpoint.ReproductionAbsent || checkpoint.Work.Reproduction != nil {
+		t.Fatalf("checkpoint = %#v, want absence retained and no adopted reproduction", checkpoint)
+	}
+}
+
+func TestWorkerCaptureReproductionRejectsMismatchedAuthoredIssueScope(t *testing.T) {
+	root, manifest := writeWorkerReproductionFixtureWithIssue(t, 999, "MumuTW/looper")
+	checkpoint := workerCheckpoint{
+		Work:               &workerInput{Repo: "MumuTW/looper", IssueNumber: 113},
+		ReproductionAbsent: true,
+		Execution:          &checkpointExecution{Status: "completed", CompletionPayload: workerReproductionCompletionJSON(t, manifest)},
+	}
+	err := captureWorkerReproduction(&checkpoint, root)
+	if err == nil || !strings.Contains(err.Error(), "does not match the current issue scope") {
+		t.Fatalf("captureWorkerReproduction() = %v, want wrong issue scope refusal", err)
+	}
+}
+
+func TestWorkerCaptureReproductionRejectsAuthoredIssueScopeWithoutRepository(t *testing.T) {
+	root, manifest := writeWorkerReproductionFixtureWithIssue(t, 113, "MumuTW/looper")
+	manifest.IssueRepo = ""
+	data := []byte(`{"version":1,"testPath":"internal/bug_test.go","testName":"TestBug","testCommand":"go test ./internal -run '^TestBug$'","testSha256":"` + manifest.TestSHA256 + `","issueNumber":113}`)
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := workerCheckpoint{
+		Work:               &workerInput{Repo: "MumuTW/looper", IssueNumber: 113},
+		ReproductionAbsent: true,
+		Execution:          &checkpointExecution{Status: "completed", CompletionPayload: workerReproductionCompletionJSON(t, manifest)},
+	}
+	err := captureWorkerReproduction(&checkpoint, root)
+	if err == nil || !strings.Contains(err.Error(), "does not match the current issue scope") {
+		t.Fatalf("captureWorkerReproduction() = %v, want missing repository scope refusal", err)
 	}
 }
 

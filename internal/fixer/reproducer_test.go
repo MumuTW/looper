@@ -191,6 +191,26 @@ func TestFixerReproductionIgnoresNewManifestDuringRetry(t *testing.T) {
 	}
 }
 
+func TestFixerReproductionDefersMalformedManifestDuringRetry(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".looper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), []byte(`{"version":`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := fixerCheckpoint{
+		ReproductionAbsent: true,
+		Repair:             &checkpointRepair{Status: "failed", Summary: "agent timed out"},
+	}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("retry capture = %v, want malformed manifest deferred", err)
+	}
+	if checkpoint.Reproduction != nil || !checkpoint.ReproductionAbsent {
+		t.Fatalf("checkpoint after retry capture = %#v, want nil reproduction with absence retained", checkpoint)
+	}
+}
+
 func TestRewindCheckpointForPrepareRetryPreservesOnlyUnfinishedRepair(t *testing.T) {
 	t.Parallel()
 

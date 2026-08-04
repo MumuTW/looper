@@ -1029,6 +1029,13 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 	}
 	manifest, err := reproducer.Load(worktreePath)
 	if err != nil {
+		if checkpoint.ReproductionAbsent && fixerRetryHasUnfinishedRepair(checkpoint) {
+			// A retry may inherit a partially written manifest from the
+			// interrupted repair. Keep the durable negative observation
+			// authoritative and let the replacement agent remove or finish
+			// the untrusted file.
+			return nil
+		}
 		return fixerReproductionFailure(err)
 	}
 	if checkpoint.Reproduction != nil {
