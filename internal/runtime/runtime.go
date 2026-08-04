@@ -1828,10 +1828,44 @@ func (r *Runtime) publishCatalogConsumers(next config.Config) {
 	if webhook != nil {
 		webhook.updateConfig(next)
 	}
+	r.refreshAgentHealthStickyReferences()
 	// Reconfiguring the health gate must not clear an open one: an operator
 	// editing config during an outage would otherwise release the cooldown and
 	// resume the exact hammering the gate is there to stop.
 	r.agentHealth.SetConfig(agentBrownoutConfig(next), next)
+}
+
+// refreshAgentHealthStickyReferences supplies the health registry with the
+// durable/live authorities that justify retaining a removed vendor breaker.
+// A config reload is the point where a provider leaves the active set; using
+// the current queue snapshot and spawn leases at that boundary avoids keeping
+// an outage row forever after its work has moved to another provider.
+func (r *Runtime) refreshAgentHealthStickyReferences() {
+	if r == nil || r.agentHealth == nil {
+		return
+	}
+	r.mu.RLock()
+	repos := r.services.Repositories
+	active := r.activeExecutions
+	logger := r.logger
+	r.mu.RUnlock()
+	refs := make([]string, 0)
+	if active != nil {
+		refs = append(refs, active.AgentVendors()...)
+	}
+	if repos != nil && repos.Queue != nil {
+		queued, err := repos.Queue.ListQueuedSnapshotVendors(context.Background(), []string{"planner", "reviewer", "fixer", "worker"})
+		if err != nil {
+			// A failed reference read is not authority to discard retained health;
+			// leave the previous set intact and retry at the next publication.
+			if logger != nil {
+				logger.Warn("agent health sticky-vendor reference refresh deferred", map[string]any{"error": err.Error()})
+			}
+			return
+		}
+		refs = append(refs, queued...)
+	}
+	r.agentHealth.SetStickyVendorReferences(refs)
 }
 
 // afterProjectsPublished deliberately runs outside configBoundary. Webhook

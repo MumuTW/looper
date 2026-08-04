@@ -31,6 +31,11 @@ type agentHealthRegistry struct {
 	configured        bool
 	configuredVendors map[string]struct{}
 	breakers          map[string]*brownout.Breaker
+	// stickyVendorRefs is the live-work authority for retaining a provider
+	// after config removes it. Queue snapshots and in-flight spawn leases feed
+	// this set; a stale breaker must not remain in status forever after the last
+	// durable retry and execution are gone.
+	stickyVendorRefs map[string]struct{}
 	// stickyBreakers retain health state for vendors referenced by a sticky
 	// retry after live configuration removes them. They are never included in
 	// AllowAny or the active-provider aggregate, so an obsolete vendor cannot
@@ -43,7 +48,7 @@ func newAgentHealthRegistry(cfg brownout.Config, daemonCfg config.Config, now fu
 	if now == nil {
 		now = time.Now
 	}
-	r := &agentHealthRegistry{now: now, onChange: onChange, onWarning: onWarning, cfg: cfg, configuredVendors: make(map[string]struct{}), breakers: make(map[string]*brownout.Breaker), stickyBreakers: make(map[string]*brownout.Breaker)}
+	r := &agentHealthRegistry{now: now, onChange: onChange, onWarning: onWarning, cfg: cfg, configuredVendors: make(map[string]struct{}), breakers: make(map[string]*brownout.Breaker), stickyBreakers: make(map[string]*brownout.Breaker), stickyVendorRefs: make(map[string]struct{})}
 	r.ensureConfiguredVendorsLocked(daemonCfg)
 	if len(r.breakers) == 0 {
 		r.ensureBreakerLocked(defaultAgentHealthVendor)
@@ -75,6 +80,10 @@ func (r *agentHealthRegistry) ensureConfiguredVendorsLocked(cfg config.Config) {
 			continue
 		}
 		if _, ok := activeVendors[vendor]; !ok {
+			if _, referenced := r.stickyVendorRefs[vendor]; !referenced {
+				delete(r.breakers, vendor)
+				continue
+			}
 			r.stickyBreakers[vendor] = r.breakers[vendor]
 			delete(r.breakers, vendor)
 		}
@@ -91,6 +100,40 @@ func (r *agentHealthRegistry) ensureConfiguredVendorsLocked(cfg config.Config) {
 		// effective vendor. Once a real provider is configured it must not keep
 		// AllowAny healthy and bypass all provider-specific breakers.
 		delete(r.breakers, defaultAgentHealthVendor)
+	}
+	r.pruneStickyBreakersLocked()
+}
+
+// SetStickyVendorReferences refreshes the durable/live-work references that
+// justify retaining removed-provider breakers. The caller supplies queued
+// snapshot vendors plus vendors held by in-flight spawn leases; the registry
+// owns only health state and never invents a reference from its own output.
+func (r *agentHealthRegistry) SetStickyVendorReferences(vendors []string) {
+	if r == nil {
+		return
+	}
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	r.mu.Lock()
+	r.stickyVendorRefs = make(map[string]struct{}, len(vendors))
+	for _, vendor := range vendors {
+		if key := strings.TrimSpace(vendor); key != "" && key != defaultAgentHealthVendor {
+			r.stickyVendorRefs[key] = struct{}{}
+		}
+	}
+	r.pruneStickyBreakersLocked()
+	r.mu.Unlock()
+}
+
+func (r *agentHealthRegistry) pruneStickyBreakersLocked() {
+	for vendor := range r.stickyBreakers {
+		if _, active := r.configuredVendors[vendor]; active {
+			delete(r.stickyBreakers, vendor)
+			continue
+		}
+		if _, referenced := r.stickyVendorRefs[vendor]; !referenced {
+			delete(r.stickyBreakers, vendor)
+		}
 	}
 }
 

@@ -953,10 +953,16 @@ func TestClaimAndRunScheduledQueueItemsCapsHalfOpenProviderBatch(t *testing.T) {
 
 	allowVendor := func(string) error { return nil }
 	withVendor := func(_ string, fn func()) error { fn(); return nil }
+	atomicLaneCalls := 0
 	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 3, defaultSchedulerTickInput{
 		Repos: repos, Config: &cfg, Now: func() time.Time { return now }, AsyncRunner: immediateSchedulerRunner{},
 		Worker: &stubWorkerScheduler{}, Reviewer: &stubReviewerScheduler{},
 		AllowClaimForVendor: allowVendor, WithAllowClaimForVendor: withVendor,
+		WithAllowClaimLanes: func(_ []storage.QueueClaimLane, fn func()) error {
+			atomicLaneCalls++
+			fn()
+			return nil
+		},
 		// The Codex lane is half-open with one remaining probe; the Claude lane
 		// is closed/unlimited. Capacity is observational, while spawn admission
 		// remains responsible for reserving the actual probe.
@@ -972,6 +978,9 @@ func TestClaimAndRunScheduledQueueItemsCapsHalfOpenProviderBatch(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if atomicLaneCalls == 0 {
+		t.Fatal("atomic lane admission was not used while a provider was half-open")
 	}
 	if len(claimed) != 2 {
 		t.Fatalf("claimed = %#v, want one Codex item plus the Claude reviewer", claimed)
@@ -993,6 +1002,82 @@ func TestClaimAndRunScheduledQueueItemsCapsHalfOpenProviderBatch(t *testing.T) {
 		}
 		if !claimedIDs[id] && item.Status != "queued" {
 			t.Fatalf("queue item %s = %#v, want one claimed and one queued", id, item)
+		}
+	}
+}
+
+func TestClaimAndRunScheduledQueueItemsSharesHalfOpenBudgetAcrossStickyAndLiveLanes(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-half-open-shared-budget.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	cfg.Agent.Vendor = &codex
+	cfg.Roles.Reviewer.Agent = &config.RoleAgentConfig{Vendor: &codex}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Validation: &config.ProjectValidationConfig{OptOut: true}}}
+
+	live := schedulerTestQueueItem("shared_budget_live", "worker", nowISO)
+	stickyLoopID := "shared_budget_sticky_loop"
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: stickyLoopID, Seq: 1, ProjectID: "looper", Type: "reviewer", TargetType: "pull_request", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	snapshot := `{"vendor":"codex","model":"frozen-reviewer"}`
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "shared_budget_sticky_run", LoopID: stickyLoopID, Status: "failed", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, AgentSnapshotJSON: &snapshot}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	sticky := schedulerTestQueueItem("shared_budget_sticky", "reviewer", nowISO)
+	sticky.LoopID = &stickyLoopID
+	for _, item := range []storage.QueueItemRecord{live, sticky} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	atomicLaneCalls := 0
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 2, defaultSchedulerTickInput{
+		Repos: repos, Config: &cfg, Now: func() time.Time { return now }, AsyncRunner: immediateSchedulerRunner{},
+		Worker: &stubWorkerScheduler{}, Reviewer: &stubReviewerScheduler{},
+		WithAllowClaimLanes: func(_ []storage.QueueClaimLane, fn func()) error {
+			atomicLaneCalls++
+			fn()
+			return nil
+		},
+		ClaimCapacityForVendor: func(vendor string, _ bool) int {
+			if vendor == string(codex) {
+				return 1
+			}
+			return -1
+		},
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if atomicLaneCalls == 0 {
+		t.Fatal("atomic lane admission was not used for the shared-budget claim")
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed = %#v, want one item for the shared Codex probe budget", claimed)
+	}
+	for _, id := range []string{live.ID, sticky.ID} {
+		item, err := repos.Queue.GetByID(context.Background(), id)
+		if err != nil {
+			t.Fatalf("Queue.GetByID(%s) error = %v", id, err)
+		}
+		if item == nil {
+			t.Fatalf("Queue.GetByID(%s) = nil", id)
+		}
+		claimedThis := item.Status != "queued"
+		if claimedThis != (claimed[0].ID == id) {
+			t.Fatalf("queue item %s = %#v, claimed = %#v; want exactly one row claimed", id, item, claimed)
 		}
 	}
 }
@@ -1225,6 +1310,11 @@ func TestClaimLanesFallThroughToLifecycleAfterEmptyProviderUnion(t *testing.T) {
 			fn()
 			return nil
 		},
+		ClaimCapacityForVendor: func(string, bool) int {
+			// Coding lanes have no half-open probe budget; the lifecycle
+			// snapshot must still be admitted independently.
+			return 0
+		},
 	}, nil, true)
 	if err != nil {
 		t.Fatalf("executeClaimPhase() error = %v", err)
@@ -1232,8 +1322,8 @@ func TestClaimLanesFallThroughToLifecycleAfterEmptyProviderUnion(t *testing.T) {
 	if claimedCount != 1 {
 		t.Fatalf("claimed count = %d, want lifecycle snapshot after empty provider union", claimedCount)
 	}
-	if providerSections == 0 || lifecycleSections == 0 {
-		t.Fatalf("provider/lifecycle sections = %d/%d, want both", providerSections, lifecycleSections)
+	if lifecycleSections == 0 {
+		t.Fatalf("lifecycle sections = %d, want lifecycle admission after coding lanes were exhausted", lifecycleSections)
 	}
 	updated, err := repos.Queue.GetByID(context.Background(), item.ID)
 	if err != nil {

@@ -3905,20 +3905,14 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 			}
 		}
 		atomicAcrossLanes := input.WithAllowClaimLanes != nil && len(atomicTypeSets) > 0
-		// An atomic union can select several items from a half-open provider
-		// before dispatch has a chance to reserve probe slots. Fall back to the
-		// lane-aware path for that pass so each lane is capped by its observed
-		// remaining recovery capacity while healthy sibling lanes stay eligible.
-		if atomicAcrossLanes && input.ClaimCapacityForVendor != nil {
-			for _, typeSet := range atomicTypeSets {
-				if input.ClaimCapacityForVendor(typeSet.vendor, typeSet.snapshotScoped) >= 0 {
-					atomicAcrossLanes = false
-					break
-				}
-			}
-		}
 		if atomicAcrossLanes {
 			active := make([]bool, len(atomicTypeSets))
+			// A provider can have both a live-role lane and a sticky-snapshot lane.
+			// They share one breaker and therefore one half-open probe budget. Keep
+			// the accounting keyed by effective vendor, not by type-set index; the
+			// latter lets one ordinary and one sticky row consume the same probe
+			// budget twice before dispatch gets a chance to reserve it.
+			claimedByProvider := make(map[string]int, len(atomicTypeSets))
 			for i := range active {
 				active[i] = true
 			}
@@ -3934,6 +3928,18 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 					typeSet := atomicTypeSets[index]
 					if !active[index] {
 						continue
+					}
+					if input.ClaimCapacityForVendor != nil && !typeSet.lifecycleOnly {
+						capacity := input.ClaimCapacityForVendor(typeSet.vendor, typeSet.snapshotScoped)
+						provider := strings.TrimSpace(typeSet.vendor)
+						if capacity >= 0 && claimedByProvider[provider] >= capacity {
+							// This is a half-open lane whose observed recovery budget is
+							// already represented by claims in this batch. Exclude it
+							// while retaining healthy sibling lanes in the same atomic
+							// selection.
+							active[index] = false
+							continue
+						}
 					}
 					if skip, stop := admitClaim(typeSet.vendor, typeSet.providerScoped, typeSet.snapshotScoped, typeSet.lifecycleOnly); skip {
 						active[index] = false
@@ -3954,8 +3960,13 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 						StickyOnlyProjectIDs:   stickyOnlyProjectIDs,
 					})
 				}
-				if stopClaiming || len(lanes) == 0 {
+				if stopClaiming {
 					return
+				}
+				if len(lanes) == 0 {
+					// Every coding lane is currently open or probe-saturated;
+					// lifecycle-only work still has its own admission boundary.
+					break atomicClaims
 				}
 				result, err := claimOne("", false, false, false, true, lanes, func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
 					return input.Repos.Queue.ClaimNextAcrossLanes(ctx, nowISO, claimedBy, lanes, longTerm)
@@ -3969,6 +3980,20 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 				case claimContinue:
 					// Rebuild the admitted lane union for every slot. The SQL UPDATE
 					// chooses the winner after all producers' writes are visible.
+					// Resolve the persisted snapshot after the claim so an ordinary
+					// and a sticky row routed to the same provider debit one shared
+					// half-open budget. The durable run snapshot is the authority;
+					// this read is only for accounting the already-claimed item.
+					claimed := queueItems[len(queueItems)-1]
+					provider, providerErr := schedulerClaimEffectiveVendor(ctx, input, claimed)
+					if providerErr != nil {
+						claimFailure = providerErr
+						stopClaiming = true
+						return
+					}
+					if provider != "" {
+						claimedByProvider[provider]++
+					}
 				case claimEmpty:
 					// No coding item is currently eligible. Continue into the
 					// lifecycle-only lanes below instead of abandoning this pass.
@@ -4021,7 +4046,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		// only prevents one lane from draining its backlog; it can still let a
 		// lower-priority worker consume the last slot ahead of a reviewer lane.
 		active := make([]bool, len(providerTypeSets))
-		claimedByLane := make([]int, len(providerTypeSets))
+		claimedByProvider := make(map[string]int, len(providerTypeSets))
 		remaining := len(providerTypeSets)
 		for i := range active {
 			active[i] = true
@@ -4040,9 +4065,10 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 				if !active[index] || stopClaiming {
 					continue
 				}
-				if input.ClaimCapacityForVendor != nil {
+				if input.ClaimCapacityForVendor != nil && !typeSet.lifecycleOnly {
 					capacity := input.ClaimCapacityForVendor(typeSet.vendor, typeSet.snapshotScoped)
-					if capacity >= 0 && claimedByLane[index] >= capacity {
+					provider := strings.TrimSpace(typeSet.vendor)
+					if capacity >= 0 && claimedByProvider[provider] >= capacity {
 						active[index] = false
 						remaining--
 						continue
@@ -4104,7 +4130,9 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 			}
 			switch result {
 			case claimContinue:
-				claimedByLane[winner.index]++
+				if !typeSet.lifecycleOnly {
+					claimedByProvider[strings.TrimSpace(typeSet.vendor)]++
+				}
 				// Re-peek every active lane after each claim. This preserves the
 				// repository's priority/availability ordering for the next slot.
 			case claimEmpty, claimSkip:
@@ -4133,6 +4161,36 @@ func codingClaimProjectScope(cfg *config.Config, quarantinedProjectIDs []string)
 		projectIDs = append(projectIDs, project.ID)
 	}
 	return []string{"fixer", "worker"}, projectIDs, quarantinedProjectIDs
+}
+
+// schedulerClaimEffectiveVendor resolves the provider that owns a durable
+// queue claim. Sticky retries restore the latest failed/interrupted run's
+// agent snapshot, while fresh/live-role rows use the current role binding.
+// The scheduler uses this only to debit an already-claimed item against a
+// half-open batch budget; provider admission itself remains the gatekeeper.
+func schedulerClaimEffectiveVendor(ctx context.Context, input defaultSchedulerTickInput, item storage.QueueItemRecord) (string, error) {
+	if item.LoopID != nil && input.Repos != nil && input.Repos.Runs != nil {
+		latest, err := input.Repos.Runs.GetLatestByLoopID(ctx, *item.LoopID)
+		if err != nil {
+			return "", err
+		}
+		if latest != nil && (latest.Status == "failed" || latest.Status == "interrupted") && latest.AgentSnapshotJSON != nil {
+			var snapshot struct {
+				Vendor string `json:"vendor"`
+			}
+			if err := json.Unmarshal([]byte(*latest.AgentSnapshotJSON), &snapshot); err == nil {
+				if vendor := strings.TrimSpace(snapshot.Vendor); vendor != "" {
+					return vendor, nil
+				}
+			}
+		}
+	}
+	if input.Config != nil {
+		if resolved, ok := config.ResolveAgent(*input.Config, "", item.Type); ok {
+			return strings.TrimSpace(string(resolved.Vendor)), nil
+		}
+	}
+	return "", nil
 }
 
 // quarantinedProjectIDsForClaim returns the IDs of unstanced legacy projects

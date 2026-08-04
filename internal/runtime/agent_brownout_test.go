@@ -420,6 +420,11 @@ func TestStickySnapshotClaimCheckDoesNotConsumeHalfOpenProbe(t *testing.T) {
 	configured := rt.Config()
 	configured.Agent.Vendor = &codex
 	rt.publishCatalogConsumers(configured)
+	preRemovalLease, err := rt.activeExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{LoopID: "retained-loop", RunID: "retained-run", ExecutionID: "retained-exec", Vendor: string(codex)})
+	if err != nil {
+		t.Fatalf("pre-removal spawn lease = %v", err)
+	}
+	defer preRemovalLease.Release()
 	for i := 0; i < 3; i++ {
 		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: string(codex), Status: "failed"})
 	}
@@ -461,6 +466,11 @@ func TestAgentHealthPromotesRetainedBreakerWhenVendorReturns(t *testing.T) {
 	configured.Agent.Vendor = &codex
 	configured.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &claude}
 	rt.publishCatalogConsumers(configured)
+	preRemovalLease, err := rt.activeExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{LoopID: "retained-loop", RunID: "retained-run", ExecutionID: "retained-exec", Vendor: string(codex)})
+	if err != nil {
+		t.Fatalf("pre-removal spawn lease = %v", err)
+	}
+	defer preRemovalLease.Release()
 	for i := 0; i < 3; i++ {
 		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: string(codex), Status: "failed"})
 	}
@@ -488,6 +498,11 @@ func TestAgentHealthRecordsInFlightOutcomeAfterVendorRemoval(t *testing.T) {
 	configured := rt.Config()
 	configured.Agent.Vendor = &codex
 	rt.publishCatalogConsumers(configured)
+	lease, err := rt.activeExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{LoopID: "in-flight-loop", RunID: "in-flight-run", ExecutionID: "in-flight-exec", Vendor: string(codex)})
+	if err != nil {
+		t.Fatalf("pre-removal spawn lease = %v", err)
+	}
+	defer lease.Release()
 	for i := 0; i < 2; i++ {
 		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: string(codex), Status: "failed"})
 	}
@@ -514,6 +529,11 @@ func TestAgentHealthSnapshotExposesNonClosedStickyProvider(t *testing.T) {
 	configured.Agent.Vendor = &codex
 	configured.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &claude}
 	rt.publishCatalogConsumers(configured)
+	lease, err := rt.activeExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{LoopID: "sticky-status-loop", RunID: "sticky-status-run", ExecutionID: "sticky-status-exec", Vendor: string(codex)})
+	if err != nil {
+		t.Fatalf("pre-removal spawn lease = %v", err)
+	}
+	defer lease.Release()
 	for i := 0; i < 3; i++ {
 		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: string(codex), Status: "failed"})
 	}
@@ -534,6 +554,29 @@ func TestAgentHealthSnapshotExposesNonClosedStickyProvider(t *testing.T) {
 	}
 	if sticky == nil || sticky.State != brownout.StateOpen {
 		t.Fatalf("provider summaries = %#v, want non-closed sticky Codex provider", summary.Providers)
+	}
+}
+
+func TestAgentHealthDropsRemovedBreakerWithoutStickyWork(t *testing.T) {
+	rt, _ := brownoutRuntime(t, func(cfg *config.AgentBrownoutConfig) {
+		cfg.MinFailures = 3
+	})
+	codex := config.AgentVendorCodex
+	configured := rt.Config()
+	configured.Agent.Vendor = &codex
+	rt.publishCatalogConsumers(configured)
+	for i := 0; i < 3; i++ {
+		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: string(codex), Status: "failed"})
+	}
+	removed := configured
+	removed.Agent.Vendor = nil
+	rt.publishCatalogConsumers(removed)
+
+	summary := rt.AgentHealth()
+	for _, provider := range summary.Providers {
+		if provider.Provider == string(codex) {
+			t.Fatalf("removed provider retained without queued/live sticky work: %#v", summary.Providers)
+		}
 	}
 }
 

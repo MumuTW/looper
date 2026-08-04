@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"errors"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -139,6 +141,40 @@ func (r *ActiveExecutionRegistry) DrainSnapshot() DrainSnapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return DrainSnapshot{LiveExecutions: len(r.executions), PendingSpawns: len(r.pending), BoundOperations: len(r.boundOps), PendingOperations: len(r.pendingOps)}
+}
+
+// AgentVendors returns providers held by pending spawn leases or live
+// executions. Runtime config publication uses this as one half of the
+// sticky-breaker retention authority; the other half comes from queued run
+// snapshots in storage.
+func (r *ActiveExecutionRegistry) AgentVendors() []string {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	seen := make(map[string]struct{})
+	add := func(vendor string) {
+		if vendor = strings.TrimSpace(vendor); vendor != "" {
+			seen[vendor] = struct{}{}
+		}
+	}
+	for _, lease := range r.pending {
+		if lease != nil {
+			add(lease.meta.Vendor)
+		}
+	}
+	for _, lease := range r.active {
+		if lease != nil {
+			add(lease.meta.Vendor)
+		}
+	}
+	vendors := make([]string, 0, len(seen))
+	for vendor := range seen {
+		vendors = append(vendors, vendor)
+	}
+	sort.Strings(vendors)
+	return vendors
 }
 
 func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
