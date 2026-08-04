@@ -26,6 +26,7 @@ import (
 	"github.com/MumuTW/looper/internal/infra/notify"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops"
+	networkclient "github.com/MumuTW/looper/internal/network/client"
 	"github.com/MumuTW/looper/internal/processidentity"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/storage"
@@ -215,9 +216,8 @@ type Runtime struct {
 	worktreeCleanupCancel       context.CancelFunc
 	worktreeCleanupRunning      bool
 	worktreeCleanupInitialDelay time.Duration
-	worktreeCleanupStatus       WorktreeCleanupStatus
-	worktreeCleanupSweepCursor  int
-	hostAdmission               *hostAdmissionGate
+	worktreeCleanupStatus      WorktreeCleanupStatus
+	worktreeCleanupSweepCursor int
 	// workProducerJoinStarted latches the first BeginDrain producer join for
 	// the process lifetime (under mu with workProducerJoinDone). Never clear:
 	// a second POST must not overwrite residual done-channels.
@@ -265,6 +265,13 @@ type Runtime struct {
 	// storageRetained is true when Stop skipped coordinator.Close after a
 	// drain failure so undrained ownership is not closed under SQLite.
 	storageRetained bool
+}
+
+type runtimeNetworkManager interface {
+	Start(context.Context) error
+	Stop()
+	Status() networkclient.Status
+	UpdateConfig(config.Config)
 }
 
 const reviewerRecoveryLoginTimeout = 3 * time.Second

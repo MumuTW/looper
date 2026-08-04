@@ -8,8 +8,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/MumuTW/looper/internal/upgradebackup"
 	"github.com/MumuTW/looper/internal/version"
 )
 
@@ -174,6 +176,178 @@ func TestParseUpgradeVerifyStartArgsRequiresBundle(t *testing.T) {
 	}
 }
 
+func TestUpgradeRestorePreflightRequiresVerifiedInactiveTargets(t *testing.T) {
+	bundle := createUpgradeRestoreBundle(t)
+	original := upgradeRestoreOpenPIDs
+	t.Cleanup(func() { upgradeRestoreOpenPIDs = original })
+	upgradeRestoreOpenPIDs = func(context.Context, []string) ([]int, error) { return nil, nil }
+	stdout := &bytes.Buffer{}
+	if err := runUpgrade(context.Background(), nil, []string{"restore-preflight", "--bundle", bundle}, stdout); err != nil {
+		t.Fatal(err)
+	}
+	var report upgradeRestorePreflight
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if !report.Ready || len(report.Blocks) != 0 || report.Source.DatabasePath == "" {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
+func TestUpgradeRestorePreflightReportsOpenTargets(t *testing.T) {
+	bundle := createUpgradeRestoreBundle(t)
+	original := upgradeRestoreOpenPIDs
+	t.Cleanup(func() { upgradeRestoreOpenPIDs = original })
+	upgradeRestoreOpenPIDs = func(context.Context, []string) ([]int, error) { return []int{12, 34}, nil }
+	stdout := &bytes.Buffer{}
+	err := runUpgrade(context.Background(), nil, []string{"restore-preflight", "--bundle", bundle}, stdout)
+	if err == nil || !strings.Contains(err.Error(), "still open") {
+		t.Fatalf("runUpgrade() error = %v", err)
+	}
+	var report upgradeRestorePreflight
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Ready || len(report.OpenPIDs) != 2 || len(report.Blocks) != 1 {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
+func TestFindUpgradeRestoreOpenPIDsSkipsMissingTargets(t *testing.T) {
+	root := t.TempDir()
+	existing := filepath.Join(root, "database.sqlite")
+	missing := filepath.Join(root, "database.sqlite-wal")
+	if err := os.WriteFile(existing, []byte("db"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	argsLog := filepath.Join(root, "lsof-args")
+	t.Setenv("LOOPER_TEST_LSOF_LOG", argsLog)
+	lsof := filepath.Join(root, "lsof")
+	if err := os.WriteFile(lsof, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LOOPER_TEST_LSOF_LOG\"\nprintf '123\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
+	pids, err := findUpgradeRestoreOpenPIDs(context.Background(), []string{existing, missing})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pids) != 1 || pids[0] != 123 {
+		t.Fatalf("pids = %#v, want [123]", pids)
+	}
+	args, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(args), missing) {
+		t.Fatalf("lsof received missing target %q: args = %q", missing, args)
+	}
+}
+
+func TestUpgradeRestoreRestoresVerifiedConfigAndSQLiteSnapshot(t *testing.T) {
+	bundle := createUpgradeRestoreBundle(t)
+	verified, err := upgradebackup.Verify(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := upgradebackup.RestoreSource(verified.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source.ConfigPath, []byte("changed-config\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source.DatabasePath, []byte("changed-database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.WriteFile(source.DatabasePath+suffix, []byte("stale"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	original := upgradeRestoreOpenPIDs
+	t.Cleanup(func() { upgradeRestoreOpenPIDs = original })
+	upgradeRestoreOpenPIDs = func(context.Context, []string) ([]int, error) { return nil, nil }
+	stdout := &bytes.Buffer{}
+	if err := runUpgrade(context.Background(), nil, []string{"restore", "--bundle", bundle, "--confirm"}, stdout); err != nil {
+		t.Fatal(err)
+	}
+	var result upgradeRestoreResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Restored || result.Bundle != bundle {
+		t.Fatalf("result = %#v", result)
+	}
+	config, err := os.ReadFile(source.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(config) != "[server]\n" {
+		t.Fatalf("config = %q", config)
+	}
+	database, err := os.ReadFile(source.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(database) != "sqlite" {
+		t.Fatalf("database = %q", database)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Lstat(source.DatabasePath + suffix); !os.IsNotExist(err) {
+			t.Fatalf("sidecar %s exists or could not be inspected: %v", suffix, err)
+		}
+	}
+}
+
+func TestUpgradeRestoreRequiresConfirmationAndFreshUnusedTargets(t *testing.T) {
+	bundle := createUpgradeRestoreBundle(t)
+	verified, err := upgradebackup.Verify(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := upgradebackup.RestoreSource(verified.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source.ConfigPath, []byte("changed-config\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source.DatabasePath, []byte("changed-database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUpgrade(context.Background(), nil, []string{"restore", "--bundle", bundle}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "--confirm") {
+		t.Fatalf("restore without confirmation error = %v", err)
+	}
+	original := upgradeRestoreOpenPIDs
+	t.Cleanup(func() { upgradeRestoreOpenPIDs = original })
+	checks := 0
+	upgradeRestoreOpenPIDs = func(context.Context, []string) ([]int, error) {
+		checks++
+		if checks == 2 {
+			return []int{42}, nil
+		}
+		return nil, nil
+	}
+	err = runUpgrade(context.Background(), nil, []string{"restore", "--confirm", "--bundle", bundle}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "open by processes: 42") {
+		t.Fatalf("restore with newly open target error = %v", err)
+	}
+	config, err := os.ReadFile(source.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(config) != "changed-config\n" {
+		t.Fatalf("config mutated without a safe restore: %q", config)
+	}
+	database, err := os.ReadFile(source.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(database) != "changed-database" {
+		t.Fatalf("database mutated without a safe restore: %q", database)
+	}
+}
+
 func completeUpgradeIdentity(commit string) version.Info {
 	ts := "2026-07-31T12:00:00Z"
 	dirty := false
@@ -256,4 +430,35 @@ func withUpgradeCommit(identity version.Info, commit string) version.Info {
 	c := commit
 	identity.Metadata.GitCommitSHA = &c
 	return identity
+}
+
+func writeUpgradeBundleFile(t *testing.T, directory, name, contents string) string {
+	t.Helper()
+	path := filepath.Join(directory, name)
+	if err := os.WriteFile(path, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func createUpgradeRestoreBundle(t *testing.T) string {
+	t.Helper()
+	bundle, _, _ := createUpgradeRestoreBundleWithSource(t)
+	return bundle
+}
+
+func createUpgradeRestoreBundleWithSource(t *testing.T) (bundleDir, databasePath, configPath string) {
+	t.Helper()
+	root := t.TempDir()
+	configPath = writeUpgradeBundleFile(t, root, "config.toml", "[server]\n")
+	cli := writeUpgradeBundleFile(t, root, "looper", "cli")
+	daemon := writeUpgradeBundleFile(t, root, "looperd", "daemon")
+	databasePath = filepath.Join(root, "looper.sqlite")
+	bundle, err := upgradebackup.Create(context.Background(), upgradebackup.Input{RootDir: filepath.Join(root, "backups"), ConfigPath: configPath, DatabasePath: databasePath, CLIBinaryPath: cli, DaemonBinaryPath: daemon, Snapshot: func(context.Context) (string, error) {
+		return writeUpgradeBundleFile(t, root, "snapshot.sqlite", "sqlite"), nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bundle.Directory, databasePath, configPath
 }
