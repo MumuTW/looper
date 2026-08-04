@@ -619,6 +619,7 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 		status.ContainersSkipped = containers.Summary.Skipped
 		status.ContainersFailed = containers.Summary.Errors
 		status.Removed += orphanProjectsRemoved
+		status.WouldRemove += orphanProjectsWouldRemove
 		status.Skipped += containers.Summary.Skipped
 		status.Failed += containers.Summary.Errors
 		if containerErr != nil {

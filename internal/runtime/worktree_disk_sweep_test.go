@@ -93,6 +93,40 @@ func TestWorktreeDiskSweepExhaustsBudgetAfterContainerRemoval(t *testing.T) {
 	}
 }
 
+func TestWorktreeDiskSweepCountsDryRunOrphanProjects(t *testing.T) {
+	fixture := newWorktreeCleanupFixture(t)
+	fixture.config.Daemon.WorktreeCleanup.RetentionDays = 7
+	fixture.config.Daemon.WorktreeCleanup.MaxDiskSweepPerTick = 1
+	fixture.config.Daemon.WorktreeCleanup.DryRun = true
+	t.Setenv("LOOPER_HOME", filepath.Dir(fixture.root))
+	repoPath := filepath.Join(filepath.Dir(fixture.root), "repo-source-dry-run")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repoPath) error = %v", err)
+	}
+	liveContainer := filepath.Join(fixture.root, "repo-live-dry-run")
+	liveRoot := filepath.Join(liveContainer, "project_1")
+	metadata := `{"worktreeRoot":"` + liveRoot + `"}`
+	fixture.project.RepoPath = repoPath
+	fixture.project.MetadataJSON = &metadata
+	if err := fixture.repos.Projects.Upsert(context.Background(), fixture.project); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	orphan := filepath.Join(liveContainer, "project-orphan", "checkout")
+	for _, path := range []string{orphan, liveContainer, filepath.Dir(orphan)} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q) error = %v", path, err)
+		}
+		if err := os.Chtimes(path, fixture.now.Add(-30*24*time.Hour), fixture.now.Add(-30*24*time.Hour)); err != nil {
+			t.Fatalf("Chtimes(%q) error = %v", path, err)
+		}
+	}
+
+	summary := fixture.runtime.runWorktreeDiskSweep(context.Background(), fixture.repos, &fakeWorktreeCleanupGit{}, fixture.config)
+	if summary.WouldRemove != 1 || summary.ContainersWouldRemove != 0 || summary.Removed != 0 {
+		t.Fatalf("summary = %#v, want orphan dry-run counted in WouldRemove only", summary)
+	}
+}
+
 // The sweep must never touch a directory the worktrees table claims, even when
 // that row is already cleaned: the record pass owns those paths and its
 // provenance is the only thing distinguishing a failed removal from debris.
