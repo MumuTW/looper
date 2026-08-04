@@ -254,6 +254,9 @@ type Runtime struct {
 // snapshot, so a config reload changes policy without leaving the API bound to
 // a stale Coordinator runner.
 func (r *Runtime) BackfillIssues(ctx context.Context, input coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error) {
+	if err := r.allowBackfillOnHost(); err != nil {
+		return coordinatorrole.BackfillResult{}, err
+	}
 	r.mu.RLock()
 	backfill := r.backfillIssues
 	activeExecutions := r.activeExecutions
@@ -270,6 +273,28 @@ func (r *Runtime) BackfillIssues(ctx context.Context, input coordinatorrole.Back
 	}
 	defer operation.Release()
 	return backfill(operation.Context(), input)
+}
+
+func (r *Runtime) allowBackfillOnHost() error {
+	if r == nil {
+		return fmt.Errorf("%w: runtime is unavailable", coordinatorrole.ErrBackfillUnavailable)
+	}
+	cfg := r.Config().Daemon.ResourceGuard
+	r.mu.RLock()
+	gate := r.hostAdmission
+	logger := r.logger
+	r.mu.RUnlock()
+	if gate == nil {
+		return nil
+	}
+	decision := gate.Decide(cfg)
+	if decision == nil || decision.Admit {
+		return nil
+	}
+	if gate.ShouldLogHold(decision) {
+		logHostAdmissionHold(logger, "backfill", 0, *decision)
+	}
+	return fmt.Errorf("%w: host resource guard: %s", coordinatorrole.ErrBackfillUnavailable, decision.Summary())
 }
 
 const reviewerRecoveryLoginTimeout = 3 * time.Second

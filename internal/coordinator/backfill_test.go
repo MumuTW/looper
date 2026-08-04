@@ -166,6 +166,31 @@ func TestBackfillIssuesForceRetriageReTriages(t *testing.T) {
 	}
 }
 
+func TestBackfillIssuesRequiresForceForTriagedIssue(t *testing.T) {
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.BackfillEnabled = true
+	})
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{
+		Number: 1, Title: "already triaged", Author: "looper",
+		State: "open", CreatedAt: fixture.now.Add(-24 * time.Hour).Format(time.RFC3339),
+		Labels: []string{"triaged"},
+	}
+
+	result, err := fixture.runner.BackfillIssues(context.Background(), BackfillInput{
+		ProjectID:   fixture.projectID,
+		Repo:        "acme/looper",
+		SkipTriaged: false,
+	})
+	if err != nil {
+		t.Fatalf("BackfillIssues() error = %v", err)
+	}
+	if result.Triaged != 0 || result.SkipReasons["force_retriage_required"] != 1 || len(fixture.github.createdBodies) != 0 {
+		t.Fatalf("result = %#v createdBodies=%v, want force confirmation before triaged mutation", result, fixture.github.createdBodies)
+	}
+}
+
 func TestBackfillIssuesMissingDetailDoesNotFail(t *testing.T) {
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true

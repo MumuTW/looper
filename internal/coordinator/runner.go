@@ -88,6 +88,39 @@ type BackfillResult struct {
 	FailedIssues    map[int64]string `json:"failedIssues,omitempty"`
 }
 
+// backfillSkipReason is the deterministic selection authority for one
+// candidate. It is intentionally reusable after the inspection/LLM phase so
+// an issue that changed while analysis was running cannot bypass the original
+// scope before mutation.
+func backfillSkipReason(loaded loadedIssue, input BackfillInput, triageCfg triage.Config, labelFilter string, now time.Time) string {
+	if loaded.detail.State != "" && !strings.EqualFold(strings.TrimSpace(loaded.detail.State), "open") {
+		return "not_open"
+	}
+	if loaded.detail.IsPullRequest {
+		return "pull_request"
+	}
+	if labelFilter != "" && !labels.Has(loaded.issue.Labels, labelFilter) {
+		return "label_mismatch"
+	}
+	if labels.Has(loaded.issue.Labels, triageCfg.TriagedLabel) && !input.ForceRetriage {
+		if input.SkipTriaged {
+			return "already_triaged"
+		}
+		return "force_retriage_required"
+	}
+	if labels.Has(loaded.issue.Labels, labels.HoldGlobal) {
+		return "hold"
+	}
+	createdAt, ok := parseCoordinatorTime(loaded.issue.CreatedAt)
+	if !ok || createdAt.After(now) {
+		return "invalid_created_at"
+	}
+	if now.Sub(createdAt) > time.Duration(input.MaxAgeDays)*24*time.Hour {
+		return "too_old"
+	}
+	return ""
+}
+
 func (r *Runner) BackfillIssues(ctx context.Context, input BackfillInput) (BackfillResult, error) {
 	result := BackfillResult{
 		SkipReasons:  make(map[string]int),
@@ -193,48 +226,9 @@ func (r *Runner) BackfillIssues(ctx context.Context, input BackfillInput) (Backf
 		if loaded.issue.Number != 0 {
 			issueNumber = loaded.issue.Number
 		}
-		if loaded.detail.State != "" && !strings.EqualFold(strings.TrimSpace(loaded.detail.State), "open") {
+		if reason := backfillSkipReason(loaded, input, triageCfg, labelFilter, r.now().UTC()); reason != "" {
 			result.Skipped++
-			result.SkipReasons["not_open"]++
-			unlock()
-			continue
-		}
-		if loaded.detail.IsPullRequest {
-			result.Skipped++
-			result.SkipReasons["pull_request"]++
-			unlock()
-			continue
-		}
-
-		if labelFilter != "" && !labels.Has(loaded.issue.Labels, labelFilter) {
-			result.Skipped++
-			result.SkipReasons["label_mismatch"]++
-			unlock()
-			continue
-		}
-
-		if input.SkipTriaged && !input.ForceRetriage && labels.Has(loaded.issue.Labels, triageCfg.TriagedLabel) {
-			result.Skipped++
-			result.SkipReasons["already_triaged"]++
-			unlock()
-			continue
-		}
-		if labels.Has(loaded.issue.Labels, labels.HoldGlobal) {
-			result.Skipped++
-			result.SkipReasons["hold"]++
-			unlock()
-			continue
-		}
-		createdAt, ok := parseCoordinatorTime(loaded.issue.CreatedAt)
-		if !ok || createdAt.After(r.now().UTC()) {
-			result.Skipped++
-			result.SkipReasons["invalid_created_at"]++
-			unlock()
-			continue
-		}
-		if r.now().UTC().Sub(createdAt) > time.Duration(input.MaxAgeDays)*24*time.Hour {
-			result.Skipped++
-			result.SkipReasons["too_old"]++
+			result.SkipReasons[reason]++
 			unlock()
 			continue
 		}
@@ -270,15 +264,9 @@ func (r *Runner) BackfillIssues(ctx context.Context, input BackfillInput) (Backf
 			result.FailedIssues[issueNumber] = err.Error()
 			continue
 		}
-		if fresh.detail.IsPullRequest {
+		if reason := backfillSkipReason(fresh, input, triageCfg, labelFilter, r.now().UTC()); reason != "" {
 			result.Skipped++
-			result.SkipReasons["pull_request"]++
-			unlock()
-			continue
-		}
-		if labels.Has(fresh.issue.Labels, labels.HoldGlobal) {
-			result.Skipped++
-			result.SkipReasons["hold"]++
+			result.SkipReasons[reason]++
 			unlock()
 			continue
 		}
@@ -375,14 +363,19 @@ type RuntimeState struct {
 	mu                sync.Mutex
 	lastTickByProject map[string]time.Time
 	watchLocks        map[string]*sync.Mutex
-	issueLocks        map[string]*sync.Mutex
+	issueLocks        map[string]*issueLockEntry
+}
+
+type issueLockEntry struct {
+	mu   sync.Mutex
+	refs int
 }
 
 func NewRuntimeState() *RuntimeState {
 	return &RuntimeState{
 		lastTickByProject: map[string]time.Time{},
 		watchLocks:        map[string]*sync.Mutex{},
-		issueLocks:        map[string]*sync.Mutex{},
+		issueLocks:        map[string]*issueLockEntry{},
 	}
 }
 
@@ -947,16 +940,25 @@ func (r *Runner) lockIssue(projectID, repo string, issueNumber int64) func() {
 	key := fmt.Sprintf("%s\x00%s\x00%d", strings.TrimSpace(projectID), strings.ToLower(strings.TrimSpace(repo)), issueNumber)
 	r.state.mu.Lock()
 	if r.state.issueLocks == nil {
-		r.state.issueLocks = make(map[string]*sync.Mutex)
+		r.state.issueLocks = make(map[string]*issueLockEntry)
 	}
-	lock := r.state.issueLocks[key]
-	if lock == nil {
-		lock = &sync.Mutex{}
-		r.state.issueLocks[key] = lock
+	entry := r.state.issueLocks[key]
+	if entry == nil {
+		entry = &issueLockEntry{}
+		r.state.issueLocks[key] = entry
 	}
+	entry.refs++
 	r.state.mu.Unlock()
-	lock.Lock()
-	return lock.Unlock
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		r.state.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 && r.state.issueLocks[key] == entry {
+			delete(r.state.issueLocks, key)
+		}
+		r.state.mu.Unlock()
+	}
 }
 
 func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, issue triage.Issue, cfg triage.Config, analysisStartedAt time.Time, decision triage.Decision) error {
