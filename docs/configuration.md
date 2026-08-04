@@ -345,9 +345,10 @@ Equivalent JSON:
   "agent": {
     "vendor": "codex",
     "model": "gpt-5",
+    "reasoningEffort": "medium",
     "profiles": {
-      "fast": { "vendor": "codex", "model": "gpt-5-mini" },
-      "strong": { "vendor": "claude-code", "model": "claude-sonnet" }
+      "fast": { "vendor": "codex", "model": "gpt-5-mini", "reasoningEffort": "low" },
+      "strong": { "vendor": "claude-code", "model": "claude-sonnet", "reasoningEffort": "high" }
     }
   },
   "roles": {
@@ -1215,14 +1216,14 @@ retryMaxAttempts = 5
 retryBaseDelayMs = 5000
 
 [agent]
-vendor = "opencode"
+vendor = "codex"
 model = "your-model-if-needed"
 reasoningEffort = "medium"
 
 # Optional named identity presets (vendor + model + reasoning effort). See
 # "Multi-role agent vendor and model" above.
 # [agent.profiles.fast]
-# vendor = "opencode"
+# vendor = "codex"
 # model = "cheaper-model"
 # reasoningEffort = "low"
 

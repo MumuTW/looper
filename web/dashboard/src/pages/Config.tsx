@@ -511,6 +511,7 @@ function AgentProfiles({
             !pendingRemoval &&
             (sourceIsConfigFile(effortMeta?.source) ||
               effortUnset ||
+              Object.hasOwn(drafts, effortPath) ||
               published?.reasoningEffort != null);
 
           // Last remaining identity leaf (or both) must remove the profile —
