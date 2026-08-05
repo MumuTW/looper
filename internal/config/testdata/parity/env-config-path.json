@@ -123,12 +123,6 @@
         "mode": "gh-forward",
         "publicBaseUrl": ""
       },
-      "network": {
-        "enrolled": false,
-        "githubLogin": "",
-        "loopernetBaseUrl": "",
-        "nodeName": ""
-      },
       "agent": {
         "vendor": "codex",
         "model": "gpt-5",
@@ -409,9 +403,6 @@
         {
           "id": "alpha",
           "name": "Alpha",
-          "network": {
-            "mode": "off"
-          },
           "repoPath": "__TMP__/alpha-repo",
           "baseBranch": "develop",
           "webhook": {},

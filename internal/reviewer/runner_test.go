@@ -80,6 +80,59 @@ func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	}
 }
 
+// TestReviewerDiscoveryLaneUsesMetadataTier is the contract/invariant
+// regression test for the GraphQL quota incident (#549): the reviewer
+// discovery lane must route author-resolution through the lightweight
+// metadata tier (ViewPullRequestForDiscovery), never the full
+// statusCheckRollup-laden view. The runner fakes delegate
+// ViewPullRequestForDiscovery to ViewPullRequest, so this test asserts
+// the discovery path actually selects the metadata method when a
+// snapshot is present and the author is missing from the list row
+// (the resolveAuthor path that previously used the heavy view).
+func TestReviewerDiscoveryLaneUsesMetadataTier(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		currentLogin: "octocat",
+		listOpenByLabel: map[string][]PullRequestSummary{
+			"": {
+				// No Author on the list row: resolveAuthor must fetch the
+				// metadata tier to fill it in.
+				{Number: 42, Title: "Needs author", State: "OPEN", HeadSHA: "head-42", ReviewRequests: []string{"octocat"}},
+			},
+		},
+	}
+	snapshot := githubinfra.NewDiscoverySnapshot(nil, githubinfra.NewDiscoveryTickState(), githubinfra.DiscoverySnapshotOptions{PullRequestLimit: 100})
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github,
+		Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{},
+		Logger: fixture.logger, Now: fixture.now,
+		DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, EnableSelfReview: false},
+	})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper", Snapshot: snapshot})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if github.viewDiscoveryCalls != 1 {
+		t.Fatalf("ViewPullRequestForDiscovery calls = %d, want 1 (resolveAuthor must use the metadata tier)", github.viewDiscoveryCalls)
+	}
+	// The follow-up loop re-check (discoverExistingReviewerLoop) legitimately
+	// uses the full tier because it consumes Reviews/Checks — that is a
+	// deliberate exception, not the discovery path. The invariant under
+	// test is that the resolveAuthor discovery step used the metadata
+	// tier; if the lane had regressed to the heavy view for discovery,
+	// viewDiscoveryCalls would be 0.
+	if github.viewCalls > 1 {
+		t.Fatalf("full ViewPullRequest calls = %d, want at most 1 (only the follow-up loop re-check)", github.viewCalls)
+	}
+	// The lane still produced a queue item: metadata tier carries enough
+	// data for discovery to proceed.
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("len(QueueItems) = %d, want 1 (metadata tier must not block discovery)", len(result.QueueItems))
+	}
+}
+
 func TestDiscoverPullRequestsSkipsOccupiedCandidateAndContinuesBatch(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -9572,6 +9625,7 @@ type fakeGitHubGateway struct {
 	listHeadSHA                     string
 	removeReviewRequestOnSecondView bool
 	viewCalls                       int
+	viewDiscoveryCalls              int
 	author                          string
 	labels                          []string
 	reviewDecision                  string
@@ -9697,7 +9751,7 @@ func (g *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string, string)
 	return "octocat", nil
 }
 
-func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error) {
+func (g *fakeGitHubGateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
 	g.viewCalls++
 	if len(g.viewErrs) > 0 {
 		err := g.viewErrs[0]
@@ -9746,6 +9800,11 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 		}
 	}
 	return PullRequestDetail{Number: 42, Title: "Review me", Body: body, State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: g.effectiveAuthor(), ReviewRequests: reviewRequests, ReviewRequestUsers: users, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Diff: diff, Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: cloneCommentMaps(g.reviews)}, nil
+}
+
+func (g *fakeGitHubGateway) ViewPullRequestForDiscovery(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	g.viewDiscoveryCalls++
+	return g.ViewPullRequest(ctx, input)
 }
 
 func (g *fakeGitHubGateway) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
