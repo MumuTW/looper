@@ -1759,7 +1759,7 @@ func TestVerifyTimeoutProgressBeforeReplacementPersistsPreservedEvidence(t *test
 		DiffFingerprint: "status", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index",
 	}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: &fakeGitGateway{inspectResult: progress}, Logger: fixture.logger, Now: fixture.now})
-	before := &worktreeProgress{HeadSHA: "head-before", WorktreeID: "wt_1", Branch: "feature/test", ChangedFiles: []string{"tracked.go"}, ChangedFileCount: 1, StagedFiles: []string{"tracked.go"}, StagedFileCount: 1, DiffFingerprint: "status", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index"}
+	before := &worktreeProgress{HeadSHA: "head-before", WorktreeID: "wt_1", Branch: "feature/test", ChangedFiles: []string{"tracked.go"}, ChangedFileCount: 1, ChangedFileBytes: pathByteList([]string{"tracked.go"}), StagedFiles: []string{"tracked.go"}, StagedFileCount: 1, StagedFileBytes: pathByteList([]string{"tracked.go"}), DiffFingerprint: "status", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index"}
 	checkpoint := workerCheckpoint{Execution: &checkpointExecution{RunID: "run_timeout", ExecutionID: "agent_timeout", Status: "timeout", ProgressBeforeTimeout: before}}
 	worktree := checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "worktree"), Branch: "feature/test", BaseBranch: "main"}
 	if err := runner.verifyTimeoutProgressBeforeReplacement(context.Background(), *project, run.ID, workerInput{BaseBranch: "main"}, worktree, &checkpoint); err != nil {
