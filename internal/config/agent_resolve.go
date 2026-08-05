@@ -19,6 +19,10 @@ type ResolvedAgent struct {
 	//   non-empty      — explicit model
 	Model     *string
 	ProfileID string // profile selected by the role binding; empty if none
+	// ReasoningEffort is the post-overlay reasoning effort:
+	//   nil — unset (no -c model_reasoning_effort flag)
+	//   non-nil — explicit effort level (including "none" to strip inherited)
+	ReasoningEffort *ReasoningEffort
 }
 
 // ResolveAgent overlays global agent vendor/model with the canonical coding
@@ -26,17 +30,18 @@ type ResolvedAgent struct {
 // ok=false when role has no compiled runner or vendor is unset after overlay.
 func ResolveAgent(cfg Config, projectID string, role string) (ResolvedAgent, bool) {
 	_ = projectID
-	vendor, model, profileID, ok := overlayAgentIdentity(cfg, role)
+	vendor, model, reasoningEffort, profileID, ok := overlayAgentIdentity(cfg, role)
 	if !ok {
 		return ResolvedAgent{}, false
 	}
 	if vendor == nil {
-		return ResolvedAgent{ProfileID: profileID}, false
+		return ResolvedAgent{ProfileID: profileID, ReasoningEffort: reasoningEffort}, false
 	}
 	return ResolvedAgent{
-		Vendor:    *vendor,
-		Model:     model,
-		ProfileID: profileID,
+		Vendor:          *vendor,
+		Model:           model,
+		ProfileID:       profileID,
+		ReasoningEffort: reasoningEffort,
 	}, true
 }
 
@@ -45,9 +50,9 @@ func ResolveAgent(cfg Config, projectID string, role string) (ResolvedAgent, boo
 // Explicit empty-string model suppresses inherited model but stays a non-nil
 // empty pointer so params filtering can strip --model/-m (nil means unset).
 // Used by ResolveAgent and hot-reload restart guards.
-func overlayAgentIdentity(cfg Config, role string) (vendor *AgentVendor, model *string, profileID string, ok bool) {
+func overlayAgentIdentity(cfg Config, role string) (vendor *AgentVendor, model *string, reasoningEffort *ReasoningEffort, profileID string, ok bool) {
 	if !isCodingRole(role) {
-		return nil, nil, "", false
+		return nil, nil, nil, "", false
 	}
 
 	if cfg.Agent.Vendor != nil {
@@ -56,6 +61,10 @@ func overlayAgentIdentity(cfg Config, role string) (vendor *AgentVendor, model *
 	}
 	if cfg.Agent.Model != nil {
 		model = stringPtr(*cfg.Agent.Model)
+	}
+	if cfg.Agent.ReasoningEffort != nil {
+		re, _ := ParseReasoningEffort(string(*cfg.Agent.ReasoningEffort))
+		reasoningEffort = &re
 	}
 
 	binding := codingRoleAgentBinding(cfg.Roles, role)
@@ -70,6 +79,10 @@ func overlayAgentIdentity(cfg Config, role string) (vendor *AgentVendor, model *
 				if profile.Model != nil {
 					model = stringPtr(*profile.Model)
 				}
+				if profile.ReasoningEffort != nil {
+					re, _ := ParseReasoningEffort(string(*profile.ReasoningEffort))
+					reasoningEffort = &re
+				}
 			}
 		}
 	}
@@ -82,12 +95,16 @@ func overlayAgentIdentity(cfg Config, role string) (vendor *AgentVendor, model *
 		if binding.Model != nil {
 			model = stringPtr(*binding.Model)
 		}
+		if binding.ReasoningEffort != nil {
+			re, _ := ParseReasoningEffort(string(*binding.ReasoningEffort))
+			reasoningEffort = &re
+		}
 	}
 
 	// Explicit empty string suppresses inherited model and is left as a non-nil
 	// empty pointer (not collapsed to nil) so ParamsForRoleVendor can strip
 	// params model flags and force the vendor default. nil means unset.
-	return vendor, model, profileID, true
+	return vendor, model, reasoningEffort, profileID, true
 }
 
 func isCodingRole(role string) bool {

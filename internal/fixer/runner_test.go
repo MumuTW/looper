@@ -4869,7 +4869,7 @@ func TestCreateRunContextRefreshesUnsupportedSnapshotWhenValidationGateEnabled(t
 	}
 	// The refreshed snapshot must be execution authority at spawn: identityFromRun
 	// resolves the codex vendor from it, not the live fallback.
-	vendor, _, _, useSnapshot, err := runner.identityFromRun(resumed.Run)
+	vendor, _, _, _, useSnapshot, err := runner.identityFromRun(resumed.Run)
 	if err != nil {
 		t.Fatalf("identityFromRun() error = %v", err)
 	}
@@ -6642,7 +6642,7 @@ func TestRunRepairStepRecreatesCheckpointOutsideWorktreeRootAndRunsAgent(t *test
 	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "wt"), Branch: "feature/fix-42", HeadSHA: "base-head"}, prepareResult: PrepareWorktreeResult{HeadSHA: "head-1", Clean: true}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed"}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ValidationCommandsByProject: map[string][]string{"project_1": {"project-check"}}})
 
 	checkpoint, err := runner.runRepairStep(context.Background(), stepInput{
 		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
@@ -6675,6 +6675,9 @@ func TestRunRepairStepRecreatesCheckpointOutsideWorktreeRootAndRunsAgent(t *test
 	}
 	if agent.starts[0].WorkingDirectory != git.createResult.WorktreePath {
 		t.Fatalf("agent WorkingDirectory = %q, want rebuilt worktree %q", agent.starts[0].WorkingDirectory, git.createResult.WorktreePath)
+	}
+	if !agent.starts[0].RestrictToolNetwork {
+		t.Fatal("agent RestrictToolNetwork = false, want project validation to enable containment")
 	}
 	if checkpoint.Repair == nil || checkpoint.Repair.Summary != "applied fixes" {
 		t.Fatalf("checkpoint.Repair = %#v, want completed repair after worktree recovery", checkpoint.Repair)
@@ -6919,6 +6922,10 @@ func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullReq
 		result.Comments[i]["threadFingerprint"] = normalizeThreadFingerprint("", threadID, commentID)
 	}
 	return result, nil
+}
+
+func (f *fakeGitHubGateway) ViewPullRequestForDiscovery(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	return f.ViewPullRequest(ctx, input)
 }
 
 func (f *fakeGitHubGateway) ListReviewThreads(_ context.Context, _ ListReviewThreadsInput) ([]ReviewThread, error) {

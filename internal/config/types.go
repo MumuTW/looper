@@ -1,5 +1,7 @@
 package config
 
+import "strings"
+
 type AgentVendor string
 
 const (
@@ -11,6 +13,37 @@ const (
 	AgentVendorDevinExperimental AgentVendor = "devin-experimental"
 	AgentVendorHermes            AgentVendor = "hermes"
 )
+
+// ReasoningEffort is the typed effort level passed to vendor model invocation.
+// "none" explicitly disables reasoning effort (strip any inherited value).
+type ReasoningEffort string
+
+const (
+	ReasoningEffortLow      ReasoningEffort = "low"
+	ReasoningEffortMedium   ReasoningEffort = "medium"
+	ReasoningEffortHigh     ReasoningEffort = "high"
+	ReasoningEffortVeryHigh ReasoningEffort = "xhigh"
+	ReasoningEffortNone     ReasoningEffort = "none"
+)
+
+// ValidReasoningEfforts returns the recognized effort levels for validation.
+func ValidReasoningEfforts() []ReasoningEffort {
+	return []ReasoningEffort{
+		ReasoningEffortLow,
+		ReasoningEffortMedium,
+		ReasoningEffortHigh,
+		ReasoningEffortVeryHigh,
+		ReasoningEffortNone,
+	}
+}
+
+func ParseReasoningEffort(raw string) (ReasoningEffort, bool) {
+	switch ReasoningEffort(strings.ToLower(strings.TrimSpace(raw))) {
+	case ReasoningEffortLow, ReasoningEffortMedium, ReasoningEffortHigh, ReasoningEffortVeryHigh, ReasoningEffortNone:
+		return ReasoningEffort(strings.ToLower(strings.TrimSpace(raw))), true
+	}
+	return "", false
+}
 
 var supportedAgentVendors = []AgentVendor{
 	AgentVendorClaudeCode,
@@ -240,25 +273,28 @@ type ProviderConfig struct {
 
 // AgentBindingConfig is vendor+model only (profiles).
 type AgentBindingConfig struct {
-	Vendor *AgentVendor `json:"vendor,omitempty"`
-	Model  *string      `json:"model,omitempty"` // nil=inherit; non-nil empty=suppress model
+	Vendor          *AgentVendor     `json:"vendor,omitempty"`
+	Model           *string          `json:"model,omitempty"` // nil=inherit; non-nil empty=suppress model
+	ReasoningEffort *ReasoningEffort `json:"reasoningEffort,omitempty"`
 }
 
 // RoleAgentConfig is optional per-role overlay (planner/worker/reviewer/fixer only).
 type RoleAgentConfig struct {
-	Profile *string      `json:"profile,omitempty"`
-	Vendor  *AgentVendor `json:"vendor,omitempty"`
-	Model   *string      `json:"model,omitempty"`
+	Profile         *string          `json:"profile,omitempty"`
+	Vendor          *AgentVendor     `json:"vendor,omitempty"`
+	Model           *string          `json:"model,omitempty"`
+	ReasoningEffort *ReasoningEffort `json:"reasoningEffort,omitempty"`
 }
 
 type AgentConfig struct {
-	Vendor       *AgentVendor                  `json:"vendor,omitempty"`
-	Model        *string                       `json:"model,omitempty"`
-	Profiles     map[string]AgentBindingConfig `json:"profiles,omitempty"`
-	Params       map[string]any                `json:"params"`
-	Env          map[string]string             `json:"env"`
-	Timeouts     AgentTimeoutConfig            `json:"timeouts"`
-	NativeResume AgentNativeResumeConfig       `json:"nativeResume"`
+	Vendor          *AgentVendor                  `json:"vendor,omitempty"`
+	Model           *string                       `json:"model,omitempty"`
+	Profiles        map[string]AgentBindingConfig `json:"profiles,omitempty"`
+	Params          map[string]any                `json:"params"`
+	Env             map[string]string             `json:"env"`
+	Timeouts        AgentTimeoutConfig            `json:"timeouts"`
+	NativeResume    AgentNativeResumeConfig       `json:"nativeResume"`
+	ReasoningEffort *ReasoningEffort              `json:"reasoningEffort,omitempty"`
 }
 
 type AgentNativeResumeConfig struct {
@@ -734,6 +770,7 @@ type RoleConfigs struct {
 	codingModelCanonical map[string]bool
 
 	Planner     PlannerRoleConfig     `json:"planner"`
+	Triager     TriagerRoleConfig     `json:"triager"`
 	Reviewer    ReviewerRoleConfig    `json:"reviewer"`
 	Fixer       FixerRoleConfig       `json:"fixer"`
 	Worker      WorkerRoleConfig      `json:"worker"`
@@ -753,6 +790,45 @@ type EscalatorRoleConfig struct {
 	UnroutedAfterSeconds  int   `json:"unroutedAfterSeconds"`
 	StaleHeadAfterSeconds int   `json:"staleHeadAfterSeconds"`
 	MaxItems              int   `json:"maxItems"`
+}
+
+type TriagerPreset string
+
+const (
+	TriagerPresetLegacy        TriagerPreset = "legacy"
+	TriagerPresetPersonal      TriagerPreset = "personal"
+	TriagerPresetMaintainedOSS TriagerPreset = "maintained-oss"
+	TriagerPresetCompany       TriagerPreset = "company"
+	TriagerPresetContributing  TriagerPreset = "contributing"
+)
+
+type TriagerAdmissionOutcome string
+
+const (
+	TriagerAdmissionAuto   TriagerAdmissionOutcome = "auto"
+	TriagerAdmissionAssess TriagerAdmissionOutcome = "assess"
+	TriagerAdmissionIgnore TriagerAdmissionOutcome = "ignore"
+)
+
+// TriagerLegacyPolicyConfig names the historic seven-condition routing gate.
+// Keeping every policy input explicit lets projects tune it without changing
+// the default behaviour of configs that predate deterministic admission.
+type TriagerLegacyPolicyConfig struct {
+	AutoRouteConfidence         float64 `json:"autoRouteConfidence"`
+	MaxAutoRouteRisk            string  `json:"maxAutoRouteRisk"`
+	RequireInScope              bool    `json:"requireInScope"`
+	RequireNoMissingInformation bool    `json:"requireNoMissingInformation"`
+	RequirePlanner              bool    `json:"requirePlanner"`
+	RequireRationale            bool    `json:"requireRationale"`
+}
+
+// TriagerRoleConfig controls the proactive, pre-Planner Triager. Empty/legacy
+// preset preserves the original model-first seven-condition gate.
+type TriagerRoleConfig struct {
+	Preset      TriagerPreset                      `json:"preset"`
+	Classify    bool                               `json:"classify"`
+	AuthorTiers map[string]TriagerAdmissionOutcome `json:"authorTiers"`
+	Legacy      TriagerLegacyPolicyConfig          `json:"legacy"`
 }
 
 // DeployerRoleConfig configures the agent-free Role that runs a project's deploy
@@ -784,13 +860,11 @@ const (
 	// GatekeeperTrustAdvise additionally publishes the verdict and its reasons on
 	// the pull request, so a human can decide without redoing the judgement.
 	GatekeeperTrustAdvise GatekeeperTrustLevel = "advise"
-	// GatekeeperTrustAuto lets Gatekeeper merge what it judges eligible. The
-	// value is accepted and implemented: on the primary evaluation pass, after
-	// the Gate report is persisted, the runner re-evaluates the pull request
-	// against the observed head and calls MergePullRequest only if it is still
-	// eligible. Config validation rejects it only when combined with
-	// roles.reviewer.autoMerge.enabled, because two merge authorities racing on
-	// the same pull request is not a configuration anyone can reason about.
+	// GatekeeperTrustAuto publishes the required current-head status for GitHub
+	// branch protection on the pull request head SHA only. It never performs a
+	// merge itself: GitHub remains the merge authority. It does not publish
+	// status for GitHub native merge-queue merge-group SHAs; branch protection
+	// that requires Looper Gatekeeper on merge-group commits is unsupported.
 	GatekeeperTrustAuto GatekeeperTrustLevel = "auto"
 )
 
@@ -840,17 +914,19 @@ type ProjectRefConfig struct {
 	// PersonalProject opts this repository into self-authored issue admission.
 	// It is never inferred from repository ownership: shared/contributing
 	// repositories remain unchanged unless an operator explicitly enables it.
-	PersonalProject bool                     `json:"personalProject,omitempty"`
-	Provider        string                   `json:"provider,omitempty"`
-	Repo            string                   `json:"repo,omitempty"`
-	RepoPath        string                   `json:"repoPath"`
-	Path            string                   `json:"path,omitempty"`
-	BaseBranch      *string                  `json:"baseBranch,omitempty"`
-	WorktreeRoot    *string                  `json:"worktreeRoot,omitempty"`
-	Network         ProjectNetworkConfig     `json:"network,omitempty"`
-	Webhook         ProjectWebhookConfig     `json:"webhook,omitempty"`
-	Validation      *ProjectValidationConfig `json:"validation,omitempty"`
-	Roles           *PartialRoleConfigs      `json:"roles,omitempty"`
+	PersonalProject bool    `json:"personalProject,omitempty"`
+	Provider        string  `json:"provider,omitempty"`
+	Repo            string  `json:"repo,omitempty"`
+	RepoPath        string  `json:"repoPath"`
+	Path            string  `json:"path,omitempty"`
+	BaseBranch      *string `json:"baseBranch,omitempty"`
+	WorktreeRoot    *string `json:"worktreeRoot,omitempty"`
+	// Network is retained only for dormant routed internals. There is no
+	// supported enrollment producer, so it is not a public config/API field.
+	Network    ProjectNetworkConfig     `json:"-"`
+	Webhook    ProjectWebhookConfig     `json:"webhook,omitempty"`
+	Validation *ProjectValidationConfig `json:"validation,omitempty"`
+	Roles      *PartialRoleConfigs      `json:"roles,omitempty"`
 }
 
 type ProjectWebhookConfig struct {
@@ -867,15 +943,10 @@ type PartialProjectRefConfig struct {
 	Path            string                          `json:"path,omitempty"`
 	BaseBranch      *string                         `json:"baseBranch,omitempty"`
 	WorktreeRoot    *string                         `json:"worktreeRoot,omitempty"`
-	Network         *PartialProjectNetworkConfig    `json:"network,omitempty"`
 	Webhook         *PartialProjectWebhookConfig    `json:"webhook,omitempty"`
 	Validation      *PartialProjectValidationConfig `json:"validation,omitempty"`
 	Instructions    map[string]string               `json:"instructions,omitempty"`
 	Roles           *PartialRoleConfigs             `json:"roles,omitempty"`
-}
-
-type PartialProjectNetworkConfig struct {
-	Mode *NetworkMode `json:"mode,omitempty"`
 }
 
 type PartialProjectWebhookConfig struct {
@@ -896,11 +967,12 @@ type PartialProviderConfig struct {
 }
 
 type Config struct {
-	Server        ServerConfig       `json:"server"`
-	Storage       StorageConfig      `json:"storage"`
-	Scheduler     SchedulerConfig    `json:"scheduler"`
-	Webhook       WebhookConfig      `json:"webhook"`
-	Network       NetworkConfig      `json:"network"`
+	Server    ServerConfig    `json:"server"`
+	Storage   StorageConfig   `json:"storage"`
+	Scheduler SchedulerConfig `json:"scheduler"`
+	Webhook   WebhookConfig   `json:"webhook"`
+	// Network is internal-only while Routed mode is withdrawn.
+	Network       NetworkConfig      `json:"-"`
 	Agent         AgentConfig        `json:"agent"`
 	Logging       LoggingConfig      `json:"logging"`
 	Notifications NotificationConfig `json:"notifications"`
@@ -1015,13 +1087,14 @@ type PartialWebhookConfig struct {
 }
 
 type PartialAgentConfig struct {
-	Vendor       *AgentVendor                    `json:"vendor,omitempty"`
-	Model        *string                         `json:"model,omitempty"`
-	Profiles     map[string]AgentBindingConfig   `json:"profiles,omitempty"`
-	Params       map[string]any                  `json:"params,omitempty"`
-	Env          map[string]string               `json:"env,omitempty"`
-	Timeouts     *PartialAgentTimeoutConfig      `json:"timeouts,omitempty"`
-	NativeResume *PartialAgentNativeResumeConfig `json:"nativeResume,omitempty"`
+	Vendor          *AgentVendor                    `json:"vendor,omitempty"`
+	Model           *string                         `json:"model,omitempty"`
+	Profiles        map[string]AgentBindingConfig   `json:"profiles,omitempty"`
+	Params          map[string]any                  `json:"params,omitempty"`
+	Env             map[string]string               `json:"env,omitempty"`
+	Timeouts        *PartialAgentTimeoutConfig      `json:"timeouts,omitempty"`
+	NativeResume    *PartialAgentNativeResumeConfig `json:"nativeResume,omitempty"`
+	ReasoningEffort *ReasoningEffort                `json:"reasoningEffort,omitempty"`
 }
 
 type PartialAgentNativeResumeConfig struct {
@@ -1134,14 +1207,6 @@ type PartialPackageConfig struct {
 	DeprecatedAutoUpgradeEnabled *bool `json:"autoUpgradeEnabled,omitempty"`
 	AutoMigrateOnStartup         *bool `json:"autoMigrateOnStartup,omitempty"`
 	RequireBackupBeforeMigrate   *bool `json:"requireBackupBeforeMigrate,omitempty"`
-}
-
-type PartialNetworkConfig struct {
-	Enrolled         *bool   `json:"enrolled,omitempty"`
-	LoopernetBaseURL *string `json:"loopernetBaseUrl,omitempty"`
-	NodeName         *string `json:"nodeName,omitempty"`
-	GitHubLogin      *string `json:"githubLogin,omitempty"`
-	GitHubUserID     *int64  `json:"githubUserId,omitempty"`
 }
 
 type PartialDefaultsConfig struct {
@@ -1306,6 +1371,22 @@ type PartialPlannerRoleConfig struct {
 	Escalation    *PartialPlannerEscalationConfig `json:"escalation,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
 	Agent         *RoleAgentConfig                `json:"agent,omitempty"`
+}
+
+type PartialTriagerLegacyPolicyConfig struct {
+	AutoRouteConfidence         *float64 `json:"autoRouteConfidence,omitempty"`
+	MaxAutoRouteRisk            *string  `json:"maxAutoRouteRisk,omitempty"`
+	RequireInScope              *bool    `json:"requireInScope,omitempty"`
+	RequireNoMissingInformation *bool    `json:"requireNoMissingInformation,omitempty"`
+	RequirePlanner              *bool    `json:"requirePlanner,omitempty"`
+	RequireRationale            *bool    `json:"requireRationale,omitempty"`
+}
+
+type PartialTriagerRoleConfig struct {
+	Preset      *TriagerPreset                      `json:"preset,omitempty"`
+	Classify    *bool                               `json:"classify,omitempty"`
+	AuthorTiers *map[string]TriagerAdmissionOutcome `json:"authorTiers,omitempty"`
+	Legacy      *PartialTriagerLegacyPolicyConfig   `json:"legacy,omitempty"`
 }
 
 type PartialPlannerEscalationConfig struct {
@@ -1486,6 +1567,7 @@ type PartialRoleConfigs struct {
 	// compiled policy cannot be overridden.
 	Coding      map[string]PartialCodingRoleConfig `json:"coding,omitempty"`
 	Planner     *PartialPlannerRoleConfig          `json:"planner,omitempty"`
+	Triager     *PartialTriagerRoleConfig          `json:"triager,omitempty"`
 	Reviewer    *PartialReviewerRoleConfig         `json:"reviewer,omitempty"`
 	Fixer       *PartialFixerRoleConfig            `json:"fixer,omitempty"`
 	Worker      *PartialWorkerRoleConfig           `json:"worker,omitempty"`
@@ -1503,7 +1585,6 @@ type PartialConfig struct {
 	Storage        *PartialStorageConfig      `json:"storage,omitempty"`
 	Scheduler      *PartialSchedulerConfig    `json:"scheduler,omitempty"`
 	Webhook        *PartialWebhookConfig      `json:"webhook,omitempty"`
-	Network        *PartialNetworkConfig      `json:"network,omitempty"`
 	Agent          *PartialAgentConfig        `json:"agent,omitempty"`
 	Logging        *PartialLoggingConfig      `json:"logging,omitempty"`
 	Notifications  *PartialNotificationConfig `json:"notifications,omitempty"`

@@ -313,6 +313,7 @@ type GitHubGateway interface {
 	ListReviewRequestedPullRequests(context.Context, ListReviewRequestedPullRequestsInput) ([]PullRequestSummary, error)
 	GetCurrentUserLogin(context.Context, string, string) (string, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
+	ViewPullRequestForDiscovery(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
 	GetPullRequestHeadSHA(context.Context, ViewPullRequestInput) (string, error)
 	GetRepositorySettings(context.Context, githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error)
@@ -357,9 +358,10 @@ type AgentRunInput struct {
 	IdempotencyKey     string
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
-	UseSnapshot    bool
-	SnapshotVendor string
-	SnapshotModel  *string
+	UseSnapshot             bool
+	SnapshotVendor          string
+	SnapshotModel           *string
+	SnapshotReasoningEffort *config.ReasoningEffort
 }
 
 type AgentResult struct {
@@ -421,6 +423,7 @@ type Options struct {
 	CriteriaVerifier        criteria.Verifier
 	AgentRuntime            string
 	AgentProfileID          string
+	AgentReasoningEffort    *config.ReasoningEffort
 	AgentModel              *string
 	LooperCLIPath           string
 	RetryBaseDelay          time.Duration
@@ -473,6 +476,7 @@ type Runner struct {
 	criteriaVerifier        criteria.Verifier
 	agentRuntime            string
 	agentProfileID          string
+	agentReasoningEffort    *config.ReasoningEffort
 	agentModel              *string
 	looperCLIPath           string
 	retryBaseDelay          time.Duration
@@ -677,6 +681,7 @@ func New(options Options) *Runner {
 		criteriaVerifier:        options.CriteriaVerifier,
 		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
 		agentProfileID:          strings.TrimSpace(options.AgentProfileID),
+		agentReasoningEffort:    cloneReasoningEffortPtr(options.AgentReasoningEffort),
 		agentModel:              cloneStringPtr(options.AgentModel),
 		looperCLIPath:           normalizeLooperCLIPath(options.LooperCLIPath),
 		retryBaseDelay:          retryBaseDelay,
@@ -732,7 +737,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		if policy.EnableSelfReview || strings.TrimSpace(pr.Author) != "" {
 			return pr
 		}
-		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: pr.Number, CWD: project.RepoPath})
+		detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: pr.Number, CWD: project.RepoPath})
 		if err != nil {
 			return pr
 		}
@@ -2430,17 +2435,17 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 	if r.hasPendingNativeResume(ctx, input.Loop.ID) {
 		prompt = nativeResumeContinuationPrompt("thread-resolution", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, idempotencyKey)
 	}
-	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+	agentVendor, agentModel, _, agentReasoningEffort, useSnapshot, err := r.identityFromRun(input.Run)
 	if err != nil {
 		return nil, fmt.Errorf("resolve run agent identity: %w", err)
 	}
-	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
+	useSnap, snapVendor, snapModel, snapReasoningEffort := agentRunSnapshotFields(agentVendor, agentModel, agentReasoningEffort, useSnapshot)
 	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
 		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 		Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 		Metadata:       map[string]any{"loopType": "reviewer", "phase": "thread_resolution", "repo": input.Repo, "prNumber": input.PRNumber},
 		IdempotencyKey: idempotencyKey,
-		UseSnapshot:    useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+		UseSnapshot:    useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
 	})
 	if err != nil {
 		return nil, err
@@ -2593,7 +2598,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		reviewRequestBypassReason = "follow_up_new_head"
 	}
 	reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
-	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+	agentVendor, agentModel, _, agentReasoningEffort, useSnapshot, err := r.identityFromRun(input.Run)
 	if err != nil {
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
@@ -2621,12 +2626,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 		}
 	}
-	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
+	useSnap, snapVendor, snapModel, snapReasoningEffort := agentRunSnapshotFields(agentVendor, agentModel, agentReasoningEffort, useSnapshot)
 	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
 		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 		Prompt: prompt, NativeResumePrompt: nativeResumePrompt, WorkingDirectory: worktree.Path,
 		Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey,
-		UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+		UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
 	})
 	if err != nil {
 		return checkpoint, err
@@ -4693,7 +4698,7 @@ func (r *Runner) markAgentExecutionNativeResumePendingForHeadChange(ctx context.
 	currentVendor := config.AgentVendor(strings.TrimSpace(r.agentRuntime))
 	if record.RunID != nil {
 		if run, runErr := r.repos.Runs.GetByID(ctx, *record.RunID); runErr == nil && run != nil {
-			if vendor, _, _, fromSnapshot, idErr := r.identityFromRun(*run); idErr == nil && fromSnapshot {
+			if vendor, _, _, _, fromSnapshot, idErr := r.identityFromRun(*run); idErr == nil && fromSnapshot {
 				currentVendor = config.AgentVendor(strings.TrimSpace(vendor))
 			}
 		}
@@ -4815,7 +4820,7 @@ func (r *Runner) isResumableNativeSession(latest *storage.AgentExecutionRecord) 
 	currentVendor := config.AgentVendor(strings.TrimSpace(r.agentRuntime))
 	if latest.RunID != nil && r.repos != nil && r.repos.Runs != nil {
 		if run, err := r.repos.Runs.GetByID(context.Background(), *latest.RunID); err == nil && run != nil {
-			if vendor, _, _, fromSnapshot, idErr := r.identityFromRun(*run); idErr == nil && fromSnapshot {
+			if vendor, _, _, _, fromSnapshot, idErr := r.identityFromRun(*run); idErr == nil && fromSnapshot {
 				currentVendor = config.AgentVendor(strings.TrimSpace(vendor))
 			}
 		}
@@ -6418,7 +6423,7 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky,
 	if previous != nil {
 		previousSnapshot = previous.AgentSnapshotJSON
 	}
-	snapshotJSON, refreshed, legacyResume, err := config.ResolveRunAgentSnapshotJSONForValidationGate(previousSnapshot, sticky, requireToolNetworkDenial, replaysAgentStep, r.agentRuntime, r.agentModel, r.agentProfileID)
+	snapshotJSON, refreshed, legacyResume, err := config.ResolveRunAgentSnapshotJSONForValidationGate(previousSnapshot, sticky, requireToolNetworkDenial, replaysAgentStep, r.agentRuntime, r.agentModel, r.agentProfileID, r.agentReasoningEffort)
 	if err != nil {
 		return nil, err
 	}
@@ -6445,15 +6450,15 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky,
 // identityFromRun returns the vendor/model/profile that must drive this run.
 // When the run has AgentSnapshotJSON, that identity is execution authority.
 // model is a pointer so nil (unset) and non-nil empty (suppress) stay distinct.
-func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, useSnapshot bool, err error) {
-	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, reasoningEffort *config.ReasoningEffort, useSnapshot bool, err error) {
+	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID, r.agentReasoningEffort)
 }
 
 // disclosureIdentity returns agent/model for disclosure stamps from the run
 // snapshot when present; falls back to runner identity on empty snapshot or
 // parse errors (stamp-only paths must not fail the run).
 func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string) {
-	vendor, modelPtr, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+	vendor, modelPtr, _, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID, r.agentReasoningEffort)
 	if err != nil {
 		// Present but invalid snapshot must not fall back to live runner identity.
 		return "", ""
@@ -6461,13 +6466,13 @@ func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string)
 	return vendor, derefString(modelPtr)
 }
 
-func agentRunSnapshotFields(vendor string, model *string, useSnapshot bool) (bool, string, *string) {
+func agentRunSnapshotFields(vendor string, model *string, reasoningEffort *config.ReasoningEffort, useSnapshot bool) (bool, string, *string, *config.ReasoningEffort) {
 	if !useSnapshot {
-		return false, "", nil
+		return false, "", nil, nil
 	}
 	// Pass through including non-nil empty suppress so SnapshotModel stays
 	// distinct from unset and ParamsForRoleVendor can strip params --model/-m.
-	return true, vendor, model
+	return true, vendor, model, reasoningEffort
 }
 
 func cloneStringPtr(value *string) *string {
@@ -6476,6 +6481,14 @@ func cloneStringPtr(value *string) *string {
 	}
 	trimmed := strings.TrimSpace(*value)
 	return &trimmed
+}
+
+func cloneReasoningEffortPtr(value *config.ReasoningEffort) *config.ReasoningEffort {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func derefString(value *string) string {

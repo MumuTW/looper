@@ -459,14 +459,21 @@ func TestMigrationRunnerAppliesPendingMigrationsOnLegacyDatabasesAcrossVersions(
 	t.Parallel()
 
 	ctx := context.Background()
-	latestFixtureID := EmbeddedMigrations[len(EmbeddedMigrations)-1].ID
-	latestDB := openSQLiteDBAtPath(t, writeLegacyDBFixture(t, latestFixtureID))
+	// The latest schema is derived by advancing the latest historical fixture.
+	// A new migration therefore tests itself before a matching binary fixture is
+	// minted, while preserving SQLite's literal schema form from prior versions.
+	latestHistoricalID := EmbeddedMigrations[len(EmbeddedMigrations)-2].ID
+	latestDB := openSQLiteDBAtPath(t, writeLegacyDBFixture(t, latestHistoricalID))
+	latestRunner := NewMigrationRunner(latestDB, MigrationRunnerOptions{Migrations: EmbeddedMigrations})
+	if _, err := latestRunner.RunPending(ctx); err != nil {
+		t.Fatalf("latest migration fixture RunPending() error = %v", err)
+	}
 	latestSchema := readSQLiteSchemaSnapshot(t, latestDB)
 
 	const legacyAppliedAt = "2026-04-17T12:00:00.000Z"
 	const goAppliedAt = "2026-04-17T13:00:00.000Z"
 
-	for version := 1; version <= len(EmbeddedMigrations); version++ {
+	for version := 1; version < len(EmbeddedMigrations); version++ {
 		version := version
 		fixtureID := EmbeddedMigrations[version-1].ID
 

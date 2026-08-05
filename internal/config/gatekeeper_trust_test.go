@@ -1,7 +1,6 @@
 package config
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -47,23 +46,6 @@ func TestGatekeeperTrustAcceptsAuto(t *testing.T) {
 	}
 }
 
-// Two merge authorities acting on the same pull request is not a configuration
-// anyone can reason about: whichever wins the race decides, and Reviewer's path
-// checks a strictly narrower set of gates.
-func TestGatekeeperAutoRejectsReviewerAutoMerge(t *testing.T) {
-	t.Parallel()
-	cfg := Config{Roles: RoleConfigs{
-		Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto},
-		Reviewer:   ReviewerRoleConfig{AutoMerge: ReviewerAutoMergeConfig{Enabled: true}},
-	}}
-
-	issues := gatekeeperIssues(cfg)
-
-	if len(issues) != 1 || !strings.Contains(issues[0].Message, "roles.reviewer.autoMerge") {
-		t.Fatalf("issues = %+v, want the two merge authorities refused", issues)
-	}
-}
-
 func TestGatekeeperTrustRejectsUnknownLevel(t *testing.T) {
 	t.Parallel()
 
@@ -74,9 +56,7 @@ func TestGatekeeperTrustRejectsUnknownLevel(t *testing.T) {
 	}
 }
 
-// A project override is validated too: checking only the global value leaves the
-// per-project door open to a combination nobody can reason about.
-func TestGatekeeperAutoRejectsReviewerAutoMergePerProject(t *testing.T) {
+func TestGatekeeperTrustAcceptsProjectAutoOverride(t *testing.T) {
 	t.Parallel()
 	auto := GatekeeperTrustAuto
 	cfg := Config{
@@ -90,40 +70,9 @@ func TestGatekeeperAutoRejectsReviewerAutoMergePerProject(t *testing.T) {
 	var issues []ValidationIssue
 	validateCoreConfig(cfg, &issues)
 
-	found := false
 	for _, issue := range issues {
 		if issue.Path == "projects[0].roles.gatekeeper.trust" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("a project running both merge authorities passed validation")
-	}
-}
-
-// A project that turns Reviewer's auto-merge off may run Gatekeeper at auto even
-// when the global setting has it on, because only one authority is then active.
-func TestGatekeeperAutoAllowedWhenTheProjectDisablesReviewerAutoMerge(t *testing.T) {
-	t.Parallel()
-	auto := GatekeeperTrustAuto
-	disabled := false
-	cfg := Config{
-		Roles: RoleConfigs{Reviewer: ReviewerRoleConfig{AutoMerge: ReviewerAutoMergeConfig{Enabled: true}}},
-		Projects: []ProjectRefConfig{{
-			ID: "looper",
-			Roles: &PartialRoleConfigs{
-				Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto},
-				Reviewer:   &PartialReviewerRoleConfig{AutoMerge: &PartialReviewerAutoMergeConfig{Enabled: &disabled}},
-			},
-		}},
-	}
-
-	var issues []ValidationIssue
-	validateCoreConfig(cfg, &issues)
-
-	for _, issue := range issues {
-		if issue.Path == "projects[0].roles.gatekeeper.trust" {
-			t.Fatalf("rejected a project with only one merge authority: %s", issue.Message)
+			t.Fatalf("project auto override was rejected: %+v", issues)
 		}
 	}
 }

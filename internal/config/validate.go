@@ -17,7 +17,6 @@ import (
 	"time"
 )
 
-var networkNodeNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 var environmentNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 var agentProfileIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
@@ -196,8 +195,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if !isValidWebhookModeOrEmpty(project.Webhook.Mode) {
 			issues = append(issues, ValidationIssue{Path: prefix + ".webhook.mode", Message: fmt.Sprintf("must be one of: %s, %s", WebhookModeGHForward, WebhookModeTunnel)})
 		}
-		if !isValidNetworkMode(project.Network.Mode) {
-			issues = append(issues, ValidationIssue{Path: prefix + ".network.mode", Message: fmt.Sprintf("must be one of: %s, %s", NetworkModeOff, NetworkModeRouted)})
+		if normalizeNetworkMode(project.Network.Mode) != NetworkModeOff {
+			issues = append(issues, ValidationIssue{Path: prefix + ".network.mode", Message: fmt.Sprintf("must be %s; Routed mode is withdrawn because enrollment has no safe credential producer", NetworkModeOff)})
 		}
 		if config.Webhook.Enabled && webhookModeRequiresTunnelConfig(config, &project) {
 			validateWebhookTunnelConfig(config.Webhook, "webhook", &issues)
@@ -225,9 +224,6 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		// implementation would otherwise fall through to single_review silently.
 		if effectiveProjectRoles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSingleReview {
 			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.publishMode", Message: fmt.Sprintf("must be %s", ReviewerPublishModeSingleReview)})
-		}
-		if normalizeNetworkMode(project.Network.Mode) == NetworkModeRouted {
-			validateRoutedProjectPrerequisites(config, effectiveProjectRoles, prefix, &issues)
 		}
 	}
 
@@ -267,10 +263,18 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateAgentConfig(config, issues)
 	validateLoggingAndNotificationConfig(config, issues)
 	validateHITLConfig(config.HITL, issues)
+	validateTriagerRoleConfig(config.Roles.Triager, "roles.triager", issues)
 	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", config.Roles.Reviewer.AutoMerge.Enabled, issues)
 	validateAuditorRoleConfig(config.Roles.Auditor, "roles.auditor", issues)
+	validateAuditorGatekeeperCompatibility(config, issues)
+	validatePostMergeDigestGatekeeperCompatibility(config, issues)
 	validateDeployerRoleConfig(config.Roles.Deployer, "roles.deployer", issues)
 	validateEscalatorRoleConfig(config.Roles.Escalator, "roles.escalator", issues)
+	for i, project := range config.Projects {
+		if project.Roles != nil && project.Roles.Triager != nil {
+			validateTriagerRoleConfig(ProjectRoleConfigs(config, project.ID).Triager, fmt.Sprintf("projects[%d].roles.triager", i), issues)
+		}
+	}
 	for i, project := range config.Projects {
 		if project.Roles == nil || project.Roles.Deployer == nil {
 			continue
@@ -332,9 +336,123 @@ func validateEscalatorRoleConfig(role EscalatorRoleConfig, path string, issues *
 	}
 }
 
+func validateTriagerRoleConfig(role TriagerRoleConfig, path string, issues *[]ValidationIssue) {
+	switch role.Preset {
+	case "", TriagerPresetLegacy, TriagerPresetPersonal, TriagerPresetMaintainedOSS, TriagerPresetCompany, TriagerPresetContributing:
+	default:
+		*issues = append(*issues, ValidationIssue{Path: path + ".preset", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s, %s", TriagerPresetLegacy, TriagerPresetPersonal, TriagerPresetMaintainedOSS, TriagerPresetCompany, TriagerPresetContributing)})
+	}
+	if role.Legacy.AutoRouteConfidence < 0 || role.Legacy.AutoRouteConfidence > 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".legacy.autoRouteConfidence", Message: "must be between 0 and 1"})
+	}
+	switch role.Legacy.MaxAutoRouteRisk {
+	case "low", "medium", "high":
+	default:
+		*issues = append(*issues, ValidationIssue{Path: path + ".legacy.maxAutoRouteRisk", Message: "must be one of: low, medium, high"})
+	}
+	validTiers := map[string]struct{}{"owner": {}, "member": {}, "past-contributor": {}, "unaffiliated": {}, "bot": {}}
+	for tier, outcome := range role.AuthorTiers {
+		if _, ok := validTiers[tier]; !ok {
+			*issues = append(*issues, ValidationIssue{Path: path + ".authorTiers." + tier, Message: "author tier must be one of: owner, member, past-contributor, unaffiliated, bot"})
+			continue
+		}
+		switch outcome {
+		case TriagerAdmissionAuto, TriagerAdmissionAssess, TriagerAdmissionIgnore:
+		default:
+			*issues = append(*issues, ValidationIssue{Path: path + ".authorTiers." + tier, Message: "must be one of: auto, assess, ignore"})
+			continue
+		}
+		if outcome == TriagerAdmissionAuto && role.Preset == TriagerPresetContributing {
+			*issues = append(*issues, ValidationIssue{Path: path + ".authorTiers." + tier, Message: "cannot be auto under the contributing preset"})
+		}
+		if outcome == TriagerAdmissionAuto && tier == "bot" {
+			*issues = append(*issues, ValidationIssue{Path: path + ".authorTiers.bot", Message: "bot authors cannot be auto-admitted"})
+		}
+	}
+}
+
 func validateAuditorRoleConfig(auditor AuditorRoleConfig, path string, issues *[]ValidationIssue) {
 	if auditor.Enabled && auditor.WindowMinutes <= 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".windowMinutes", Message: "must be a positive integer when auditor is enabled"})
+	}
+}
+
+func gatekeeperTrustIsAuto(trust GatekeeperTrustLevel) bool {
+	return GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(trust)))) == GatekeeperTrustAuto
+}
+
+const auditorGatekeeperAutoConflictMessage = "requires Gatekeeper merge-outcome events or forge-observed merges; gatekeeper trust auto publishes commit status only and does not emit merge outcomes — disable auditor or use gatekeeper trust observe/advise until forge-observed merge evidence is implemented"
+
+// validateAuditorGatekeeperCompatibility rejects auditor enabled together with
+// gatekeeper auto on the same effective project scope. Auto trust is
+// status-only; Auditor still reads MergeOutcome events Gatekeeper no longer
+// emits.
+func validateAuditorGatekeeperCompatibility(config Config, issues *[]ValidationIssue) {
+	globalConflict := config.Roles.Auditor.Enabled && gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust)
+	if globalConflict {
+		*issues = append(*issues, ValidationIssue{
+			Path:    "roles.auditor.enabled",
+			Message: auditorGatekeeperAutoConflictMessage,
+		})
+	}
+	for i, project := range config.Projects {
+		overridesAuto := project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil && gatekeeperTrustIsAuto(*project.Roles.Gatekeeper.Trust)
+		overridesAuditorOn := project.Roles != nil && project.Roles.Auditor != nil && project.Roles.Auditor.Enabled != nil && *project.Roles.Auditor.Enabled
+		// Inherited global roles are already covered by the global issue; only
+		// project overrides can introduce a distinct conflict path.
+		if !overridesAuto && !overridesAuditorOn {
+			continue
+		}
+		roles := ProjectRoleConfigs(config, project.ID)
+		if !roles.Auditor.Enabled || !gatekeeperTrustIsAuto(roles.Gatekeeper.Trust) {
+			continue
+		}
+		if globalConflict {
+			continue
+		}
+		path := fmt.Sprintf("projects[%d].roles.auditor.enabled", i)
+		if overridesAuto {
+			path = fmt.Sprintf("projects[%d].roles.gatekeeper.trust", i)
+		}
+		*issues = append(*issues, ValidationIssue{Path: path, Message: auditorGatekeeperAutoConflictMessage})
+	}
+}
+
+const postMergeDigestGatekeeperAutoConflictMessage = "requires merge-outcome events that gatekeeper trust auto no longer emits; disable post-merge digest or use gatekeeper trust observe/advise until forge-observed merge evidence is implemented"
+
+func postMergeDigestEnabled(digest *CoordinatorPostMergeDigestConfig) bool {
+	return digest != nil && digest.Enabled
+}
+
+// validatePostMergeDigestGatekeeperCompatibility rejects post-merge digest enabled
+// together with gatekeeper auto on the same effective project scope. Auto trust
+// is status-only and does not emit merge-outcome events the digest still reads.
+// Post-merge digest is global-only, so the project loop only looks for an
+// explicit gatekeeper trust override into auto.
+func validatePostMergeDigestGatekeeperCompatibility(config Config, issues *[]ValidationIssue) {
+	globalConflict := postMergeDigestEnabled(config.Roles.Coordinator.PostMergeDigest) && gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust)
+	if globalConflict {
+		*issues = append(*issues, ValidationIssue{
+			Path:    "roles.coordinator.postMergeDigest.enabled",
+			Message: postMergeDigestGatekeeperAutoConflictMessage,
+		})
+	}
+	for i, project := range config.Projects {
+		overridesAuto := project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil && gatekeeperTrustIsAuto(*project.Roles.Gatekeeper.Trust)
+		if !overridesAuto {
+			continue
+		}
+		roles := ProjectRoleConfigs(config, project.ID)
+		if !postMergeDigestEnabled(roles.Coordinator.PostMergeDigest) || !gatekeeperTrustIsAuto(roles.Gatekeeper.Trust) {
+			continue
+		}
+		if globalConflict {
+			continue
+		}
+		*issues = append(*issues, ValidationIssue{
+			Path:    fmt.Sprintf("projects[%d].roles.gatekeeper.trust", i),
+			Message: postMergeDigestGatekeeperAutoConflictMessage,
+		})
 	}
 }
 
@@ -433,6 +551,7 @@ func validateAgentConfig(config Config, issues *[]ValidationIssue) {
 	if config.Agent.Vendor != nil && !isValidAgentVendor(*config.Agent.Vendor) {
 		*issues = append(*issues, ValidationIssue{Path: "agent.vendor", Message: agentVendorValidationMessage()})
 	}
+	validateReasoningEffort("agent.reasoningEffort", config.Agent.ReasoningEffort, issues)
 	validateAgentProfiles(config.Agent.Profiles, issues)
 	validateEnvironmentNames(config.Agent.Env, "agent.env", issues)
 	validateAgentTimeouts(config.Agent.Timeouts, "agent.timeouts", issues)
@@ -512,11 +631,8 @@ func validateIntakeConfig(config Config, issues *[]ValidationIssue) {
 	*issues = append(*issues, ValidationIssue{Path: "intake.telegram.defaultProjectId", Message: fmt.Sprintf("must name a configured project; %q is not in projects[]", defaultProject)})
 }
 
-// validateGatekeeperRoleConfig rejects a trust level Looper cannot honour.
+// validateGatekeeperRoleConfig rejects unknown Gatekeeper trust levels.
 //
-// "auto" is rejected rather than accepted-and-ignored on purpose: a merge
-// authority that silently behaves one level below what the operator configured
-// is the worst possible failure for this setting.
 // validateDeployerRoleConfig fails startup rather than at deploy time. A project
 // configured to deploy but unable to is otherwise only discovered on the first
 // merge, which is the worst moment to learn it.
@@ -536,17 +652,7 @@ func validateDeployerRoleConfig(deployerRole DeployerRoleConfig, path string, is
 func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, reviewerAutoMerge bool, issues *[]ValidationIssue) {
 	validateGatekeeperDiffBudget(gatekeeper.DiffBudget, path+".diffBudget", issues)
 	switch GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(gatekeeper.Trust)))) {
-	case "", GatekeeperTrustObserve, GatekeeperTrustAdvise:
-	case GatekeeperTrustAuto:
-		// Two merge authorities acting on the same pull request is not a
-		// configuration anyone can reason about: whichever wins the race decides,
-		// and Reviewer's path checks a strictly narrower set of gates.
-		if reviewerAutoMerge {
-			*issues = append(*issues, ValidationIssue{
-				Path:    path + ".trust",
-				Message: fmt.Sprintf("%q cannot be combined with roles.reviewer.autoMerge.enabled: disable one, and prefer Gatekeeper because it also gates on unresolved review threads and requested changes", GatekeeperTrustAuto),
-			})
-		}
+	case "", GatekeeperTrustObserve, GatekeeperTrustAdvise, GatekeeperTrustAuto:
 	default:
 		*issues = append(*issues, ValidationIssue{
 			Path:    path + ".trust",
@@ -764,36 +870,6 @@ func isLoopbackBindHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func validateRoutedProjectPrerequisites(config Config, roles RoleConfigs, prefix string, issues *[]ValidationIssue) {
-	if !config.Network.Enrolled {
-		*issues = append(*issues, ValidationIssue{Path: "network.enrolled", Message: fmt.Sprintf("must be true when %s.network.mode is %s; join a Network or set the project back to %s", prefix, NetworkModeRouted, NetworkModeOff)})
-	}
-	parsedLoopernetURL, err := url.Parse(strings.TrimSpace(config.Network.LoopernetBaseURL))
-	if err != nil || parsedLoopernetURL.Scheme == "" || parsedLoopernetURL.Host == "" {
-		*issues = append(*issues, ValidationIssue{Path: "network.loopernetBaseUrl", Message: fmt.Sprintf("must be an absolute URL with a host when %s.network.mode is %s", prefix, NetworkModeRouted)})
-	}
-	if err := validateNetworkNodeName(config.Network.NodeName); err != nil {
-		*issues = append(*issues, ValidationIssue{Path: "network.nodeName", Message: fmt.Sprintf("%v when %s.network.mode is %s", err, prefix, NetworkModeRouted)})
-	}
-	if config.Network.GitHubUserID < 0 {
-		*issues = append(*issues, ValidationIssue{Path: "network.githubUserId", Message: "must be a positive integer when configured"})
-	}
-	if strings.TrimSpace(config.Network.GitHubLogin) == "" {
-		*issues = append(*issues, ValidationIssue{Path: "network.githubLogin", Message: fmt.Sprintf("must be configured when %s.network.mode is %s so routed claims can fall back when numeric GitHub IDs are unavailable", prefix, NetworkModeRouted)})
-	}
-	registry := EffectiveCodingRoles(roles)
-	if planner := registry[CodingRolePlanner]; planner.Discovery.Enabled {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.planner.autoDiscovery", Message: "must be false for routed projects; planner routed execution is not supported yet"})
-	}
-	if fixer := registry[CodingRoleFixer]; fixer.Discovery.Enabled {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.fixer.autoDiscovery", Message: "must be false for routed projects; fixer routed execution is not supported yet"})
-	}
-}
-
-func isValidNetworkMode(mode NetworkMode) bool {
-	return normalizeNetworkMode(mode) == NetworkModeOff || normalizeNetworkMode(mode) == NetworkModeRouted
-}
-
 func isValidProviderKind(kind ProviderKind) bool {
 	return kind == ProviderKindGitHub
 }
@@ -971,26 +1047,6 @@ func normalizeNetworkMode(mode NetworkMode) NetworkMode {
 	default:
 		return mode
 	}
-}
-
-func validateNetworkNodeName(nodeName string) error {
-	trimmed := strings.TrimSpace(nodeName)
-	if trimmed == "" {
-		return fmt.Errorf("must be a non-empty string")
-	}
-	if trimmed != nodeName {
-		return fmt.Errorf("must not contain leading or trailing whitespace")
-	}
-	if strings.Contains(trimmed, ":") {
-		return fmt.Errorf("must not contain ':' so it can form looper:target:<node_name>")
-	}
-	if len(trimmed) > 32 {
-		return fmt.Errorf("must be 32 characters or fewer so it can form looper:target:<node_name>")
-	}
-	if !networkNodeNamePattern.MatchString(trimmed) {
-		return fmt.Errorf("must contain only letters, numbers, '.', '_' or '-' so it can form looper:target:<node_name>")
-	}
-	return nil
 }
 
 func validateWebhookTunnelConfig(config WebhookConfig, path string, issues *[]ValidationIssue) {
@@ -1414,12 +1470,22 @@ func validateAgentProfiles(profiles map[string]AgentBindingConfig, issues *[]Val
 			continue
 		}
 		binding := profiles[id]
-		if binding.Vendor == nil && binding.Model == nil {
-			*issues = append(*issues, ValidationIssue{Path: path, Message: "must set at least one of vendor or model"})
+		if binding.Vendor == nil && binding.Model == nil && binding.ReasoningEffort == nil {
+			*issues = append(*issues, ValidationIssue{Path: path, Message: "must set at least one of vendor, model, or reasoningEffort"})
 		}
 		if binding.Vendor != nil && !isValidAgentVendor(*binding.Vendor) {
 			*issues = append(*issues, ValidationIssue{Path: path + ".vendor", Message: agentVendorValidationMessage()})
 		}
+		validateReasoningEffort(path+".reasoningEffort", binding.ReasoningEffort, issues)
+	}
+}
+
+func validateReasoningEffort(path string, effort *ReasoningEffort, issues *[]ValidationIssue) {
+	if effort == nil {
+		return
+	}
+	if _, ok := ParseReasoningEffort(string(*effort)); !ok {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must be one of: low, medium, high, xhigh, none"})
 	}
 }
 
@@ -1479,6 +1545,7 @@ func validateRoleAgentBinding(config Config, prefix string, agent *RoleAgentConf
 	if agent.Vendor != nil && !isValidAgentVendor(*agent.Vendor) {
 		*issues = append(*issues, ValidationIssue{Path: prefix + ".vendor", Message: agentVendorValidationMessage()})
 	}
+	validateReasoningEffort(prefix+".reasoningEffort", agent.ReasoningEffort, issues)
 }
 
 func validateProjectRoleAgentBindings(roles *PartialRoleConfigs, prefix string, issues *[]ValidationIssue) {
@@ -1517,7 +1584,7 @@ func roleAgentBindingSet(agent *RoleAgentConfig) bool {
 	if agent == nil {
 		return false
 	}
-	return agent.Profile != nil || agent.Vendor != nil || agent.Model != nil
+	return agent.Profile != nil || agent.Vendor != nil || agent.Model != nil || agent.ReasoningEffort != nil
 }
 
 func isValidAuthMode(mode AuthMode) bool {

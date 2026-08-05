@@ -45,12 +45,6 @@
         "mode": "gh-forward",
         "publicBaseUrl": ""
       },
-      "network": {
-        "enrolled": false,
-        "githubLogin": "",
-        "loopernetBaseUrl": "",
-        "nodeName": ""
-      },
       "agent": {
         "params": {},
         "env": {},
@@ -310,6 +304,19 @@
             ],
             "labelMode": "all",
             "requireAssigneeCurrentUser": true
+          }
+        },
+        "triager": {
+          "preset": "legacy",
+          "classify": true,
+          "authorTiers": {},
+          "legacy": {
+            "autoRouteConfidence": 0.8,
+            "maxAutoRouteRisk": "low",
+            "requireInScope": true,
+            "requireNoMissingInformation": true,
+            "requirePlanner": true,
+            "requireRationale": true
           }
         }
       },

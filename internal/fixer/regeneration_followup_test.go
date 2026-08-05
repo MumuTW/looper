@@ -103,6 +103,10 @@ func TestTerminalRegenerationReplayRequeuesAndClaimsAfterHandoffFailure(t *testi
 	if result.Status != "failed" || routes != 2 || len(gateway.closeCalls) != 1 {
 		t.Fatalf("replay result=%#v routes=%d closes=%d, want failed/2/1", result, routes, len(gateway.closeCalls))
 	}
+	persistedQueue, err = fixture.repos.Queue.GetByID(context.Background(), claimed.ID)
+	if err != nil || persistedQueue == nil || persistedQueue.Status != "completed" {
+		t.Fatalf("replay queue after ProcessClaimedQueueItem() = %#v err=%v, want completed", persistedQueue, err)
+	}
 }
 
 func TestTerminalRegenerationReplayDoesNotRequeueHumanTakeoverLoop(t *testing.T) {

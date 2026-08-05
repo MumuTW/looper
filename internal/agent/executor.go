@@ -97,6 +97,7 @@ var inheritedAgentEnvKeys = []string{
 type ExecutorConfig struct {
 	Vendor              config.AgentVendor
 	Model               *string
+	ReasoningEffort     *config.ReasoningEffort
 	Params              map[string]any
 	Env                 map[string]string
 	NativeResumeEnabled bool
@@ -158,11 +159,17 @@ type RunInput struct {
 	HeartbeatTimeout   time.Duration
 	GracefulShutdown   time.Duration
 	MaxOutputBytes     int
-	Metadata           map[string]any
-	IdempotencyKey     string
-	Env                map[string]string
-	// OnBeforeTimeout runs synchronously before this execution signals its
-	// process group for an idle or max-runtime timeout. It is for daemon-owned
+	// TimeoutObservationBudget bounds the daemon-owned observation callback
+	// that runs after a timeout process group is contained. A zero value keeps
+	// the conservative default; callers that need a larger Git observation
+	// window must set it explicitly rather than relying on a hidden constant.
+	TimeoutObservationBudget time.Duration
+	Metadata                 map[string]any
+	IdempotencyKey           string
+	Env                      map[string]string
+	// OnBeforeTimeout runs synchronously after an idle or max-runtime timeout
+	// terminates this execution's process group and that group is confirmed dead,
+	// and before terminal timeout persistence. It is for daemon-owned
 	// durability observations, never for business policy or process control.
 	// Its error is reported in Result but cannot prevent termination.
 	OnBeforeTimeout func(context.Context, TimeoutObservation) error
@@ -177,7 +184,7 @@ type RunInput struct {
 	Assessment      bool
 	NativeSessionID string
 	// UseSnapshot, when true with a non-empty SnapshotVendor, overrides the
-	// executor's configured vendor/model for this start only (spawn, native
+	// executor's configured vendor/model/reasoning effort for this start only (spawn, native
 	// resume vendor checks, and persisted execution vendor). Env and
 	// NativeResumeEnabled still come from the executor config. Identity-bearing
 	// params are filtered against the frozen vendor: wrappers are kept when the
@@ -188,6 +195,9 @@ type RunInput struct {
 	// SnapshotModel is used only when UseSnapshot is true. nil means no model
 	// flag; a non-nil value (including empty) sets the model override.
 	SnapshotModel *string
+	// SnapshotReasoningEffort is used only when UseSnapshot is true. nil means
+	// no reasoning-effort override.
+	SnapshotReasoningEffort *config.ReasoningEffort
 }
 
 // TimeoutObservation identifies the timeout that is about to terminate an
@@ -216,6 +226,8 @@ type Result struct {
 	ElapsedRuntimeSeconds        int64
 	LastProgressAt               string
 	PreTimeoutError              string
+	NativeResumeMode             string
+	NativeResumeStatus           string
 	PID                          int
 }
 
@@ -287,6 +299,7 @@ func (e *ConfiguredExecutor) effectiveConfig(input RunInput) ExecutorConfig {
 		if vendor := strings.TrimSpace(input.SnapshotVendor); vendor != "" {
 			cfg.Vendor = config.AgentVendor(vendor)
 			cfg.Model = input.SnapshotModel
+			cfg.ReasoningEffort = input.SnapshotReasoningEffort
 		}
 	}
 
@@ -956,10 +969,8 @@ func (x *execution) run(ctx context.Context) {
 			if killReason == "" {
 				killReason = fmt.Sprintf("agent max runtime timed out after %s", x.timeout)
 			}
-			preTimeoutError = x.observeBeforeTimeout("max_runtime")
 			select {
 			case reason := <-x.killCh:
-				preTimeoutError = ""
 				killed = true
 				killReason = reason
 				x.setStatus("killed")
@@ -968,7 +979,6 @@ func (x *execution) run(ctx context.Context) {
 			default:
 			}
 			if runCtx.Err() != nil {
-				preTimeoutError = ""
 				killed = true
 				killReason = runCtx.Err().Error()
 				x.setStatus("killed")
@@ -977,7 +987,6 @@ func (x *execution) run(ctx context.Context) {
 			}
 			select {
 			case waitErr = <-waitCh:
-				preTimeoutError = ""
 				waiting = false
 				continue
 			default:
@@ -1002,10 +1011,8 @@ func (x *execution) run(ctx context.Context) {
 			if killReason == "" {
 				killReason = fmt.Sprintf("agent idle timed out after %s without observable progress", x.heartbeatTimeout)
 			}
-			preTimeoutError = x.observeBeforeTimeout("idle")
 			select {
 			case reason := <-x.killCh:
-				preTimeoutError = ""
 				killed = true
 				killReason = reason
 				x.setStatus("killed")
@@ -1014,7 +1021,6 @@ func (x *execution) run(ctx context.Context) {
 			default:
 			}
 			if runCtx.Err() != nil {
-				preTimeoutError = ""
 				killed = true
 				killReason = runCtx.Err().Error()
 				x.setStatus("killed")
@@ -1023,13 +1029,11 @@ func (x *execution) run(ctx context.Context) {
 			}
 			select {
 			case waitErr = <-waitCh:
-				preTimeoutError = ""
 				waiting = false
 				continue
 			default:
 			}
 			if x.timeSinceLastOutput() < x.heartbeatTimeout {
-				preTimeoutError = ""
 				continue
 			}
 			timedOut = true
@@ -1059,6 +1063,16 @@ func (x *execution) run(ctx context.Context) {
 	}
 	if termDelivered && (killed || timedOut) {
 		_ = x.killProcessGroup()
+	}
+	if timedOut {
+		// The callback persists the timeout snapshot. Run it only after the
+		// process group is confirmed dead, so no writer can change the worktree
+		// between the snapshot and the retry preservation check.
+		if err := x.ensureConfirmedDeadBeforeTerminal(); err != nil {
+			preTimeoutError = err.Error()
+		} else {
+			preTimeoutError = x.observeBeforeTimeout(timeoutType)
+		}
 	}
 
 	stdout, stderr := x.resolveOutputLogs()
@@ -1100,6 +1114,7 @@ func (x *execution) run(ctx context.Context) {
 	}
 	endedAtISO := eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
 	lastProgressAt := x.lastProgressAtISO()
+	_, nativeResumeMode, nativeResumeStatus, _ := x.nativeResumeSnapshot()
 	result := Result{
 		Status:                       status,
 		Summary:                      completion.Summary,
@@ -1119,6 +1134,8 @@ func (x *execution) run(ctx context.Context) {
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               lastProgressAt,
 		PreTimeoutError:              preTimeoutError,
+		NativeResumeMode:             nativeResumeMode,
+		NativeResumeStatus:           nativeResumeStatus,
 		PID:                          x.leaderPID(),
 	}
 	if x.shouldFallbackNativeResume(status, stdout, stderr) {
@@ -1141,6 +1158,8 @@ func (x *execution) run(ctx context.Context) {
 			}
 		}
 	}
+	x.finalizeNativeResumeStatus(status, errorMessage, result.Stderr)
+	_, result.NativeResumeMode, result.NativeResumeStatus, _ = x.nativeResumeSnapshot()
 
 	// No terminal observation before containment is confirmed dead for owned
 	// executions (ties to #574/#576 / ADR-0015 R5).
@@ -1154,6 +1173,10 @@ func (x *execution) run(ctx context.Context) {
 	}
 
 	persistErr := x.persistFinal(status, result, errorMessage, endedAtISO)
+	// persistFinal may promote a session id extracted from terminal output from
+	// unavailable to captured. Refresh the returned metadata after that durable
+	// normalization so Worker checkpoints never lag the AgentExecution record.
+	_, result.NativeResumeMode, result.NativeResumeStatus, _ = x.nativeResumeSnapshot()
 	if hard := x.classifyPersistError(persistErr); hard != nil {
 		x.reportHardPersistFailure(hard)
 		persistErr = errors.Join(ErrExecutionPersistence, fmt.Errorf("persist terminal agent execution: %w", hard))
@@ -1192,12 +1215,30 @@ func (x *execution) run(ctx context.Context) {
 	x.doneCh <- execOutcome{result: result, err: persistErr}
 }
 
+// finalizeNativeResumeStatus makes the returned terminal result agree with the
+// native-resume state that persistFinal records. Fallbacks have already
+// replaced this state before this point, so only an attached native session
+// that terminates without fallback is finalized here.
+func (x *execution) finalizeNativeResumeStatus(status, errorMessage, stderr string) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.nativeResumeMode != "native_resume" || status != "failed" {
+		return
+	}
+	x.nativeResumeStatus = "failed"
+	x.nativeResumeError = firstNonEmpty(x.nativeResumeError, errorMessage, strings.TrimSpace(stderr))
+}
+
 func (x *execution) observeBeforeTimeout(timeoutType string) string {
 	callback := x.input.OnBeforeTimeout
 	if callback == nil {
 		return ""
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	budget := x.input.TimeoutObservationBudget
+	if budget <= 0 {
+		budget = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	if err := callback(ctx, TimeoutObservation{TimeoutType: timeoutType, LastProgressAt: x.lastProgressAtISO()}); err != nil {
 		return err.Error()
@@ -1386,6 +1427,8 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 				ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
 				ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 				LastProgressAt:               x.lastProgressAtISO(),
+				NativeResumeMode:             "checkpoint_restart",
+				NativeResumeStatus:           "fallback_failed",
 				PID:                          x.leaderPID(),
 			}, errMsg, true, nil
 		}
@@ -1456,10 +1499,8 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 			default:
 			}
 			killReason = fmt.Sprintf("agent max runtime timed out after %s", x.timeout)
-			preTimeoutError = x.observeBeforeTimeout("max_runtime")
 			select {
 			case reason := <-x.killCh:
-				preTimeoutError = ""
 				killed = true
 				killReason = reason
 				terminate()
@@ -1467,7 +1508,6 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 			default:
 			}
 			if ctx.Err() != nil {
-				preTimeoutError = ""
 				killed = true
 				killReason = ctx.Err().Error()
 				terminate()
@@ -1475,7 +1515,6 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 			}
 			select {
 			case waitErr = <-waitCh:
-				preTimeoutError = ""
 				waiting = false
 				continue
 			default:
@@ -1488,10 +1527,8 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 				continue
 			}
 			killReason = fmt.Sprintf("agent idle timed out after %s without observable progress", x.heartbeatTimeout)
-			preTimeoutError = x.observeBeforeTimeout("idle")
 			select {
 			case reason := <-x.killCh:
-				preTimeoutError = ""
 				killed = true
 				killReason = reason
 				terminate()
@@ -1499,7 +1536,6 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 			default:
 			}
 			if ctx.Err() != nil {
-				preTimeoutError = ""
 				killed = true
 				killReason = ctx.Err().Error()
 				terminate()
@@ -1507,13 +1543,11 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 			}
 			select {
 			case waitErr = <-waitCh:
-				preTimeoutError = ""
 				waiting = false
 				continue
 			default:
 			}
 			if x.timeSinceLastOutput() < x.heartbeatTimeout {
-				preTimeoutError = ""
 				continue
 			}
 			timedOut = true
@@ -1538,6 +1572,15 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		ctx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
 		_ = handle.Kill(ctx)
 		cancel()
+	}
+	if timedOut {
+		// A native-resume fallback has a fresh containment handle. Do not let
+		// its timeout snapshot race descendants that survived the leader exit.
+		if err := x.ensureConfirmedDeadBeforeTerminal(); err != nil {
+			preTimeoutError = err.Error()
+		} else {
+			preTimeoutError = x.observeBeforeTimeout(timeoutType)
+		}
 	}
 	stdout := x.stdoutString()
 	stderr := x.stderrString()
@@ -1582,6 +1625,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		x.nativeResumeStatus = "fallback_failed"
 	}
 	x.mu.Unlock()
+	_, nativeResumeMode, nativeResumeStatus, _ := x.nativeResumeSnapshot()
 	return Result{
 		Status:                       status,
 		Summary:                      completion.Summary,
@@ -1601,6 +1645,8 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               x.lastProgressAtISO(),
 		PreTimeoutError:              preTimeoutError,
+		NativeResumeMode:             nativeResumeMode,
+		NativeResumeStatus:           nativeResumeStatus,
 		PID:                          x.leaderPID(),
 	}, errorMessage, true, nil
 }
@@ -1878,13 +1924,21 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 		// Fail closed: assessments never persist a resumable native session id.
 		nativeSessionID = ""
 	}
-	if nativeResumeMode == "native_resume" && status == "failed" {
-		nativeResumeStatus = "failed"
-		nativeResumeError = firstNonEmpty(nativeResumeError, errorMessage, strings.TrimSpace(result.Stderr))
-	}
 	if nativeSessionID != "" && (nativeResumeStatus == "" || nativeResumeStatus == "unavailable") {
 		nativeResumeStatus = "captured"
 	}
+	// Keep the in-memory authority in sync with the terminal record. The result
+	// is refreshed by run() after persistFinal returns, including when the
+	// session id was discovered only while assembling the terminal payload.
+	x.mu.Lock()
+	if !x.input.Assessment {
+		if nativeSessionID != "" {
+			x.nativeSessionID = nativeSessionID
+		}
+		x.nativeResumeStatus = nativeResumeStatus
+		x.nativeResumeError = nativeResumeError
+	}
+	x.mu.Unlock()
 	cfg := x.executor.effectiveConfig(x.input)
 	record := storage.AgentExecutionRecord{
 		ID:                 x.executionID,
@@ -2271,12 +2325,11 @@ func InteractiveResumeCommandLine(cfg ExecutorConfig, workingDirectory, sessionI
 	if sessionID == "" || !InteractiveTakeoverSupported(cfg.Vendor) {
 		return "", false
 	}
-	command := resolveCommand(cfg)
 	adapter, ok := runtimeAdapterFor(cfg.Vendor)
 	if !ok || adapter.resolveInteractiveResume == nil {
 		return "", false
 	}
-	resume := adapter.resolveInteractiveResume(command, sessionID)
+	resume := adapter.resolveInteractiveResume(resolveCommand(cfg), cfg, sessionID)
 	if workingDirectory != "" {
 		return "cd " + shellSingleQuote(workingDirectory) + " && " + resume, true
 	}
@@ -2345,10 +2398,71 @@ func resolveCodexArgs(cfg ExecutorConfig, args []string, prompt string) []string
 	// to the worktree and the temporary directories.
 	resolved = appendCodexSandboxDefaults(resolved)
 	withModel := prependModelFlag(resolved, cfg.Model, "--model", []string{"--model", "-m"})
-	if hasAnyFlag(withModel, []string{"-"}) {
-		return withModel
+	withReasoning := appendReasoningEffortFlag(withModel, cfg.ReasoningEffort)
+	if hasAnyFlag(withReasoning, []string{"-"}) {
+		return withReasoning
 	}
-	return append(withModel, prompt)
+	return append(withReasoning, prompt)
+}
+
+// appendReasoningEffortFlag appends `-c model_reasoning_effort=<value>` when the
+// operator configured a Codex-supported effort level. "none" is a Looper
+// overlay sentinel that suppresses an inherited setting; it is not a value
+// accepted by the Codex CLI, so it must never be forwarded as a literal.
+func appendReasoningEffortFlag(args []string, effort *config.ReasoningEffort) []string {
+	if effort == nil {
+		return args
+	}
+	if *effort == config.ReasoningEffortNone {
+		return stripReasoningEffortFlags(args)
+	}
+	flag := []string{"-c", fmt.Sprintf("model_reasoning_effort=%s", string(*effort))}
+	for i, arg := range args {
+		if arg == "-" {
+			withFlag := make([]string, 0, len(args)+len(flag))
+			withFlag = append(withFlag, args[:i]...)
+			withFlag = append(withFlag, flag...)
+			return append(withFlag, args[i:]...)
+		}
+	}
+	return append(args, flag...)
+}
+
+// stripReasoningEffortFlags removes inherited Codex config assignments when
+// the Looper overlay explicitly suppresses reasoning effort. It accepts the
+// separate and equals forms supported by Codex without treating unrelated -c
+// settings as identity-bearing.
+func stripReasoningEffortFlags(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "-c" || arg == "--config" {
+			if i+1 < len(args) && isReasoningEffortConfig(args[i+1]) {
+				i++
+				continue
+			}
+			out = append(out, arg)
+			continue
+		}
+		if strings.HasPrefix(arg, "-c=") && isReasoningEffortConfig(strings.TrimPrefix(arg, "-c=")) {
+			continue
+		}
+		if strings.HasPrefix(arg, "--config=") && isReasoningEffortConfig(strings.TrimPrefix(arg, "--config=")) {
+			continue
+		}
+		if strings.HasPrefix(arg, "-c") && isReasoningEffortConfig(strings.TrimPrefix(arg, "-c")) {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
+func isReasoningEffortConfig(arg string) bool {
+	return strings.HasPrefix(strings.TrimSpace(arg), "model_reasoning_effort=")
 }
 
 // enforceCodexToolNetworkDenied overrides all operator-supplied Codex sandbox

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,7 +39,7 @@ var (
 	prViewMetadataJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
 	prViewFixerJSONFields      = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "statusCheckRollup", "mergeStateStatus"}
 	prViewReviewerJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "statusCheckRollup", "mergeStateStatus"}
-	prViewGatekeeperJSONFields = []string{"number", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "mergeStateStatus", "changedFiles", "deletions"}
+	prViewGatekeeperJSONFields = []string{"number", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "mergeStateStatus", "changedFiles", "deletions", "closingIssuesReferences"}
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
@@ -172,6 +173,8 @@ type PullRequestDetail struct {
 	Mergeable          *bool
 	MergeableState     MergeabilityState
 	MergedAt           string
+	MergeCommitSHA     string
+	ClosingIssues      []IssueReference
 	AutoMerge          *PullRequestAutoMerge
 }
 
@@ -182,6 +185,13 @@ type PullRequestDiffStats struct {
 	Deletions    int `json:"deletions"`
 }
 
+// IssueReference is GitHub's explicit pull-request-to-issue relationship.
+// It is deliberately not derived from PR title or body text.
+type IssueReference struct {
+	Number int64  `json:"number"`
+	Repo   string `json:"repo"`
+	URL    string `json:"url"`
+}
 type PullRequestAutoMerge struct {
 	EnabledBy   string
 	MergeMethod string
@@ -195,16 +205,24 @@ type PullRequestCheckRuns struct {
 }
 
 type PullRequestCheckRun struct {
+	ID           int64
 	Name         string
 	Status       string
 	Conclusion   string
 	AppID        int64
 	CheckSuiteID int64
+	StartedAt    string
+	CompletedAt  string
 }
 
 type PullRequestStatus struct {
 	Context string
 	State   string
+}
+
+type CheckRunAnnotation struct {
+	Path  string
+	Level string
 }
 
 type CommentInfo struct {
@@ -318,6 +336,7 @@ type RepositorySettings struct {
 	AllowMergeCommit bool
 	AllowRebaseMerge bool
 	AllowAutoMerge   bool
+	Visibility       string
 }
 
 type BranchProtectionInput struct {
@@ -369,6 +388,7 @@ type IssueDetail struct {
 	ClosedAt          string
 	Author            string
 	AuthorAssociation string
+	AuthorType        string
 	Assignees         []string
 	AssigneeUsers     []GitHubUser
 	Labels            []string
@@ -521,10 +541,28 @@ type PullRequestCommit struct {
 	CommitterKnown bool
 }
 
+// CommitStatusInput is a policy result attached to one immutable commit. GitHub
+// branch protection, not Looper's local event log, enforces this result before
+// a merge or merge-queue progression.
+type CommitStatusInput struct {
+	Repo        string
+	SHA         string
+	Context     string
+	State       string
+	Description string
+	CWD         string
+}
+
 type PullRequestCheckRunsInput struct {
 	Repo string
 	Ref  string
 	CWD  string
+}
+
+type CheckRunAnnotationsInput struct {
+	Repo       string
+	CheckRunID int64
+	CWD        string
 }
 
 // RerequestCheckSuiteInput identifies one GitHub check suite to rerun. The
@@ -566,7 +604,10 @@ type VerifyReviewMarkerInput struct {
 	AllowedReviewEvents []string
 	AuthorLogin         string
 	AllowCleanComment   bool
-	CWD                 string
+	// SkipInlineComments skips the review-comments fetch when the caller only
+	// needs marker presence and outcome (Gatekeeper auto mode).
+	SkipInlineComments bool
+	CWD                string
 }
 
 type ReviewMarkerResult struct {
@@ -1114,6 +1155,7 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 		ClosedAt:          firstNonEmpty(asString(row["closed_at"]), asString(row["closedAt"])),
 		Author:            extractAuthor(firstNonNil(row["user"], row["author"])),
 		AuthorAssociation: asString(row["author_association"]),
+		AuthorType:        extractActorType(firstNonNil(row["user"], row["author"])),
 		Assignees:         extractActorLogins(row["assignees"]),
 		AssigneeUsers:     extractActorUsers(row["assignees"]),
 		Labels:            extractLabelNames(row["labels"]),
@@ -1341,9 +1383,24 @@ func (g *Gateway) ListIssueCommentsContaining(ctx context.Context, input ViewIss
 	return extractCommentInfos(rows), nil
 }
 
+// issueTimelineProjection keeps issue timeline reads independent of the size of
+// the discussion. Cross-referenced events embed the full source issue or pull
+// request body, so one busy issue can exceed the shell capture cap and erase
+// the whole timeline. gh applies this projection to each page before anything
+// crosses that boundary, keeping only the fields the coordinator and triager
+// consume: event kind, timestamp, event id, and the label for label events.
+//
+// The projection also retains the minimal identifying fields of a cross-
+// referenced source, a top-level pull_request, and a top-level issue — number,
+// html_url, url, and the nested pull_request marker — so linkedPullRequestNumbers
+// can still discover the PR a cross-referenced event points at and drive
+// merge-watch and mark-ready. The full bodies those objects carry are dropped,
+// which is what keeps the wire shape under the capture cap.
+const issueTimelineProjection = `.[] | {id, event, created_at, label: (.label | if . then {name} else null end), source: (.source | if . then {issue: (.issue | if . then {number, html_url, url, pull_request: (if .pull_request then {number, html_url, url} else null end)} else null end)} else null end), pull_request: (.pull_request | if . then {number, html_url, url} else null end), issue: (.issue | if . then {number, html_url, url, pull_request: (if .pull_request then {number, html_url, url} else null end)} else null end)}`
+
 func (g *Gateway) ListIssueTimeline(ctx context.Context, input IssueTimelineInput) ([]map[string]any, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
-	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/timeline", repo, input.IssueNumber), "-H", "Accept: application/vnd.github+json"}
+	args := []string{"api", "--paginate", fmt.Sprintf("repos/%s/issues/%d/timeline", repo, input.IssueNumber), "-H", "Accept: application/vnd.github+json", "--jq", issueTimelineProjection}
 	if hostname != "" {
 		args = append(args, "--hostname", hostname)
 	}
@@ -1351,7 +1408,7 @@ func (g *Gateway) ListIssueTimeline(ctx context.Context, input IssueTimelineInpu
 	if err != nil {
 		return nil, err
 	}
-	return decodeJSONArrayOrPages(result.Stdout)
+	return decodeJSONObjects(result.Stdout)
 }
 
 func (g *Gateway) ListIssueReactions(ctx context.Context, input IssueReactionInput) ([]IssueReaction, error) {
@@ -1674,7 +1731,21 @@ func (g *Gateway) GetRepositorySettings(ctx context.Context, input RepositorySet
 		AllowMergeCommit: asBool(row["allow_merge_commit"]),
 		AllowRebaseMerge: asBool(row["allow_rebase_merge"]),
 		AllowAutoMerge:   asBool(row["allow_auto_merge"]),
+		Visibility:       repositoryVisibility(row),
 	}, nil
+}
+
+func repositoryVisibility(row map[string]any) string {
+	if visibility := strings.ToLower(strings.TrimSpace(asString(row["visibility"]))); visibility != "" {
+		return visibility
+	}
+	if private, ok := row["private"].(bool); ok {
+		if private {
+			return "private"
+		}
+		return "public"
+	}
+	return "unknown"
 }
 
 func (g *Gateway) GetBranchProtection(ctx context.Context, input BranchProtectionInput) (BranchProtection, error) {
@@ -1750,6 +1821,25 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 	return g.viewPullRequestWithFields(ctx, input, prViewMetadataJSONFields, false, false)
 }
 
+// ViewPullRequestForDiscovery returns the lightweight metadata tier of a
+// pull request (no statusCheckRollup, no reviews, no review threads, no
+// issue comments) for discovery-path callers that only need
+// IsDraft/Author/ReviewRequests/Labels/State. During scheduler ticks it
+// shares the per-tick discovery snapshot's metadata cache so the whole
+// tick costs one thin view per PR; outside a snapshot it falls back to a
+// direct thin query.
+//
+// Callers that consume detail.Checks or detail.Reviews must keep using
+// ViewPullRequestForFixer / ViewPullRequestForReviewer (or ViewPullRequest
+// when the snapshot's full tier is required); this method deliberately
+// omits statusCheckRollup, the most expensive GraphQL field per tick.
+func (g *Gateway) ViewPullRequestForDiscovery(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
+		return snapshot.viewPullRequestMetadata(ctx, input)
+	}
+	return g.viewPullRequestWithFields(ctx, input, prViewMetadataJSONFields, false, false)
+}
+
 func (g *Gateway) ViewPullRequestForFixer(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
 	return g.viewPullRequestWithFields(ctx, input, prViewFixerJSONFields, true, true)
 }
@@ -1761,7 +1851,33 @@ func (g *Gateway) ViewPullRequestForReviewer(ctx context.Context, input ViewPull
 func (g *Gateway) ViewPullRequestForGatekeeper(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
 	// Gate decisions must bypass the per-tick discovery snapshot: this method
 	// is the fresh provider read that binds a report to the current head.
-	return g.viewPullRequestWithFields(ctx, input, prViewGatekeeperJSONFields, false, false)
+	detail, err := g.viewPullRequestWithFields(ctx, input, prViewGatekeeperJSONFields, false, false)
+	if err == nil {
+		return detail, nil
+	}
+	// closingIssuesReferences is provenance enrichment, not merge authority.
+	// Older GitHub Enterprise APIs may reject the optional field; retry the
+	// authoritative gate read without it rather than blocking every evaluation.
+	if !isUnsupportedClosingIssuesFieldError(err) {
+		return PullRequestDetail{}, err
+	}
+	return g.viewPullRequestWithFields(ctx, input, withoutJSONField(prViewGatekeeperJSONFields, "closingIssuesReferences"), false, false)
+}
+
+func isUnsupportedClosingIssuesFieldError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if !strings.Contains(message, "closingissuesreferences") {
+		return false
+	}
+	for _, marker := range []string{"unknown field", "unknown argument", "unsupported field", "doesn't exist", "does not exist", "cannot query field", "could not resolve to a field"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Gateway) viewPullRequestWithFields(ctx context.Context, input ViewPullRequestInput, fields []string, includeReviewThreads bool, includeIssueComments bool) (PullRequestDetail, error) {
@@ -1820,6 +1936,8 @@ func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, 
 		Mergeable:          boolPtrFromValue(row["mergeable"]),
 		MergeableState:     ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),
 		MergedAt:           asString(row["merged_at"]),
+		MergeCommitSHA:     nestedString(row, "mergeCommit", "oid"),
+		ClosingIssues:      extractIssueReferences(row["closingIssuesReferences"]),
 		AutoMerge:          extractAutoMerge(row["auto_merge"]),
 	}
 }
@@ -1880,6 +1998,7 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		IsDraft:        asBool(row["draft"]),
 		Author:         extractAuthor(row["user"]),
 		MergedAt:       firstNonEmpty(asString(row["merged_at"]), asString(row["mergedAt"])),
+		MergeCommitSHA: firstNonEmpty(asString(row["merge_commit_sha"]), nestedString(row, "mergeCommit", "oid")),
 		Labels:         extractLabelNames(row["labels"]),
 		HeadRefName:    nestedString(row, "head", "ref"),
 		BaseRefName:    nestedString(row, "base", "ref"),
@@ -1890,6 +2009,26 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		MergeableState: ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),
 		AutoMerge:      extractAutoMerge(row["auto_merge"]),
 	}, nil
+}
+
+func extractIssueReferences(value any) []IssueReference {
+	references := make([]IssueReference, 0)
+	for _, issue := range toObjectSlice(value) {
+		owner := nestedString(issue, "repository", "owner", "login")
+		name := nestedString(issue, "repository", "name")
+		nameWithOwner := strings.Trim(strings.TrimSpace(owner)+"/"+strings.TrimSpace(name), "/")
+		repo := hostQualifiedRepo(nameWithOwner, asString(issue["url"]))
+		if number := asInt64(issue["number"]); number > 0 && repo != "" {
+			references = append(references, IssueReference{Number: number, Repo: repo, URL: asString(issue["url"])})
+		}
+	}
+	sort.Slice(references, func(i, j int) bool {
+		if !strings.EqualFold(references[i].Repo, references[j].Repo) {
+			return strings.ToLower(references[i].Repo) < strings.ToLower(references[j].Repo)
+		}
+		return references[i].Number < references[j].Number
+	})
+	return references
 }
 
 func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullRequestCheckRunsInput) (PullRequestCheckRuns, error) {
@@ -1921,7 +2060,7 @@ func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullReques
 	checkRuns := toObjectSlice(row["check_runs"])
 	out := PullRequestCheckRuns{TotalCount: int(asInt64(row["total_count"])), CheckRuns: make([]PullRequestCheckRun, 0, len(checkRuns))}
 	for _, checkRun := range checkRuns {
-		out.CheckRuns = append(out.CheckRuns, PullRequestCheckRun{Name: asString(checkRun["name"]), Status: asString(checkRun["status"]), Conclusion: asString(checkRun["conclusion"]), AppID: nestedInt64(checkRun, "app", "id"), CheckSuiteID: nestedInt64(checkRun, "check_suite", "id")})
+		out.CheckRuns = append(out.CheckRuns, PullRequestCheckRun{ID: asInt64(checkRun["id"]), Name: asString(checkRun["name"]), Status: asString(checkRun["status"]), Conclusion: asString(checkRun["conclusion"]), AppID: nestedInt64(checkRun, "app", "id"), CheckSuiteID: nestedInt64(checkRun, "check_suite", "id"), StartedAt: asString(checkRun["started_at"]), CompletedAt: asString(checkRun["completed_at"])})
 	}
 	statuses := toObjectSlice(statusRow["statuses"])
 	out.StatusesTotalCount = int(asInt64(statusRow["total_count"]))
@@ -1940,6 +2079,67 @@ func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullReques
 		out.Statuses = append(out.Statuses, PullRequestStatus{Context: contextName, State: asString(status["state"])})
 	}
 	return out, nil
+}
+
+func (g *Gateway) ListCheckRunAnnotations(ctx context.Context, input CheckRunAnnotationsInput) ([]CheckRunAnnotation, error) {
+	if input.CheckRunID <= 0 {
+		return nil, fmt.Errorf("list check run annotations: positive check run ID is required")
+	}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/check-runs/%d/annotations?per_page=100", repo, input.CheckRunID), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	annotations := make([]CheckRunAnnotation, 0, len(rows))
+	for _, row := range rows {
+		if path := strings.TrimSpace(asString(row["path"])); path != "" {
+			level := firstNonEmpty(asString(row["annotation_level"]), asString(row["level"]))
+			annotations = append(annotations, CheckRunAnnotation{Path: path, Level: strings.ToLower(strings.TrimSpace(level))})
+		}
+	}
+	return annotations, nil
+}
+
+func (g *Gateway) ListPullRequestFiles(ctx context.Context, input ViewPullRequestInput) ([]string, error) {
+	if input.PRNumber <= 0 {
+		return nil, fmt.Errorf("list pull request files: positive pull request number is required")
+	}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/files?per_page=100", repo, input.PRNumber), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(rows))
+	files := make([]string, 0, len(rows))
+	for _, row := range rows {
+		filename := strings.TrimSpace(asString(row["filename"]))
+		if filename == "" {
+			continue
+		}
+		if _, exists := seen[filename]; exists {
+			continue
+		}
+		seen[filename] = struct{}{}
+		files = append(files, filename)
+	}
+	sort.Strings(files)
+	return files, nil
 }
 
 // RerequestCheckSuite asks GitHub to rerun one check suite. It deliberately
@@ -2077,6 +2277,35 @@ func (g *Gateway) MergePullRequest(ctx context.Context, input EnableAutoMergeInp
 		return fmt.Errorf("merge head SHA is required")
 	}
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "merge", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--"+strategy, "--match-head-commit", headSHA)
+	return err
+}
+
+// SetCommitStatus publishes a status for exactly one commit. A later push has a
+// different SHA and therefore cannot inherit this decision.
+func (g *Gateway) SetCommitStatus(ctx context.Context, input CommitStatusInput) error {
+	sha := strings.TrimSpace(input.SHA)
+	contextName := strings.TrimSpace(input.Context)
+	state := strings.ToLower(strings.TrimSpace(input.State))
+	if sha == "" {
+		return fmt.Errorf("commit status SHA is required")
+	}
+	if contextName == "" {
+		return fmt.Errorf("commit status context is required")
+	}
+	switch state {
+	case "error", "failure", "pending", "success":
+	default:
+		return fmt.Errorf("commit status state %q is invalid", input.State)
+	}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/statuses/%s", repo, encodeURIComponent(sha)), "--method", "POST", "-f", "state=" + state, "-f", "context=" + contextName}
+	if description := strings.TrimSpace(input.Description); description != "" {
+		args = append(args, "-f", "description="+description)
+	}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
 	return err
 }
 
@@ -2857,7 +3086,7 @@ func (g *Gateway) FindReviewMarker(ctx context.Context, input VerifyReviewMarker
 		return ReviewMarkerResult{}, err
 	}
 	marker := findAllowedReviewMarker(reviewsResult.Stdout, input.Marker, input.AllowedReviewEvents, input.AuthorLogin, input.AllowCleanComment)
-	if marker.Found && marker.ReviewID != "" {
+	if marker.Found && marker.ReviewID != "" && !input.SkipInlineComments {
 		comments, err := g.fetchReviewCommentBodies(ctx, input.Repo, input.PRNumber, marker.ReviewID, input.CWD)
 		if err != nil {
 			return ReviewMarkerResult{}, err
@@ -4465,6 +4694,10 @@ func extractAuthorIsBot(value any) bool {
 	return asBool(row["is_bot"])
 }
 
+func extractActorType(value any) string {
+	row, _ := value.(map[string]any)
+	return asString(row["type"])
+}
 func extractOID(value any) string {
 	row, ok := value.(map[string]any)
 	if !ok {

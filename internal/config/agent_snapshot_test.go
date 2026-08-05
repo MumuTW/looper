@@ -33,6 +33,26 @@ func TestAgentSnapshotMarshalRoundTrip(t *testing.T) {
 	}
 }
 
+func TestParseAgentSnapshotCanonicalizesReasoningEffort(t *testing.T) {
+	t.Parallel()
+
+	got, err := ParseAgentSnapshot(`{"vendor":"codex","reasoningEffort":" HIGH "}`)
+	if err != nil {
+		t.Fatalf("ParseAgentSnapshot() error = %v", err)
+	}
+	if got.ReasoningEffort == nil || *got.ReasoningEffort != ReasoningEffortHigh {
+		t.Fatalf("ReasoningEffort = %v, want %q", got.ReasoningEffort, ReasoningEffortHigh)
+	}
+}
+
+func TestParseAgentSnapshotRejectsInvalidReasoningEffort(t *testing.T) {
+	t.Parallel()
+
+	if _, err := ParseAgentSnapshot(`{"vendor":"codex","reasoningEffort":"max"}`); err == nil {
+		t.Fatal("ParseAgentSnapshot() error = nil, want invalid reasoning effort")
+	}
+}
+
 func TestAgentSnapshotFromResolvedAndIdentity(t *testing.T) {
 	t.Parallel()
 
@@ -51,7 +71,7 @@ func TestAgentSnapshotFromResolvedAndIdentity(t *testing.T) {
 	}
 
 	opencodeModel := "opencode-model"
-	fromIdentity := AgentSnapshotFromIdentity(string(AgentVendorOpenCode), &opencodeModel, "worker-profile")
+	fromIdentity := AgentSnapshotFromIdentity(string(AgentVendorOpenCode), &opencodeModel, "worker-profile", nil)
 	if fromIdentity.Vendor != string(AgentVendorOpenCode) || fromIdentity.ProfileID != "worker-profile" {
 		t.Fatalf("AgentSnapshotFromIdentity() = %#v", fromIdentity)
 	}
@@ -60,11 +80,11 @@ func TestAgentSnapshotFromResolvedAndIdentity(t *testing.T) {
 	}
 
 	empty := ""
-	fromEmpty := AgentSnapshotFromIdentity(string(AgentVendorClaudeCode), &empty, "review")
+	fromEmpty := AgentSnapshotFromIdentity(string(AgentVendorClaudeCode), &empty, "review", nil)
 	if fromEmpty.Model == nil || *fromEmpty.Model != "" {
 		t.Fatalf("AgentSnapshotFromIdentity(empty model) = %#v, want non-nil empty model", fromEmpty)
 	}
-	if AgentSnapshotFromIdentity(string(AgentVendorClaudeCode), nil, "review").Model != nil {
+	if AgentSnapshotFromIdentity(string(AgentVendorClaudeCode), nil, "review", nil).Model != nil {
 		t.Fatal("AgentSnapshotFromIdentity(nil model) should leave Model unset")
 	}
 }
@@ -73,7 +93,7 @@ func TestResolveRunAgentSnapshotJSON_CopiesPredecessorOnResume(t *testing.T) {
 	t.Parallel()
 
 	predecessor := `{"vendor":"codex","model":"old-model","profileId":"sticky"}`
-	got, legacy, err := ResolveRunAgentSnapshotJSON(&predecessor, true, string(AgentVendorClaudeCode), strPtr("new-model"), "new-profile")
+	got, legacy, err := ResolveRunAgentSnapshotJSON(&predecessor, true, string(AgentVendorClaudeCode), strPtr("new-model"), "new-profile", nil)
 	if err != nil {
 		t.Fatalf("ResolveRunAgentSnapshotJSON() error = %v", err)
 	}
@@ -88,7 +108,7 @@ func TestResolveRunAgentSnapshotJSON_CopiesPredecessorOnResume(t *testing.T) {
 func TestResolveRunAgentSnapshotJSON_LegacyResumeUsesCurrentIdentity(t *testing.T) {
 	t.Parallel()
 
-	got, legacy, err := ResolveRunAgentSnapshotJSON(nil, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast")
+	got, legacy, err := ResolveRunAgentSnapshotJSON(nil, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast", nil)
 	if err != nil {
 		t.Fatalf("ResolveRunAgentSnapshotJSON() error = %v", err)
 	}
@@ -113,8 +133,8 @@ func TestResolveRunAgentSnapshotJSON_LegacyResumeUsesCurrentIdentity(t *testing.
 func TestIdentityFromRunSnapshot_UsesSnapshotWhenPresent(t *testing.T) {
 	t.Parallel()
 
-	raw := `{"vendor":"codex","model":"sticky-model","profileId":"sticky-profile"}`
-	vendor, model, profile, fromSnapshot, err := IdentityFromRunSnapshot(&raw, string(AgentVendorClaudeCode), strPtr("fallback-model"), "fallback-profile")
+	raw := `{"vendor":"codex","model":"sticky-model","profileId":"sticky-profile","reasoningEffort":"xhigh"}`
+	vendor, model, profile, reasoningEffort, fromSnapshot, err := IdentityFromRunSnapshot(&raw, string(AgentVendorClaudeCode), strPtr("fallback-model"), "fallback-profile", nil)
 	if err != nil {
 		t.Fatalf("IdentityFromRunSnapshot() error = %v", err)
 	}
@@ -124,12 +144,15 @@ func TestIdentityFromRunSnapshot_UsesSnapshotWhenPresent(t *testing.T) {
 	if vendor != string(AgentVendorCodex) || model == nil || *model != "sticky-model" || profile != "sticky-profile" {
 		t.Fatalf("identity = (%q, %v, %q)", vendor, model, profile)
 	}
+	if reasoningEffort == nil || *reasoningEffort != ReasoningEffortVeryHigh {
+		t.Fatalf("reasoning effort = %v, want xhigh", reasoningEffort)
+	}
 }
 
 func TestIdentityFromRunSnapshot_FallsBackWhenEmpty(t *testing.T) {
 	t.Parallel()
 
-	vendor, model, profile, fromSnapshot, err := IdentityFromRunSnapshot(nil, string(AgentVendorOpenCode), strPtr("opencode-model"), "worker")
+	vendor, model, profile, _, fromSnapshot, err := IdentityFromRunSnapshot(nil, string(AgentVendorOpenCode), strPtr("opencode-model"), "worker", nil)
 	if err != nil {
 		t.Fatalf("IdentityFromRunSnapshot() error = %v", err)
 	}
@@ -145,7 +168,7 @@ func TestIdentityFromRunSnapshot_MalformedReturnsError(t *testing.T) {
 	t.Parallel()
 
 	raw := `{not-json`
-	_, _, _, _, err := IdentityFromRunSnapshot(&raw, string(AgentVendorCodex), strPtr("m"), "p")
+	_, _, _, _, _, err := IdentityFromRunSnapshot(&raw, string(AgentVendorCodex), strPtr("m"), "p", nil)
 	if err == nil {
 		t.Fatal("IdentityFromRunSnapshot() error = nil, want parse error")
 	}
@@ -155,7 +178,7 @@ func TestIdentityFromRunSnapshot_EmptyVendorReturnsError(t *testing.T) {
 	t.Parallel()
 
 	raw := `{"vendor":"","model":"m","profileId":"p"}`
-	_, _, _, _, err := IdentityFromRunSnapshot(&raw, string(AgentVendorCodex), strPtr("fallback-model"), "fallback-profile")
+	_, _, _, _, _, err := IdentityFromRunSnapshot(&raw, string(AgentVendorCodex), strPtr("fallback-model"), "fallback-profile", nil)
 	if err == nil {
 		t.Fatal("IdentityFromRunSnapshot() error = nil, want missing vendor")
 	}
@@ -168,7 +191,7 @@ func TestIdentityFromRunSnapshot_WhitespaceVendorReturnsError(t *testing.T) {
 	t.Parallel()
 
 	raw := `{"vendor":"   ","model":"m"}`
-	_, _, _, _, err := IdentityFromRunSnapshot(&raw, string(AgentVendorOpenCode), strPtr("m"), "p")
+	_, _, _, _, _, err := IdentityFromRunSnapshot(&raw, string(AgentVendorOpenCode), strPtr("m"), "p", nil)
 	if err == nil {
 		t.Fatal("IdentityFromRunSnapshot() error = nil, want missing vendor")
 	}
@@ -178,13 +201,13 @@ func TestResolveRunAgentSnapshotJSON_RejectsInvalidPredecessor(t *testing.T) {
 	t.Parallel()
 
 	malformed := `{not-json`
-	_, _, err := ResolveRunAgentSnapshotJSON(&malformed, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast")
+	_, _, err := ResolveRunAgentSnapshotJSON(&malformed, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast", nil)
 	if err == nil {
 		t.Fatal("ResolveRunAgentSnapshotJSON() error = nil, want parse error for malformed predecessor")
 	}
 
 	emptyVendor := `{"vendor":"","model":"old"}`
-	_, _, err = ResolveRunAgentSnapshotJSON(&emptyVendor, true, string(AgentVendorClaudeCode), strPtr("new-model"), "new-profile")
+	_, _, err = ResolveRunAgentSnapshotJSON(&emptyVendor, true, string(AgentVendorClaudeCode), strPtr("new-model"), "new-profile", nil)
 	if err == nil {
 		t.Fatal("ResolveRunAgentSnapshotJSON() error = nil, want missing vendor for predecessor")
 	}
@@ -197,7 +220,7 @@ func TestResolveRunAgentSnapshotJSON_EmptyPredecessorIsLegacy(t *testing.T) {
 	t.Parallel()
 
 	empty := "   "
-	got, legacy, err := ResolveRunAgentSnapshotJSON(&empty, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast")
+	got, legacy, err := ResolveRunAgentSnapshotJSON(&empty, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast", nil)
 	if err != nil {
 		t.Fatalf("ResolveRunAgentSnapshotJSON() error = %v", err)
 	}
@@ -219,7 +242,7 @@ func TestResolveRunAgentSnapshotJSON_EmptyPredecessorIsLegacy(t *testing.T) {
 func TestResolveRunAgentSnapshotJSON_EmptyVendorLeavesNil(t *testing.T) {
 	t.Parallel()
 
-	got, legacy, err := ResolveRunAgentSnapshotJSON(nil, false, "", strPtr("model"), "profile")
+	got, legacy, err := ResolveRunAgentSnapshotJSON(nil, false, "", strPtr("model"), "profile", nil)
 	if err != nil {
 		t.Fatalf("ResolveRunAgentSnapshotJSON() error = %v", err)
 	}
@@ -372,7 +395,8 @@ func TestResolveRunAgentSnapshotJSONForValidationGate_NonStickyDelegates(t *test
 
 	// A fresh (non-sticky) create builds from current identity regardless of the
 	// gate flag; no predecessor to refresh.
-	got, refreshed, legacy, err := ResolveRunAgentSnapshotJSONForValidationGate(nil, false, true, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast")
+	effort := ReasoningEffortHigh
+	got, refreshed, legacy, err := ResolveRunAgentSnapshotJSONForValidationGate(nil, false, true, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast", &effort)
 	if err != nil {
 		t.Fatalf("ResolveRunAgentSnapshotJSONForValidationGate() error = %v", err)
 	}
@@ -389,13 +413,16 @@ func TestResolveRunAgentSnapshotJSONForValidationGate_NonStickyDelegates(t *test
 	if parsed.Vendor != string(AgentVendorCodex) || parsed.ProfileID != "fast" {
 		t.Fatalf("parsed = %#v, want current identity", parsed)
 	}
+	if parsed.ReasoningEffort == nil || *parsed.ReasoningEffort != effort {
+		t.Fatalf("parsed.ReasoningEffort = %v, want %q", parsed.ReasoningEffort, effort)
+	}
 }
 
 func TestResolveRunAgentSnapshotJSON_PreservesEmptyModel(t *testing.T) {
 	t.Parallel()
 
 	empty := ""
-	got, legacy, err := ResolveRunAgentSnapshotJSON(nil, false, string(AgentVendorClaudeCode), &empty, "review")
+	got, legacy, err := ResolveRunAgentSnapshotJSON(nil, false, string(AgentVendorClaudeCode), &empty, "review", nil)
 	if err != nil {
 		t.Fatalf("ResolveRunAgentSnapshotJSON() error = %v", err)
 	}
@@ -413,7 +440,7 @@ func TestResolveRunAgentSnapshotJSON_PreservesEmptyModel(t *testing.T) {
 		t.Fatalf("parsed.Model = %v, want non-nil empty", parsed.Model)
 	}
 
-	vendor, model, profile, fromSnapshot, err := IdentityFromRunSnapshot(got, string(AgentVendorCodex), strPtr("fallback"), "fb")
+	vendor, model, profile, _, fromSnapshot, err := IdentityFromRunSnapshot(got, string(AgentVendorCodex), strPtr("fallback"), "fb", nil)
 	if err != nil {
 		t.Fatalf("IdentityFromRunSnapshot() error = %v", err)
 	}

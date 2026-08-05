@@ -35,7 +35,6 @@ import (
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/shell"
 	"github.com/MumuTW/looper/internal/loops"
-	networkclient "github.com/MumuTW/looper/internal/network/client"
 	"github.com/MumuTW/looper/internal/postmergedigest"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/reviewer/convergence"
@@ -150,10 +149,11 @@ type PullRequestTarget struct {
 // vendor of the loop's last run, so the caller can hand a human the exact resume
 // command.
 type TakeoverResult struct {
-	LoopID       string
-	Vendor       string
-	SessionID    string
-	WorktreePath string
+	LoopID          string
+	Vendor          string
+	ReasoningEffort *config.ReasoningEffort
+	SessionID       string
+	WorktreePath    string
 }
 
 type Handler struct {
@@ -1072,7 +1072,6 @@ type statusResponse struct {
 	ResourceGuard   any                 `json:"resourceGuard"`
 	Webhook         statusWebhook       `json:"webhook"`
 	Loops           statusLoops         `json:"loops"`
-	Network         any                 `json:"network,omitempty"`
 	Safety          statusSafety        `json:"safety"`
 	Notifications   statusNotifications `json:"notifications"`
 	Tools           statusTools         `json:"tools"`
@@ -1300,7 +1299,6 @@ type configResponse struct {
 	Storage       config.StorageConfig      `json:"storage"`
 	Scheduler     config.SchedulerConfig    `json:"scheduler"`
 	Webhook       config.WebhookConfig      `json:"webhook"`
-	Network       config.NetworkConfig      `json:"network"`
 	Agent         configAgentResponse       `json:"agent"`
 	Logging       config.LoggingConfig      `json:"logging"`
 	Notifications config.NotificationConfig `json:"notifications"`
@@ -1335,14 +1333,15 @@ type configServerResponse struct {
 }
 
 type configAgentResponse struct {
-	Vendor       *config.AgentVendor                  `json:"vendor,omitempty"`
-	Model        *string                              `json:"model,omitempty"`
-	Profiles     map[string]config.AgentBindingConfig `json:"profiles,omitempty"`
-	Params       map[string]any                       `json:"params"`
-	Env          map[string]string                    `json:"env"`
-	EnvKeys      []string                             `json:"envKeys"`
-	Timeouts     config.AgentTimeoutConfig            `json:"timeouts"`
-	NativeResume config.AgentNativeResumeConfig       `json:"nativeResume"`
+	Vendor          *config.AgentVendor                  `json:"vendor,omitempty"`
+	Model           *string                              `json:"model,omitempty"`
+	ReasoningEffort *config.ReasoningEffort              `json:"reasoningEffort,omitempty"`
+	Profiles        map[string]config.AgentBindingConfig `json:"profiles,omitempty"`
+	Params          map[string]any                       `json:"params"`
+	Env             map[string]string                    `json:"env"`
+	EnvKeys         []string                             `json:"envKeys"`
+	Timeouts        config.AgentTimeoutConfig            `json:"timeouts"`
+	NativeResume    config.AgentNativeResumeConfig       `json:"nativeResume"`
 }
 
 type configDaemonResponse struct {
@@ -1379,16 +1378,16 @@ func (h *Handler) buildConfigResponse() configResponse {
 		Storage:   cfg.Storage,
 		Scheduler: cfg.Scheduler,
 		Webhook:   cfg.Webhook,
-		Network:   cfg.Network,
 		Agent: configAgentResponse{
-			Vendor:       cfg.Agent.Vendor,
-			Model:        cfg.Agent.Model,
-			Profiles:     cloneAgentProfiles(cfg.Agent.Profiles),
-			Params:       map[string]any{},
-			Env:          map[string]string{},
-			EnvKeys:      sortedMapKeys(cfg.Agent.Env),
-			Timeouts:     cfg.Agent.Timeouts,
-			NativeResume: cfg.Agent.NativeResume,
+			Vendor:          cfg.Agent.Vendor,
+			Model:           cfg.Agent.Model,
+			ReasoningEffort: cfg.Agent.ReasoningEffort,
+			Profiles:        cloneAgentProfiles(cfg.Agent.Profiles),
+			Params:          map[string]any{},
+			Env:             map[string]string{},
+			EnvKeys:         sortedMapKeys(cfg.Agent.Env),
+			Timeouts:        cfg.Agent.Timeouts,
+			NativeResume:    cfg.Agent.NativeResume,
 		},
 		Logging:       cfg.Logging,
 		Notifications: cfg.Notifications,
@@ -1468,6 +1467,10 @@ func cloneAgentProfiles(profiles map[string]config.AgentBindingConfig) map[strin
 		if binding.Model != nil {
 			model := *binding.Model
 			entry.Model = &model
+		}
+		if binding.ReasoningEffort != nil {
+			effort := *binding.ReasoningEffort
+			entry.ReasoningEffort = &effort
 		}
 		cloned[id] = entry
 	}
@@ -1623,7 +1626,6 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 		ResourceGuard:   h.buildResourceGuardStatusResponse(),
 		Webhook:         summarizeWebhookStatus(h.buildWebhookStatusResponse()),
 		Loops:           loopCounts,
-		Network:         h.buildNetworkStatusResponse(),
 		Safety: statusSafety{
 			AllowAutoCommit:    h.context.Config.Defaults.AllowAutoCommit,
 			AllowAutoPush:      h.context.Config.Defaults.AllowAutoPush,
@@ -1659,9 +1661,6 @@ func (h *Handler) buildWorktreeCleanupStatusResponse() any {
 	}
 }
 
-// buildResourceGuardStatusResponse surfaces the last host reading. A scheduler
-// that is withholding slots must be able to say so: without this, a guarded
-// daemon and an idle one look identical from the outside.
 func (h *Handler) buildResourceGuardStatusResponse() any {
 	if runtimeWithGuard, ok := any(h.context.Runtime).(interface {
 		HostAdmissionStatus() looperdruntime.HostAdmissionStatus
@@ -1672,13 +1671,6 @@ func (h *Handler) buildResourceGuardStatusResponse() any {
 		Enabled: h.context.Config.Daemon.ResourceGuard.Enabled,
 		Admit:   true,
 	}
-}
-
-func (h *Handler) buildNetworkStatusResponse() any {
-	if runtimeWithNetwork, ok := any(h.context.Runtime).(interface{ NetworkStatus() networkclient.Status }); ok {
-		return runtimeWithNetwork.NetworkStatus()
-	}
-	return nil
 }
 
 type storageState struct {
@@ -2011,7 +2003,8 @@ type loopResponse struct {
 	LastFailureReason *string `json:"lastFailureReason,omitempty"`
 	// Outcome is the latest run's derived outcome, so a loop view shows what that
 	// run actually accomplished rather than only that it failed.
-	Outcome *fixer.FixerRunOutcome `json:"outcome,omitempty"`
+	Outcome      *fixer.FixerRunOutcome `json:"outcome,omitempty"`
+	Continuation *activeRunContinuation `json:"continuation,omitempty"`
 }
 
 type reviewerConvergenceProjection struct {
@@ -2144,25 +2137,26 @@ type activeRunsQuery struct {
 }
 
 type activeRunView struct {
-	Seq               int64              `json:"seq"`
-	RunID             *string            `json:"runId"`
-	LoopID            string             `json:"loopId"`
-	ProjectID         string             `json:"projectId"`
-	Type              string             `json:"type"`
-	Status            string             `json:"status"`
-	LoopStatus        string             `json:"loopStatus"`
-	DisplayStatus     string             `json:"displayStatus"`
-	Attempts          *int64             `json:"attempts,omitempty"`
-	MaxAttempts       *int64             `json:"maxAttempts,omitempty"`
-	LastFailureKind   *string            `json:"lastFailureKind,omitempty"`
-	LastFailureReason *string            `json:"lastFailureReason,omitempty"`
-	ResumePolicy      *string            `json:"resumePolicy,omitempty"`
-	CurrentStep       *string            `json:"currentStep"`
-	StartedAt         *string            `json:"startedAt"`
-	EndedAt           *string            `json:"endedAt,omitempty"`
-	Target            activeRunTarget    `json:"target"`
-	Agent             *activeRunAgent    `json:"agent"`
-	Worktree          *activeRunWorktree `json:"worktree"`
+	Seq               int64                  `json:"seq"`
+	RunID             *string                `json:"runId"`
+	LoopID            string                 `json:"loopId"`
+	ProjectID         string                 `json:"projectId"`
+	Type              string                 `json:"type"`
+	Status            string                 `json:"status"`
+	LoopStatus        string                 `json:"loopStatus"`
+	DisplayStatus     string                 `json:"displayStatus"`
+	Attempts          *int64                 `json:"attempts,omitempty"`
+	MaxAttempts       *int64                 `json:"maxAttempts,omitempty"`
+	LastFailureKind   *string                `json:"lastFailureKind,omitempty"`
+	LastFailureReason *string                `json:"lastFailureReason,omitempty"`
+	ResumePolicy      *string                `json:"resumePolicy,omitempty"`
+	CurrentStep       *string                `json:"currentStep"`
+	StartedAt         *string                `json:"startedAt"`
+	EndedAt           *string                `json:"endedAt,omitempty"`
+	Target            activeRunTarget        `json:"target"`
+	Agent             *activeRunAgent        `json:"agent"`
+	Worktree          *activeRunWorktree     `json:"worktree"`
+	Continuation      *activeRunContinuation `json:"continuation,omitempty"`
 }
 
 type retryLoopRequest struct {
@@ -2205,6 +2199,31 @@ type activeRunWorktree struct {
 	ID     *string `json:"id"`
 	Path   string  `json:"path"`
 	Branch *string `json:"branch"`
+}
+
+// activeRunContinuation is a redacted, read-only projection of a Worker's
+// persisted timeout-retry evidence. It intentionally omits changed file paths
+// and diff contents: the dashboard needs preservation status, not source data.
+type activeRunContinuation struct {
+	PredecessorRunID       string                 `json:"predecessorRunId,omitempty"`
+	PredecessorExecutionID string                 `json:"predecessorExecutionId,omitempty"`
+	Mode                   string                 `json:"mode,omitempty"`
+	Outcome                string                 `json:"outcome,omitempty"`
+	BeforeTimeout          *activeRunProgressView `json:"beforeTimeout,omitempty"`
+	AfterRestart           *activeRunProgressView `json:"afterRestart,omitempty"`
+}
+
+type activeRunProgressView struct {
+	HeadSHA            string `json:"headSha,omitempty"`
+	WorktreeID         string `json:"worktreeId,omitempty"`
+	Branch             string `json:"branch,omitempty"`
+	ChangedFileCount   int    `json:"changedFileCount"`
+	StagedFileCount    int    `json:"stagedFileCount"`
+	UntrackedFileCount int    `json:"untrackedFileCount"`
+	DiffFingerprint    string `json:"diffFingerprint,omitempty"`
+	TimeoutType        string `json:"timeoutType,omitempty"`
+	LastProgressAt     string `json:"lastProgressAt,omitempty"`
+	CapturedAt         string `json:"capturedAt,omitempty"`
 }
 
 type projectService interface {
@@ -3631,6 +3650,7 @@ func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQ
 		}
 	}
 	view.ResumePolicy = resumePolicyFromRun(latestRun)
+	view.Continuation = buildActiveRunContinuation(latestRun)
 	// Do not override a closed loop's status with manual_intervention: the loop
 	// is no longer actionable even if the latest queue item still has that status.
 	if !isClosedLoopStatus(loop.Status) && (isManualInterventionQueue(latestQueue) || (view.ResumePolicy != nil && *view.ResumePolicy == loops.ResumePolicyManualIntervention)) {
@@ -4008,6 +4028,101 @@ func buildWorktreeSummary(loop storage.LoopRecord, run storage.RunRecord) *activ
 		ID:     firstNonEmptyString(readObjectString(checkpointWorktree, "id"), readStringMap(loopMetadata, "worktreeId")),
 		Path:   *path,
 		Branch: firstNonEmptyString(readObjectString(checkpointWorktree, "branch"), readStringMap(loopMetadata, "branch")),
+	}
+}
+
+func buildActiveRunContinuation(run *storage.RunRecord) *activeRunContinuation {
+	if run == nil || run.CheckpointJSON == nil {
+		return nil
+	}
+	checkpoint := parseJSONObject(run.CheckpointJSON)
+	continuation, _ := readOptionalObject(checkpoint, "continuation")
+	meaningfulContinuation := hasMeaningfulTimeoutContinuation(continuation)
+	// A retry can time out again after inheriting a predecessor continuation.
+	// Its own execution evidence is newer than that inherited comparison, so
+	// expose it first while the operator decides how to recover this attempt.
+	if execution, ok := readOptionalObject(checkpoint, "execution"); ok {
+		executionRunID := derefString(readObjectString(execution, "runId"))
+		sameRun := strings.TrimSpace(run.ID) != "" && executionRunID == run.ID
+		if sameRun || !meaningfulContinuation {
+			if progressError := derefString(readObjectString(execution, "progressSnapshotError")); progressError != "" {
+				return &activeRunContinuation{
+					PredecessorRunID:       executionRunID,
+					PredecessorExecutionID: derefString(readObjectString(execution, "executionId")),
+					Mode:                   "timeout_observed",
+					Outcome:                "observation failed",
+				}
+			}
+			if progressBeforeTimeout, hasProgress := readOptionalObject(execution, "progressBeforeTimeout"); hasProgress {
+				return &activeRunContinuation{
+					PredecessorRunID:       executionRunID,
+					PredecessorExecutionID: derefString(readObjectString(execution, "executionId")),
+					Mode:                   "timeout_observed",
+					BeforeTimeout:          buildActiveRunProgress(progressBeforeTimeout),
+				}
+			}
+		}
+	}
+	if meaningfulContinuation {
+		beforeTimeout, _ := readOptionalObject(continuation, "beforeTimeout")
+		afterRestart, _ := readOptionalObject(continuation, "afterRestart")
+		before := buildActiveRunProgress(beforeTimeout)
+		after := buildActiveRunProgress(afterRestart)
+		return &activeRunContinuation{
+			PredecessorRunID:       derefString(readObjectString(continuation, "predecessorRunId")),
+			PredecessorExecutionID: derefString(readObjectString(continuation, "predecessorExecutionId")),
+			Mode:                   derefString(readObjectString(continuation, "mode")),
+			Outcome:                derefString(readObjectString(continuation, "outcome")),
+			BeforeTimeout:          before,
+			AfterRestart:           after,
+		}
+	}
+	return nil
+}
+
+func hasMeaningfulTimeoutContinuation(value map[string]any) bool {
+	if value == nil {
+		return false
+	}
+	for _, key := range []string{"predecessorRunId", "predecessorExecutionId", "mode", "outcome", "beforeTimeout", "afterRestart"} {
+		if _, ok := value[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func buildActiveRunProgress(value map[string]any) *activeRunProgressView {
+	if value == nil {
+		return nil
+	}
+	return &activeRunProgressView{
+		HeadSHA:            derefString(readObjectString(value, "headSha")),
+		WorktreeID:         derefString(readObjectString(value, "worktreeId")),
+		Branch:             derefString(readObjectString(value, "branch")),
+		ChangedFileCount:   readObjectInt(value, "changedFileCount"),
+		StagedFileCount:    readObjectInt(value, "stagedFileCount"),
+		UntrackedFileCount: readObjectInt(value, "untrackedFileCount"),
+		DiffFingerprint:    derefString(readObjectString(value, "diffFingerprint")),
+		TimeoutType:        derefString(readObjectString(value, "timeoutType")),
+		LastProgressAt:     derefString(readObjectString(value, "lastProgressAt")),
+		CapturedAt:         derefString(readObjectString(value, "capturedAt")),
+	}
+}
+
+func readObjectInt(value map[string]any, key string) int {
+	if value == nil {
+		return 0
+	}
+	switch typed := value[key].(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	default:
+		return 0
 	}
 }
 
@@ -6057,7 +6172,7 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 	// Role runs already filter via ParamsForRoleVendor; takeover must do the same
 	// so a Claude role session is not handed a global Codex wrapper resume line.
 	params := agent.ParamsForRoleVendor(h.context.Config.Agent.Params, h.context.Config.Agent.Vendor, vendor, nil)
-	cmdLine, ok := agent.InteractiveResumeCommandLine(agent.ExecutorConfig{Vendor: vendor, Params: params}, result.WorktreePath, result.SessionID)
+	cmdLine, ok := agent.InteractiveResumeCommandLine(agent.ExecutorConfig{Vendor: vendor, ReasoningEffort: result.ReasoningEffort, Params: params}, result.WorktreePath, result.SessionID)
 	resp.Supported = ok
 	if ok {
 		resp.ResumeCommand = cmdLine
@@ -6627,6 +6742,21 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			if err := h.assertDiscardSharedPRWorktreeClear(ctx, repos, *loop); err != nil {
 				return retryResult{}, err
 			}
+			// The operator's discard request is the authority to stop preserving a
+			// timed-out worker's old edits. Clear only that evidence in the same
+			// transaction that publishes its replacement, so a failed requeue never
+			// converts a preservation checkpoint into an unacknowledged discard.
+			if loop.Type == string(domain.LoopTypeWorker) {
+				latestRun, err := repos.Runs.GetLatestByLoopID(ctx, loop.ID)
+				if err != nil {
+					return retryResult{}, err
+				}
+				if latestRun != nil && latestRun.CheckpointJSON != nil {
+					if err := repos.Runs.ClearTimeoutProgress(ctx, latestRun.ID, nowISO); err != nil {
+						return retryResult{}, err
+					}
+				}
+			}
 		}
 
 		target, targetErr := loopTargetFromRecordCompat(*loop)
@@ -6940,6 +7070,7 @@ func (h *Handler) serializeLoopWithDiagnostics(ctx context.Context, loop storage
 		latestRun = run
 	}
 	decorateLoopDiagnostics(&view, latestQueue, latestRun)
+	view.Continuation = buildActiveRunContinuation(latestRun)
 	return view, nil
 }
 
@@ -7294,8 +7425,18 @@ func assertNoActiveSiblingPRWorktreeLoops(existing []storage.LoopRecord, candida
 // local changes without creating a replacement queue item.
 func (h *Handler) assertLoopRetryPreconditions(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) error {
 	if strings.TrimSpace(loop.ProjectID) != "" {
-		if _, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID); err != nil {
+		project, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID)
+		if err != nil {
 			return err
+		}
+		if project != nil {
+			// A legacy project can remain in SQLite while config validation has
+			// quarantined it from scheduler claims. Explicit retry must enforce the
+			// same coding-role admission or it would publish a queue item no worker
+			// can claim.
+			if err := h.validateCodingProjectRunnable(*project, domain.LoopType(loop.Type)); err != nil {
+				return err
+			}
 		}
 	}
 	if loop.Status == string(domain.LoopStatusStopped) || loop.Status == string(domain.LoopStatusTerminated) || loop.Status == string(domain.LoopStatusCompleted) {
@@ -7815,6 +7956,15 @@ func readObject(value map[string]any, key string) map[string]any {
 		return map[string]any{}
 	}
 	return typed
+}
+
+func readOptionalObject(value map[string]any, key string) (map[string]any, bool) {
+	child, ok := value[key]
+	if !ok {
+		return nil, false
+	}
+	typed, ok := child.(map[string]any)
+	return typed, ok
 }
 
 func readObjectString(value map[string]any, key string) *string {

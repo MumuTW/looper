@@ -42,7 +42,7 @@ func allowedQueueTypesFromRunners(input defaultSchedulerTickInput) []string {
 func TestWorkerAgentExecutionAdapterPropagatesParseStatus(t *testing.T) {
 	t.Parallel()
 
-	adapter := workerAgentExecutionAdapter{execution: stubAgentExecution{result: agent.Result{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed", ChangedFiles: []string{"worker.go"}, Commits: []string{"abc123"}}}}
+	adapter := workerAgentExecutionAdapter{execution: stubAgentExecution{result: agent.Result{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed", ChangedFiles: []string{"worker.go"}, Commits: []string{"abc123"}, NativeResumeMode: "native_resume", NativeResumeStatus: "started"}}}
 
 	result, err := adapter.Wait(context.Background())
 	if err != nil {
@@ -51,7 +51,7 @@ func TestWorkerAgentExecutionAdapterPropagatesParseStatus(t *testing.T) {
 	if result.ParseStatus != "parsed" {
 		t.Fatalf("ParseStatus = %q, want parsed", result.ParseStatus)
 	}
-	if result.Status != "completed" || result.Summary != "done" || result.Stdout != "ok" || len(result.ChangedFiles) != 1 || result.ChangedFiles[0] != "worker.go" || len(result.Commits) != 1 || result.Commits[0] != "abc123" {
+	if result.Status != "completed" || result.Summary != "done" || result.Stdout != "ok" || len(result.ChangedFiles) != 1 || result.ChangedFiles[0] != "worker.go" || len(result.Commits) != 1 || result.Commits[0] != "abc123" || result.NativeResumeMode != "native_resume" || result.NativeResumeStatus != "started" {
 		t.Fatalf("result = %#v, want propagated agent result fields", result)
 	}
 }

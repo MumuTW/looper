@@ -75,6 +75,25 @@ func TestTriagerLaneSharesActualForgeReadBudgetAcrossProjects(t *testing.T) {
 	}
 }
 
+func TestTriagerLaneFairTurnCoversConfiguredAdmissionAcrossProjects(t *testing.T) {
+	t.Parallel()
+	runner := &fairPendingReadBudgetTriager{reserved: map[string]int{}, budgetFactory: &triager.Runner{}}
+	cfg := config.Config{Projects: []config.ProjectRefConfig{
+		{ID: "project_1"}, {ID: "project_2"}, {ID: "project_3"},
+	}}
+	lane := triagerLane(defaultSchedulerTickInput{
+		Triager: runner, Config: &cfg, TriagerEnabled: func(string) bool { return true },
+	})
+	for _, projectID := range []string{"project_1", "project_2", "project_3"} {
+		if _, err := lane.Discover(context.Background(), projectID, "acme/looper", nil); err != nil {
+			t.Fatalf("Discover(%q) error = %v", projectID, err)
+		}
+	}
+	if runner.reserved["project_1"] < 5 || runner.reserved["project_2"] < 5 || runner.reserved["project_3"] != 0 {
+		t.Fatalf("per-project pending reads = %#v, want two complete five-read turns and one deferred project", runner.reserved)
+	}
+}
+
 // Projects are discovered concurrently through one lane, so every project shares
 // the tick-wide budget. This asserts the lane still hands the same budget to each
 // caller under concurrency; the reservation invariant itself is proven under real
@@ -132,6 +151,27 @@ type budgetTriager struct {
 }
 
 type pendingReadBudgetTriager struct{ reserved atomic.Int64 }
+
+type fairPendingReadBudgetTriager struct {
+	mu            sync.Mutex
+	reserved      map[string]int
+	budgetFactory *triager.Runner
+}
+
+func (f *fairPendingReadBudgetTriager) BeginPendingForgeReadTick(projectIDs []string) *triager.PendingForgeReadBudget {
+	return f.budgetFactory.BeginPendingForgeReadTick(projectIDs)
+}
+
+func (f *fairPendingReadBudgetTriager) DiscoverIssues(_ context.Context, input triager.DiscoveryInput) (triager.DiscoveryResult, error) {
+	count := 0
+	for input.PendingForgeReadBudget.Reserve(input.ProjectID) {
+		count++
+	}
+	f.mu.Lock()
+	f.reserved[input.ProjectID] += count
+	f.mu.Unlock()
+	return triager.DiscoveryResult{}, nil
+}
 
 func (f *pendingReadBudgetTriager) DiscoverIssues(_ context.Context, input triager.DiscoveryInput) (triager.DiscoveryResult, error) {
 	for input.PendingForgeReadBudget.Reserve(input.ProjectID) {

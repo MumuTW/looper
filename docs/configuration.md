@@ -12,29 +12,28 @@ For the default supported install flow:
 
 Keep the runtime directory (`~/.looper` by default, or the directory containing `storage.dbPath`) on a local filesystem. The database lock uses OS file locking and is not designed for NFS-style shared filesystems. If shutdown retains SQLite after an undrained ownership failure, it retains the shared lock too; start a replacement only after the owning process has exited. Tunnel-mode webhook secrets live under the same runtime directory in `secrets/` and must be mode `0600`.
 
-## Network mode summary
+## Network mode
 
-Looper has two project-level network modes:
+Only local operation is supported. `looper:target:*` labels are ignored and
+local-only admission does not add a network-specific Worker label or assignee
+requirement. Worker discovery still applies the configured
+`roles.worker.triggers` policy; Reviewer discovery applies its configured
+review-request policy.
 
-- `projects[].network.mode = "off"` — local-only operation. `looper:target:*` labels are ignored and the classic single-Node assignee/review-request behavior stays unchanged.
-- `projects[].network.mode = "routed"` — multi-Node operation coordinated through `loopernet`.
+The former `[network]` and `projects[].network` sections are rejected. They were
+removed because a user-authored enrollment flag or URL cannot prove that a
+credential was issued, persisted, or can be revoked safely. Routed mode may be
+reintroduced only with one crash-safe enrollment producer and recovery contract.
+The Network ADRs document the withdrawn design and are not configuration guidance.
 
-Authority stays split on purpose:
-
-- GitHub work intent stays on GitHub: `looper:worker-ready` for Worker and GitHub review requests for Reviewer.
-- exactly one `looper:target:<node_name>` label is the exact-Node authority in Routed mode.
-- the `loopernet` lease is a mutation fence for Coordinator only; it does not become the source of truth for work intent.
-
-Operational notes:
-
-- `loopernet` centralizes webhook ingress and Node wakeups, but it must not mutate GitHub on its own.
-- Coordinator writes coarse GitHub authority first, then writes the exact target label last.
-- polling remains enabled as fallback and drift recovery when webhook delivery or SSE wakeups are missed.
-- when enabling Routed mode / network membership in config, Looper rejects enrollment when Planner or Fixer auto-discovery is still enabled for those projects; disable those settings first or opt projects into Routed mode manually.
-
-The formal contract is documented in ADRs [0007](adr/0007-coordinator-admission-assignment-authority.md) through [0011](adr/0011-coordinator-control-plane-for-routed-projects-v1.md).
-
-For runtime deployment details — container image, required environment variables, persistence, and the current single-instance recommendation — see [loopernet deployment](loopernet-deployment.md).
+Before removing those fields and restarting, an existing Routed installation that
+ran more than one Node under a shared GitHub identity must stop all but one Node,
+or assign distinct identities to surviving Worker/Reviewer Nodes while disabling
+`roles.coordinator.enabled` on every Node except one and draining in-flight work.
+Otherwise every upgraded daemon treats the same projects as local-only, ignores
+`looper:target:*`, and separate SQLite queues can run the same Issue or review
+concurrently. See the [user guide](users-guide.md#decommission-extra-nodes-before-the-local-only-cutover)
+for the full cutover steps, including Node credential revocation.
 
 ## Webhook delivery modes
 
@@ -92,9 +91,9 @@ Later layers override earlier ones. Objects are merged deeply, arrays are replac
 
 The hot-safe surface is an explicit allowlist (see [ADR-0014](adr/0014-config-file-is-global-runtime-policy-authority.md) for field classification):
 
-- `agent.vendor` (including adding the first vendor after daemon startup), `agent.model`, individual `agent.env` entries, and the canonical idle/max-runtime fields under `agent.timeouts.*`
-- named `agent.profiles.<id>` entries and their `vendor` / `model` leaves (whole-map `agent.profiles` is not a dashboard path; profile ids match `[A-Za-z0-9_-]+`)
-- coding-role agent bindings: `roles.{planner,worker,reviewer,fixer}.agent.{profile,vendor,model}`
+- `agent.vendor` (including adding the first vendor after daemon startup), `agent.model`, `agent.reasoningEffort`, individual `agent.env` entries, and the canonical idle/max-runtime fields under `agent.timeouts.*`
+- named `agent.profiles.<id>` entries and their `vendor` / `model` / `reasoningEffort` leaves (whole-map `agent.profiles` is not a dashboard path; profile ids match `[A-Za-z0-9_-]+`)
+- coding-role agent bindings: `roles.{planner,worker,reviewer,fixer}.agent.{profile,vendor,model,reasoningEffort}`
 - `scheduler.maxConcurrentRuns` and `scheduler.slowLaneWarnThresholdMs`
 - `notifications.inApp` and the current `notifications.osascript.*` fields; notification webhooks and Feishu notification transport are restart-bound
 - the current `disclosure.*` fields
@@ -103,11 +102,11 @@ The hot-safe surface is an explicit allowlist (see [ADR-0014](adr/0014-config-fi
 - the current Planner discovery/trigger/instruction fields; all current Worker and Fixer discovery/trigger/instruction fields; Reviewer discovery, most behavior, and instructions; and Coordinator polling, triage, dispatch, and merge-watch policy except `mergeWatch.transientRetries`
 - `tools.looperPath` and `tools.osascriptPath`
 
-Profile and role agent vendor/model fields are hot-safe curated identity fields: a claim made after publication resolves against the new config; an already active run keeps the frozen agent snapshot it started with (resume/retry lineages copy that predecessor snapshot rather than re-resolving live config).
+Profile and role agent vendor/model/reasoning-effort fields are hot-safe curated identity fields: a claim made after publication resolves against the new config; an already active run keeps the frozen agent snapshot it started with (resume/retry lineages copy that predecessor snapshot rather than re-resolving live config).
 
 `agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and no explicit model is being silently carried across vendors. If `agent.model` is set, change or unset it in the same candidate; an unchanged explicit model blocks that vendor-to-vendor switch. Clearing a configured vendor uses the same guard, so a retained profile cannot be laundered through an intermediate `null`. The same leave/switch guards apply to each coding role's *resolved* vendor after global → profile → role overlay. Configuring the first vendor may use an already prepared model/params profile. Continuations of failed or interrupted runs copy the predecessor's durable `agent_snapshot_json` (sticky identity across the retry lineage) while retaining checkpoint, worktree, HITL answer, and queued human instructions. Only legacy predecessors with a null snapshot adopt the runner's current resolved identity. Looper never sends an old vendor's native session ID to a different CLI.
 
-Notably, `agent.nativeResume`, `agent.params`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `intake.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. `roles.reviewer.behavior.convergence.*` is the exception for new claims: its four leaves are hot-safe and an active loop keeps its captured policy snapshot. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
+Notably, `agent.nativeResume`, `agent.params`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `intake.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
 
 Deprecated file-layer aliases for `agent.timeouts.{planner,worker,reviewer,fixer}Seconds`, `defaults.allowAutoApprove`, and `defaults.fixAllPullRequests` are normalized into their canonical hot-safe fields so existing files can still reload without a restart. They remain file-only compatibility syntax: the dashboard exposes and writes only canonical paths, and a canonical dashboard edit removes the corresponding alias leaf so a later unset cannot resurrect the old value.
 
@@ -194,7 +193,7 @@ Looper's frozen canonical top-level config roots are:
 
 ### Project authority and import
 
-`[[projects]]` is a declarative startup import, not a second runtime project store. During daemon startup Looper validates and transactionally imports configured projects into SQLite, then builds the runtime Project Catalog exclusively from active database records. Scheduler, Webhook, Network, and Roles all capture that same Catalog.
+`[[projects]]` is a declarative startup import, not a second runtime project store. During daemon startup Looper validates and transactionally imports configured projects into SQLite, then builds the runtime Project Catalog exclusively from active database records. Scheduler, Webhook, and Roles all capture that same Catalog.
 
 - Removing a config-managed project from `[[projects]]` archives its SQLite record on the next startup.
 - Config import never removes API-managed projects.
@@ -239,11 +238,11 @@ closed or use the documented fresh-session fallback.
 
 ## Multi-role agent vendor and model
 
-Coding roles can share one global agent or override vendor/model per role. Overrides are identity-only (vendor + model). Shared executor settings such as `agent.params`, `agent.env`, timeouts, and `agent.nativeResume` stay global.
+Coding roles can share one global agent or override vendor/model/reasoning effort per role. These are identity fields captured in the run snapshot. Shared executor settings such as `agent.params`, `agent.env`, timeouts, and `agent.nativeResume` stay global.
 
 ### Named profiles (`agent.profiles`)
 
-Define reusable vendor/model pairs under `agent.profiles.<id>`. Each profile may set `vendor`, `model`, or both (at least one is required). Profile ids are non-empty, trimmed, and match `[A-Za-z0-9_-]+`.
+Define reusable vendor/model/reasoning-effort bindings under `agent.profiles.<id>`. Each profile may set `vendor`, `model`, `reasoningEffort`, or any combination (at least one is required). Profile ids are non-empty, trimmed, and match `[A-Za-z0-9_-]+`.
 
 Profiles do not carry params, env, or timeouts.
 
@@ -258,8 +257,9 @@ This named form remains compatibility input. For new canonical registry configur
 | `profile` | Name of an entry in `agent.profiles` |
 | `vendor` | Inline vendor override |
 | `model` | Inline model override |
+| `reasoningEffort` | Inline reasoning-effort override (`low`, `medium`, `high`, `xhigh`, or `none`) |
 
-A role may use a profile ref, inline vendor/model, or both (inline wins over the selected profile for the same field).
+A role may use a profile ref, inline vendor/model/reasoningEffort, or both (inline wins over the selected profile for the same field).
 
 Project-level `projects[].roles.*.agent` bindings are **not supported**. Agent identity is global-only; project role partials that set agent fields fail validation.
 
@@ -267,9 +267,9 @@ Project-level `projects[].roles.*.agent` bindings are **not supported**. Agent i
 
 For each coding role, Looper overlays identity in this order:
 
-1. **Global** `agent.vendor` / `agent.model`
+1. **Global** `agent.vendor` / `agent.model` / `agent.reasoningEffort`
 2. **Role profile** — from the effective canonical registry (projected from `roles.<role>.agent` and then overlaid by `roles.coding.<role>.agent`)
-3. **Role inline** — the registry's inline vendor/model fields win over the selected profile
+3. **Role inline** — the registry's inline vendor/model/reasoningEffort fields win over the selected profile
 
 A role is runnable only when the overlay leaves a non-empty vendor. Missing global vendor is fine when a profile or role inline supplies one.
 
@@ -283,9 +283,15 @@ A role is runnable only when the overlay leaves a non-empty vendor. Missing glob
 
 After the full overlay, an empty-string model is kept as an explicit empty binding (not the same as unset): the vendor CLI uses its own default, and any global `agent.params` `--model`/`-m` flags are stripped so they cannot override the suppression.
 
+### Reasoning-effort semantics
+
+`reasoningEffort` accepts `low`, `medium`, `high`, `xhigh`, or `none`. Values are trimmed and case-insensitive in config input, then stored in their lowercase canonical form. An omitted value inherits from the previous layer; an explicit `none` suppresses an inherited effort setting. Vendor adapters translate the resolved value only where that vendor exposes a corresponding CLI setting.
+
+The resolved effort is part of the durable `agent_snapshot_json` created for each run. A retry, resume, native resume, or interactive takeover uses that snapshot instead of the current live role configuration, so changing a role's effort cannot silently change an in-flight run or its human handback command.
+
 ### Coordinator triage
 
-Coordinator triage LLM uses the **global** agent only (`agent.vendor` / `agent.model`, plus global params/env/timeouts). It does not read `roles.coordinator.agent` or coding-role profile bindings. If global `agent.vendor` is unset, triage LLM is skipped; coding roles that resolve via profile or role bindings can still run.
+Coordinator triage LLM uses the **global** agent only (`agent.vendor` / `agent.model` / `agent.reasoningEffort`, plus global params/env/timeouts). It does not read `roles.coordinator.agent` or coding-role profile bindings. If global `agent.vendor` is unset, triage LLM is skipped; coding roles that resolve via profile or role bindings can still run.
 
 ### Hot reload and frozen runs
 
@@ -302,15 +308,18 @@ TOML:
 [agent]
 vendor = "codex"
 model = "gpt-5"
+reasoningEffort = "medium"
 
-# Shared identity presets (vendor + model only).
+# Shared identity presets (vendor + model + reasoning effort).
 [agent.profiles.fast]
 vendor = "codex"
 model = "gpt-5-mini"
+reasoningEffort = "low"
 
 [agent.profiles.strong]
 vendor = "claude-code"
 model = "claude-sonnet"
+reasoningEffort = "high"
 
 # Worker keeps the global codex/gpt-5 binding (no roles.worker.agent block).
 
@@ -318,13 +327,15 @@ model = "claude-sonnet"
 profile = "strong"
 # Optional inline pin on top of the profile:
 # model = "claude-opus"
+# reasoningEffort = "xhigh"
 
 [roles.fixer.agent]
 profile = "fast"
 
-# Suppress model so the vendor CLI default is used:
+# Suppress model and reasoning so the vendor defaults are used:
 # [roles.planner.agent]
 # model = ""
+# reasoningEffort = "none"
 ```
 
 Equivalent JSON:
@@ -334,9 +345,10 @@ Equivalent JSON:
   "agent": {
     "vendor": "codex",
     "model": "gpt-5",
+    "reasoningEffort": "medium",
     "profiles": {
-      "fast": { "vendor": "codex", "model": "gpt-5-mini" },
-      "strong": { "vendor": "claude-code", "model": "claude-sonnet" }
+      "fast": { "vendor": "codex", "model": "gpt-5-mini", "reasoningEffort": "low" },
+      "strong": { "vendor": "claude-code", "model": "claude-sonnet", "reasoningEffort": "high" }
     }
   },
   "roles": {
@@ -499,6 +511,38 @@ requireAssigneeCurrentUser = false
 [roles.coding.worker.agent]
 profile = "fast"
 ```
+
+## Triager admission policy
+
+The internal Triager separates deterministic admission from model classification. `roles.triager.preset` is project-overridable and defaults to `legacy`, which preserves the original model-first seven-condition gate exactly. Opting into a relationship preset makes forge facts—not Issue prose—the admission authority.
+
+| Preset | Owner | Member/collaborator | Past contributor | Unaffiliated |
+| --- | --- | --- | --- | --- |
+| `personal` | `auto` | `assess` | `assess` | `assess` |
+| `maintained-oss` | `auto` | `auto` | `assess` | `assess` |
+| `company` | `auto` | `assess` | `assess` | `assess` |
+| `contributing` | `assess` | `assess` | `assess` | `assess` |
+
+- `auto` writes a Triage Report and routes directly to Planner without a classification model call.
+- `assess` runs classification when `classify = true`, writes the result, and waits for the report-specific `/plan <token>` confirmation. Classification describes the work but cannot authorize routing.
+- `ignore` writes the admission decision and retires that source without a model call.
+- Bot authors default to `ignore`; `looper:hold` always produces `ignore` for configured presets. Neither can be overridden to `auto`.
+- `contributing` can never auto-route, including through a tier override.
+- If the forge cannot report repository visibility, a would-be `auto` result degrades to `assess` rather than guessing.
+
+Tier overrides use `owner`, `member`, `past-contributor`, `unaffiliated`, or `bot` keys:
+
+```toml
+[roles.triager]
+preset = "company"
+classify = true
+
+[roles.triager.authorTiers]
+member = "auto"
+unaffiliated = "ignore"
+```
+
+The historic gate remains configurable under `roles.triager.legacy`: `autoRouteConfidence` (`0.8`), `maxAutoRouteRisk` (`low`), `requireInScope`, `requireNoMissingInformation`, `requirePlanner`, and `requireRationale` (all `true`). These fields apply only to `legacy`; an omitted Triager section therefore behaves exactly as before.
 
 ## Coordinator config reference
 
@@ -848,34 +892,39 @@ decides what it may do with that judgement.
 | --- | --- |
 | `observe` (default) | Gate report only. Nothing is published, nothing is merged. |
 | `advise` | Additionally publishes the verdict and every blocking reason on the pull request, so the decision costs one read instead of a re-investigation. The human still merges. |
-| `auto` | Gatekeeper merges what it judges eligible, after re-establishing that judgement immediately beforehand. |
+| `auto` | Requires a completed Looper/Codex review for the current head, then publishes the `Looper Gatekeeper` status for that exact **pull request head SHA**. GitHub branch protection consumes the status; Gatekeeper never calls merge itself. |
 
-### What `auto` does before merging
+`auto` has one required external authority: GitHub branch protection must require
+the `Looper Gatekeeper` status context on the target branch. The status is the
+enforcement point for Mergify's branch-protection queue injection on the PR head;
+the local Gate report remains audit evidence only. If protection does not
+require that context, Gatekeeper publishes a failing status and marks the PR
+ineligible — but an *unrequired* failing status cannot stop merge, so operators
+must add the required check before relying on `auto`.
 
-An eligible verdict is not a licence. Holds, reviews, threads, and project policy
-can all change without moving the head, so a Gate report is only ever a statement
-about the moment it was made.
+**Known limitations at `auto`:**
 
-At `auto`, Gatekeeper therefore **re-runs the complete evaluation** immediately
-before merging and proceeds only if it still passes against the same head. A
-cheaper head comparison would miss exactly the changes that invariant names. The
-merge itself passes `--match-head-commit`, so the forge refuses if anything was
-pushed in between — the decision cannot be applied to a commit it was not made
-about.
-
-Every attempt is recorded, refusals included, with the gates that blocked the
-confirming pass. The merge is immediate rather than handed to GitHub's
-auto-merge: auto-merge applies the decision later, by which time the evaluation
-behind it is stale.
-
-`auto` cannot be combined with `roles.reviewer.autoMerge.enabled`. Two merge
-authorities on one pull request is not a configuration anyone can reason about —
-whichever wins the race decides, and Reviewer's path checks a strictly narrower
-set of gates.
+- Status is keyed by commit SHA, not pull request. If two open pull requests share
+  the same head commit, discovery aggregates their verdicts before publishing
+  success — any blocked open PR on that head keeps the status non-successful.
+- Status is published on the pull request head only. GitHub's native merge queue
+  evaluates required checks on merge-group commits; `auto` does not publish
+  status for those SHAs and cannot satisfy branch protection bound to merge-group
+  heads. Use observe/advise, or require the status only on PR heads with a merge
+  path that does not depend on merge-group checks.
+- `roles.auditor` cannot be enabled on the same project scope while gatekeeper
+  trust is `auto`. Auditor still reads Gatekeeper `MergeOutcome` events that
+  status-only auto no longer emits; forge-observed merge evidence is not yet
+  implemented.
+- `roles.coordinator.postMergeDigest` still classifies merges from Coordinator
+  merge-watch events and historical Gatekeeper `MergeOutcome` rows. Status-only
+  `auto` does not emit new merge-outcome events, so Mergify or manual merges
+  without a linked Coordinator merge-watch are absent from the daily digest
+  until forge-observed merge evidence exists.
 
 ```toml
 [roles.gatekeeper]
-trust = "advise"
+trust = "auto"
 ```
 
 Project overrides use `projects[].roles.gatekeeper.trust`.
@@ -911,13 +960,11 @@ report is audit evidence rather than merge authority.
 
 ### Relationship to `roles.reviewer.autoMerge`
 
-These are two different merge stories, and today they coexist: Reviewer's
-auto-merge opts a PR into GitHub's native auto-merge on its own approval, while
-Gatekeeper only observes or advises. Reviewer's path checks a narrower set of
-conditions — notably **not** unresolved review threads or requested changes.
-[#116](https://github.com/MumuTW/looper/issues/116) consolidates both behind this
-ladder and retires `roles.reviewer.autoMerge`; until `auto` exists, Reviewer's
-setting remains the only way Looper merges anything.
+These are two different responsibilities. Reviewer can opt a PR into GitHub's
+native auto-merge, while `Gatekeeper = auto` supplies the externally enforced
+status that prevents GitHub or Mergify from completing a merge until the exact
+head has a completed Codex review and every other Gatekeeper condition passes.
+Reviewer approval alone is therefore insufficient once the status is required.
 
 ## Merge Gatekeeper diff budget (`roles.gatekeeper.diffBudget`)
 
@@ -925,10 +972,9 @@ The diff budget is an optional boolean change-size guard. When configured,
 Gatekeeper reads GitHub's provider-observed `changedFiles` and `deletions` for
 the exact pull-request head during evaluation and blocks the verdict when either
 count exceeds its configured bound. GitHub's provider metadata is the authority
-for the counts; the agent's output is not used. The gate runs on both the primary
-evaluation and the confirming pass before an `auto` merge, and it fails closed
-(blocking with `provider_state_unavailable`) when the enabled stats cannot be
-read.
+for the counts; the agent's output is not used. The gate runs during periodic
+Gatekeeper evaluation and fails closed (blocking with `provider_state_unavailable`)
+when the enabled stats cannot be read.
 
 | Path | Purpose | Default |
 | --- | --- | --- |
@@ -982,13 +1028,9 @@ Reviewers should weigh these blind spots before relying on it:
   the head does not. The discovery fingerprint includes the base SHA so a
   rewritten merge base invalidates a reused verdict rather than serving a stale
   one for up to the skip window.
-- At the `auto` trust level the merge action binds only the pull-request head
-  (`gh pr merge --match-head-commit`); GitHub's merge API accepts no parameter
-  that atomically pins the base. The confirming pass revalidates the base
-  immediately before the merge, but if the base branch advances in the window
-  between that final read and the merge call itself, the merge can still proceed
-  against a new base whose recomputed diff exceeds the budget. That window is
-  narrow but not closed — it is a documented blind spot, not a guarantee.
+- At the `auto` trust level Gatekeeper publishes commit status only; it never
+  merges. The diff-budget gate still runs on each evaluation and fails closed when
+  the enabled stats cannot be read or the merge base advances between reads.
 
 ## Pipeline digest (`roles.escalator`)
 
@@ -1174,17 +1216,16 @@ retryMaxAttempts = 5
 retryBaseDelayMs = 5000
 
 [agent]
-vendor = "opencode"
+vendor = "codex"
 model = "your-model-if-needed"
+reasoningEffort = "medium"
 
-# Optional named identity presets (vendor + model only). See
+# Optional named identity presets (vendor + model + reasoning effort). See
 # "Multi-role agent vendor and model" above.
 # [agent.profiles.fast]
-# vendor = "opencode"
+# vendor = "codex"
 # model = "cheaper-model"
-
-[agent.params]
-reasoning = "medium"
+# reasoningEffort = "low"
 
 [agent.env]
 OPENAI_API_KEY = "replace-me"
@@ -1426,7 +1467,7 @@ Canonical replacement:
 [roles.reviewer]
 instructions = "Review for correctness, regressions, and migration safety."
 
-# Optional per-role agent identity (profile and/or inline vendor/model).
+# Optional per-role agent identity (profile and/or inline vendor/model/reasoningEffort).
 # [roles.reviewer.agent]
 # profile = "strong"
 
@@ -1576,7 +1617,9 @@ validationCommands = ["make check"]
 
 Looper logs each project using this deprecated fallback. Move commands into every `projects[].validation.commands` block, verify the project-specific commands, then remove `defaults.validationCommands`. A project-level policy always wins over the legacy global list, including an explicit opt-out.
 
-The command strings come from daemon configuration, but commands such as `make check` and `go test ./...` intentionally execute repository-controlled code. Looper therefore launches each command through the vendor-neutral [Sandbox Runtime](https://github.com/anthropic-experimental/sandbox-runtime) (`srt`) process boundary: network access is disabled, `HOME`/XDG/Go write caches are disposable, daemon credentials (`SSH_AUTH_SOCK`, `LOOPER_CONFIG`, forge/API keys) are omitted, and writes are limited to the worktree plus that disposable root. Tool directories on `PATH` and the existing Go module cache are read-only. Exactly `@anthropic-ai/sandbox-runtime@0.0.67` and its platform support tools are required when any project has validation commands enabled. Install the runtime and its complete `node_modules` dependency tree in a dedicated administrator-owned prefix, and install Node, `ripgrep`, and (on Linux) `bubblewrap`/`socat` in paths whose files and ancestor directories the daemon user cannot modify. User-writable npm/Homebrew installs are intentionally rejected so an authorized coding agent cannot replace the next restricted runner, and sandboxed execution is rejected when `looperd` runs as root. Ubuntu 24.04+ also needs SRT's documented AppArmor `userns` allowance (or `kernel.apparmor_restrict_unprivileged_userns=0`). If the runtime is missing or rejects the profile, validation fails closed rather than falling back to an unsandboxed shell.
+The command strings come from daemon configuration, but commands such as `make check` and `go test ./...` intentionally execute repository-controlled code. Looper therefore launches each command through the vendor-neutral [Sandbox Runtime](https://github.com/anthropic-experimental/sandbox-runtime) (`srt`) process boundary: network access is disabled, `HOME`/XDG/Go write caches are disposable, daemon credentials (`SSH_AUTH_SOCK`, `LOOPER_CONFIG`, forge/API keys) are omitted, and writes are limited to the worktree plus that disposable root. Tool directories on `PATH` and the existing Go module cache are read-only. Exactly `@anthropic-ai/sandbox-runtime@0.0.67` and its platform support tools are required when any project has validation commands enabled.
+
+The installation authority is a root-owned `.looper-srt-trust.json` manifest at the runtime install prefix. Build `./cmd/looper-srt-seal`, run it as root after installing the runtime, and pass the complete `node_modules` tree plus the absolute launcher, Node, `ripgrep`, and platform support-tool paths. The sealer records SHA-256 digests for the runtime and all transitive npm packages, script interpreter, ELF interpreter, support binaries, the resolved `ldd` closure resolver, and their shared-library closure. Before every sandbox spawn, Looper verifies the sealed bytes and recomputes the same closure; writable ancestor directories are not authority and do not make an otherwise matching install fail. A missing, non-root-owned, stale, or incomplete manifest fails closed. Sandboxed execution is also rejected when `looperd` runs as root. This detects substitution but does not eliminate the verify-to-exec TOCTOU window, and root ownership cannot constrain an operator or CI account with passwordless sudo. Ubuntu 24.04+ still needs SRT's documented AppArmor `userns` allowance (or `kernel.apparmor_restrict_unprivileged_userns=0`). If the runtime is missing or rejects the profile, validation fails closed rather than falling back to an unsandboxed shell.
 
 When this gate is configured, Looper is the fetch-and-publish authority. The daemon prepares the worktree before execution, then launches the coding agent with a read-isolated permission profile and a disposable, allowlisted tool environment. The agent's parent process can still authenticate to its model provider, but model-invoked tools cannot read daemon `HOME`/`CODEX_HOME`, SSH agents, forge credentials, or unrelated host files; they can edit and commit only inside the prepared worktree and cannot use the network. Looper then pushes the exact commit SHA that passed validation. A later local `HEAD` change is not included in that push.
 

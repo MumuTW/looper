@@ -246,6 +246,29 @@ export type ActiveRunWorktree = {
   branch?: string | null;
 };
 
+/** Redacted daemon-owned evidence for a Worker timeout continuation. */
+export type ActiveRunProgress = {
+  headSha?: string | null;
+  worktreeId?: string | null;
+  branch?: string | null;
+  changedFileCount: number;
+  stagedFileCount: number;
+  untrackedFileCount: number;
+  diffFingerprint?: string | null;
+  timeoutType?: string | null;
+  lastProgressAt?: string | null;
+  capturedAt?: string | null;
+};
+
+export type ActiveRunContinuation = {
+  predecessorRunId?: string | null;
+  predecessorExecutionId?: string | null;
+  mode?: string | null;
+  outcome?: "preserved" | "changed" | "committed" | "lost" | string | null;
+  beforeTimeout?: ActiveRunProgress | null;
+  afterRestart?: ActiveRunProgress | null;
+};
+
 export type ActiveRun = {
   seq: number;
   runId?: string | null;
@@ -268,6 +291,7 @@ export type ActiveRun = {
   target: ActiveRunTarget;
   agent?: ActiveRunAgent | null;
   worktree?: ActiveRunWorktree | null;
+  continuation?: ActiveRunContinuation | null;
 };
 
 export type ActiveRunsList = {
@@ -371,6 +395,8 @@ export type Loop = {
   convergence?: ReviewerConvergence | null;
   /** Latest run's derived outcome, when that run was a fixer run. */
   outcome?: FixerRunOutcome | null;
+  /** Redacted timeout-continuation evidence from the latest run, including closed loops. */
+  continuation?: ActiveRunContinuation | null;
 };
 
 export type LoopsList = {
@@ -424,12 +450,13 @@ export type ConfigMetadata = {
 export type ConfigAgentProfileView = {
   vendor?: string | null;
   model?: string | null;
+  reasoningEffort?: string | null;
 };
 
 export type ConfigAgentView = {
   vendor?: string | null;
   model?: string | null;
-  /** Named vendor/model profiles (no params). */
+  /** Named vendor/model/reasoning-effort profiles (no params). */
   profiles?: Record<string, ConfigAgentProfileView>;
   nativeResume?: { enabled?: boolean };
   timeouts?: Record<string, number>;

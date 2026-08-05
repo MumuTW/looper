@@ -1,9 +1,12 @@
 // Package runpipe holds the mechanical scaffolding shared by the planner,
 // worker, fixer, and reviewer runners: queue failure classification, run
-// record persistence, and queue item failure handling. Each runner retains
-// its own step execution logic and ProcessClaimedItem orchestration; runpipe
-// only owns the persistence primitives that were previously copy-pasted
-// across four packages.
+// record persistence, queue item failure handling, and (under #537) the
+// StepRunner step-loop engine. Only the planner has migrated its
+// ProcessClaimedItem loop onto StepRunner so far; worker, reviewer, and
+// fixer still own their historical step-loop copies until their slices
+// land. Each runner retains its own step execution logic and
+// ProcessClaimedItem orchestration beyond what StepRunner owns; runpipe
+// centralizes the persistence primitives and the shared ordering contract.
 //
 // Authority: the runner remains the authority for step execution and
 // orchestration. runpipe is the authority for the mechanical shape of run
@@ -20,12 +23,12 @@
 //	it in sync is low: the scaffolding is mechanical and has no branching on
 //	runner-specific state.
 //
-//	What does it still not catch? ProcessClaimedItem itself is still
-//	duplicated across four runners — the step loop, error classification, and
-//	event emission remain per-runner. Extracting ProcessClaimedItem would
-//	require a generic step-execution interface that risks abstracting away
-//	real differences in how each runner handles awaiting-human, hold-skip, and
-//	label-mismatch errors. That extraction is deliberately deferred.
+//	What does it still not catch? StepRunner adoption is incremental: only
+//	the planner uses it today, so worker/reviewer/fixer still carry their
+//	own step-loop copies until migrated. Even after full adoption, runner-
+//	specific failure dispatch (awaiting-human, hold-skip, label-mismatch)
+//	stays in OnFailure hooks rather than a generic step-execution interface
+//	that would abstract away real behavioral differences.
 package runpipe
 
 import (

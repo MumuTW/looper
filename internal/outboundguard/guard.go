@@ -35,6 +35,10 @@ var (
 	highEntropyCandidateRE = regexp.MustCompile(`[A-Za-z0-9_+/=-]{24,}`)
 	gitObjectIDRE          = regexp.MustCompile(`(?i)^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
 	uuidRE                 = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	// assignmentNameRE recognizes the NAME part of a NAME=value candidate token
+	// so the value can be evaluated separately. Base64 '=' padding does not
+	// qualify: its prefix contains non-identifier characters.
+	assignmentNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
 // sensitiveEnvNameKeywords are long, high-confidence segments only. Matched as
@@ -125,11 +129,60 @@ func unsafeText(text string, highEntropyExemptions []string) string {
 		if gitObjectIDRE.MatchString(token) || uuidRE.MatchString(token) {
 			continue
 		}
+		// A NAME=value candidate with a Git object ID or UUID value is exempt;
+		// those are Looper's own durable identifier formats (for example,
+		// fixItemsFingerprint=<sha1>). Non-exempt assignments retain their
+		// NAME=value structure for the entropy check so long hexadecimal values
+		// cannot evade the bar by being judged as the value alone.
+		if value, isAssignment := assignmentValue(token); isAssignment {
+			if value == "" || gitObjectIDRE.MatchString(value) || uuidRE.MatchString(value) {
+				continue
+			}
+			// A secret value can be high-entropy even when it uses only one
+			// character class (for example a long alphabetic token). Check the
+			// value on its own before using the assignment structure as extra
+			// evidence; otherwise the NAME= prefix can make the result depend on
+			// how many classes happen to occur in the variable name.
+			if shannonEntropy(value) >= highEntropyThreshold {
+				return "contains a high-entropy credential-shaped token"
+			}
+			// Preserve the assignment structure for non-exempt values. The
+			// separator/name is evidence that a high-entropy token is being
+			// published as a credential-shaped assignment; judging only the
+			// value lets long hexadecimal credentials fall below the entropy
+			// threshold even though the full assignment is secret-shaped.
+			if characterClassCount(token) >= 3 && shannonEntropy(token) >= highEntropyThreshold {
+				return "contains a high-entropy credential-shaped token"
+			}
+			continue
+		}
 		if characterClassCount(token) >= 3 && shannonEntropy(token) >= highEntropyThreshold {
 			return "contains a high-entropy credential-shaped token"
 		}
 	}
 	return ""
+}
+
+// assignmentValue splits a NAME=value-shaped candidate token, reporting the
+// value separately so the entropy check judges the secret-shaped part alone.
+// ok is false for tokens that are not identifier assignments, so anything
+// ambiguous stays judged as a whole:
+//   - the '=' is base64 padding rather than an assignment separator — an
+//     identifier-shaped base64 blob like Zm9v...== would otherwise split into
+//     a value of "=" or "" that can never trip the entropy bar, letting a
+//     padded base64 credential bypass detection;
+//   - a trailing '=' with nothing after it, which is padding or a malformed
+//     assignment with no value to judge.
+func assignmentValue(token string) (string, bool) {
+	separator := strings.IndexByte(token, '=')
+	if separator <= 0 || !assignmentNameRE.MatchString(token[:separator]) {
+		return "", false
+	}
+	value := token[separator+1:]
+	if value == "" || value[0] == '=' {
+		return "", false
+	}
+	return value, true
 }
 
 // isSensitiveAssignment reports high-confidence env-style credential lines such

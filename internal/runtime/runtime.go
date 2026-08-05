@@ -25,7 +25,6 @@ import (
 	"github.com/MumuTW/looper/internal/infra/notify"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops"
-	networkclient "github.com/MumuTW/looper/internal/network/client"
 	"github.com/MumuTW/looper/internal/processidentity"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/storage"
@@ -227,7 +226,6 @@ type Runtime struct {
 	databaseDaemonLock          *storage.DatabaseLock
 	webhookForwarder            WebhookForwarder
 	notificationGateways        *schedulerNotificationGatewayFactory
-	networkManager              runtimeNetworkManager
 	schedulerDisabled           bool
 	startupReadyOnce            sync.Once
 	startupReadyErr             error
@@ -246,13 +244,6 @@ type Runtime struct {
 	// storageRetained is true when Stop skipped coordinator.Close after a
 	// drain failure so undrained ownership is not closed under SQLite.
 	storageRetained bool
-}
-
-type runtimeNetworkManager interface {
-	Start(context.Context) error
-	Stop()
-	Status() networkclient.Status
-	UpdateConfig(config.Config)
 }
 
 const reviewerRecoveryLoginTimeout = 3 * time.Second
@@ -461,8 +452,6 @@ func (r *Runtime) Stop(reason string) {
 		r.stopped = true
 		forwarder := r.webhookForwarder
 		r.webhookForwarder = nil
-		networkManager := r.networkManager
-		r.networkManager = nil
 		coordinator := r.services.Coordinator
 		repositories := r.services.Repositories
 		ownershipAcquired := r.ownershipAcquired
@@ -475,13 +464,10 @@ func (r *Runtime) Stop(reason string) {
 			}
 		}
 
-		// Independent infra (forwarder/network) still stop on drain failure;
+		// Independent webhook infra still stops on drain failure;
 		// they are not Supervisor domain and must not block retain-storage.
 		if forwarder != nil {
 			forwarder.Close()
-		}
-		if networkManager != nil {
-			networkManager.Stop()
 		}
 
 		// #577: retain SQLite when containment drain failed. Never report
@@ -777,16 +763,6 @@ func (r *Runtime) WebhookForwarder() WebhookForwarder {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.webhookForwarder
-}
-
-func (r *Runtime) NetworkStatus() networkclient.Status {
-	r.mu.RLock()
-	manager := r.networkManager
-	r.mu.RUnlock()
-	if manager == nil {
-		return networkclient.Status{}
-	}
-	return manager.Status()
 }
 
 func runtimeHomeDirOrEmpty() string {
@@ -1122,16 +1098,12 @@ func (r *Runtime) start(ctx context.Context) error {
 		}
 	}
 	r.githubGateway = githubGateway
-	r.networkManager = networkclient.NewManager(filepath.Join(runtimeHomeDirOrEmpty(), ".looper", "network.json"), r.config, repositories, githubGateway)
 	r.databaseDaemonLock = lock
 	r.schedulerDisabled = schedulerDisabled
 	r.mu.Unlock()
 	resourcesPublished = true
 
 	if r.deferRecovery {
-		if r.networkManager != nil {
-			_ = r.networkManager.Start(context.Background())
-		}
 		started = true
 		return nil
 	}
@@ -1184,13 +1156,6 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		r.recovery = recoverySummary
 		r.ownershipAcquired = true
 		r.mu.Unlock()
-		if r.networkManager != nil {
-			if err := r.networkManager.Start(ctx); err != nil {
-				r.startupReadyErr = err
-				return
-			}
-		}
-
 		if r.webhook != nil {
 			if err := r.webhook.Start(repositories); err != nil {
 				r.startupReadyErr = err
@@ -1422,13 +1387,9 @@ func (r *Runtime) publishProjectsSnapshot(materialized []config.ProjectRefConfig
 func (r *Runtime) publishCatalogConsumers(next config.Config) {
 	r.mu.RLock()
 	webhook := r.webhook
-	networkManager := r.networkManager
 	r.mu.RUnlock()
 	if webhook != nil {
 		webhook.updateConfig(next)
-	}
-	if networkManager != nil {
-		networkManager.UpdateConfig(next)
 	}
 }
 

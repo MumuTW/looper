@@ -24,7 +24,9 @@ import (
 	"github.com/MumuTW/looper/internal/loops"
 	"github.com/MumuTW/looper/internal/loops/failureclass"
 	"github.com/MumuTW/looper/internal/loops/runpipe"
+	"github.com/MumuTW/looper/internal/planner/workgraph"
 	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/workgraphdispatch"
 	"github.com/MumuTW/looper/internal/worktreesafety"
 )
 
@@ -178,6 +180,7 @@ type GitHubGateway interface {
 	AddIssueAssignees(context.Context, IssueAssigneesInput) error
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
+	ViewPullRequestForDiscovery(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	CreatePullRequest(context.Context, CreatePullRequestInput) (CreatePullRequestResult, error)
 	UpdatePullRequestBody(context.Context, UpdatePullRequestBodyInput) error
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
@@ -254,9 +257,10 @@ type AgentRunInput struct {
 	IdempotencyKey   string
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
-	UseSnapshot    bool
-	SnapshotVendor string
-	SnapshotModel  *string
+	UseSnapshot             bool
+	SnapshotVendor          string
+	SnapshotModel           *string
+	SnapshotReasoningEffort *config.ReasoningEffort
 }
 
 type AgentResult struct {
@@ -264,6 +268,7 @@ type AgentResult struct {
 	Summary                      string
 	Stdout                       string
 	Stderr                       string
+	CompletionPayload            string
 	Commits                      []string
 	Lifecycle                    *lifecycle.State
 	TimeoutType                  string
@@ -308,6 +313,7 @@ type Options struct {
 	Disclosure              *config.DisclosureConfig
 	AgentRuntime            string
 	AgentProfileID          string
+	AgentReasoningEffort    *config.ReasoningEffort
 	CustomInstructions      *config.Config
 	AgentModel              *string
 	RetryBaseDelay          time.Duration
@@ -341,6 +347,7 @@ type Runner struct {
 	disclosure              config.DisclosureConfig
 	agentRuntime            string
 	agentProfileID          string
+	agentReasoningEffort    *config.ReasoningEffort
 	customInstructions      config.Config
 	projectRoleConfig       *config.Config
 	agentModel              *string
@@ -349,6 +356,7 @@ type Runner struct {
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onQueueItemEnqueued     func()
 	discoveryPolicy         DiscoveryPolicy
+	workGraphs              *workgraphdispatch.Service
 }
 
 type DiscoveryInput struct {
@@ -417,6 +425,7 @@ type checkpointWriteSpec struct {
 	Status                       string           `json:"status,omitempty"`
 	Summary                      string           `json:"summary,omitempty"`
 	Stdout                       string           `json:"stdout,omitempty"`
+	WorkGraphID                  string           `json:"workGraphId,omitempty"`
 	Commits                      []string         `json:"commits,omitempty"`
 	Lifecycle                    *lifecycle.State `json:"gitPrLifecycle,omitempty"`
 	GitReconciled                bool             `json:"gitReconciled,omitempty"`
@@ -503,7 +512,10 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultPlanTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), agentProfileID: strings.TrimSpace(options.AgentProfileID), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: cloneStringPtr(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
+	runner := &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), agentProfileID: strings.TrimSpace(options.AgentProfileID), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: cloneStringPtr(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
+	runner.agentReasoningEffort = cloneReasoningEffortPtr(options.AgentReasoningEffort)
+	runner.workGraphs = workgraphdispatch.New(workgraphdispatch.Options{DB: options.DB, Repositories: options.Repos, Now: now, RetryMaxAttempts: retryMax, OnEnqueued: options.OnQueueItemEnqueued})
+	return runner
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -823,6 +835,14 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser}
 }
 
+func (r *Runner) workerRoleConfigured(projectID string) bool {
+	if r.projectRoleConfig == nil {
+		return true
+	}
+	_, ok := config.ResolveAgent(*r.projectRoleConfig, projectID, config.CodingRoleWorker)
+	return ok
+}
+
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*runpipe.ProcessResult, error) {
 	if r.repos == nil || r.repos.Queue == nil {
 		return nil, fmt.Errorf("planner queue repository is not configured")
@@ -950,33 +970,37 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(resumedRun.StartStep)}})
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
 
-	for _, step := range stepsFrom(resumedRun.StartStep) {
-		run, err = r.persistStepStarted(ctx, run, step, checkpoint)
-		if err != nil {
-			return runpipe.ProcessResult{}, err
-		}
-		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step)}})
-		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint})
-		if err != nil {
+	engine := runpipe.StepRunner[PlannerStep, plannerCheckpoint]{
+		PersistStarted:   r.persistStepStarted,
+		PersistCompleted: r.persistStepCompleted,
+		EmitStepEvent: func(ctx context.Context, eventType string, step PlannerStep, run storage.RunRecord) {
+			r.appendEvent(ctx, eventInput{eventType: eventType, projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step)}})
+		},
+		Execute: func(ctx context.Context, step PlannerStep, run storage.RunRecord, checkpoint plannerCheckpoint) (plannerCheckpoint, error) {
+			return r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint})
+		},
+		OnFailure: func(ctx context.Context, step PlannerStep, run storage.RunRecord, checkpoint plannerCheckpoint, stepErr error) (runpipe.ProcessResult, bool, error) {
 			var awaiting *plannerAwaitingHumanError
-			if errors.As(err, &awaiting) {
-				return r.suspendPlannerForHuman(ctx, *loop, run, queueItem, checkpoint, awaiting)
+			if errors.As(stepErr, &awaiting) {
+				result, err := r.suspendPlannerForHuman(ctx, *loop, run, queueItem, checkpoint, awaiting)
+				return result, err == nil, err
 			}
 			var holdErr *runpipe.HoldSkipError
-			if errors.As(err, &holdErr) {
-				return r.finishHeldPlannerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.Summary)
+			if errors.As(stepErr, &holdErr) {
+				result, err := r.finishHeldPlannerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.Summary)
+				return result, err == nil, err
 			}
-			failure := r.classifyFailureWithBoundary(err, plannerFailureBoundaryForStep(step))
+			failure := r.classifyFailureWithBoundary(stepErr, plannerFailureBoundaryForStep(step))
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
 			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.Kind), latest.ResumePolicy)
 			if _, err := r.completeRun(ctx, run, "failed", failure.Message, failure.Message, latest); err != nil {
-				return runpipe.ProcessResult{}, err
+				return runpipe.ProcessResult{}, false, err
 			}
 			r.appendEvent(ctx, eventInput{eventType: "loop.step.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"message": failure.Message, "failureKind": string(failure.Kind), "currentStep": derefString(run.CurrentStep)}})
 			r.appendEvent(ctx, eventInput{eventType: "run.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": failure.Message, "failureKind": string(failure.Kind)}})
 			failedQueue, err := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
 			if err != nil {
-				return runpipe.ProcessResult{}, err
+				return runpipe.ProcessResult{}, false, err
 			}
 			if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 				updated.LastRunAt = runpipe.StringPtr(r.nowISO())
@@ -991,22 +1015,30 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					updated.NextRunAt = nil
 				}
 			}); err != nil {
-				return runpipe.ProcessResult{}, err
+				return runpipe.ProcessResult{}, false, err
 			}
-			return runpipe.ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.Message, FailureKind: failure.Kind}, nil
-		}
-		if step == stepDiscoverIssues {
-			claimedLockKey = checkpoint.ClaimedLockKey
-			acquiredClaimedLock = claimedLockKey != ""
-		}
-		run, err = r.persistStepCompleted(ctx, run, step, checkpoint)
-		if err != nil {
-			return runpipe.ProcessResult{}, err
-		}
-		r.appendEvent(ctx, eventInput{eventType: "loop.step.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step)}})
-		if checkpoint.SkipReason != "" {
-			break
-		}
+			return runpipe.ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.Message, FailureKind: failure.Kind}, true, nil
+		},
+		AfterExecuted: func(_ context.Context, step PlannerStep, checkpoint plannerCheckpoint) {
+			// Rebind before completion persists: if PersistCompleted fails,
+			// the deferred release must already cover the lock discover
+			// acquired (its local error-release path is disabled by then).
+			if step == stepDiscoverIssues {
+				claimedLockKey = checkpoint.ClaimedLockKey
+				acquiredClaimedLock = claimedLockKey != ""
+			}
+		},
+		AfterCompleted: func(_ context.Context, _ PlannerStep, checkpoint plannerCheckpoint) bool {
+			return checkpoint.SkipReason != ""
+		},
+	}
+	var terminal *runpipe.ProcessResult
+	run, checkpoint, terminal, err = engine.Run(ctx, stepsFrom(resumedRun.StartStep), run, checkpoint)
+	if err != nil {
+		return runpipe.ProcessResult{}, err
+	}
+	if terminal != nil {
+		return *terminal, nil
 	}
 
 	summary := checkpoint.SkipReason
@@ -1080,7 +1112,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		return input.Checkpoint, err
 	}
 	currentLogin := firstNonEmpty(normalizeLogin(stringFromAnyDefault(payload["currentUserLogin"])), input.CheckpointIssueLogin())
-	failureContext := stringFromAnyDefault(payload["failureContext"])
+	failureContext := mergePlannerFailureContext(stringFromAnyDefault(payload["failureContext"]), payload)
 	lockKey := firstNonEmpty(derefString(input.QueueItem.LockKey), storage.IssueLockKey(input.Project.ID, repo, issueNumber))
 	nowISO := r.nowISO()
 	reason := "planner-run"
@@ -1230,11 +1262,11 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	}
 	if !writeSpecCompleted {
 		executionID := eventlog.NewEventID("agent")
-		agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+		agentVendor, agentModel, _, agentReasoningEffort, useSnapshot, err := r.identityFromRun(input.Run)
 		if err != nil {
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 		}
-		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel))
+		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel), r.workerRoleConfigured(input.Project.ID))
 		metadata := map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
@@ -1246,12 +1278,12 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 				return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 			}
 		}
-		useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
+		useSnap, snapVendor, snapModel, snapReasoningEffort := agentRunSnapshotFields(agentVendor, agentModel, agentReasoningEffort, useSnapshot)
 		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
 			ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 			Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 			Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID),
-			UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+			UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
 		})
 		if err != nil {
 			return checkpoint, err
@@ -1286,6 +1318,22 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			}
 		}
 		checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
+		if result.CompletionPayload != "" {
+			graph, graphErr := workgraph.ParseResult([]byte(result.CompletionPayload))
+			if graphErr != nil {
+				return checkpoint, &runpipe.LoopError{Message: "planner work graph: " + graphErr.Error(), Kind: runpipe.FailureNonRetryable}
+			}
+			if graph != nil {
+				if !r.workerRoleConfigured(input.Project.ID) {
+					return checkpoint, &runpipe.LoopError{Message: "work graph requires a configured worker agent", Kind: runpipe.FailureNonRetryable}
+				}
+				created, createErr := r.workGraphs.Create(ctx, workgraphdispatch.CreateInput{ProjectID: input.Project.ID, ParentRepo: issue.Repo, ParentIssueNumber: issue.IssueNumber, PlannerLoopID: input.Loop.ID, BaseBranch: worktree.BaseBranch, Graph: *graph})
+				if createErr != nil {
+					return checkpoint, &runpipe.LoopError{Message: "persist planner work graph: " + createErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
+				}
+				checkpoint.WriteSpec.WorkGraphID = created.GraphID
+			}
+		}
 		checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
 		if result.Lifecycle != nil {
 			checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
@@ -1503,7 +1551,31 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 		}
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	if checkpoint.WriteSpec != nil && strings.TrimSpace(checkpoint.WriteSpec.WorkGraphID) != "" {
+		if _, err := r.workGraphs.Activate(ctx, checkpoint.WriteSpec.WorkGraphID); err != nil {
+			return checkpoint, &runpipe.LoopError{Message: "activate planner work graph: " + err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		}
+	}
 	return checkpoint, nil
+}
+
+func mergePlannerFailureContext(existing string, payload map[string]any) string {
+	replanReason := strings.TrimSpace(stringFromAnyDefault(payload["replanReason"]))
+	if replanReason == "" {
+		return existing
+	}
+	parts := []string{"Work graph replan context:", "- Reason: " + replanReason}
+	if graphID := strings.TrimSpace(stringFromAnyDefault(payload["workGraphID"])); graphID != "" {
+		parts = append(parts, "- Graph: "+graphID)
+	}
+	if nodeKey := strings.TrimSpace(stringFromAnyDefault(payload["failedNodeKey"])); nodeKey != "" {
+		parts = append(parts, "- Failed node: "+nodeKey)
+	}
+	replanContext := strings.Join(parts, "\n")
+	if strings.TrimSpace(existing) == "" {
+		return replanContext
+	}
+	return existing + "\n\n" + replanContext
 }
 
 func (r *Runner) plannerHoldSummary(ctx context.Context, project storage.ProjectRecord, queueItem storage.QueueItemRecord, loop storage.LoopRecord) (bool, string, error) {
@@ -1545,7 +1617,7 @@ func (r *Runner) plannerHoldSummaryForCheckpoint(ctx context.Context, project st
 	if checkpoint.Publish == nil || checkpoint.Publish.PullRequest == nil || checkpoint.Publish.PullRequest.Number == 0 {
 		return false, "", nil
 	}
-	prDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: checkpoint.Issue.Repo, PRNumber: checkpoint.Publish.PullRequest.Number, CWD: project.RepoPath})
+	prDetail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: checkpoint.Issue.Repo, PRNumber: checkpoint.Publish.PullRequest.Number, CWD: project.RepoPath})
 	if err != nil {
 		return false, "", err
 	}
@@ -1559,7 +1631,7 @@ func (r *Runner) plannerAdoptedPullRequestHoldSummary(ctx context.Context, proje
 	if plannerQueueItemIsManual(queueItem) || r.github == nil || repo == "" || prNumber == 0 {
 		return false, "", nil
 	}
-	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
+	detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
 	if err != nil {
 		return false, "", err
 	}
@@ -1645,7 +1717,7 @@ func (r *Runner) validatedLifecyclePullRequest(ctx context.Context, input stepIn
 	if state == nil || state.PRNumber <= 0 {
 		return nil, nil
 	}
-	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: issue.Repo, PRNumber: state.PRNumber, CWD: input.Project.RepoPath})
+	detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: issue.Repo, PRNumber: state.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
 		return nil, nil
 	}
@@ -1666,7 +1738,7 @@ func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, run storage
 	if r.github == nil || prNumber <= 0 || !r.disclosure.Enabled || !r.disclosure.Channels.PullRequest {
 		return nil
 	}
-	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		return err
 	}
@@ -1686,7 +1758,7 @@ func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, run storage
 // snapshot when present; falls back to runner identity on empty snapshot or
 // parse errors (stamp-only paths must not fail the run).
 func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string) {
-	vendor, modelPtr, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+	vendor, modelPtr, _, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID, r.agentReasoningEffort)
 	if err != nil {
 		// Present but invalid snapshot must not fall back to live runner identity.
 		return "", ""
@@ -2147,7 +2219,7 @@ func (c *plannerCheckpoint) ensureLifecycle(runner, branch, baseBranch string, e
 	}
 }
 
-func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.Config, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
+func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.Config, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, workGraphAllowed bool) (string, config.CustomInstructionBlock) {
 	parts := []string{
 		fmt.Sprintf("Write a planning spec for GitHub issue %s#%d.", issue.Repo, issue.IssueNumber),
 		"Repository: " + issue.Repo,
@@ -2185,6 +2257,11 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 		"- Create or update the spec at " + issue.SpecPath,
 		"- Use Markdown with clear problem, goals, approach, risks, and validation sections",
 		"- Keep the implementation scope aligned to the issue",
+	}
+	if workGraphAllowed {
+		requirements = append(requirements,
+			"- For work that benefits from dependency-ordered child pull requests, include workGraph in the final __LOOPER_RESULT__ JSON: {\"nodes\":[{\"key\":\"stable-key\",\"goal\":\"...\",\"acceptanceCriteria\":[\"...\"],\"dependencies\":[\"prerequisite-key\"],\"expectedPrScope\":\"...\"}]}; each node may depend on at most one prerequisite; omit workGraph for one cohesive implementation",
+		)
 	}
 	if allowAutoPush {
 		requirements = append(requirements, "- Commit the spec changes on the current branch so the PR can be opened")
@@ -2630,7 +2707,7 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky,
 	if previous != nil {
 		previousSnapshot = previous.AgentSnapshotJSON
 	}
-	snapshotJSON, refreshed, legacyResume, err := config.ResolveRunAgentSnapshotJSONForValidationGate(previousSnapshot, sticky, requireToolNetworkDenial, replaysAgentStep, r.agentRuntime, r.agentModel, r.agentProfileID)
+	snapshotJSON, refreshed, legacyResume, err := config.ResolveRunAgentSnapshotJSONForValidationGate(previousSnapshot, sticky, requireToolNetworkDenial, replaysAgentStep, r.agentRuntime, r.agentModel, r.agentProfileID, r.agentReasoningEffort)
 	if err != nil {
 		return nil, err
 	}
@@ -2657,17 +2734,17 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky,
 // identityFromRun returns the vendor/model/profile that must drive this run.
 // When the run has AgentSnapshotJSON, that identity is execution authority.
 // model is a pointer so nil (unset) and non-nil empty (suppress) stay distinct.
-func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, useSnapshot bool, err error) {
-	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, reasoningEffort *config.ReasoningEffort, useSnapshot bool, err error) {
+	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID, r.agentReasoningEffort)
 }
 
-func agentRunSnapshotFields(vendor string, model *string, useSnapshot bool) (bool, string, *string) {
+func agentRunSnapshotFields(vendor string, model *string, reasoningEffort *config.ReasoningEffort, useSnapshot bool) (bool, string, *string, *config.ReasoningEffort) {
 	if !useSnapshot {
-		return false, "", nil
+		return false, "", nil, nil
 	}
 	// Pass through including non-nil empty suppress so SnapshotModel stays
 	// distinct from unset and ParamsForRoleVendor can strip params --model/-m.
-	return true, vendor, model
+	return true, vendor, model, reasoningEffort
 }
 
 func cloneStringPtr(value *string) *string {
@@ -2676,6 +2753,14 @@ func cloneStringPtr(value *string) *string {
 	}
 	trimmed := strings.TrimSpace(*value)
 	return &trimmed
+}
+
+func cloneReasoningEffortPtr(value *config.ReasoningEffort) *config.ReasoningEffort {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func derefString(value *string) string {

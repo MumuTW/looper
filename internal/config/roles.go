@@ -346,6 +346,9 @@ func mergePartialCodingRoleConfig(base, overlay PartialCodingRoleConfig) Partial
 		if overlay.Agent.Model != nil {
 			base.Agent.Model = overlay.Agent.Model
 		}
+		if overlay.Agent.ReasoningEffort != nil {
+			base.Agent.ReasoningEffort = overlay.Agent.ReasoningEffort
+		}
 	}
 	if overlay.Discovery != nil {
 		base.Discovery = mergePartialRoleDiscoveryConfig(base.Discovery, overlay.Discovery)

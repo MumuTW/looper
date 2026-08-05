@@ -85,6 +85,22 @@ func TestMergeRunResumePolicyPreservesOtherFields(t *testing.T) {
 	}
 }
 
+func TestClearTimeoutProgressSupersedesInterruptedObservation(t *testing.T) {
+	t.Parallel()
+	repos := mergeFixture(t)
+	seedRunWithCheckpoint(t, repos, "run_timeout_observing", `{"execution":{"status":"timeout_observing","progressBeforeTimeout":{"headSha":"before"},"progressSnapshotError":"capture interrupted"},"continuation":{"mode":"timeout_observed","outcome":"observation failed","beforeTimeout":{"headSha":"before"}},"work":{"title":"keep"}}`)
+	if err := repos.Runs.ClearTimeoutProgress(context.Background(), "run_timeout_observing", "2026-04-11T13:00:00.000Z"); err != nil {
+		t.Fatalf("ClearTimeoutProgress() error = %v", err)
+	}
+	got := storedCheckpoint(t, repos, "run_timeout_observing")
+	if strings.Contains(got, "timeout_observing") || strings.Contains(got, "progressBeforeTimeout") || strings.Contains(got, "progressSnapshotError") || strings.Contains(got, "continuation") {
+		t.Fatalf("checkpoint = %s, want interrupted observation superseded", got)
+	}
+	if !strings.Contains(got, `"status":"timeout"`) || !strings.Contains(got, `"title":"keep"`) {
+		t.Fatalf("checkpoint = %s, want timeout status and unrelated fields preserved", got)
+	}
+}
+
 func TestMergeWorktreeCleanupTimestampsNormalizesNonObjectCheckpoints(t *testing.T) {
 	t.Parallel()
 	for _, testCase := range []struct{ name, stored string }{
