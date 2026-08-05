@@ -1,5 +1,9 @@
 package gatekeeper
 
+import (
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+)
+
 // MergeOutcomeEventType records a historical Gatekeeper merge attempt at the
 // auto trust level. Auto trust now publishes commit status only and does not
 // merge; this event type remains so Auditor and post-merge digest can read
@@ -14,12 +18,14 @@ type MergeOutcome struct {
 	PRNumber  int64  `json:"prNumber"`
 	// HeadSHA is the commit the decision was made about and, on success, the
 	// commit that was merged.
-	HeadSHA string `json:"headSha"`
+	HeadSHA        string                      `json:"headSha"`
+	MergeCommitSHA string                      `json:"mergeCommitSha,omitempty"`
+	SourceIssue    *githubinfra.IssueReference `json:"sourceIssue,omitempty"`
 	// TouchedFiles is GitHub's authoritative pull-request file list captured
-	// after a successful merge. Auditor may use it as attribution evidence; it
-	// is not merge authority and therefore a read failure never undoes a merge.
-	TouchedFiles []string `json:"touchedFiles,omitempty"`
-	Merged       bool     `json:"merged"`
+	// after a successful merge. Auditor may use it as attribution evidence.
+	TouchedFiles          []string `json:"touchedFiles,omitempty"`
+	TouchedFilesAvailable bool     `json:"touchedFilesAvailable,omitempty"`
+	Merged                bool     `json:"merged"`
 	// Reason explains a refusal. Empty on success.
 	Reason string `json:"reason,omitempty"`
 	// ConfirmingReasons are the gates that blocked the confirming evaluation, when

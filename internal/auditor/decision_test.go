@@ -28,3 +28,14 @@ func TestDecideProposesRevertOnlyForConfirmedHighConfidenceCandidate(t *testing.
 		})
 	}
 }
+
+func TestDecideEscalatesAuthoritativeCandidateWithoutMergeCommit(t *testing.T) {
+	decision := Decide(ConfirmationResult{Outcome: ConfirmationConfirmed}, Attribution{
+		Confidence: ConfidenceHigh,
+		Candidate:  &MergeCandidate{PRNumber: 42, TouchedFilesAvailable: true},
+		Reason:     "unique",
+	})
+	if decision.Action != ActionEscalate || decision.Candidate != nil || decision.Reason != "unique" {
+		t.Fatalf("Decide() = %#v, want escalation without a revert target", decision)
+	}
+}

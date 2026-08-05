@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -752,7 +753,7 @@ func TestListAttributionPathsUsesPaginatedGitHubEvidence(t *testing.T) {
 			if want := "api --paginate --slurp repos/acme/looper/check-runs/99/annotations?per_page=100 -H Accept: application/vnd.github+json --hostname ghes.example"; got != want {
 				t.Fatalf("annotation args = %q, want %q", got, want)
 			}
-			return shell.Result{Stdout: `[[{"path":"internal/runtime/a.go"},{"path":"internal/runtime/a.go"}]]`}, nil
+			return shell.Result{Stdout: `[[{"path":"internal/runtime/a.go","annotation_level":"failure"},{"path":"internal/runtime/a.go","annotation_level":"warning"}]]`}, nil
 		case 2:
 			if want := "api --paginate --slurp repos/acme/looper/pulls/42/files?per_page=100 -H Accept: application/vnd.github+json --hostname ghes.example"; got != want {
 				t.Fatalf("files args = %q, want %q", got, want)
@@ -769,9 +770,98 @@ func TestListAttributionPathsUsesPaginatedGitHubEvidence(t *testing.T) {
 	if err != nil || len(annotations) != 2 || annotations[0].Path != "internal/runtime/a.go" {
 		t.Fatalf("ListCheckRunAnnotations() = %#v, %v", annotations, err)
 	}
+	if annotations[0].Level != "failure" || annotations[1].Level != "warning" {
+		t.Fatalf("annotation levels = %#v, want REST annotation_level values", annotations)
+	}
 	files, err := gateway.ListPullRequestFiles(context.Background(), ViewPullRequestInput{Repo: "ghes.example/acme/looper", PRNumber: 42})
 	if err != nil || len(files) != 2 || files[0] != "a.go" || files[1] != "z.go" {
 		t.Fatalf("ListPullRequestFiles() = %#v, %v", files, err)
+	}
+}
+
+func TestPullRequestDetailReadsNativeClosingIssueAndMergeCommit(t *testing.T) {
+	detail := pullRequestDetailFromViewRow(map[string]any{
+		"number":      float64(42),
+		"mergeCommit": map[string]any{"oid": "merge-commit-1"},
+		"closingIssuesReferences": []any{map[string]any{
+			"number": float64(118), "url": "https://example.test/acme/looper/issues/118",
+			"repository": map[string]any{"name": "looper", "owner": map[string]any{"login": "acme"}},
+		}},
+	}, nil, nil)
+	if detail.MergeCommitSHA != "merge-commit-1" || len(detail.ClosingIssues) != 1 || detail.ClosingIssues[0].Number != 118 || detail.ClosingIssues[0].Repo != "example.test/acme/looper" {
+		t.Fatalf("pullRequestDetailFromViewRow() = %#v, want native merge and closing-issue identity", detail)
+	}
+}
+
+func TestViewPullRequestForGatekeeperRetriesWithoutOptionalClosingIssues(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	call := 0
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		call++
+		args := strings.Join(options.Args, " ")
+		if call == 1 {
+			if !strings.Contains(args, "closingIssuesReferences") {
+				t.Fatalf("first gatekeeper view args = %q, want optional provenance field", args)
+			}
+			return shell.Result{}, errors.New("unknown field closingIssuesReferences")
+		}
+		if strings.Contains(args, "closingIssuesReferences") {
+			t.Fatalf("fallback gatekeeper view args = %q, want optional provenance field omitted", args)
+		}
+		return shell.Result{Stdout: `{"number":42,"state":"OPEN","headRefOid":"head-1"}`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	detail, err := gateway.ViewPullRequestForGatekeeper(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil || detail.Number != 42 || detail.HeadSHA != "head-1" || call != 2 {
+		t.Fatalf("ViewPullRequestForGatekeeper() = %#v, %v; calls=%d, want fallback success", detail, err, call)
+	}
+}
+
+func TestViewPullRequestForGatekeeperDoesNotRetryProviderFailures(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	call := 0
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		call++
+		if !strings.Contains(strings.Join(options.Args, " "), "closingIssuesReferences") {
+			t.Fatalf("gatekeeper view args = %q, want optional field on the only attempt", strings.Join(options.Args, " "))
+		}
+		return shell.Result{}, errors.New("rate limit exceeded")
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	_, err := gateway.ViewPullRequestForGatekeeper(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err == nil || call != 1 {
+		t.Fatalf("ViewPullRequestForGatekeeper() error=%v calls=%d, want one provider attempt", err, call)
+	}
+}
+
+func TestIssueReferenceUsesLowerCamelJSON(t *testing.T) {
+	raw, err := json.Marshal(IssueReference{Number: 118, Repo: "acme/looper", URL: "https://github.com/acme/looper/issues/118"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(raw); got != `{"number":118,"repo":"acme/looper","url":"https://github.com/acme/looper/issues/118"}` {
+		t.Fatalf("IssueReference JSON = %s", got)
+	}
+}
+
+func TestViewPullRequestMergeWatchReadsDefaultBranchMergeCommit(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if got, want := strings.Join(options.Args, " "), "api repos/acme/looper/pulls/42 -H Accept: application/vnd.github+json"; got != want {
+			t.Fatalf("gh args = %q, want %q", got, want)
+		}
+		return shell.Result{Stdout: `{"number":42,"state":"closed","merged_at":"2026-07-31T12:01:00Z","merge_commit_sha":"merge-commit-1"}`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	detail, err := gateway.ViewPullRequestMergeWatch(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil || detail.MergeCommitSHA != "merge-commit-1" || detail.MergedAt == "" {
+		t.Fatalf("ViewPullRequestMergeWatch() = %#v, %v", detail, err)
 	}
 }
 
