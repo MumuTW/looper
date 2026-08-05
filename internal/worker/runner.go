@@ -319,17 +319,17 @@ type InspectHeadInput struct {
 }
 
 type InspectHeadResult struct {
-	HeadSHA                    string
-	Branch                     string
-	NewCommitSHAs              []string
-	HasUncommittedChanges      bool
-	ChangedFiles               []string
-	StagedFiles                []string
-	UntrackedFiles             []string
-	UnstagedFileCount          int
-	RenameSourceFiles          []string
-	DiffFingerprint            string
-	ContentFingerprint         string
+	HeadSHA               string
+	Branch                string
+	NewCommitSHAs         []string
+	HasUncommittedChanges bool
+	ChangedFiles          []string
+	StagedFiles           []string
+	UntrackedFiles        []string
+	UnstagedFileCount     int
+	RenameSourceFiles     []string
+	DiffFingerprint       string
+	ContentFingerprint    string
 	// Compared* fingerprints are scoped to InspectHeadInput.ContentPaths. They
 	// prove that predecessor paths survived while a replacement adds new paths.
 	ComparedContentFingerprint string
