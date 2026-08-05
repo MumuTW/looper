@@ -32,10 +32,15 @@ const (
 // changes only when operator-relevant source state changes, not as AgeSeconds
 // advances.
 type Item struct {
-	ID          string `json:"id"`
-	Kind        Kind   `json:"kind"`
-	Reason      Reason `json:"reason"`
-	ProjectID   string `json:"projectId"`
+	ID        string `json:"id"`
+	Kind      Kind   `json:"kind"`
+	Reason    Reason `json:"reason"`
+	ProjectID string `json:"projectId"`
+	// Repo is the source repository identity used to reject stale standalone
+	// items after a project is rebound. It is optional for legacy digest rows;
+	// a read surface with a known current binding must not admit such an
+	// unscoped item as current standalone work.
+	Repo        string `json:"repo,omitempty"`
 	Stage       string `json:"stage"`
 	Title       string `json:"title"`
 	Detail      string `json:"detail,omitempty"`
@@ -56,6 +61,11 @@ type Snapshot struct {
 	GeneratedAt string         `json:"generatedAt"`
 	Items       []Item         `json:"items"`
 	Backlog     []StageBacklog `json:"backlog"`
+	// Partial is true while a bounded collector is still rotating through a
+	// larger source projection. Partial censuses are useful for read surfaces,
+	// but must not become a complete digest baseline because omitted items are
+	// not evidence that work resolved.
+	Partial bool `json:"partial,omitempty"`
 }
 
 // Normalize pins deterministic ordering for rendering, persistence, and delta

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MumuTW/looper/internal/domain"
@@ -38,7 +39,12 @@ type Collector struct {
 	retryAfter    int64
 	unroutedAfter time.Duration
 	staleAfter    time.Duration
+	triageMu      sync.Mutex
+	triageCursor  map[string]string
+	triageStates  map[string]map[string]storage.TriageSourceStateRecord
 }
+
+const triageSourceScanLimit = 64
 
 func NewCollector(repositories *storage.Repositories, links Linker, options CollectorOptions) *Collector {
 	now := options.Now
@@ -57,7 +63,7 @@ func NewCollector(repositories *storage.Repositories, links Linker, options Coll
 	if staleAfter <= 0 {
 		staleAfter = 24 * time.Hour
 	}
-	return &Collector{repositories: repositories, links: links, now: now, retryAfter: retryAfter, unroutedAfter: unroutedAfter, staleAfter: staleAfter}
+	return &Collector{repositories: repositories, links: links, now: now, retryAfter: retryAfter, unroutedAfter: unroutedAfter, staleAfter: staleAfter, triageCursor: map[string]string{}, triageStates: map[string]map[string]storage.TriageSourceStateRecord{}}
 }
 
 func (c *Collector) Collect(ctx context.Context) (Snapshot, error) {
@@ -142,7 +148,7 @@ func (c *Collector) collectTriageConfirmations(ctx context.Context, now time.Tim
 			return fmt.Errorf("triage confirmation %s#%d: %w", source.Repo, source.IssueNumber, err)
 		}
 		id := itemID(ReasonTriageConfirmation, source.ProjectID, source.Repo, source.IssueNumber)
-		snapshot.Items = append(snapshot.Items, newItem(id, KindWaiting, ReasonTriageConfirmation, source.ProjectID, "triager", fmt.Sprintf("Confirm triage for %s#%d", source.Repo, source.IssueNumber), source.Command, link, source.AgeSeconds, 1, source.Command))
+		snapshot.Items = append(snapshot.Items, newItem(id, KindWaiting, ReasonTriageConfirmation, source.ProjectID, source.Repo, "triager", fmt.Sprintf("Confirm triage for %s#%d", source.Repo, source.IssueNumber), source.Command, link, source.AgeSeconds, 1, source.Command))
 	}
 	return nil
 }
@@ -159,6 +165,10 @@ func (c *Collector) collectLoops(now time.Time, active map[string]storage.LoopRe
 		}
 		blockedWork := 1 + blocked[loop.ID]
 		if loop.Status == string(domain.LoopStatusAwaitingHuman) {
+			repo := ""
+			if loop.Repo != nil {
+				repo = *loop.Repo
+			}
 			reason, detail := ReasonPlannerEscalation, "Planner needs an operator decision"
 			if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && ask.Status == "awaiting" {
 				reason, detail = ReasonHITLQuestion, ask.Question
@@ -169,15 +179,23 @@ func (c *Collector) collectLoops(now time.Time, active map[string]storage.LoopRe
 					}
 				}
 			}
-			snapshot.Items = append(snapshot.Items, newItem(itemID(reason, loop.ProjectID, loop.ID), KindWaiting, reason, loop.ProjectID, loop.Type, fmt.Sprintf("%s loop #%d is waiting on a human", loop.Type, loop.Seq), detail, link, age, blockedWork, loop.Status, detail))
+			snapshot.Items = append(snapshot.Items, newItem(itemID(reason, loop.ProjectID, loop.ID), KindWaiting, reason, loop.ProjectID, repo, loop.Type, fmt.Sprintf("%s loop #%d is waiting on a human", loop.Type, loop.Seq), detail, link, age, blockedWork, loop.Status, detail))
 			continue
 		}
 		if loop.Status == string(domain.LoopStatusPaused) && metadataString(loop.MetadataJSON, "pauseReason") == "agent_failure_streak" {
-			snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonCircuitBreaker, loop.ProjectID, loop.ID), KindStuck, ReasonCircuitBreaker, loop.ProjectID, loop.Type, fmt.Sprintf("%s loop #%d tripped its circuit breaker", loop.Type, loop.Seq), "Repeated agent failures paused this loop", link, age, blockedWork, loop.Status, "agent_failure_streak"))
+			repo := ""
+			if loop.Repo != nil {
+				repo = *loop.Repo
+			}
+			snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonCircuitBreaker, loop.ProjectID, loop.ID), KindStuck, ReasonCircuitBreaker, loop.ProjectID, repo, loop.Type, fmt.Sprintf("%s loop #%d tripped its circuit breaker", loop.Type, loop.Seq), "Repeated agent failures paused this loop", link, age, blockedWork, loop.Status, "agent_failure_streak"))
 			continue
 		}
 		if loop.Type == string(domain.LoopTypeReviewer) && loop.Status == string(domain.LoopStatusPaused) {
-			snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonReviewStall, loop.ProjectID, loop.ID), KindWaiting, ReasonReviewStall, loop.ProjectID, loop.Type, fmt.Sprintf("Reviewer loop #%d is stalled", loop.Seq), "Review is paused or waiting", link, age, blockedWork, loop.Status))
+			repo := ""
+			if loop.Repo != nil {
+				repo = *loop.Repo
+			}
+			snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonReviewStall, loop.ProjectID, loop.ID), KindWaiting, ReasonReviewStall, loop.ProjectID, repo, loop.Type, fmt.Sprintf("Reviewer loop #%d is stalled", loop.Seq), "Review is paused or waiting", link, age, blockedWork, loop.Status))
 		}
 	}
 	return nil
@@ -209,93 +227,137 @@ func (c *Collector) collectQueue(now time.Time, records []storage.QueueItemRecor
 			return fmt.Errorf("queue item %s: %w", item.ID, err)
 		}
 		detail := fmt.Sprintf("%d/%d attempts; status %s", item.Attempts, item.MaxAttempts, item.Status)
-		snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonQueueRetries, *item.ProjectID, item.ID), KindStuck, ReasonQueueRetries, *item.ProjectID, item.Type, fmt.Sprintf("%s queue item has repeated retries", item.Type), detail, link, age, 1, strconv.FormatInt(item.Attempts, 10), strconv.FormatInt(item.MaxAttempts, 10), item.Status, value(item.LastErrorKind), value(item.LastError)))
+		repo := ""
+		if item.Repo != nil {
+			repo = *item.Repo
+		}
+		snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonQueueRetries, *item.ProjectID, item.ID), KindStuck, ReasonQueueRetries, *item.ProjectID, repo, item.Type, fmt.Sprintf("%s queue item has repeated retries", item.Type), detail, link, age, 1, strconv.FormatInt(item.Attempts, 10), strconv.FormatInt(item.MaxAttempts, 10), item.Status, value(item.LastErrorKind), value(item.LastError)))
 	}
 	return nil
 }
 
 func (c *Collector) collectUnroutedTriage(ctx context.Context, now time.Time, activeProjects map[string]struct{}, snapshot *Snapshot) error {
-	events, err := c.repositories.Events.ListByEntityTypeAndEventTypes(ctx, "github_issue", []string{triager.EnrollmentEventType, triager.ReportEventType, triager.ProjectionEventType, triager.RetirementEventType})
-	if err != nil {
-		return fmt.Errorf("list triage routing lifecycle: %w", err)
-	}
-	type state struct {
-		enrollment         *triager.Enrollment
-		report             *triager.Report
-		projected, retired bool
-	}
-	states := map[string]*state{}
-	stateFor := func(key string) *state {
-		if states[key] == nil {
-			states[key] = &state{}
+	for projectID := range activeProjects {
+		records, complete, err := c.nextTriageSourceWindow(ctx, projectID)
+		if err != nil {
+			return fmt.Errorf("list triage routing lifecycle: %w", err)
 		}
-		return states[key]
-	}
-	for _, event := range events {
-		switch event.EventType {
-		case triager.EnrollmentEventType:
+		c.triageMu.Lock()
+		if c.triageStates == nil {
+			c.triageStates = map[string]map[string]storage.TriageSourceStateRecord{}
+		}
+		states := c.triageStates[projectID]
+		if states == nil {
+			states = map[string]storage.TriageSourceStateRecord{}
+			c.triageStates[projectID] = states
+		}
+		for _, record := range records {
+			if record.Projected || record.Retired {
+				// Terminal lifecycle rows remain in the SQL projection to consume
+				// bounded scan slots, but do not need a durable in-memory entry.
+				delete(states, record.SourceKey)
+				continue
+			}
+			states[record.SourceKey] = record
+		}
+		stable := make([]storage.TriageSourceStateRecord, 0, len(states))
+		for _, record := range states {
+			stable = append(stable, record)
+		}
+		c.triageMu.Unlock()
+		if !complete {
+			snapshot.Partial = true
+		}
+		for _, record := range stable {
+			if record.EnrollmentJSON == nil {
+				continue
+			}
 			var enrollment triager.Enrollment
-			if err := json.Unmarshal([]byte(event.PayloadJSON), &enrollment); err != nil {
+			if err := json.Unmarshal([]byte(*record.EnrollmentJSON), &enrollment); err != nil {
 				return fmt.Errorf("decode triage enrollment for escalator: %w", err)
 			}
-			copy := enrollment
-			stateFor(enrollment.IdempotencyKey).enrollment = &copy
-		case triager.ReportEventType:
-			var report triager.Report
-			if err := json.Unmarshal([]byte(event.PayloadJSON), &report); err != nil {
-				return fmt.Errorf("decode triage report for escalator: %w", err)
+			if enrollment.ProjectID != projectID || record.Projected || record.Retired {
+				continue
 			}
-			copy := report
-			stateFor(report.IdempotencyKey).report = &copy
-		case triager.ProjectionEventType:
-			var projection triager.Projection
-			if err := json.Unmarshal([]byte(event.PayloadJSON), &projection); err != nil {
-				return fmt.Errorf("decode triage projection for escalator: %w", err)
+			var report *triager.Report
+			if record.ReportJSON != nil {
+				var decoded triager.Report
+				if err := json.Unmarshal([]byte(*record.ReportJSON), &decoded); err != nil {
+					return fmt.Errorf("decode triage report for escalator: %w", err)
+				}
+				report = &decoded
 			}
-			stateFor(projection.ReportKey).projected = true
-		case triager.RetirementEventType:
-			var retirement triager.Retirement
-			if err := json.Unmarshal([]byte(event.PayloadJSON), &retirement); err != nil {
-				return fmt.Errorf("decode triage retirement for escalator: %w", err)
+			// Human-confirmation reports are already represented by the dedicated
+			// waiting item above. This category is specifically work that has no ask.
+			if report != nil && report.Policy.Action == triager.ActionAwaitHuman {
+				continue
 			}
-			stateFor(retirement.EnrollmentKey).retired = true
+			age, err := ageSeconds(now, enrollment.EnrolledAt)
+			if err != nil {
+				return fmt.Errorf("parse triage enrollment %s: %w", enrollment.IdempotencyKey, err)
+			}
+			if time.Duration(age)*time.Second < c.unroutedAfter {
+				continue
+			}
+			link, err := requiredLink(c.links.Issue(enrollment.ProjectID, enrollment.Repo, enrollment.IssueNumber))
+			if err != nil {
+				return fmt.Errorf("triage enrollment %s: %w", enrollment.IdempotencyKey, err)
+			}
+			detail := "No Triage report or route was persisted"
+			if report != nil {
+				detail = "A Triage report exists, but no Planner route was persisted"
+			}
+			snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonTriageNotRouted, enrollment.ProjectID, enrollment.IdempotencyKey), KindStuck, ReasonTriageNotRouted, enrollment.ProjectID, enrollment.Repo, "triager", fmt.Sprintf("%s#%d was enrolled but never routed", enrollment.Repo, enrollment.IssueNumber), detail, link, age, 1, enrollment.EnrolledAt, detail))
 		}
-	}
-	for key, state := range states {
-		if state.enrollment == nil || state.projected || state.retired {
-			continue
-		}
-		// Human-confirmation reports are already represented by the dedicated
-		// waiting item above. This category is specifically work that has no ask.
-		if state.report != nil && state.report.Policy.Action == triager.ActionAwaitHuman {
-			continue
-		}
-		enrollment := state.enrollment
-		if _, active := activeProjects[enrollment.ProjectID]; !active {
-			continue
-		}
-		age, err := ageSeconds(now, enrollment.EnrolledAt)
-		if err != nil {
-			return fmt.Errorf("parse triage enrollment %s: %w", key, err)
-		}
-		if time.Duration(age)*time.Second < c.unroutedAfter {
-			continue
-		}
-		link, err := requiredLink(c.links.Issue(enrollment.ProjectID, enrollment.Repo, enrollment.IssueNumber))
-		if err != nil {
-			return fmt.Errorf("triage enrollment %s: %w", key, err)
-		}
-		detail := "No Triage report or route was persisted"
-		if state.report != nil {
-			detail = "A Triage report exists, but no Planner route was persisted"
-		}
-		snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonTriageNotRouted, enrollment.ProjectID, key), KindStuck, ReasonTriageNotRouted, enrollment.ProjectID, "triager", fmt.Sprintf("%s#%d was enrolled but never routed", enrollment.Repo, enrollment.IssueNumber), detail, link, age, 1, enrollment.EnrolledAt, detail))
 	}
 	return nil
 }
 
+// nextTriageSourceWindow rotates through the current triage projection. The
+// SQL aggregation retains only the enrollment/report payload and terminal
+// flags needed by this collector, so a busy repository cannot make every
+// Escalator poll reread an ever-growing event history. complete is true only
+// after the cursor has covered the full projection at least once.
+func (c *Collector) nextTriageSourceWindow(ctx context.Context, projectID string) ([]storage.TriageSourceStateRecord, bool, error) {
+	c.triageMu.Lock()
+	if c.triageCursor == nil {
+		c.triageCursor = map[string]string{}
+	}
+	cursor := c.triageCursor[projectID]
+	c.triageMu.Unlock()
+	records, err := c.repositories.Events.ListTriageSourceStateWindow(ctx, projectID, cursor, triageSourceScanLimit)
+	if err != nil {
+		return nil, false, err
+	}
+	complete := false
+	if cursor == "" {
+		// A short first window contains the whole current projection. Exactly a
+		// full window remains ambiguous until the next call proves a wrap.
+		complete = len(records) < triageSourceScanLimit
+	} else {
+		wrapped := len(records) == 0
+		for _, record := range records {
+			if record.SourceKey <= cursor {
+				wrapped = true
+				break
+			}
+		}
+		complete = wrapped
+	}
+	if len(records) > 0 {
+		c.triageMu.Lock()
+		c.triageCursor[projectID] = records[len(records)-1].SourceKey
+		c.triageMu.Unlock()
+	} else if cursor != "" {
+		c.triageMu.Lock()
+		c.triageCursor[projectID] = ""
+		c.triageMu.Unlock()
+	}
+	return records, complete, nil
+}
+
 func (c *Collector) collectEligibleAdvise(ctx context.Context, now time.Time, activeProjects map[string]struct{}, snapshot *Snapshot) error {
-	events, err := c.repositories.Events.ListByEntityTypeAndEventTypes(ctx, "pull_request", []string{gatekeeper.GateReportEventType})
+	events, err := c.repositories.Events.ListLatestByEntityTypeAndEventTypes(ctx, "", "pull_request", []string{gatekeeper.GateReportEventType})
 	if err != nil {
 		return fmt.Errorf("list Gatekeeper reports: %w", err)
 	}
@@ -319,13 +381,13 @@ func (c *Collector) collectEligibleAdvise(ctx context.Context, now time.Time, ac
 		if err != nil {
 			return fmt.Errorf("Gatekeeper report %s#%d: %w", report.Repo, report.PRNumber, err)
 		}
-		snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonEligibleAdvisePR, report.ProjectID, report.Repo, report.PRNumber), KindWaiting, ReasonEligibleAdvisePR, report.ProjectID, "gatekeeper", fmt.Sprintf("%s#%d is eligible to merge", report.Repo, report.PRNumber), "Gatekeeper advise is waiting for a human merge decision", link, age, 1, report.ObservedHeadSHA, report.Status))
+		snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonEligibleAdvisePR, report.ProjectID, report.Repo, report.PRNumber), KindWaiting, ReasonEligibleAdvisePR, report.ProjectID, report.Repo, "gatekeeper", fmt.Sprintf("%s#%d is eligible to merge", report.Repo, report.PRNumber), "Gatekeeper advise is waiting for a human merge decision", link, age, 1, report.ObservedHeadSHA, report.Status))
 	}
 	return nil
 }
 
 func (c *Collector) collectStaleHeads(ctx context.Context, now time.Time, activeLoops map[string]storage.LoopRecord, snapshot *Snapshot) error {
-	records, err := c.repositories.PullRequestSnapshots.List(ctx)
+	records, err := c.repositories.PullRequestSnapshots.ListLatest(ctx)
 	if err != nil {
 		return fmt.Errorf("list pull request snapshots: %w", err)
 	}
@@ -361,7 +423,7 @@ func (c *Collector) collectStaleHeads(ctx context.Context, now time.Time, active
 		if err != nil {
 			return fmt.Errorf("PR snapshot %s#%d: %w", record.Repo, record.PRNumber, err)
 		}
-		snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonStalePRHead, key.project, key.repo, key.number), KindStuck, ReasonStalePRHead, record.ProjectID, "pull_request", fmt.Sprintf("%s#%d has stale head evidence", record.Repo, record.PRNumber), "No current-head snapshot has been captured within the threshold", link, age, 1, record.HeadSHA, record.CapturedAt))
+		snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonStalePRHead, key.project, key.repo, key.number), KindStuck, ReasonStalePRHead, record.ProjectID, record.Repo, "pull_request", fmt.Sprintf("%s#%d has stale head evidence", record.Repo, record.PRNumber), "No current-head snapshot has been captured within the threshold", link, age, 1, record.HeadSHA, record.CapturedAt))
 	}
 	return nil
 }
@@ -390,8 +452,8 @@ func buildBacklog(now time.Time, loopsByID map[string]storage.LoopRecord) ([]Sta
 	return result, nil
 }
 
-func newItem(id string, kind Kind, reason Reason, projectID, stage, title, detail, link string, age int64, blocked int, fingerprintParts ...string) Item {
-	return Item{ID: id, Kind: kind, Reason: reason, ProjectID: projectID, Stage: stage, Title: title, Detail: detail, Link: link, AgeSeconds: age, BlockedWork: blocked, Fingerprint: fingerprint(fingerprintParts...)}
+func newItem(id string, kind Kind, reason Reason, projectID, repo, stage, title, detail, link string, age int64, blocked int, fingerprintParts ...string) Item {
+	return Item{ID: id, Kind: kind, Reason: reason, ProjectID: projectID, Repo: strings.ToLower(strings.TrimSpace(repo)), Stage: stage, Title: title, Detail: detail, Link: link, AgeSeconds: age, BlockedWork: blocked, Fingerprint: fingerprint(fingerprintParts...)}
 }
 
 func itemID(reason Reason, parts ...any) string {

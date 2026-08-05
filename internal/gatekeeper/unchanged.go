@@ -60,6 +60,14 @@ func sourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled
 	return strings.Join(fields, "\x1f")
 }
 
+// SourceFingerprint is the discovery-page evidence fingerprint shared with
+// read-only projections such as the Web UI. Keeping the formatter here makes
+// Gatekeeper's skip authority the single definition; consumers must not
+// reconstruct the field order independently.
+func SourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled bool) string {
+	return sourceFingerprint(pullRequest, budgetEnabled)
+}
+
 // checkReasonCodes are the gate reasons that resolve on their own, without
 // anything changing on the pull request. A pending check turning green or a
 // missing check appearing changes the gate while every field the list page can

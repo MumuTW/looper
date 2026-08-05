@@ -794,6 +794,37 @@ func (r *EventsRepository) ListTriageSourceStates(ctx context.Context, projectID
 	return records, nil
 }
 
+// ListAwaitingTriageSourceStates returns one current lifecycle row per source
+// that has not reached confirmation, routing, or retirement. The event log is
+// append-only, so status readers must aggregate by source key in SQLite rather
+// than reread every historical event on each poll. The returned projection is
+// still authoritative only for the report and terminal-event evidence it
+// contains; it does not create a second lifecycle record.
+func (r *EventsRepository) ListAwaitingTriageSourceStates(ctx context.Context, projectID string) ([]TriageSourceStateRecord, error) {
+	args := []any{}
+	projectFilter := ""
+	if strings.TrimSpace(projectID) != "" {
+		projectFilter = " AND project_id = ?"
+		args = append(args, projectID)
+	}
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT `+triageSourceKeySQL+` AS source_key,
+			MIN(CASE WHEN event_type = 'triage.enrolled' THEN payload_json END),
+			MIN(CASE WHEN event_type = 'triage.report' THEN payload_json END),
+			MAX(event_type = 'triage.routed'),
+			MAX(event_type = 'triage.retired')
+		FROM event_logs INDEXED BY idx_event_logs_triage_source_key
+		WHERE `+triageLifecyclePredicateSQL+projectFilter+`
+		GROUP BY source_key
+		HAVING MAX(CASE WHEN event_type IN ('triage.confirmed', 'triage.routed', 'triage.retired') THEN 1 ELSE 0 END) = 0
+		ORDER BY source_key
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list awaiting triage source states: %w", err)
+	}
+	return scanTriageSourceStates(rows)
+}
+
 // ListTriageSourceStateWindow returns at most limit source lifecycles, rotating
 // after afterSourceKey and wrapping once. Terminal sources intentionally count
 // against the window: asking SQL to skip unbounded terminal history until it
@@ -2362,12 +2393,41 @@ func (r *PullRequestSnapshotsRepository) List(ctx context.Context) ([]PullReques
 	return scanPullRequestSnapshots(rows)
 }
 
+// ListLatest returns one snapshot per project/repository/pull request. Snapshot
+// captures are append-only, and callers that render current state should not
+// materialize historical payloads (which may include a full diff) just to
+// discard them in memory.
+func (r *PullRequestSnapshotsRepository) ListLatest(ctx context.Context) ([]PullRequestSnapshotRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `
+		WITH ranked AS (
+			SELECT id, ROW_NUMBER() OVER (
+				PARTITION BY project_id, lower(repo), pr_number
+				-- IDs are random; rowid preserves insertion order when both
+				-- millisecond timestamps tie.
+				ORDER BY captured_at DESC, created_at DESC, rowid DESC
+			) AS row_number
+			FROM pull_request_snapshots
+		)
+		SELECT `+qualifiedColumns("snapshots", pullRequestSnapshotColumns)+`
+		FROM pull_request_snapshots snapshots
+		JOIN ranked ON ranked.id = snapshots.id
+		WHERE ranked.row_number = 1
+		ORDER BY snapshots.captured_at DESC, snapshots.created_at DESC, snapshots.rowid DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list latest pull request snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	return scanPullRequestSnapshots(rows)
+}
+
 func (r *PullRequestSnapshotsRepository) ListLatestByRepoAndPR(ctx context.Context, repo string, prNumber int64) ([]PullRequestSnapshotRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `
 		WITH ranked AS (
 			SELECT id, ROW_NUMBER() OVER (
 				PARTITION BY project_id
-				ORDER BY captured_at DESC, created_at DESC, id DESC
+				ORDER BY captured_at DESC, created_at DESC, rowid DESC
 			) AS row_number
 			FROM pull_request_snapshots
 			WHERE repo = ? COLLATE NOCASE AND pr_number = ?
@@ -2376,7 +2436,7 @@ func (r *PullRequestSnapshotsRepository) ListLatestByRepoAndPR(ctx context.Conte
 		FROM pull_request_snapshots snapshots
 		JOIN ranked ON ranked.id = snapshots.id
 		WHERE ranked.row_number = 1
-		ORDER BY snapshots.captured_at DESC, snapshots.created_at DESC, snapshots.id DESC
+		ORDER BY snapshots.captured_at DESC, snapshots.created_at DESC, snapshots.rowid DESC
 	`, repo, prNumber)
 	if err != nil {
 		return nil, fmt.Errorf("list latest pull request snapshots by repository and pull request: %w", err)
@@ -2404,7 +2464,7 @@ func (r *PullRequestSnapshotsRepository) GetLatest(ctx context.Context, repo str
 }
 
 func (r *PullRequestSnapshotsRepository) GetLatestByProject(ctx context.Context, projectID, repo string, prNumber int64) (*PullRequestSnapshotRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT `+pullRequestSnapshotColumns+` FROM pull_request_snapshots WHERE project_id = ? AND repo = ? COLLATE NOCASE AND pr_number = ? ORDER BY captured_at DESC, created_at DESC LIMIT 1`, projectID, repo, prNumber)
+	row := r.q.QueryRowContext(ctx, `SELECT `+pullRequestSnapshotColumns+` FROM pull_request_snapshots WHERE project_id = ? AND repo = ? COLLATE NOCASE AND pr_number = ? ORDER BY captured_at DESC, created_at DESC, rowid DESC LIMIT 1`, projectID, repo, prNumber)
 	record, err := scanPullRequestSnapshot(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2704,6 +2764,24 @@ func (r *QueueRepository) List(ctx context.Context) ([]QueueItemRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `SELECT `+queueItemColumns+` FROM queue_items ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list queue items: %w", err)
+	}
+	defer rows.Close()
+
+	return scanQueueItems(rows)
+}
+
+// ListForTriage returns queue items whose status can still affect the
+// operator board. Terminal history remains available through List, while the
+// bounded read avoids decoding completed/failed/cancelled rows on every poll.
+func (r *QueueRepository) ListForTriage(ctx context.Context) ([]QueueItemRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT `+queueItemColumns+`
+		FROM queue_items
+		WHERE status IS NULL OR status NOT IN ('completed', 'failed', 'cancelled')
+		ORDER BY updated_at DESC, created_at DESC, id DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list queue items for triage: %w", err)
 	}
 	defer rows.Close()
 

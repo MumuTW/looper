@@ -861,6 +861,14 @@ func TestPullRequestLookupsStayScopedAndReturnLatestSnapshotPerProject(t *testin
 		t.Fatalf("PullRequestSnapshots.ListLatestByRepoAndPR() IDs = %v, want [second-new github-new]", got)
 	}
 
+	gotLatest, err := repos.PullRequestSnapshots.ListLatest(ctx)
+	if err != nil {
+		t.Fatalf("PullRequestSnapshots.ListLatest() error = %v", err)
+	}
+	if got := snapshotIDs(gotLatest); !reflect.DeepEqual(got, []string{"other-repo", "other-pr", "second-new", "github-new"}) {
+		t.Fatalf("PullRequestSnapshots.ListLatest() IDs = %v, want one newest row per project/repo/PR", got)
+	}
+
 	matchingRepo := "Acme/Looper"
 	matchingPR := prNumber
 	otherPR := int64(99)
@@ -879,6 +887,44 @@ func TestPullRequestLookupsStayScopedAndReturnLatestSnapshotPerProject(t *testin
 	}
 	if len(gotLoops) != 1 || gotLoops[0].ID != "github-loop" {
 		t.Fatalf("Loops.ListByRepoAndPR() = %#v, want github-loop", gotLoops)
+	}
+}
+
+func TestPullRequestSnapshotsLatestTieUsesInsertionOrder(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	const projectID = "snapshot-tie-project"
+	const repo = "acme/looper"
+	const prNumber int64 = 42
+	const tieAt = "2026-07-13T09:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, CreatedAt: tieAt, UpdatedAt: tieAt}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	// The later insert deliberately sorts earlier by ID. Timestamp-only and
+	// random-ID tie breakers would return the stale first observation.
+	for _, snapshot := range []PullRequestSnapshotRecord{
+		{ID: "z-first", ProjectID: projectID, Repo: repo, PRNumber: prNumber, HeadSHA: "old-head", CapturedAt: tieAt, CreatedAt: tieAt},
+		{ID: "a-second", ProjectID: projectID, Repo: repo, PRNumber: prNumber, HeadSHA: "new-head", CapturedAt: tieAt, CreatedAt: tieAt},
+	} {
+		if err := repos.PullRequestSnapshots.Upsert(ctx, snapshot); err != nil {
+			t.Fatalf("PullRequestSnapshots.Upsert(%q) error = %v", snapshot.ID, err)
+		}
+	}
+
+	latest, err := repos.PullRequestSnapshots.ListLatest(ctx)
+	if err != nil || len(latest) != 1 || latest[0].ID != "a-second" {
+		t.Fatalf("ListLatest() = %#v err=%v, want the later a-second observation", latest, err)
+	}
+	byRepo, err := repos.PullRequestSnapshots.ListLatestByRepoAndPR(ctx, repo, prNumber)
+	if err != nil || len(byRepo) != 1 || byRepo[0].ID != "a-second" {
+		t.Fatalf("ListLatestByRepoAndPR() = %#v err=%v, want the later a-second observation", byRepo, err)
+	}
+	byProject, err := repos.PullRequestSnapshots.GetLatestByProject(ctx, projectID, repo, prNumber)
+	if err != nil || byProject == nil || byProject.ID != "a-second" {
+		t.Fatalf("GetLatestByProject() = %#v err=%v, want the later a-second observation", byProject, err)
 	}
 }
 
@@ -1516,6 +1562,42 @@ func TestQueueRoundTripBasics(t *testing.T) {
 	}
 	if len(all) != 1 || all[0].ID != "qi_1" {
 		t.Fatalf("Queue.List() = %#v, want [qi_1]", all)
+	}
+}
+
+func TestQueueListForTriageExcludesTerminalHistory(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	for _, item := range []QueueItemRecord{
+		{ID: "triage_queued", Priority: 1, MaxAttempts: 1, Status: "queued", CreatedAt: now, UpdatedAt: now},
+		{ID: "triage_running", Priority: 1, MaxAttempts: 1, Status: "running", CreatedAt: now, UpdatedAt: now},
+		{ID: "triage_manual", Priority: 1, MaxAttempts: 1, Status: "manual_intervention", CreatedAt: now, UpdatedAt: now},
+		{ID: "triage_completed", Priority: 1, MaxAttempts: 1, Status: "completed", CreatedAt: now, UpdatedAt: now},
+		{ID: "triage_failed", Priority: 1, MaxAttempts: 1, Status: "failed", CreatedAt: now, UpdatedAt: now},
+		{ID: "triage_cancelled", Priority: 1, MaxAttempts: 1, Status: "cancelled", CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := repos.Queue.Upsert(ctx, item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	items, err := repos.Queue.ListForTriage(ctx)
+	if err != nil {
+		t.Fatalf("Queue.ListForTriage() error = %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("Queue.ListForTriage() returned %d items, want 3: %#v", len(items), items)
+	}
+	for _, item := range items {
+		switch item.Status {
+		case "queued", "running", "manual_intervention":
+		default:
+			t.Errorf("Queue.ListForTriage() returned terminal status %q", item.Status)
+		}
 	}
 }
 
@@ -3246,5 +3328,84 @@ func TestRunsTouchHeartbeatOnlyMovesForward(t *testing.T) {
 	}
 	if run.Status != "running" || run.CheckpointJSON == nil || *run.CheckpointJSON != checkpoint || run.StartedAt != now {
 		t.Fatalf("TouchHeartbeat disturbed other columns: %#v", run)
+	}
+}
+
+func TestEventsListLatestByEntityTypeAndEventTypesKeepsNewestPerEntity(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	pullRequest := "pull_request"
+	issue := "github_issue"
+	first := "acme/widgets#1"
+	second := "acme/widgets#2"
+	other := "acme/widgets#9"
+	for _, event := range []EventLogRecord{
+		{ID: "gate_1_old", EventType: "pull_request.merge_gate.evaluated", EntityType: &pullRequest, EntityID: &first, PayloadJSON: `{"n":1}`, CreatedAt: "2026-04-11T12:00:00.000Z"},
+		{ID: "gate_1_new", EventType: "pull_request.merge_gate.evaluated", EntityType: &pullRequest, EntityID: &first, PayloadJSON: `{"n":2}`, CreatedAt: "2026-04-11T12:05:00.000Z"},
+		{ID: "gate_2_z", EventType: "pull_request.merge_gate.evaluated", EntityType: &pullRequest, EntityID: &second, PayloadJSON: `{"n":3}`, CreatedAt: "2026-04-11T12:07:00.000Z"},
+		// Same created_at as gate_2_z: the later insert wins even though its ID sorts first.
+		{ID: "gate_2_a", EventType: "pull_request.merge_gate.evaluated", EntityType: &pullRequest, EntityID: &second, PayloadJSON: `{"n":4}`, CreatedAt: "2026-04-11T12:07:00.000Z"},
+		// Neither the other event type nor the other entity type may leak in.
+		{ID: "gate_1_other_type", EventType: "pull_request.snapshot.captured", EntityType: &pullRequest, EntityID: &first, PayloadJSON: `{"n":5}`, CreatedAt: "2026-04-11T12:09:00.000Z"},
+		{ID: "gate_issue", EventType: "pull_request.merge_gate.evaluated", EntityType: &issue, EntityID: &other, PayloadJSON: `{"n":6}`, CreatedAt: "2026-04-11T12:09:00.000Z"},
+	} {
+		if err := repos.Events.Append(ctx, event); err != nil {
+			t.Fatalf("Events.Append(%s) error = %v", event.ID, err)
+		}
+	}
+
+	latest, err := repos.Events.ListLatestByEntityTypeAndEventTypes(ctx, "", "pull_request", []string{"pull_request.merge_gate.evaluated"})
+	if err != nil {
+		t.Fatalf("Events.ListLatestByEntityTypeAndEventTypes() error = %v", err)
+	}
+	if len(latest) != 2 {
+		t.Fatalf("len(Events.ListLatestByEntityTypeAndEventTypes()) = %d, want 2: %#v", len(latest), latest)
+	}
+	if latest[0].ID != "gate_1_new" || latest[1].ID != "gate_2_a" {
+		t.Fatalf("Events.ListLatestByEntityTypeAndEventTypes() = [%s %s], want [gate_1_new gate_2_a]", latest[0].ID, latest[1].ID)
+	}
+
+	empty, err := repos.Events.ListLatestByEntityTypeAndEventTypes(ctx, "", "pull_request", nil)
+	if err != nil {
+		t.Fatalf("Events.ListLatestByEntityTypeAndEventTypes(no types) error = %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("Events.ListLatestByEntityTypeAndEventTypes(no types) = %#v, want none", empty)
+	}
+}
+
+func TestEventsListLatestPartitionsByProjectAndEntity(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	pullRequest, entityID := "pull_request", "acme/widgets#42"
+	projectOne, projectTwo := "project-one", "project-two"
+	for _, projectID := range []string{projectOne, projectTwo} {
+		if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, CreatedAt: "2026-08-02T09:00:00.000Z", UpdatedAt: "2026-08-02T09:00:00.000Z"}); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", projectID, err)
+		}
+	}
+	for _, event := range []EventLogRecord{
+		{ID: "project_one_old", EventType: "pull_request.merge_gate.evaluated", ProjectID: &projectOne, EntityType: &pullRequest, EntityID: &entityID, PayloadJSON: `{"project":"one-old"}`, CreatedAt: "2026-08-02T10:00:00.000Z"},
+		{ID: "project_one_new", EventType: "pull_request.merge_gate.evaluated", ProjectID: &projectOne, EntityType: &pullRequest, EntityID: &entityID, PayloadJSON: `{"project":"one-new"}`, CreatedAt: "2026-08-02T10:05:00.000Z"},
+		{ID: "project_two_new", EventType: "pull_request.merge_gate.evaluated", ProjectID: &projectTwo, EntityType: &pullRequest, EntityID: &entityID, PayloadJSON: `{"project":"two-new"}`, CreatedAt: "2026-08-02T10:06:00.000Z"},
+	} {
+		if err := repos.Events.Append(ctx, event); err != nil {
+			t.Fatalf("Events.Append(%s) error = %v", event.ID, err)
+		}
+	}
+
+	latest, err := repos.Events.ListLatestByEntityTypeAndEventTypes(ctx, "", pullRequest, []string{"pull_request.merge_gate.evaluated"})
+	if err != nil {
+		t.Fatalf("ListLatestByEntityTypeAndEventTypes() error = %v", err)
+	}
+	if len(latest) != 2 || latest[0].ID != "project_one_new" || latest[1].ID != "project_two_new" {
+		t.Fatalf("latest project/entity events = %#v, want one newest row per project", latest)
 	}
 }

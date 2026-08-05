@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MumuTW/looper/internal/agent"
@@ -27,6 +28,7 @@ import (
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/daemonbinary"
 	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/escalator"
 	"github.com/MumuTW/looper/internal/eventlog"
 	"github.com/MumuTW/looper/internal/fixer"
 	"github.com/MumuTW/looper/internal/gatekeeper"
@@ -41,6 +43,7 @@ import (
 	"github.com/MumuTW/looper/internal/triager"
 	"github.com/MumuTW/looper/internal/version"
 	"github.com/MumuTW/looper/internal/webhookforward"
+	"github.com/MumuTW/looper/internal/webui"
 	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
@@ -159,6 +162,13 @@ type Handler struct {
 	recoverySummary  func() any
 	webhookForwarder webhookforward.Forwarder
 	bootstrap        *bootstrapCodes
+	// webUICache bounds what the /ui/ poll costs when several tabs are open:
+	// the page handler is rebuilt per request, so the cache has to live here.
+	webUICache *webui.LoadCache
+	// webUICollectorState keeps the Escalator's bounded triage cursor across
+	// request-local page handlers. Its pointer survives ServeHTTP's shallow
+	// Handler copy while its mutex protects concurrent web requests.
+	webUICollectorState *webUICollectorState
 	// discardBeforeGitHook is test-only: invoked after discard preflight recheck
 	// and immediately before git reset/clean so tests can inject a requeue race
 	// that bypasses LockLoopRequeue (defense-in-depth for the pre-git recheck).
@@ -174,6 +184,13 @@ type Handler struct {
 	// loopLogsFollowObserve is test-only instrumentation for enforcing the
 	// stream's query/read budgets without coupling tests to SQLite internals.
 	loopLogsFollowObserve func(loopLogsFollowObservation)
+}
+
+type webUICollectorState struct {
+	mu           sync.Mutex
+	collector    *escalator.Collector
+	repositories *storage.Repositories
+	configKey    string
 }
 
 // effectiveConfig returns the live config when ConfigSnapshot is wired, else
@@ -220,11 +237,13 @@ func NewHandler(context Context) *Handler {
 	bootstrap.now = now
 
 	return &Handler{
-		context:          context,
-		now:              now,
-		recoverySummary:  recoverySummary,
-		webhookForwarder: forwarder,
-		bootstrap:        bootstrap,
+		context:             context,
+		now:                 now,
+		recoverySummary:     recoverySummary,
+		webhookForwarder:    forwarder,
+		bootstrap:           bootstrap,
+		webUICache:          webui.NewLoadCache(webui.RefreshInterval, now),
+		webUICollectorState: &webUICollectorState{},
 	}
 }
 
@@ -308,6 +327,13 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, requestID, typed)
 			return
 		}
+	}
+
+	// The hypermedia UI answers in HTML, so it is dispatched before the JSON
+	// route table — but only after the same authorization every JSON read runs.
+	if isWebUIPath(path) {
+		h.handleWebUIRoute(w, r)
+		return
 	}
 
 	switch path {
@@ -920,7 +946,15 @@ func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 		return nil
 	}
 
-	if r.Header.Get("Authorization") != fmt.Sprintf("Bearer %s", *cfg.Server.LocalToken) {
+	authenticatedToken := r.Header.Get("Authorization")
+	if strings.TrimSpace(authenticatedToken) == "" {
+		if cookie, err := r.Cookie(dashboardSessionCookieName); err == nil {
+			if token, ok := dashboardSessionTokenFromCookie(cookie.Value); ok {
+				authenticatedToken = "Bearer " + token
+			}
+		}
+	}
+	if authenticatedToken != fmt.Sprintf("Bearer %s", *cfg.Server.LocalToken) {
 		return apiError{
 			code:    pkgapi.ErrorCodeUnauthorized,
 			status:  http.StatusUnauthorized,
@@ -959,16 +993,8 @@ func isLoopbackRemoteAddr(remoteAddr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func normalizePath(path string) string {
-	if path == "" {
-		return "/"
-	}
-
-	if len(path) == 1 {
-		return path
-	}
-
-	return strings.TrimRight(path, "/")
+func normalizePath(requestPath string) string {
+	return webui.NormalizePath(requestPath)
 }
 
 func (h *Handler) writeSuccess(w http.ResponseWriter, requestID string, data any) {

@@ -2041,12 +2041,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	var escalatorRunner escalatorScheduler
 	if cfg.Roles.Escalator.Enabled {
 		escalatorRunner = escalator.NewRunner(
-			escalator.NewCollector(repos, newRuntimeEscalatorLinker(cfg), escalator.CollectorOptions{
-				Now:                   now,
-				RetryAttemptThreshold: cfg.Roles.Escalator.RetryAttemptThreshold,
-				UnroutedAfter:         time.Duration(cfg.Roles.Escalator.UnroutedAfterSeconds) * time.Second,
-				StaleHeadAfter:        time.Duration(cfg.Roles.Escalator.StaleHeadAfterSeconds) * time.Second,
-			}),
+			NewEscalatorCollector(cfg, repos, now),
 			notificationGateway,
 			repos,
 			escalator.RunnerOptions{Now: now, MaxItems: cfg.Roles.Escalator.MaxItems},
@@ -3034,8 +3029,10 @@ func runEscalatorIfDue(ctx context.Context, input defaultSchedulerTickInput, run
 	if !input.EscalatorCadence.start(runAt, cadence) {
 		return nil
 	}
-	_, err := input.Escalator.Run(ctx)
-	input.EscalatorCadence.finish(runAt, err == nil)
+	result, err := input.Escalator.Run(ctx)
+	// A rotating census is intentionally not a successful cadence tick: its
+	// snapshot omits source rows and must be retried on the next scheduler tick.
+	input.EscalatorCadence.finish(runAt, err == nil && !result.Snapshot.Partial)
 	return err
 }
 
