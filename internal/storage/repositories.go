@@ -1826,8 +1826,8 @@ func (r *RunsRepository) ClearTimeoutProgress(ctx context.Context, id, updatedAt
 				WHEN json_valid(checkpoint_json) AND json_type(checkpoint_json) = 'object'
 					THEN CASE
 						WHEN json_extract(checkpoint_json, '$.execution.status') = 'timeout_observing'
-							THEN json_set(json_remove(checkpoint_json, '$.execution.progressBeforeTimeout', '$.execution.progressSnapshotError'), '$.execution.status', 'timeout')
-						ELSE json_remove(checkpoint_json, '$.execution.progressBeforeTimeout', '$.execution.progressSnapshotError')
+						THEN json_set(json_remove(checkpoint_json, '$.execution.progressBeforeTimeout', '$.execution.progressSnapshotError', '$.continuation'), '$.execution.status', 'timeout')
+						ELSE json_remove(checkpoint_json, '$.execution.progressBeforeTimeout', '$.execution.progressSnapshotError', '$.continuation')
 					END
 				ELSE checkpoint_json
 			END,

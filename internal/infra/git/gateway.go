@@ -421,7 +421,6 @@ func (g *Gateway) DetectOriginRemote(ctx context.Context, repoPath string) (Orig
 
 func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInput) (*storage.WorktreeRecord, error) {
 	checkoutMode := normalizeCheckoutMode(input.CheckoutMode)
-	hasStoredIdentity := false
 
 	if g.repos != nil {
 		var stored *storage.WorktreeRecord
@@ -436,7 +435,6 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		if err != nil {
 			return nil, err
 		}
-		hasStoredIdentity = stored != nil
 		if stored != nil && stored.Status != "cleaned" && normalizeComparablePath(stored.RepoPath) == normalizeComparablePath(input.RepoPath) && worktreesafety.IsSafe(worktreesafety.CheckInput{WorktreePath: stored.WorktreePath, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}) {
 			storedHealthy, err := g.isHealthyWorktree(ctx, stored.WorktreePath)
 			if err != nil {
@@ -523,7 +521,7 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 	// uncommitted work from the previous owner and must never be adopted. A
 	// healthy checkout with no provenance is instead an interrupted create and
 	// is safely recovered below.
-	if g.repos != nil && !hasStoredIdentity {
+	if g.repos != nil {
 		owner, err := g.repos.Worktrees.GetByPath(ctx, match.Path)
 		if err != nil {
 			return nil, fmt.Errorf("get worktree retirement provenance: %w", err)

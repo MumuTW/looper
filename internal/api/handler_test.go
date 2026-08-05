@@ -654,6 +654,205 @@ func TestHandlerActiveRunsSurfacesResumePolicyManualIntervention(t *testing.T) {
 	assertEqual(t, item["lastFailureReason"], runError)
 }
 
+func TestHandlerActiveRunsProjectsWorkerTimeoutContinuationWithoutPaths(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_timeout_continuation"
+	loopID := "loop_timeout_continuation"
+	targetID := projectID
+	checkpoint := `{
+		"resumePolicy":"manual_intervention",
+		"continuation":{
+			"predecessorRunId":"run_predecessor",
+			"predecessorExecutionId":"agent_predecessor",
+			"mode":"checkpoint_same_worktree",
+			"outcome":"lost",
+			"beforeTimeout":{"headSha":"before-head","worktreeId":"wt_1","branch":"feature/continue","changedFileCount":3,"stagedFileCount":1,"untrackedFileCount":1,"changedFiles":["private.go"],"diffFingerprint":"before-status","timeoutType":"idle","lastProgressAt":"2026-04-11T11:59:00.000Z"},
+			"afterRestart":{"headSha":"before-head","worktreeId":"wt_1","branch":"feature/continue","changedFileCount":0,"stagedFileCount":0,"untrackedFileCount":0,"diffFingerprint":"clean-status","capturedAt":"2026-04-11T12:00:00.000Z"}
+		}
+	}`
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 48, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_timeout_continuation", LoopID: loopID, Status: "failed", CheckpointJSON: &checkpoint, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	items := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("items len = %d, want 1: %#v", len(items), items)
+	}
+	continuation := items[0].(map[string]any)["continuation"].(map[string]any)
+	assertEqual(t, continuation["predecessorRunId"], "run_predecessor")
+	assertEqual(t, continuation["predecessorExecutionId"], "agent_predecessor")
+	assertEqual(t, continuation["mode"], "checkpoint_same_worktree")
+	assertEqual(t, continuation["outcome"], "lost")
+	before := continuation["beforeTimeout"].(map[string]any)
+	assertEqual(t, before["changedFileCount"], float64(3))
+	assertEqual(t, before["diffFingerprint"], "before-status")
+	if _, ok := before["changedFiles"]; ok {
+		t.Fatalf("beforeTimeout = %#v, must not expose persisted file paths", before)
+	}
+}
+
+func TestBuildActiveRunContinuationUsesTimeoutEvidenceBeforeRetry(t *testing.T) {
+	checkpoint := `{
+		"execution":{
+			"runId":"run_timeout",
+			"executionId":"agent_timed_out",
+			"progressBeforeTimeout":{
+				"headSha":"before-head",
+				"worktreeId":"wt_1",
+				"branch":"feature/continue",
+				"changedFileCount":3,
+				"stagedFileCount":1,
+				"untrackedFileCount":1,
+				"diffFingerprint":"before-status",
+				"timeoutType":"idle"
+			}
+		}
+	}`
+
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_timeout", CheckpointJSON: &checkpoint})
+	if continuation == nil {
+		t.Fatal("buildActiveRunContinuation() = nil, want timeout evidence")
+	}
+	assertEqual(t, continuation.PredecessorExecutionID, "agent_timed_out")
+	assertEqual(t, continuation.Mode, "timeout_observed")
+	if continuation.BeforeTimeout == nil {
+		t.Fatal("BeforeTimeout = nil, want timeout evidence")
+	}
+	assertEqual(t, continuation.BeforeTimeout.HeadSHA, "before-head")
+	assertEqual(t, continuation.BeforeTimeout.ChangedFileCount, 3)
+	assertEqual(t, continuation.BeforeTimeout.DiffFingerprint, "before-status")
+	if continuation.AfterRestart != nil {
+		t.Fatalf("AfterRestart = %#v, want nil", continuation.AfterRestart)
+	}
+}
+
+func TestBuildActiveRunContinuationAcceptsLegacyUncorrelatedTimeoutEvidence(t *testing.T) {
+	checkpoint := `{"execution":{"executionId":"agent_legacy","status":"timeout","progressBeforeTimeout":{"headSha":"legacy-head","changedFileCount":2,"diffFingerprint":"legacy-status"}}}`
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_upgraded", CheckpointJSON: &checkpoint})
+	if continuation == nil || continuation.BeforeTimeout == nil {
+		t.Fatalf("buildActiveRunContinuation() = %#v, want legacy timeout evidence", continuation)
+	}
+	assertEqual(t, continuation.PredecessorExecutionID, "agent_legacy")
+	assertEqual(t, continuation.BeforeTimeout.HeadSHA, "legacy-head")
+}
+
+func TestBuildActiveRunContinuationProjectsOutcomeWithoutSnapshots(t *testing.T) {
+	checkpoint := `{"continuation":{"predecessorRunId":"run_timeout","predecessorExecutionId":"agent_timeout","mode":"checkpoint_same_worktree","outcome":"observation failed"}}`
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_retry", CheckpointJSON: &checkpoint})
+	if continuation == nil {
+		t.Fatal("buildActiveRunContinuation() = nil, want outcome-only continuation")
+	}
+	assertEqual(t, continuation.Outcome, "observation failed")
+	if continuation.BeforeTimeout != nil || continuation.AfterRestart != nil {
+		t.Fatalf("continuation = %#v, want no snapshots for outcome-only evidence", continuation)
+	}
+}
+
+func TestBuildActiveRunContinuationPrefersNewestTimeoutEvidenceAfterRetry(t *testing.T) {
+	checkpoint := `{
+		"continuation":{
+			"predecessorRunId":"run_first_timeout",
+			"predecessorExecutionId":"agent_first_timeout",
+			"mode":"checkpoint_same_worktree",
+			"outcome":"preserved",
+			"beforeTimeout":{"headSha":"first-head","diffFingerprint":"first-timeout"},
+			"afterRestart":{"headSha":"first-head","diffFingerprint":"first-restart"}
+		},
+		"execution":{
+			"runId":"run_second_timeout",
+			"executionId":"agent_second_timeout",
+			"progressBeforeTimeout":{
+				"headSha":"second-head",
+				"worktreeId":"wt_1",
+				"branch":"feature/continue",
+				"changedFileCount":5,
+				"diffFingerprint":"second-timeout",
+				"timeoutType":"wall"
+			}
+		}
+	}`
+
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_second_timeout", CheckpointJSON: &checkpoint})
+	if continuation == nil || continuation.BeforeTimeout == nil {
+		t.Fatalf("buildActiveRunContinuation() = %#v, want newest timeout evidence", continuation)
+	}
+	assertEqual(t, continuation.PredecessorExecutionID, "agent_second_timeout")
+	assertEqual(t, continuation.Mode, "timeout_observed")
+	assertEqual(t, continuation.BeforeTimeout.HeadSHA, "second-head")
+	assertEqual(t, continuation.BeforeTimeout.ChangedFileCount, 5)
+	assertEqual(t, continuation.BeforeTimeout.DiffFingerprint, "second-timeout")
+	if continuation.Outcome != "" || continuation.AfterRestart != nil {
+		t.Fatalf("continuation = %#v, must not report older retry outcome", continuation)
+	}
+}
+
+func TestBuildActiveRunContinuationReportsObservationError(t *testing.T) {
+	checkpoint := `{"execution":{"runId":"run_timeout","executionId":"agent_timeout","status":"timeout","progressSnapshotError":"git status unavailable"}}`
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_timeout", CheckpointJSON: &checkpoint})
+	if continuation == nil {
+		t.Fatal("buildActiveRunContinuation() = nil, want failed-observation projection")
+	}
+	assertEqual(t, continuation.PredecessorRunID, "run_timeout")
+	assertEqual(t, continuation.PredecessorExecutionID, "agent_timeout")
+	assertEqual(t, continuation.Mode, "timeout_observed")
+	assertEqual(t, continuation.Outcome, "observation failed")
+	if continuation.BeforeTimeout != nil || continuation.AfterRestart != nil {
+		t.Fatalf("continuation = %#v, want no partial progress snapshot", continuation)
+	}
+}
+
+func TestBuildActiveRunContinuationPrefersObservationErrorOverPartialSnapshot(t *testing.T) {
+	checkpoint := `{"execution":{"runId":"run_timeout","executionId":"agent_timeout","status":"timeout","progressSnapshotError":"worktree changed after termination","progressBeforeTimeout":{"headSha":"before-head","diffFingerprint":"before-status"}}}`
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_timeout", CheckpointJSON: &checkpoint})
+	if continuation == nil {
+		t.Fatal("buildActiveRunContinuation() = nil, want failed-observation projection")
+	}
+	assertEqual(t, continuation.Outcome, "observation failed")
+	if continuation.BeforeTimeout != nil || continuation.AfterRestart != nil {
+		t.Fatalf("continuation = %#v, want error to suppress partial snapshot", continuation)
+	}
+}
+
+func TestBuildActiveRunContinuationProjectsWorkerRetryOutcome(t *testing.T) {
+	checkpoint := `{"execution":{"status":"completed","runId":"run_retry","executionId":"agent_retry"},"continuation":{"predecessorRunId":"run_timeout","predecessorExecutionId":"agent_timeout","mode":"checkpoint_same_worktree","outcome":"preserved","beforeTimeout":{"headSha":"before-head","diffFingerprint":"before-status"},"afterRestart":{"headSha":"before-head","diffFingerprint":"before-status"}}}`
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_retry", CheckpointJSON: &checkpoint})
+	if continuation == nil || continuation.BeforeTimeout == nil || continuation.AfterRestart == nil {
+		t.Fatalf("buildActiveRunContinuation() = %#v, want persisted retry comparison", continuation)
+	}
+	assertEqual(t, continuation.PredecessorRunID, "run_timeout")
+	assertEqual(t, continuation.PredecessorExecutionID, "agent_timeout")
+	assertEqual(t, continuation.Mode, "checkpoint_same_worktree")
+	assertEqual(t, continuation.Outcome, "preserved")
+}
+
+func TestBuildActiveRunContinuationIgnoresInheritedExecutionForRetryComparison(t *testing.T) {
+	checkpoint := `{"execution":{"runId":"run_timeout","executionId":"agent_timeout","progressBeforeTimeout":{"headSha":"old-head","diffFingerprint":"old-timeout"}},"continuation":{"predecessorRunId":"run_timeout","predecessorExecutionId":"agent_timeout","mode":"checkpoint_same_worktree","outcome":"changed","beforeTimeout":{"headSha":"old-head","diffFingerprint":"old-timeout"},"afterRestart":{"headSha":"new-head","diffFingerprint":"new-timeout"}}}`
+
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_retry", CheckpointJSON: &checkpoint})
+	if continuation == nil || continuation.AfterRestart == nil {
+		t.Fatalf("buildActiveRunContinuation() = %#v, want retry comparison", continuation)
+	}
+	assertEqual(t, continuation.PredecessorRunID, "run_timeout")
+	assertEqual(t, continuation.Mode, "checkpoint_same_worktree")
+	assertEqual(t, continuation.Outcome, "changed")
+	assertEqual(t, continuation.AfterRestart.HeadSHA, "new-head")
+}
+
 // Successful completeRun summaries must not populate lastFailureReason when there
 // is no queue error (queued/running loops and ps --all completed rows).
 func TestHandlerActiveRunsDoesNotUseSuccessSummaryAsFailureReason(t *testing.T) {

@@ -2042,6 +2042,46 @@ func TestGatewayRestoreWorktreeRefusesUnregisteredLinkedCheckout(t *testing.T) {
 	}
 }
 
+func TestGatewayRestoreWorktreeRejectsRetiredMatchWithOtherStoredIdentity(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createLocalFeatureRepo(t)
+	gateway := fixture.gateway()
+	retired, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: "feature/fixer", BaseBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	if _, err := fixture.repos.Worktrees.RetireByProject(ctx, fixture.projectID, fixture.now().UTC().Format(javaScriptISOStringLayout)); err != nil {
+		t.Fatalf("RetireByProject() error = %v", err)
+	}
+	// Simulate a stale active row for the same project/branch that is selected
+	// first but rejected because its path no longer exists. The linked checkout
+	// returned by git worktree list is still the retired path and must remain
+	// protected even though an unrelated stored identity exists.
+	fakePath := filepath.Join(fixture.worktreeRoot, "stale-active")
+	baseBranch := "main"
+	metadata := `{"recovered":false}`
+	if err := fixture.repos.Worktrees.Upsert(ctx, storage.WorktreeRecord{
+		ID: "stale-active-record", ProjectID: fixture.projectID, RepoPath: fixture.repoPath,
+		WorktreePath: fakePath, Branch: "feature/fixer", BaseBranch: &baseBranch, Status: "active",
+		MetadataJSON: &metadata, CreatedAt: fixture.now().UTC().Format(javaScriptISOStringLayout), UpdatedAt: fixture.now().UTC().Format(javaScriptISOStringLayout),
+	}); err != nil {
+		t.Fatalf("Worktrees.Upsert() error = %v", err)
+	}
+
+	_, err = gateway.RestoreWorktree(ctx, RestoreWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, Branch: "feature/fixer",
+		WorktreeRoot: fixture.worktreeRoot, ExpectedWorktreePath: retired.WorktreePath,
+	})
+	if err == nil || !strings.Contains(err.Error(), "refusing to adopt retired worktree") {
+		t.Fatalf("RestoreWorktree() error = %v, want retired-match refusal", err)
+	}
+}
+
 func TestGatewayRecreatesMissingRetiredWorktree(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
