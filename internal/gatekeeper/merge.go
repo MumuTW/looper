@@ -15,7 +15,11 @@ type MergeOutcome struct {
 	// HeadSHA is the commit the decision was made about and, on success, the
 	// commit that was merged.
 	HeadSHA string `json:"headSha"`
-	Merged  bool   `json:"merged"`
+	// TouchedFiles is GitHub's authoritative pull-request file list captured
+	// after a successful merge. Auditor may use it as attribution evidence; it
+	// is not merge authority and therefore a read failure never undoes a merge.
+	TouchedFiles []string `json:"touchedFiles,omitempty"`
+	Merged       bool     `json:"merged"`
 	// Reason explains a refusal. Empty on success.
 	Reason string `json:"reason,omitempty"`
 	// ConfirmingReasons are the gates that blocked the confirming evaluation, when

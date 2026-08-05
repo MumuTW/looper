@@ -16,8 +16,9 @@ import (
 )
 
 type fakeAuditorGateway struct {
-	head   string
-	checks githubinfra.PullRequestCheckRuns
+	head        string
+	checks      githubinfra.PullRequestCheckRuns
+	annotations map[int64][]githubinfra.CheckRunAnnotation
 }
 
 func (f fakeAuditorGateway) GetBranchHeadSHA(context.Context, githubinfra.BranchHeadInput) (string, error) {
@@ -26,6 +27,14 @@ func (f fakeAuditorGateway) GetBranchHeadSHA(context.Context, githubinfra.Branch
 
 func (f fakeAuditorGateway) ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error) {
 	return f.checks, nil
+}
+
+func (f fakeAuditorGateway) RerequestCheckSuite(context.Context, githubinfra.RerequestCheckSuiteInput) error {
+	return nil
+}
+
+func (f fakeAuditorGateway) ListCheckRunAnnotations(_ context.Context, input githubinfra.CheckRunAnnotationsInput) ([]githubinfra.CheckRunAnnotation, error) {
+	return f.annotations[input.CheckRunID], nil
 }
 
 func TestObservePostMergeFailureRecordsOneOptInDefaultBranchObservation(t *testing.T) {
@@ -45,7 +54,7 @@ func TestObservePostMergeFailureRecordsOneOptInDefaultBranchObservation(t *testi
 		t.Fatalf("Append merge outcome error = %v", err)
 	}
 	role := config.AuditorRoleConfig{Enabled: true, WindowMinutes: 60}
-	gateway := fakeAuditorGateway{head: head, checks: githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "failure", CheckSuiteID: 7654}}}}
+	gateway := fakeAuditorGateway{head: head, checks: githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{ID: 99, Name: "ci", Status: "completed", Conclusion: "failure", CheckSuiteID: 7654}}}, annotations: map[int64][]githubinfra.CheckRunAnnotation{99: {{Path: "internal/runtime/auditor.go"}}}}
 	if err := observePostMergeFailure(ctx, repos, gateway, project, repo, base, role, func() time.Time { return now }); err != nil {
 		t.Fatalf("observePostMergeFailure() error = %v", err)
 	}
@@ -58,7 +67,7 @@ func TestObservePostMergeFailureRecordsOneOptInDefaultBranchObservation(t *testi
 	if err := json.Unmarshal([]byte(events[0].PayloadJSON), &observation); err != nil {
 		t.Fatal(err)
 	}
-	if observation.Version != 2 || observation.ProjectID != projectID || observation.HeadSHA != head || len(observation.CandidatePRs) != 1 || observation.CandidatePRs[0] != 42 || len(observation.FailedChecks) != 1 || observation.FailedChecks[0] != "ci" || len(observation.CheckSuiteIDs) != 1 || observation.CheckSuiteIDs[0] != 7654 {
+	if observation.Version != 3 || observation.ProjectID != projectID || observation.HeadSHA != head || len(observation.CandidatePRs) != 1 || observation.CandidatePRs[0] != 42 || len(observation.FailedChecks) != 1 || observation.FailedChecks[0] != "ci" || len(observation.FailingPaths) != 1 || observation.FailingPaths[0] != "internal/runtime/auditor.go" || len(observation.CheckSuiteIDs) != 1 || observation.CheckSuiteIDs[0] != 7654 {
 		t.Fatalf("observation = %#v", observation)
 	}
 	if err := observePostMergeFailure(ctx, repos, gateway, project, repo, base, role, func() time.Time { return now }); err != nil {
