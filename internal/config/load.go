@@ -369,6 +369,9 @@ func decodeJSONConfigFile(raw []byte) (PartialConfig, error) {
 	if err := rejectRemovedProviderKind(raw); err != nil {
 		return PartialConfig{}, err
 	}
+	if err := rejectWithdrawnNetworkSurface(raw); err != nil {
+		return PartialConfig{}, err
+	}
 	var partialConfig PartialConfig
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	if err := decodeTopLevelConfigSections(decoder, &partialConfig); err != nil {
@@ -378,6 +381,44 @@ func decodeJSONConfigFile(raw []byte) (PartialConfig, error) {
 		return PartialConfig{}, fmt.Errorf("trailing JSON value")
 	}
 	return partialConfig, nil
+}
+
+// rejectWithdrawnNetworkSurface fails old Routed configuration explicitly.
+// Unknown top-level sections are otherwise ignored for forward compatibility,
+// which would make an old [network] block look accepted while doing nothing.
+func rejectWithdrawnNetworkSurface(raw []byte) error {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return nil // strict decoding reports malformed input
+	}
+	for key := range root {
+		if strings.EqualFold(key, "network") {
+			return &ConfigValidationError{Issues: []ValidationIssue{{
+				Path:    "network",
+				Message: "is no longer supported because Routed enrollment has no safe credential producer; remove this section and use local-only projects",
+			}}}
+		}
+	}
+	for key, rawProjects := range root {
+		if !strings.EqualFold(key, "projects") {
+			continue
+		}
+		var projects []map[string]json.RawMessage
+		if err := json.Unmarshal(rawProjects, &projects); err != nil {
+			return nil
+		}
+		for index, project := range projects {
+			for projectKey := range project {
+				if strings.EqualFold(projectKey, "network") {
+					return &ConfigValidationError{Issues: []ValidationIssue{{
+						Path:    fmt.Sprintf("projects[%d].network", index),
+						Message: "is no longer supported because Routed enrollment has no safe credential producer; remove it to use local-only mode",
+					}}}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // rejectRemovedProviderKind scans the normalized JSON config for a provider
@@ -446,9 +487,6 @@ func topLevelConfigSections(partialConfig *PartialConfig) []topLevelConfigSectio
 		}},
 		{key: "webhook", decode: func(raw json.RawMessage) error {
 			return decodeTopLevelConfigSection(raw, "webhook", &partialConfig.Webhook)
-		}},
-		{key: "network", decode: func(raw json.RawMessage) error {
-			return decodeTopLevelConfigSection(raw, "network", &partialConfig.Network)
 		}},
 		{key: "agent", decode: func(raw json.RawMessage) error {
 			return decodeTopLevelConfigSection(raw, "agent", &partialConfig.Agent)

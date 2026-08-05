@@ -250,6 +250,7 @@ type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	ListOpenIssues(context.Context, ListOpenIssuesInput) ([]IssueSummary, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
+	ViewPullRequestForDiscovery(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error)
 	GetCurrentUserLogin(context.Context, string, string) (string, error)
 	AddIssueAssignees(context.Context, IssueAssigneesInput) error
@@ -3239,7 +3240,7 @@ func (r *Runner) workerHoldSummaryForWork(ctx context.Context, project storage.P
 		return false, "", nil
 	}
 	if work.PRNumber > 0 {
-		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: work.Repo, PRNumber: work.PRNumber, CWD: project.RepoPath})
+		detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: work.Repo, PRNumber: work.PRNumber, CWD: project.RepoPath})
 		if err != nil {
 			return false, "", err
 		}
@@ -3370,7 +3371,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 		if repo == "" || prNumber == 0 {
 			return workerInput{}, &runpipe.LoopError{Message: "pull_request worker loop requires repo and prNumber", Kind: runpipe.FailureNonRetryable}
 		}
-		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
+		detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
 		if err != nil {
 			return workerInput{}, err
 		}
@@ -4562,7 +4563,7 @@ func (r *Runner) renamePlannerSpecPullRequestAfterTakeover(ctx context.Context, 
 	if r.github == nil || work.ExecutionMode != "push-existing" || work.PRNumber <= 0 {
 		return nil
 	}
-	current, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: work.Repo, PRNumber: work.PRNumber, CWD: cwd})
+	current, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: work.Repo, PRNumber: work.PRNumber, CWD: cwd})
 	if err != nil {
 		return err
 	}
@@ -4606,7 +4607,7 @@ func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, run storage
 	if r.github == nil || prNumber <= 0 || !r.disclosure.Enabled || !r.disclosure.Channels.PullRequest {
 		return nil
 	}
-	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		return err
 	}
@@ -4627,7 +4628,7 @@ func (r *Runner) lifecycleAgentCreatedPullRequest(ctx context.Context, currentLo
 	}
 	expectedBranch = strings.TrimSpace(expectedBranch)
 	expectedBaseBranch = strings.TrimSpace(expectedBaseBranch)
-	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: state.PRNumber, CWD: cwd})
+	detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: repo, PRNumber: state.PRNumber, CWD: cwd})
 	if err != nil {
 		return checkpointPullPR{}, "", false, err
 	}

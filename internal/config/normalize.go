@@ -360,10 +360,6 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		mergeWebhookConfig(&config.Webhook, *partial.Webhook)
 	}
 
-	if partial.Network != nil {
-		mergeNetworkConfig(&config.Network, *partial.Network)
-	}
-
 	if partial.Agent != nil {
 		mergeAgentConfig(&config.Agent, *partial.Agent)
 	}
@@ -599,24 +595,6 @@ func mergeWebhookConfig(config *WebhookConfig, partial PartialWebhookConfig) {
 
 	if partial.FallbackPollIntervalSeconds != nil {
 		config.FallbackPollIntervalSeconds = *partial.FallbackPollIntervalSeconds
-	}
-}
-
-func mergeNetworkConfig(config *NetworkConfig, partial PartialNetworkConfig) {
-	if partial.Enrolled != nil {
-		config.Enrolled = *partial.Enrolled
-	}
-	if partial.LoopernetBaseURL != nil {
-		config.LoopernetBaseURL = *partial.LoopernetBaseURL
-	}
-	if partial.NodeName != nil {
-		config.NodeName = *partial.NodeName
-	}
-	if partial.GitHubLogin != nil {
-		config.GitHubLogin = *partial.GitHubLogin
-	}
-	if partial.GitHubUserID != nil {
-		config.GitHubUserID = *partial.GitHubUserID
 	}
 }
 
@@ -1251,6 +1229,9 @@ func mergeInstructionsConfig(config *InstructionsConfig, partial PartialInstruct
 }
 
 func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
+	if partial.Triager != nil {
+		mergeTriagerRoleConfig(&config.Triager, *partial.Triager)
+	}
 	if partial.Coordinator != nil {
 		mergeCoordinatorRoleConfig(&config.Coordinator, *partial.Coordinator)
 	}
@@ -1321,6 +1302,47 @@ func mergeEscalatorRoleConfig(config *EscalatorRoleConfig, partial PartialEscala
 	}
 	if partial.MaxItems != nil {
 		config.MaxItems = *partial.MaxItems
+	}
+}
+
+func mergeTriagerRoleConfig(config *TriagerRoleConfig, partial PartialTriagerRoleConfig) {
+	if partial.Preset != nil {
+		config.Preset = TriagerPreset(strings.TrimSpace(string(*partial.Preset)))
+	}
+	if partial.Classify != nil {
+		config.Classify = *partial.Classify
+	}
+	if partial.AuthorTiers != nil {
+		if config.AuthorTiers == nil {
+			config.AuthorTiers = map[string]TriagerAdmissionOutcome{}
+		}
+		for tier, outcome := range *partial.AuthorTiers {
+			config.AuthorTiers[tier] = TriagerAdmissionOutcome(strings.TrimSpace(string(outcome)))
+		}
+	}
+	if partial.Legacy != nil {
+		mergeTriagerLegacyPolicyConfig(&config.Legacy, *partial.Legacy)
+	}
+}
+
+func mergeTriagerLegacyPolicyConfig(config *TriagerLegacyPolicyConfig, partial PartialTriagerLegacyPolicyConfig) {
+	if partial.AutoRouteConfidence != nil {
+		config.AutoRouteConfidence = *partial.AutoRouteConfidence
+	}
+	if partial.MaxAutoRouteRisk != nil {
+		config.MaxAutoRouteRisk = strings.TrimSpace(*partial.MaxAutoRouteRisk)
+	}
+	if partial.RequireInScope != nil {
+		config.RequireInScope = *partial.RequireInScope
+	}
+	if partial.RequireNoMissingInformation != nil {
+		config.RequireNoMissingInformation = *partial.RequireNoMissingInformation
+	}
+	if partial.RequirePlanner != nil {
+		config.RequirePlanner = *partial.RequirePlanner
+	}
+	if partial.RequireRationale != nil {
+		config.RequireRationale = *partial.RequireRationale
 	}
 }
 
@@ -1746,10 +1768,6 @@ func cloneStrings(values []string) []string {
 
 func clonePartialConfig(partial PartialConfig) PartialConfig {
 	cloned := partial
-	if partial.Network != nil {
-		network := *partial.Network
-		cloned.Network = &network
-	}
 	if partial.Agent != nil {
 		cloned.Agent = clonePartialAgentConfig(partial.Agent)
 	}
@@ -1821,7 +1839,6 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 			Path:            project.Path,
 			BaseBranch:      cloneStringPtr(project.BaseBranch),
 			WorktreeRoot:    cloneStringPtr(project.WorktreeRoot),
-			Network:         clonePartialProjectNetworkConfig(project.Network),
 			Webhook:         clonePartialProjectWebhookConfig(project.Webhook),
 			Validation:      clonePartialProjectValidationConfig(project.Validation),
 			Instructions:    cloneStringMap(project.Instructions),
@@ -1829,14 +1846,6 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 		}
 	}
 	return cloned
-}
-
-func clonePartialProjectNetworkConfig(config *PartialProjectNetworkConfig) *PartialProjectNetworkConfig {
-	if config == nil {
-		return nil
-	}
-	cloned := *config
-	return &cloned
 }
 
 func clonePartialProjectWebhookConfig(config *PartialProjectWebhookConfig) *PartialProjectWebhookConfig {
@@ -1930,9 +1939,6 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 		}
 		if project.Repo != nil {
 			cloned[index].Repo = strings.TrimSpace(*project.Repo)
-		}
-		if project.Network != nil && project.Network.Mode != nil {
-			cloned[index].Network.Mode = *project.Network.Mode
 		}
 		if project.Webhook != nil && project.Webhook.Mode != nil {
 			cloned[index].Webhook.Mode = *project.Webhook.Mode
@@ -2120,6 +2126,21 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 		}
 		planner.Agent = cloneRoleAgentConfig(configs.Planner.Agent)
 		cloned.Planner = &planner
+	}
+	if configs.Triager != nil {
+		triager := *configs.Triager
+		if configs.Triager.AuthorTiers != nil {
+			overrides := make(map[string]TriagerAdmissionOutcome, len(*configs.Triager.AuthorTiers))
+			for tier, outcome := range *configs.Triager.AuthorTiers {
+				overrides[tier] = outcome
+			}
+			triager.AuthorTiers = &overrides
+		}
+		if configs.Triager.Legacy != nil {
+			legacy := *configs.Triager.Legacy
+			triager.Legacy = &legacy
+		}
+		cloned.Triager = &triager
 	}
 	if configs.Worker != nil {
 		worker := *configs.Worker

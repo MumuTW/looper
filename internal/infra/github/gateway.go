@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -195,16 +196,23 @@ type PullRequestCheckRuns struct {
 }
 
 type PullRequestCheckRun struct {
+	ID           int64
 	Name         string
 	Status       string
 	Conclusion   string
 	AppID        int64
 	CheckSuiteID int64
+	StartedAt    string
+	CompletedAt  string
 }
 
 type PullRequestStatus struct {
 	Context string
 	State   string
+}
+
+type CheckRunAnnotation struct {
+	Path string
 }
 
 type CommentInfo struct {
@@ -318,6 +326,7 @@ type RepositorySettings struct {
 	AllowMergeCommit bool
 	AllowRebaseMerge bool
 	AllowAutoMerge   bool
+	Visibility       string
 }
 
 type BranchProtectionInput struct {
@@ -369,6 +378,7 @@ type IssueDetail struct {
 	ClosedAt          string
 	Author            string
 	AuthorAssociation string
+	AuthorType        string
 	Assignees         []string
 	AssigneeUsers     []GitHubUser
 	Labels            []string
@@ -537,6 +547,12 @@ type PullRequestCheckRunsInput struct {
 	Repo string
 	Ref  string
 	CWD  string
+}
+
+type CheckRunAnnotationsInput struct {
+	Repo       string
+	CheckRunID int64
+	CWD        string
 }
 
 // RerequestCheckSuiteInput identifies one GitHub check suite to rerun. The
@@ -1129,6 +1145,7 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 		ClosedAt:          firstNonEmpty(asString(row["closed_at"]), asString(row["closedAt"])),
 		Author:            extractAuthor(firstNonNil(row["user"], row["author"])),
 		AuthorAssociation: asString(row["author_association"]),
+		AuthorType:        extractActorType(firstNonNil(row["user"], row["author"])),
 		Assignees:         extractActorLogins(row["assignees"]),
 		AssigneeUsers:     extractActorUsers(row["assignees"]),
 		Labels:            extractLabelNames(row["labels"]),
@@ -1356,9 +1373,24 @@ func (g *Gateway) ListIssueCommentsContaining(ctx context.Context, input ViewIss
 	return extractCommentInfos(rows), nil
 }
 
+// issueTimelineProjection keeps issue timeline reads independent of the size of
+// the discussion. Cross-referenced events embed the full source issue or pull
+// request body, so one busy issue can exceed the shell capture cap and erase
+// the whole timeline. gh applies this projection to each page before anything
+// crosses that boundary, keeping only the fields the coordinator and triager
+// consume: event kind, timestamp, event id, and the label for label events.
+//
+// The projection also retains the minimal identifying fields of a cross-
+// referenced source, a top-level pull_request, and a top-level issue — number,
+// html_url, url, and the nested pull_request marker — so linkedPullRequestNumbers
+// can still discover the PR a cross-referenced event points at and drive
+// merge-watch and mark-ready. The full bodies those objects carry are dropped,
+// which is what keeps the wire shape under the capture cap.
+const issueTimelineProjection = `.[] | {id, event, created_at, label: (.label | if . then {name} else null end), source: (.source | if . then {issue: (.issue | if . then {number, html_url, url, pull_request: (if .pull_request then {number, html_url, url} else null end)} else null end)} else null end), pull_request: (.pull_request | if . then {number, html_url, url} else null end), issue: (.issue | if . then {number, html_url, url, pull_request: (if .pull_request then {number, html_url, url} else null end)} else null end)}`
+
 func (g *Gateway) ListIssueTimeline(ctx context.Context, input IssueTimelineInput) ([]map[string]any, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
-	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/timeline", repo, input.IssueNumber), "-H", "Accept: application/vnd.github+json"}
+	args := []string{"api", "--paginate", fmt.Sprintf("repos/%s/issues/%d/timeline", repo, input.IssueNumber), "-H", "Accept: application/vnd.github+json", "--jq", issueTimelineProjection}
 	if hostname != "" {
 		args = append(args, "--hostname", hostname)
 	}
@@ -1366,7 +1398,7 @@ func (g *Gateway) ListIssueTimeline(ctx context.Context, input IssueTimelineInpu
 	if err != nil {
 		return nil, err
 	}
-	return decodeJSONArrayOrPages(result.Stdout)
+	return decodeJSONObjects(result.Stdout)
 }
 
 func (g *Gateway) ListIssueReactions(ctx context.Context, input IssueReactionInput) ([]IssueReaction, error) {
@@ -1689,7 +1721,21 @@ func (g *Gateway) GetRepositorySettings(ctx context.Context, input RepositorySet
 		AllowMergeCommit: asBool(row["allow_merge_commit"]),
 		AllowRebaseMerge: asBool(row["allow_rebase_merge"]),
 		AllowAutoMerge:   asBool(row["allow_auto_merge"]),
+		Visibility:       repositoryVisibility(row),
 	}, nil
+}
+
+func repositoryVisibility(row map[string]any) string {
+	if visibility := strings.ToLower(strings.TrimSpace(asString(row["visibility"]))); visibility != "" {
+		return visibility
+	}
+	if private, ok := row["private"].(bool); ok {
+		if private {
+			return "private"
+		}
+		return "public"
+	}
+	return "unknown"
 }
 
 func (g *Gateway) GetBranchProtection(ctx context.Context, input BranchProtectionInput) (BranchProtection, error) {
@@ -1761,6 +1807,25 @@ func compactIssueAssignees(values []string) []string {
 func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
 	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
 		return snapshot.viewPullRequest(ctx, input)
+	}
+	return g.viewPullRequestWithFields(ctx, input, prViewMetadataJSONFields, false, false)
+}
+
+// ViewPullRequestForDiscovery returns the lightweight metadata tier of a
+// pull request (no statusCheckRollup, no reviews, no review threads, no
+// issue comments) for discovery-path callers that only need
+// IsDraft/Author/ReviewRequests/Labels/State. During scheduler ticks it
+// shares the per-tick discovery snapshot's metadata cache so the whole
+// tick costs one thin view per PR; outside a snapshot it falls back to a
+// direct thin query.
+//
+// Callers that consume detail.Checks or detail.Reviews must keep using
+// ViewPullRequestForFixer / ViewPullRequestForReviewer (or ViewPullRequest
+// when the snapshot's full tier is required); this method deliberately
+// omits statusCheckRollup, the most expensive GraphQL field per tick.
+func (g *Gateway) ViewPullRequestForDiscovery(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
+		return snapshot.viewPullRequestMetadata(ctx, input)
 	}
 	return g.viewPullRequestWithFields(ctx, input, prViewMetadataJSONFields, false, false)
 }
@@ -1936,7 +2001,7 @@ func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullReques
 	checkRuns := toObjectSlice(row["check_runs"])
 	out := PullRequestCheckRuns{TotalCount: int(asInt64(row["total_count"])), CheckRuns: make([]PullRequestCheckRun, 0, len(checkRuns))}
 	for _, checkRun := range checkRuns {
-		out.CheckRuns = append(out.CheckRuns, PullRequestCheckRun{Name: asString(checkRun["name"]), Status: asString(checkRun["status"]), Conclusion: asString(checkRun["conclusion"]), AppID: nestedInt64(checkRun, "app", "id"), CheckSuiteID: nestedInt64(checkRun, "check_suite", "id")})
+		out.CheckRuns = append(out.CheckRuns, PullRequestCheckRun{ID: asInt64(checkRun["id"]), Name: asString(checkRun["name"]), Status: asString(checkRun["status"]), Conclusion: asString(checkRun["conclusion"]), AppID: nestedInt64(checkRun, "app", "id"), CheckSuiteID: nestedInt64(checkRun, "check_suite", "id"), StartedAt: asString(checkRun["started_at"]), CompletedAt: asString(checkRun["completed_at"])})
 	}
 	statuses := toObjectSlice(statusRow["statuses"])
 	out.StatusesTotalCount = int(asInt64(statusRow["total_count"]))
@@ -1955,6 +2020,66 @@ func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullReques
 		out.Statuses = append(out.Statuses, PullRequestStatus{Context: contextName, State: asString(status["state"])})
 	}
 	return out, nil
+}
+
+func (g *Gateway) ListCheckRunAnnotations(ctx context.Context, input CheckRunAnnotationsInput) ([]CheckRunAnnotation, error) {
+	if input.CheckRunID <= 0 {
+		return nil, fmt.Errorf("list check run annotations: positive check run ID is required")
+	}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/check-runs/%d/annotations?per_page=100", repo, input.CheckRunID), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	annotations := make([]CheckRunAnnotation, 0, len(rows))
+	for _, row := range rows {
+		if path := strings.TrimSpace(asString(row["path"])); path != "" {
+			annotations = append(annotations, CheckRunAnnotation{Path: path})
+		}
+	}
+	return annotations, nil
+}
+
+func (g *Gateway) ListPullRequestFiles(ctx context.Context, input ViewPullRequestInput) ([]string, error) {
+	if input.PRNumber <= 0 {
+		return nil, fmt.Errorf("list pull request files: positive pull request number is required")
+	}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/files?per_page=100", repo, input.PRNumber), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(rows))
+	files := make([]string, 0, len(rows))
+	for _, row := range rows {
+		filename := strings.TrimSpace(asString(row["filename"]))
+		if filename == "" {
+			continue
+		}
+		if _, exists := seen[filename]; exists {
+			continue
+		}
+		seen[filename] = struct{}{}
+		files = append(files, filename)
+	}
+	sort.Strings(files)
+	return files, nil
 }
 
 // RerequestCheckSuite asks GitHub to rerun one check suite. It deliberately
@@ -4509,6 +4634,10 @@ func extractAuthorIsBot(value any) bool {
 	return asBool(row["is_bot"])
 }
 
+func extractActorType(value any) string {
+	row, _ := value.(map[string]any)
+	return asString(row["type"])
+}
 func extractOID(value any) string {
 	row, ok := value.(map[string]any)
 	if !ok {

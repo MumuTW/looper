@@ -232,6 +232,19 @@ func DefaultConfig(cwd string) (Config, error) {
 		},
 		Instructions: InstructionsConfig{Enabled: true, MaxBytes: 8192},
 		Roles: RoleConfigs{
+			Triager: TriagerRoleConfig{
+				Preset:      TriagerPresetLegacy,
+				Classify:    true,
+				AuthorTiers: map[string]TriagerAdmissionOutcome{},
+				Legacy: TriagerLegacyPolicyConfig{
+					AutoRouteConfidence:         0.8,
+					MaxAutoRouteRisk:            "low",
+					RequireInScope:              true,
+					RequireNoMissingInformation: true,
+					RequirePlanner:              true,
+					RequireRationale:            true,
+				},
+			},
 			Auditor: AuditorRoleConfig{Enabled: false, WindowMinutes: 60},
 			Coordinator: CoordinatorRoleConfig{
 				Enabled:      false,

@@ -12,29 +12,28 @@ For the default supported install flow:
 
 Keep the runtime directory (`~/.looper` by default, or the directory containing `storage.dbPath`) on a local filesystem. The database lock uses OS file locking and is not designed for NFS-style shared filesystems. If shutdown retains SQLite after an undrained ownership failure, it retains the shared lock too; start a replacement only after the owning process has exited. Tunnel-mode webhook secrets live under the same runtime directory in `secrets/` and must be mode `0600`.
 
-## Network mode summary
+## Network mode
 
-Looper has two project-level network modes:
+Only local operation is supported. `looper:target:*` labels are ignored and
+local-only admission does not add a network-specific Worker label or assignee
+requirement. Worker discovery still applies the configured
+`roles.worker.triggers` policy; Reviewer discovery applies its configured
+review-request policy.
 
-- `projects[].network.mode = "off"` — local-only operation. `looper:target:*` labels are ignored and the classic single-Node assignee/review-request behavior stays unchanged.
-- `projects[].network.mode = "routed"` — multi-Node operation coordinated through `loopernet`.
+The former `[network]` and `projects[].network` sections are rejected. They were
+removed because a user-authored enrollment flag or URL cannot prove that a
+credential was issued, persisted, or can be revoked safely. Routed mode may be
+reintroduced only with one crash-safe enrollment producer and recovery contract.
+The Network ADRs document the withdrawn design and are not configuration guidance.
 
-Authority stays split on purpose:
-
-- GitHub work intent stays on GitHub: `looper:worker-ready` for Worker and GitHub review requests for Reviewer.
-- exactly one `looper:target:<node_name>` label is the exact-Node authority in Routed mode.
-- the `loopernet` lease is a mutation fence for Coordinator only; it does not become the source of truth for work intent.
-
-Operational notes:
-
-- `loopernet` centralizes webhook ingress and Node wakeups, but it must not mutate GitHub on its own.
-- Coordinator writes coarse GitHub authority first, then writes the exact target label last.
-- polling remains enabled as fallback and drift recovery when webhook delivery or SSE wakeups are missed.
-- when enabling Routed mode / network membership in config, Looper rejects enrollment when Planner or Fixer auto-discovery is still enabled for those projects; disable those settings first or opt projects into Routed mode manually.
-
-The formal contract is documented in ADRs [0007](adr/0007-coordinator-admission-assignment-authority.md) through [0011](adr/0011-coordinator-control-plane-for-routed-projects-v1.md).
-
-For runtime deployment details — container image, required environment variables, persistence, and the current single-instance recommendation — see [loopernet deployment](loopernet-deployment.md).
+Before removing those fields and restarting, an existing Routed installation that
+ran more than one Node under a shared GitHub identity must stop all but one Node,
+or assign distinct identities to surviving Worker/Reviewer Nodes while disabling
+`roles.coordinator.enabled` on every Node except one and draining in-flight work.
+Otherwise every upgraded daemon treats the same projects as local-only, ignores
+`looper:target:*`, and separate SQLite queues can run the same Issue or review
+concurrently. See the [user guide](users-guide.md#decommission-extra-nodes-before-the-local-only-cutover)
+for the full cutover steps, including Node credential revocation.
 
 ## Webhook delivery modes
 
@@ -107,7 +106,7 @@ Profile and role agent vendor/model fields are hot-safe curated identity fields:
 
 `agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and no explicit model is being silently carried across vendors. If `agent.model` is set, change or unset it in the same candidate; an unchanged explicit model blocks that vendor-to-vendor switch. Clearing a configured vendor uses the same guard, so a retained profile cannot be laundered through an intermediate `null`. The same leave/switch guards apply to each coding role's *resolved* vendor after global → profile → role overlay. Configuring the first vendor may use an already prepared model/params profile. Continuations of failed or interrupted runs copy the predecessor's durable `agent_snapshot_json` (sticky identity across the retry lineage) while retaining checkpoint, worktree, HITL answer, and queued human instructions. Only legacy predecessors with a null snapshot adopt the runner's current resolved identity. Looper never sends an old vendor's native session ID to a different CLI.
 
-Notably, `agent.nativeResume`, `agent.params`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `intake.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. `roles.reviewer.behavior.convergence.*` is the exception for new claims: its four leaves are hot-safe and an active loop keeps its captured policy snapshot. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
+Notably, `agent.nativeResume`, `agent.params`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `intake.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
 
 Deprecated file-layer aliases for `agent.timeouts.{planner,worker,reviewer,fixer}Seconds`, `defaults.allowAutoApprove`, and `defaults.fixAllPullRequests` are normalized into their canonical hot-safe fields so existing files can still reload without a restart. They remain file-only compatibility syntax: the dashboard exposes and writes only canonical paths, and a canonical dashboard edit removes the corresponding alias leaf so a later unset cannot resurrect the old value.
 
@@ -194,7 +193,7 @@ Looper's frozen canonical top-level config roots are:
 
 ### Project authority and import
 
-`[[projects]]` is a declarative startup import, not a second runtime project store. During daemon startup Looper validates and transactionally imports configured projects into SQLite, then builds the runtime Project Catalog exclusively from active database records. Scheduler, Webhook, Network, and Roles all capture that same Catalog.
+`[[projects]]` is a declarative startup import, not a second runtime project store. During daemon startup Looper validates and transactionally imports configured projects into SQLite, then builds the runtime Project Catalog exclusively from active database records. Scheduler, Webhook, and Roles all capture that same Catalog.
 
 - Removing a config-managed project from `[[projects]]` archives its SQLite record on the next startup.
 - Config import never removes API-managed projects.
@@ -499,6 +498,38 @@ requireAssigneeCurrentUser = false
 [roles.coding.worker.agent]
 profile = "fast"
 ```
+
+## Triager admission policy
+
+The internal Triager separates deterministic admission from model classification. `roles.triager.preset` is project-overridable and defaults to `legacy`, which preserves the original model-first seven-condition gate exactly. Opting into a relationship preset makes forge facts—not Issue prose—the admission authority.
+
+| Preset | Owner | Member/collaborator | Past contributor | Unaffiliated |
+| --- | --- | --- | --- | --- |
+| `personal` | `auto` | `assess` | `assess` | `assess` |
+| `maintained-oss` | `auto` | `auto` | `assess` | `assess` |
+| `company` | `auto` | `assess` | `assess` | `assess` |
+| `contributing` | `assess` | `assess` | `assess` | `assess` |
+
+- `auto` writes a Triage Report and routes directly to Planner without a classification model call.
+- `assess` runs classification when `classify = true`, writes the result, and waits for the report-specific `/plan <token>` confirmation. Classification describes the work but cannot authorize routing.
+- `ignore` writes the admission decision and retires that source without a model call.
+- Bot authors default to `ignore`; `looper:hold` always produces `ignore` for configured presets. Neither can be overridden to `auto`.
+- `contributing` can never auto-route, including through a tier override.
+- If the forge cannot report repository visibility, a would-be `auto` result degrades to `assess` rather than guessing.
+
+Tier overrides use `owner`, `member`, `past-contributor`, `unaffiliated`, or `bot` keys:
+
+```toml
+[roles.triager]
+preset = "company"
+classify = true
+
+[roles.triager.authorTiers]
+member = "auto"
+unaffiliated = "ignore"
+```
+
+The historic gate remains configurable under `roles.triager.legacy`: `autoRouteConfidence` (`0.8`), `maxAutoRouteRisk` (`low`), `requireInScope`, `requireNoMissingInformation`, `requirePlanner`, and `requireRationale` (all `true`). These fields apply only to `legacy`; an omitted Triager section therefore behaves exactly as before.
 
 ## Coordinator config reference
 

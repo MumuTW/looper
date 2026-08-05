@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/MumuTW/looper/internal/config"
-	networkclient "github.com/MumuTW/looper/internal/network/client"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/webhookforward"
@@ -66,22 +65,10 @@ func TestRuntimeFailedStartupDoesNotResumeIncompleteDiscovery(t *testing.T) {
 func TestRuntimeDiscoveryResumeFailureStopsStartedResources(t *testing.T) {
 	t.Parallel()
 
-	network := &startupRollbackNetworkManager{started: make(chan struct{}), stopped: make(chan struct{})}
 	forwarder := &startupRollbackWebhookForwarder{canceled: make(chan struct{}), closed: make(chan struct{})}
 	rt, _ := startRuntimeWithPendingDiscovery(t, "rollback", func(options *Options) {
 		options.WebhookForwarder = forwarder
 	})
-	// Kept white-box under #121: networkManager is wired inside start() from
-	// runtime internals and typed as an unexported interface — exporting a
-	// construction seam for one rollback-observation test would be a prop.
-	// The swap installs the observable fake and stops the real manager the
-	// boot started, so the rollback assertion below sees only the fake.
-	rt.mu.Lock()
-	previousNetwork := rt.networkManager
-	rt.networkManager = network
-	rt.mu.Unlock()
-	previousNetwork.Stop()
-
 	startupErr := errors.New("resume discovery failed")
 	var schedulerDone, cleanupDone <-chan struct{}
 	rt.resumeProjectDiscoveries = func(context.Context, *projects.Service) error {
@@ -96,8 +83,6 @@ func TestRuntimeDiscoveryResumeFailureStopsStartedResources(t *testing.T) {
 		t.Fatalf("CompleteStartup() error = %v, want %v", err, startupErr)
 	}
 	for name, done := range map[string]<-chan struct{}{
-		"network start":  network.started,
-		"network stop":   network.stopped,
 		"scheduler stop": schedulerDone,
 		"cleanup stop":   cleanupDone,
 		"webhook cancel": forwarder.canceled,
@@ -255,21 +240,6 @@ func startRuntimeWithPendingDiscovery(t *testing.T, projectID string, customize 
 	}
 	return rt, services.Projects
 }
-
-type startupRollbackNetworkManager struct {
-	started chan struct{}
-	stopped chan struct{}
-}
-
-func (m *startupRollbackNetworkManager) Start(context.Context) error {
-	close(m.started)
-	return nil
-}
-func (m *startupRollbackNetworkManager) Stop() { close(m.stopped) }
-func (*startupRollbackNetworkManager) Status() networkclient.Status {
-	return networkclient.Status{}
-}
-func (*startupRollbackNetworkManager) UpdateConfig(config.Config) {}
 
 type startupRollbackWebhookForwarder struct {
 	canceled chan struct{}

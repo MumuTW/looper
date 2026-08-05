@@ -35,7 +35,7 @@ Also make sure:
 - GitHub projects: `gh` is authenticated with the target GitHub account
 - each coding role you want to run can resolve a vendor: set global `agent.vendor` in the config (for example `vendor = "opencode"`), or supply vendor via `agent.profiles` / `roles.<role>.agent` as described in [Multi-role agent vendor and model](configuration.md#multi-role-agent-vendor-and-model). A single global vendor is the zero-diff default that covers planner, worker, reviewer, and fixer until you add per-role bindings. Coordinator triage always uses the global agent only and is skipped when global vendor is unset.
 
-`GET /api/v1/status` reports service, storage, scheduler, agent, webhook, loop, network, safety, notification, and tool state; there is no per-provider health surface. `looper status` reports the config file, daemon reachability, and the registered projects.
+`GET /api/v1/status` reports service, storage, scheduler, agent, webhook, loop, safety, notification, and tool state; there is no per-provider health surface. `looper status` reports the config file, daemon reachability, and the registered projects.
 
 ### Grok Build (xAI)
 
@@ -43,38 +43,48 @@ For xAI Grok Build, configure `agent.vendor = "grok-build"`; Looper runs the `gr
 
 Configured Grok arguments take precedence: `--permission-mode` can prompt or fail unattended work, a non-`plain` `--output-format` can break direct completion-marker parsing, and `-p`/`--single` replaces Looper's generated task prompt. Grok Build has no daemon native resume or interactive park-for-handwork path beyond the generic `looper takeover <selector>` loop park. Retries start with a fresh checkpoint prompt; Looper never uses ambient `--continue`.
 
-## 1a. Local-only vs Routed projects
+## 1a. Local-only projects
 
-Looper supports two project modes:
+Looper currently runs local-only. Local-only admission does not add a
+network-specific Worker label or assignee requirement; Worker discovery still
+uses the configured `roles.worker.triggers` policy. Reviewer discovery uses its
+configured review-request policy, and `looper:target:*` labels do nothing.
 
-- `network.mode=off` — local-only. Worker claims `looper:worker-ready` Issues assigned to the local GitHub user, Reviewer claims PRs with a review request for the local GitHub user, and `looper:target:*` labels do nothing.
-- `network.mode=routed` — multi-Node. `loopernet` receives centralized webhook ingress, fans out wakeups to Nodes, and exposes the Coordinator lease used for fencing.
+Routed setup is not supported. Remove old `[network]` and
+`projects[].network` configuration before starting an upgraded daemon. Looper
+rejects those fields explicitly because neither config nor the dashboard has a
+safe producer for durable membership credentials. There is no Network status or
+maintenance API while this surface is withdrawn.
 
-Routed mode keeps authorities separate:
+### Decommission extra Nodes before the local-only cutover
 
-- GitHub remains the work-intent authority.
-- `looper:target:<node_name>` is only the exact-Node authority.
-- the lease only decides which Coordinator may mutate GitHub.
+The previous Routed rollout explicitly allowed multiple Nodes to share one
+GitHub identity because the `looper:target:<node_name>` label disambiguated
+which Node could claim work. Once `[network]` and `projects[].network` are
+removed, every upgraded daemon treats the same projects as local-only and
+ignores `looper:target:*`; `EvaluateWorker` and `EvaluateReviewer` then allow
+the work on every Node, so separate SQLite queues can run the same Issue or
+review concurrently.
 
-That means `loopernet` never becomes the source of truth for Issue admission or PR review assignment, and it must not mutate GitHub directly.
+Before removing those fields and restarting, an existing Routed installation
+that ran more than one Node under a shared GitHub identity must do one of the
+following first:
 
-## 1b. Routed setup and recovery
+- stop all but one Node, so only a single daemon can claim work for that
+  identity; or
+- assign each surviving Node a distinct GitHub identity, disable
+  `roles.coordinator.enabled` on every Node except one, and drain any in-flight
+  work that the old shared identity still owns.
 
-Before enrolling Nodes, deploy exactly one active `loopernet` instance per Network. For container examples, persistence requirements, and the current non-HA constraint, see [loopernet deployment](loopernet-deployment.md).
+Before restarting an enrolled Node, revoke its old Network membership while the
+legacy `loopernet` service is still available: call `/v1/leave` for every Node,
+verify that the membership is gone, and retire the `loopernet` deployment when
+no Nodes remain. Then remove that Node's `~/.looper/network.json` (which contains
+the bearer `nodeToken`) before starting the local-only daemon. Do not carry a
+stale token or membership into the withdrawn surface.
 
-Typical Routed rollout:
-
-1. join each Node to `loopernet` by configuring network membership in the config file / dashboard (the `looper network join` CLI was removed)
-2. disable unsupported routed auto-discovery (`planner` and `fixer`) before opting projects into `network.mode=routed`
-3. keep Worker and Reviewer identities stable per Node; duplicate GitHub identities are safe only because the exact target label disambiguates which Node may claim
-4. restart `looperd` and confirm membership, identity, and lease state on the dashboard or `GET /api/v1/network/status`
-
-Operator recovery rules:
-
-- if the target label is removed, duplicated, changed, or stale before work starts, Worker/Reviewer will not claim it
-- if `looper:worker-ready`, the GitHub assignee, or the review request disappears before processing starts, the queued item becomes unclaimable
-- if webhook ingress or SSE wakeups degrade, polling continues as a fallback so Coordinator can repair drift
-- if a stale target label remains after lease loss or a partial GitHub mutation, let Coordinator reconciliation repair or remove it before retrying
+Only after that cutover is complete, remove the `[network]` and
+`projects[].network` sections and restart the remaining daemon(s).
 
 ## 2. How Looper resolves the project
 
@@ -102,8 +112,8 @@ There is no current-directory inference and no `--project` flag: the stripped CL
 ### Overview
 
 1. Create a clear GitHub issue
-2. Triager persists a structured report and routes high-confidence, low-risk work directly to Planner
-3. If the report is risky, uncertain, or missing information, Triager comments on the issue with what it needs and the exact `/plan <confirmation token>` command for that report; a collaborator with write access replies with it. Anything typed after the command is passed to Planner as a clarification that supersedes the issue body
+2. Triager applies the configured admission policy, persists its explainable decision, and routes admitted work or classifies work needing assessment
+3. When admission requires assessment—or the legacy report is risky, uncertain, or incomplete—Triager comments with the exact `/plan <confirmation token>` command; a collaborator with write access replies with it. Anything typed after the command is passed to Planner as a clarification that supersedes the issue body
 4. Planner creates a spec PR
 5. Let `reviewer` review the spec PR
 6. Let `fixer` address review comments until the review is clean
@@ -206,9 +216,9 @@ This creates a `planner` loop targeting that issue. `projectId` is required — 
 
 ### Triager route
 
-For a GitHub project with Planner auto-discovery enabled and Coordinator disabled, new and reopened issues enter the internal Triager without a routing label. Each poll searches GitHub's recently updated Issues in updated-event order, with a lookback of at least five minutes, so enabling the role does not sweep the historical open backlog. Triager checks project support, source-event freshness, open-issue state, existing holds, and its persisted idempotency key, then records `triage.enrolled` before calling the LLM. That enrollment remains retryable after the lookback if the agent is unavailable. At most one new triage decision starts per scheduler tick across Projects. Triager revalidates the target after the decision and persists classification, scope, risk, confidence, missing information, recommended next role, rationale, and the policy outcome as a `triage.report` event.
+For a GitHub project with Planner auto-discovery enabled and Coordinator disabled, new and reopened issues enter the internal Triager without a routing label. Each poll searches GitHub's recently updated Issues in updated-event order, with a lookback of at least five minutes, so enabling the role does not sweep the historical open backlog. Triager records `triage.enrolled`, then applies `roles.triager` to forge-owned facts: author association, repository visibility, bot type, and the global hold. The resulting `triage.report` records the outcome, author tier, preset, visibility, and exact deciding rule. Replays reuse that durable decision.
 
-Only an in-scope, low-risk decision with confidence of at least `0.8`, no missing information, and `planner` as the recommended next role is projected directly into Planner's durable queue. Other reports remain `await_human_confirmation` and do not start Planner. A repository collaborator with `write`, `maintain`, or `admin` permission can confirm the persisted report by posting a later comment whose complete body is `/plan`; Looper records a `triage.confirmed` event before routing that report. A successful Planner projection is acknowledged by `triage.routed`, so a crash or route failure replays the report without repeating the LLM decision. The comment is a human confirmation, not a routing label.
+With the default `legacy` preset, behavior is unchanged: only an in-scope, low-risk decision with confidence of at least `0.8`, no missing information, and `planner` as the recommended next role routes automatically. Relationship presets instead produce `auto`, `assess`, or `ignore`: `auto` routes without a model call, `assess` optionally classifies and waits for a human, and `ignore` records and stops. A repository collaborator with `write`, `maintain`, or `admin` permission confirms an awaiting report with its exact `/plan <confirmation token>` command. Looper records `triage.confirmed` before routing and `triage.routed` after Planner accepts the projection, so replay does not repeat admission or classification.
 
 ### Label-based auto-discovery conditions
 

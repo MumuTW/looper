@@ -5790,6 +5790,10 @@ func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullReq
 	return detail, nil
 }
 
+func (f *fakeGitHubGateway) ViewPullRequestForDiscovery(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	return f.ViewPullRequest(ctx, input)
+}
+
 func (f *fakeGitHubGateway) ViewIssue(_ context.Context, input ViewIssueInput) (IssueDetail, error) {
 	f.viewIssueCalls = append(f.viewIssueCalls, input)
 	detail := f.issueDetail

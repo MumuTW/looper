@@ -10,6 +10,7 @@ type FailureObservation struct {
 	Repo          string   `json:"repo"`
 	HeadSHA       string   `json:"headSha"`
 	FailedChecks  []string `json:"failedChecks"`
+	FailingPaths  []string `json:"failingPaths"`
 	CheckSuiteIDs []int64  `json:"checkSuiteIds"`
 	CandidatePRs  []int64  `json:"candidatePrs"`
 	ObservedAt    string   `json:"observedAt"`

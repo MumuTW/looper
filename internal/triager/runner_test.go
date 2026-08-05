@@ -146,12 +146,13 @@ func TestDiscoverIssuesPersistsUnsafeOrUncertainDecisionsForConfirmation(t *test
 }
 
 type runnerFixture struct {
-	now         time.Time
-	coordinator *storage.SQLiteCoordinator
-	repos       *storage.Repositories
-	github      *fakeGitHub
-	llm         *fakeLLM
-	planner     *fakePlanner
+	now          time.Time
+	coordinator  *storage.SQLiteCoordinator
+	repos        *storage.Repositories
+	github       *fakeGitHub
+	llm          *fakeLLM
+	planner      *fakePlanner
+	runnerPolicy ProjectPolicy
 }
 
 func newRunnerFixture(t *testing.T) *runnerFixture {
@@ -183,7 +184,12 @@ func newRunnerFixture(t *testing.T) *runnerFixture {
 }
 
 func (f *runnerFixture) runner() *Runner {
-	return New(Options{Repos: f.repos, GitHub: f.github, LLM: f.llm, Planner: f.planner, Now: func() time.Time { return f.now }})
+	options := Options{Repos: f.repos, GitHub: f.github, LLM: f.llm, Planner: f.planner, Now: func() time.Time { return f.now }}
+	if f.runnerPolicy.Admission.Preset != "" {
+		policy := f.runnerPolicy
+		options.PolicyForProject = func(string) ProjectPolicy { return policy }
+	}
+	return New(options)
 }
 
 func (f *runnerFixture) singleReport(t *testing.T) Report {
@@ -209,20 +215,22 @@ func (f *runnerFixture) singleReport(t *testing.T) Report {
 }
 
 type fakeGitHub struct {
+	timelineRequests []int64
+	permissionCalls  int
+	viewRequests     []int64
 	detail           githubinfra.IssueDetail
 	details          map[int64]githubinfra.IssueDetail
 	viewSequence     []githubinfra.IssueDetail
 	viewCalls        int
-	viewRequests     []int64
 	timeline         []map[string]any
-	timelineRequests []int64
 	onTimeline       func()
 	listInput        githubinfra.ListOpenIssuesInput
 	listEmpty        bool
 	permission       string
-	permissionCalls  int
 	comments         []githubinfra.IssueCommentInput
 	commentErr       error
+	settings         githubinfra.RepositorySettings
+	settingsCalls    int
 }
 
 func (f *fakeGitHub) CreateIssueComment(_ context.Context, input githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error) {
@@ -279,6 +287,15 @@ func (f *fakeGitHub) ListIssueTimeline(_ context.Context, input githubinfra.Issu
 func (f *fakeGitHub) GetRepositoryPermission(context.Context, githubinfra.RepositoryPermissionInput) (string, error) {
 	f.permissionCalls++
 	return f.permission, nil
+}
+
+func (f *fakeGitHub) GetRepositorySettings(context.Context, githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
+	f.settingsCalls++
+	settings := f.settings
+	if settings.Visibility == "" {
+		settings.Visibility = "private"
+	}
+	return settings, nil
 }
 
 type fakeLLM struct {

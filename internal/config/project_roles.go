@@ -9,6 +9,12 @@ package config
 // memory, they are stripped before merge.
 func ProjectRoleConfigs(cfg Config, projectID string) RoleConfigs {
 	roles := cfg.Roles
+	if cfg.Roles.Triager.AuthorTiers != nil {
+		roles.Triager.AuthorTiers = make(map[string]TriagerAdmissionOutcome, len(cfg.Roles.Triager.AuthorTiers))
+		for tier, outcome := range cfg.Roles.Triager.AuthorTiers {
+			roles.Triager.AuthorTiers[tier] = outcome
+		}
+	}
 	if roles.Planner.Escalation != nil {
 		cloned := *roles.Planner.Escalation
 		roles.Planner.Escalation = &cloned

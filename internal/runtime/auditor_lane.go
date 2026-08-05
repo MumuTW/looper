@@ -17,6 +17,8 @@ import (
 type auditorGateway interface {
 	GetBranchHeadSHA(context.Context, githubinfra.BranchHeadInput) (string, error)
 	ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error)
+	ListCheckRunAnnotations(context.Context, githubinfra.CheckRunAnnotationsInput) ([]githubinfra.CheckRunAnnotation, error)
+	RerequestCheckSuite(context.Context, githubinfra.RerequestCheckSuiteInput) error
 }
 
 // runAuditorLane observes, but never mutates, a project's default branch. The
@@ -30,7 +32,11 @@ func runAuditorLane(ctx context.Context, input defaultSchedulerTickInput, projec
 	if !role.Enabled {
 		return nil
 	}
-	return observePostMergeFailure(ctx, input.Repos, input.GitHubGateway, project, repo, deployBaseBranch(*input.Config, project), role, input.Now)
+	baseBranch := deployBaseBranch(*input.Config, project)
+	if err := observePostMergeFailure(ctx, input.Repos, input.GitHubGateway, project, repo, baseBranch, role, input.Now); err != nil {
+		return err
+	}
+	return progressAuditorConfirmation(ctx, input.Repos, input.GitHubGateway, project, repo, baseBranch, role, input.Now)
 }
 
 func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, gateway auditorGateway, project storage.ProjectRecord, repo, baseBranch string, role config.AuditorRoleConfig, now func() time.Time) error {
@@ -88,6 +94,7 @@ func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, g
 		candidatePRs = append(candidatePRs, prNumber)
 	}
 	sort.Slice(candidatePRs, func(i, j int) bool { return candidatePRs[i] < candidatePRs[j] })
+	failingPaths := failedAuditorCheckPaths(ctx, gateway, repo, project.RepoPath, checks)
 	entityType, entityID := "branch_head", repo+"@"+headSHA
 	existing, err := events.ListByEntity(ctx, entityType, entityID)
 	if err != nil {
@@ -101,8 +108,32 @@ func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, g
 	projectID := project.ID
 	return eventlog.Append(ctx, repos, eventlog.AppendInput{
 		EventType: auditor.ObservedFailureEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
-		Payload: auditor.FailureObservation{Version: 2, ProjectID: project.ID, Repo: repo, HeadSHA: headSHA, FailedChecks: failureEvidence.Names, CheckSuiteIDs: failureEvidence.SuiteIDs, CandidatePRs: candidatePRs, ObservedAt: eventlog.FormatJavaScriptISOString(observedAt)}, CreatedAt: observedAt,
+		Payload: auditor.FailureObservation{Version: 3, ProjectID: project.ID, Repo: repo, HeadSHA: headSHA, FailedChecks: failureEvidence.Names, FailingPaths: failingPaths, CheckSuiteIDs: failureEvidence.SuiteIDs, CandidatePRs: candidatePRs, ObservedAt: eventlog.FormatJavaScriptISOString(observedAt)}, CreatedAt: observedAt,
 	})
+}
+
+func failedAuditorCheckPaths(ctx context.Context, gateway auditorGateway, repo, cwd string, checks githubinfra.PullRequestCheckRuns) []string {
+	paths := make(map[string]struct{})
+	for _, check := range checks.CheckRuns {
+		if check.ID <= 0 || !isFailedCheckState(check.Status, check.Conclusion) {
+			continue
+		}
+		annotations, err := gateway.ListCheckRunAnnotations(ctx, githubinfra.CheckRunAnnotationsInput{Repo: repo, CheckRunID: check.ID, CWD: cwd})
+		if err != nil {
+			continue
+		}
+		for _, annotation := range annotations {
+			if path := strings.TrimSpace(annotation.Path); path != "" {
+				paths[path] = struct{}{}
+			}
+		}
+	}
+	result := make([]string, 0, len(paths))
+	for path := range paths {
+		result = append(result, path)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func auditorRoleForProject(cfg config.Config, projectID string) config.AuditorRoleConfig {
