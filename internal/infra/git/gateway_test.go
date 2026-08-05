@@ -137,7 +137,7 @@ func TestGatewayCreatesRestoresAndCleansWorktreesWithBranchProtection(t *testing
 	if err != nil {
 		t.Fatalf("Commit() error = %v", err)
 	}
-	inspectAfterCommit, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.WorktreePath, BaseRef: prepared.HeadSHA})
+	inspectAfterCommit, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.WorktreePath, BaseRef: prepared.HeadSHA, ContentPaths: inspectBeforeCommitContentChange.ChangedFiles, CompareHeadSHA: inspectBeforeCommitContentChange.HeadSHA})
 	if err != nil {
 		t.Fatalf("InspectHead(after) error = %v", err)
 	}
@@ -160,17 +160,23 @@ func TestGatewayCreatesRestoresAndCleansWorktreesWithBranchProtection(t *testing
 	if got := inspectBeforeCommit.UntrackedFiles; len(got) != 1 || got[0] != "timeout-progress.txt" {
 		t.Fatalf("InspectHead(before).UntrackedFiles = %#v, want [timeout-progress.txt]", got)
 	}
-	if inspectBeforeCommit.DiffFingerprint == "" {
-		t.Fatal("InspectHead(before).DiffFingerprint = empty, want status fingerprint")
+	if inspectBeforeCommit.ContentFingerprint == "" {
+		t.Fatal("InspectHead(before).ContentFingerprint = empty, want content fingerprint")
 	}
-	if inspectBeforeCommitContentChange.DiffFingerprint != inspectBeforeCommit.DiffFingerprint {
-		t.Fatalf("status fingerprint changed after content-only update: before=%q after=%q", inspectBeforeCommit.DiffFingerprint, inspectBeforeCommitContentChange.DiffFingerprint)
+	if inspectBeforeCommitContentChange.ContentFingerprint == inspectBeforeCommit.ContentFingerprint {
+		t.Fatalf("content fingerprint unchanged after content-only update: before=%q after=%q", inspectBeforeCommit.ContentFingerprint, inspectBeforeCommitContentChange.ContentFingerprint)
 	}
 	if commitResult.CommitSHA == "" {
 		t.Fatal("Commit().CommitSHA = empty, want value")
 	}
 	if inspectAfterCommit.HasUncommittedChanges {
 		t.Fatalf("InspectHead(after).HasUncommittedChanges = true, want false")
+	}
+	if !inspectAfterCommit.HeadDescendsFromCompare {
+		t.Fatal("InspectHead(after).HeadDescendsFromCompare = false, want committed successor")
+	}
+	if inspectAfterCommit.ContentFingerprint != inspectBeforeCommitContentChange.ContentFingerprint {
+		t.Fatalf("content fingerprint after commit = %q, want pre-commit content %q", inspectAfterCommit.ContentFingerprint, inspectBeforeCommitContentChange.ContentFingerprint)
 	}
 	if len(inspectAfterCommit.NewCommitSHAs) != 1 {
 		t.Fatalf("InspectHead(after).NewCommitSHAs = %#v, want 1 entry", inspectAfterCommit.NewCommitSHAs)
@@ -234,6 +240,12 @@ func TestGatewayInspectHeadRecordsExactRenamePathsAndDetachedBranch(t *testing.T
 	if got := inspect.StagedFiles; len(got) != 1 || got[0] != "after name.txt" {
 		t.Fatalf("InspectHead().StagedFiles = %#v, want exact rename destination", got)
 	}
+	if got := inspect.RenameSourceFiles; len(got) != 1 || got[0] != "before name.txt" {
+		t.Fatalf("InspectHead().RenameSourceFiles = %#v, want exact rename source", got)
+	}
+	if strings.Contains(inspect.ChangedFiles[0], " -> ") {
+		t.Fatalf("InspectHead().ChangedFiles = %#v, must not contain formatted rename text", inspect.ChangedFiles)
+	}
 
 	runGit(t, worktree.WorktreePath, "checkout", "--detach")
 	detached, err := gateway.InspectHead(ctx, InspectHeadInput{RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: worktree.WorktreePath})
@@ -245,12 +257,392 @@ func TestGatewayInspectHeadRecordsExactRenamePathsAndDetachedBranch(t *testing.T
 	}
 }
 
+func TestParseNULStatusResultHandlesWorktreeRenameColumn(t *testing.T) {
+	entries := parseNULStatusResult(" R new.txt\x00old.txt\x00")
+	if len(entries) != 1 {
+		t.Fatalf("entries = %#v, want one worktree rename", entries)
+	}
+	if entries[0].Code != " R" || entries[0].Path != "new.txt" || entries[0].OriginalPath != "old.txt" {
+		t.Fatalf("entry = %#v, want destination/source from worktree rename column", entries[0])
+	}
+}
+
 func TestParseStatusResultRejectsTruncatedOutput(t *testing.T) {
 	t.Parallel()
 
 	_, err := parseStatusResult(shell.Result{Stdout: "?? partial-path", StdoutTruncated: true})
 	if err == nil || !strings.Contains(err.Error(), "exceeded capture limit") {
 		t.Fatalf("parseStatusResult() error = %v, want truncated-output rejection", err)
+	}
+}
+
+func TestGatewayInspectHeadContentFingerprintIncludesExecutableMode(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	scriptPath := filepath.Join(fixture.repoPath, "script.sh")
+	writeFile(t, scriptPath, "#!/bin/sh\necho base\n")
+	runGit(t, fixture.repoPath, "add", "script.sh")
+	runGit(t, fixture.repoPath, "commit", "-m", "add script")
+	writeFile(t, scriptPath, "#!/bin/sh\necho changed\n")
+	if err := os.Chmod(scriptPath, 0o755); err != nil {
+		t.Fatalf("Chmod(executable) error = %v", err)
+	}
+	before, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(before) error = %v", err)
+	}
+	if err := os.Chmod(scriptPath, 0o644); err != nil {
+		t.Fatalf("Chmod(non-executable) error = %v", err)
+	}
+	after, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(after) error = %v", err)
+	}
+	if before.DiffFingerprint != after.DiffFingerprint {
+		t.Fatalf("status fingerprint changed for mode-only drift: before=%q after=%q", before.DiffFingerprint, after.DiffFingerprint)
+	}
+	if before.ContentFingerprint == after.ContentFingerprint {
+		t.Fatalf("content fingerprint ignored executable mode: before=%q after=%q", before.ContentFingerprint, after.ContentFingerprint)
+	}
+}
+
+func TestGatewayInspectHeadRejectsWorktreeModeDriftAgainstHead(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+	path := filepath.Join(fixture.repoPath, "README.md")
+	if err := os.Chmod(path, 0o755); err != nil {
+		t.Fatalf("Chmod(executable) error = %v", err)
+	}
+	inspect, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead() error = %v", err)
+	}
+	if inspect.WorktreeMatchesHead {
+		t.Fatal("WorktreeMatchesHead = true, want false for executable-bit drift")
+	}
+}
+
+func TestGatewayInspectHeadRejectsAssumeUnchangedTrackedPath(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+	runGit(t, fixture.repoPath, "update-index", "--assume-unchanged", "README.md")
+	t.Cleanup(func() { runGit(t, fixture.repoPath, "update-index", "--no-assume-unchanged", "README.md") })
+	_, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err == nil || !strings.Contains(err.Error(), "hidden Git index flag") {
+		t.Fatalf("InspectHead() error = %v, want assume-unchanged rejection", err)
+	}
+}
+
+func TestGatewayInspectHeadRejectsSkipWorktreeTrackedPath(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+	runGit(t, fixture.repoPath, "update-index", "--skip-worktree", "README.md")
+	t.Cleanup(func() { runGit(t, fixture.repoPath, "update-index", "--no-skip-worktree", "README.md") })
+	_, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err == nil || !strings.Contains(err.Error(), "hidden Git index flag") {
+		t.Fatalf("InspectHead() error = %v, want skip-worktree rejection", err)
+	}
+}
+
+func TestGatewayWorktreeMatchesHeadSupportsSHA256ObjectFormat(t *testing.T) {
+	t.Parallel()
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--object-format=sha256")
+	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "config", "user.name", "Test")
+	path := filepath.Join(repo, "README.md")
+	writeFile(t, path, "base\n")
+	runGit(t, repo, "add", "README.md")
+	runGit(t, repo, "commit", "-m", "initial")
+	indexFile := filepath.Join(t.TempDir(), "staged-content")
+	writeFile(t, indexFile, "staged\n")
+	indexObject := stringsTrimSpace(runGit(t, repo, "hash-object", "-w", indexFile))
+	runGit(t, repo, "update-index", "--cacheinfo", "100644,"+indexObject+",README.md")
+	inspect, err := New(Options{GitPath: "git"}).InspectHead(context.Background(), InspectHeadInput{WorktreePath: repo})
+	if err != nil {
+		t.Fatalf("InspectHead() error = %v", err)
+	}
+	if !inspect.WorktreeMatchesHead {
+		t.Fatal("WorktreeMatchesHead = false, want true for SHA-256 staged-index-only edit")
+	}
+}
+
+func TestGatewayInspectHeadIndexFingerprintDetectsStagedBlobDrift(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	path := filepath.Join(fixture.repoPath, "staged.txt")
+	writeFile(t, path, "base\n")
+	runGit(t, fixture.repoPath, "add", "staged.txt")
+	runGit(t, fixture.repoPath, "commit", "-m", "add staged file")
+	writeFile(t, path, "worktree\n")
+	runGit(t, fixture.repoPath, "add", "staged.txt")
+	writeFile(t, path, "worktree-dirty\n")
+	first, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(first) error = %v", err)
+	}
+	// Replace only the index blob; the worktree bytes and MM status remain the
+	// same. A status/content-only digest must not authorize this transition.
+	indexFile := filepath.Join(fixture.rootDir, "alternate-index-content")
+	writeFile(t, indexFile, "index-only\n")
+	indexObject := stringsTrimSpace(runGit(t, fixture.repoPath, "hash-object", "-w", indexFile))
+	runGit(t, fixture.repoPath, "update-index", "--cacheinfo", "100644,"+indexObject+",staged.txt")
+	second, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(second) error = %v", err)
+	}
+	if first.DiffFingerprint != second.DiffFingerprint || first.ContentFingerprint != second.ContentFingerprint {
+		t.Fatalf("status/content fingerprints changed for index-only drift: first=%#v second=%#v", first, second)
+	}
+	if first.IndexFingerprint == second.IndexFingerprint {
+		t.Fatalf("index fingerprint unchanged for staged blob drift: first=%q second=%q", first.IndexFingerprint, second.IndexFingerprint)
+	}
+}
+
+func TestGatewayInspectHeadContentFingerprintPreservesWhitespacePaths(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	path := filepath.Join(fixture.repoPath, " leading.txt ")
+	writeFile(t, path, "first\n")
+	first, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(first) error = %v", err)
+	}
+	writeFile(t, path, "second\n")
+	second, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(second) error = %v", err)
+	}
+	if first.ContentFingerprint == second.ContentFingerprint {
+		t.Fatalf("content fingerprint ignored content change in whitespace path: first=%q second=%q", first.ContentFingerprint, second.ContentFingerprint)
+	}
+}
+
+func TestGatewayInspectHeadDetectsStagedIndexOnlyWorktreeBytes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+	indexFile := filepath.Join(fixture.rootDir, "staged-index-content")
+	writeFile(t, indexFile, "staged but not checked out\n")
+	indexObject := stringsTrimSpace(runGit(t, fixture.repoPath, "hash-object", "-w", indexFile))
+	runGit(t, fixture.repoPath, "update-index", "--cacheinfo", "100644,"+indexObject+",README.md")
+	inspect, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead() error = %v", err)
+	}
+	if !inspect.WorktreeMatchesHead {
+		t.Fatal("InspectHead().WorktreeMatchesHead = false, want true for staged index-only edit with old HEAD bytes")
+	}
+}
+
+func TestGatewayInspectHeadFingerprintsDirtySubmodule(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	submoduleSource := filepath.Join(fixture.rootDir, "submodule-source")
+	mustMkdirAll(t, submoduleSource)
+	runGit(t, submoduleSource, "init", "-b", "main")
+	configureRepo(t, submoduleSource)
+	writeFile(t, filepath.Join(submoduleSource, "nested.txt"), "base\n")
+	runGit(t, submoduleSource, "add", "nested.txt")
+	runGit(t, submoduleSource, "commit", "-m", "init nested")
+	runGit(t, fixture.repoPath, "-c", "protocol.file.allow=always", "submodule", "add", submoduleSource, "modules/nested")
+	runGit(t, fixture.repoPath, "commit", "-am", "add nested module")
+
+	nestedPath := filepath.Join(fixture.repoPath, "modules", "nested", "nested.txt")
+	writeFile(t, nestedPath, "first dirty state\n")
+	first, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(first dirty submodule) error = %v", err)
+	}
+	writeFile(t, nestedPath, "second dirty state\n")
+	second, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(second dirty submodule) error = %v", err)
+	}
+	if got := first.ChangedFiles; len(got) != 1 || got[0] != "modules/nested" {
+		t.Fatalf("InspectHead().ChangedFiles = %#v, want dirty submodule path", got)
+	}
+	if first.ContentFingerprint == second.ContentFingerprint {
+		t.Fatalf("dirty submodule content fingerprint did not change: first=%q second=%q", first.ContentFingerprint, second.ContentFingerprint)
+	}
+}
+
+func TestGatewayInspectHeadFingerprintsStagedSubmoduleIndex(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	submoduleSource := filepath.Join(fixture.rootDir, "submodule-index-source")
+	mustMkdirAll(t, submoduleSource)
+	runGit(t, submoduleSource, "init", "-b", "main")
+	configureRepo(t, submoduleSource)
+	writeFile(t, filepath.Join(submoduleSource, "nested.txt"), "base\n")
+	runGit(t, submoduleSource, "add", "nested.txt")
+	runGit(t, submoduleSource, "commit", "-m", "init nested")
+	runGit(t, fixture.repoPath, "-c", "protocol.file.allow=always", "submodule", "add", submoduleSource, "modules/nested-index")
+	runGit(t, fixture.repoPath, "commit", "-am", "add nested module")
+
+	submodulePath := filepath.Join(fixture.repoPath, "modules", "nested-index")
+	nestedPath := filepath.Join(submodulePath, "nested.txt")
+	writeFile(t, nestedPath, "working-tree-content\n")
+	runGit(t, submodulePath, "add", "nested.txt")
+	first, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(first staged submodule index) error = %v", err)
+	}
+	alternate := filepath.Join(fixture.rootDir, "alternate-submodule-index-content")
+	writeFile(t, alternate, "replacement-staged-content\n")
+	indexObject := stringsTrimSpace(runGit(t, submodulePath, "hash-object", "-w", alternate))
+	runGit(t, submodulePath, "update-index", "--cacheinfo", "100644,"+indexObject+",nested.txt")
+	second, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(second staged submodule index) error = %v", err)
+	}
+	if first.ContentFingerprint != second.ContentFingerprint {
+		t.Fatalf("content fingerprint changed for staged-index-only submodule edit: first=%q second=%q", first.ContentFingerprint, second.ContentFingerprint)
+	}
+	if first.IndexFingerprint == second.IndexFingerprint {
+		t.Fatalf("index fingerprint unchanged for staged submodule blob drift: first=%q second=%q", first.IndexFingerprint, second.IndexFingerprint)
+	}
+}
+
+func TestGatewayInspectHeadSkipsUninitializedSubmoduleIndex(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	submoduleSource := filepath.Join(fixture.rootDir, "submodule-uninitialized-source")
+	mustMkdirAll(t, submoduleSource)
+	runGit(t, submoduleSource, "init", "-b", "main")
+	configureRepo(t, submoduleSource)
+	writeFile(t, filepath.Join(submoduleSource, "nested.txt"), "base\n")
+	runGit(t, submoduleSource, "add", "nested.txt")
+	runGit(t, submoduleSource, "commit", "-m", "init nested")
+	runGit(t, fixture.repoPath, "-c", "protocol.file.allow=always", "submodule", "add", submoduleSource, "modules/uninitialized")
+	runGit(t, fixture.repoPath, "commit", "-am", "add nested module")
+	runGit(t, fixture.repoPath, "submodule", "deinit", "-f", "modules/uninitialized")
+
+	inspect, err := gateway.InspectHead(ctx, InspectHeadInput{
+		WorktreePath: fixture.repoPath,
+		ContentPaths: []string{"modules/uninitialized"},
+	})
+	if err != nil {
+		t.Fatalf("InspectHead(uninitialized submodule) error = %v", err)
+	}
+	if inspect.ContentFingerprint == "" || inspect.IndexFingerprint == "" {
+		t.Fatalf("InspectHead(uninitialized submodule) = %#v, want bounded evidence", inspect)
+	}
+}
+
+func TestGatewayInspectHeadPreservesDirtySubmoduleCommitTransition(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	submoduleSource := filepath.Join(fixture.rootDir, "submodule-commit-source")
+	mustMkdirAll(t, submoduleSource)
+	runGit(t, submoduleSource, "init", "-b", "main")
+	configureRepo(t, submoduleSource)
+	nestedFile := filepath.Join(submoduleSource, "nested.txt")
+	writeFile(t, nestedFile, "base\n")
+	runGit(t, submoduleSource, "add", "nested.txt")
+	runGit(t, submoduleSource, "commit", "-m", "init nested")
+	runGit(t, fixture.repoPath, "-c", "protocol.file.allow=always", "submodule", "add", submoduleSource, "modules/nested-commit")
+	runGit(t, fixture.repoPath, "commit", "-am", "add nested module")
+	// The cloned submodule has its own Git identity; do not rely on the
+	// developer or CI runner's global config for the nested progress commit.
+	configureRepo(t, filepath.Join(fixture.repoPath, "modules", "nested-commit"))
+
+	nestedPath := filepath.Join(fixture.repoPath, "modules", "nested-commit", "nested.txt")
+	writeFile(t, nestedPath, "committed progress\n")
+	before, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(before dirty submodule) error = %v", err)
+	}
+	if len(before.ChangedFiles) != 1 || before.ChangedFiles[0] != "modules/nested-commit" {
+		t.Fatalf("InspectHead(before).ChangedFiles = %#v, want dirty submodule path", before.ChangedFiles)
+	}
+
+	runGit(t, filepath.Join(fixture.repoPath, "modules", "nested-commit"), "add", "nested.txt")
+	runGit(t, filepath.Join(fixture.repoPath, "modules", "nested-commit"), "commit", "-m", "persist nested progress")
+	runGit(t, fixture.repoPath, "add", "modules/nested-commit")
+	runGit(t, fixture.repoPath, "commit", "-m", "record nested progress")
+	after, err := gateway.InspectHead(ctx, InspectHeadInput{
+		WorktreePath:   fixture.repoPath,
+		ContentPaths:   before.ChangedFiles,
+		CompareHeadSHA: before.HeadSHA,
+	})
+	if err != nil {
+		t.Fatalf("InspectHead(after committed submodule) error = %v", err)
+	}
+	if after.HasUncommittedChanges {
+		t.Fatalf("InspectHead(after).HasUncommittedChanges = true, want clean descendant")
+	}
+	if !after.HeadDescendsFromCompare {
+		t.Fatalf("InspectHead(after).HeadDescendsFromCompare = false, want descendant")
+	}
+	if before.ContentFingerprint != after.ContentFingerprint {
+		t.Fatalf("submodule content fingerprint changed across dirty-to-committed transition: before=%q after=%q", before.ContentFingerprint, after.ContentFingerprint)
+	}
+}
+
+func TestGatewayInspectHeadHashesChangedFilesWithoutGitHashObjectProcesses(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	for _, name := range []string{"one.txt", "two.txt", "three.txt"} {
+		writeFile(t, filepath.Join(fixture.repoPath, name), name+"\n")
+	}
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("LookPath(git) error = %v", err)
+	}
+	wrapperPath := filepath.Join(fixture.rootDir, "git-without-hash-object")
+	wrapper := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = hash-object ]; then exit 99; fi\nexec %q \"$@\"\n", gitPath)
+	if err := os.WriteFile(wrapperPath, []byte(wrapper), 0o755); err != nil {
+		t.Fatalf("WriteFile(git wrapper) error = %v", err)
+	}
+	gateway := New(Options{GitPath: wrapperPath, Repos: fixture.repos, Now: fixture.now})
+	inspect, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead() error = %v; content hashing must not launch git hash-object per file", err)
+	}
+	if len(inspect.ChangedFiles) != 3 || inspect.ContentFingerprint == "" {
+		t.Fatalf("InspectHead() = %#v, want three hashed files", inspect)
 	}
 }
 
@@ -1258,6 +1650,44 @@ exit 0
 	}
 	if got := stringsTrimSpace(readFile(t, countPath)); got != "2" {
 		t.Fatalf("git attempts = %s, want 2", got)
+	}
+}
+
+func TestInspectHeadRejectsTruncatedStatusEvidence(t *testing.T) {
+	gitPath := writeFakeGit(t, `#!/bin/sh
+if [ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ]; then
+  printf 'head-sha\n'
+  exit 0
+fi
+if [ "$1" = "rev-parse" ] && [ "$2" = "--abbrev-ref" ]; then
+  printf 'main\n'
+  exit 0
+fi
+if [ "$1" = "status" ]; then
+  awk 'BEGIN { for (i = 0; i < 300000; i++) printf "x" }'
+  exit 0
+fi
+exit 0
+`)
+	gateway := New(Options{GitPath: gitPath})
+	_, err := gateway.InspectHead(context.Background(), InspectHeadInput{WorktreePath: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "truncated") {
+		t.Fatalf("InspectHead() error = %v, want truncated Git evidence failure", err)
+	}
+}
+
+func TestIndexFingerprintRejectsTruncatedStageEvidence(t *testing.T) {
+	gitPath := writeFakeGit(t, `#!/bin/sh
+if [ "$1" = "ls-files" ] && [ "$2" = "--stage" ]; then
+  awk 'BEGIN { for (i = 0; i < 300000; i++) printf "x" }'
+  exit 0
+fi
+exit 0
+`)
+	gateway := New(Options{GitPath: gitPath})
+	_, err := gateway.indexFingerprint(context.Background(), t.TempDir(), []string{"tracked.txt"})
+	if err == nil || !strings.Contains(err.Error(), "truncated") {
+		t.Fatalf("indexFingerprint() error = %v, want truncated Git evidence failure", err)
 	}
 }
 

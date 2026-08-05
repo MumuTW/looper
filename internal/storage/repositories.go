@@ -1814,6 +1814,39 @@ func (r *RunsRepository) AppendCheckpointSecondaryIssue(ctx context.Context, id,
 	return nil
 }
 
+// ClearTimeoutProgress removes the timeout-preservation evidence only after an
+// operator has explicitly authorized discarding the associated worktree. The
+// checkpoint otherwise remains intact so the next worker run keeps its work,
+// plan, and worktree identity while no longer trying to preserve discarded
+// progress.
+func (r *RunsRepository) ClearTimeoutProgress(ctx context.Context, id, updatedAt string) error {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE runs
+		SET checkpoint_json = CASE
+				WHEN json_valid(checkpoint_json) AND json_type(checkpoint_json) = 'object'
+					THEN CASE
+						WHEN json_extract(checkpoint_json, '$.execution.status') = 'timeout_observing'
+							THEN json_set(json_remove(checkpoint_json, '$.execution.progressBeforeTimeout', '$.execution.progressSnapshotError'), '$.execution.status', 'timeout')
+						ELSE json_remove(checkpoint_json, '$.execution.progressBeforeTimeout', '$.execution.progressSnapshotError')
+					END
+				ELSE checkpoint_json
+			END,
+			updated_at = ?
+		WHERE id = ?
+	`, updatedAt, id)
+	if err != nil {
+		return fmt.Errorf("clear run timeout progress: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read cleared run timeout progress rows: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("clear run timeout progress: run not found: %s", id)
+	}
+	return nil
+}
+
 // MergeRunResumePolicy rewrites only the checkpoint's resume policy.
 //
 // The retry-policy writers read a run, change this one field, and would otherwise
