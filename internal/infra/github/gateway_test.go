@@ -3021,6 +3021,25 @@ func TestGatewaySetCommitStatusRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestGatewayListMergedPullRequests(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if args := strings.Join(options.Args, " "); args != "pr list --repo acme/looper --state merged --limit 100 --json number,url,state,mergedAt,headRefOid,additions,deletions" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `[{"number":42,"url":"https://example.test/pull/42","state":"MERGED","mergedAt":"2026-07-30T12:00:00Z","headRefOid":"abc123","additions":120,"deletions":30}]`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	prs, err := gateway.ListMergedPullRequests(context.Background(), ListMergedPullRequestsInput{Repo: "acme/looper", Limit: 100})
+	if err != nil {
+		t.Fatalf("ListMergedPullRequests() error = %v", err)
+	}
+	if len(prs) != 1 || prs[0].HeadSHA != "abc123" || prs[0].Additions != 120 || prs[0].Deletions != 30 {
+		t.Fatalf("ListMergedPullRequests() = %#v", prs)
+	}
+}
+
 func TestGatewayCloseIssueRejectsUnknownStateReason(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

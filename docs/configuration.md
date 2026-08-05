@@ -915,7 +915,7 @@ decides what it may do with that judgement.
 | --- | --- |
 | `observe` (default) | Gate report only. Nothing is published, nothing is merged. |
 | `advise` | Additionally publishes the verdict and every blocking reason on the pull request, so the decision costs one read instead of a re-investigation. The human still merges. |
-| `auto` | Requires a completed Looper/Codex review for the current head, then publishes the `Looper Gatekeeper` status for that exact SHA. GitHub branch protection consumes the status; Gatekeeper never calls merge itself. |
+| `auto` | Requires a completed Looper/Codex review for the current head when the changed-line threshold is met, then publishes the `Looper Gatekeeper` status for that exact SHA. GitHub branch protection consumes the status; Gatekeeper never calls merge itself. |
 
 `auto` has one required external authority: GitHub branch protection must require
 the `Looper Gatekeeper` status context on the target branch. The status is the
@@ -927,9 +927,26 @@ claiming the PR is eligible.
 ```toml
 [roles.gatekeeper]
 trust = "auto"
+# additions + deletions; 0 also means this deliberate default
+requiredReviewChangedLines = 200
 ```
 
-Project overrides use `projects[].roles.gatekeeper.trust`.
+`requiredReviewChangedLines` is additions plus deletions. Its default is `200`,
+and a project can override it under
+`projects[].roles.gatekeeper.requiredReviewChangedLines`. A change at or above
+the effective threshold remains `pending` until the authenticated reviewer has
+posted its marker for the current SHA; below it, the Gatekeeper status still
+checks every other merge condition but does not consume scarce review capacity.
+
+Reviewer writes `pr.review.completed` evidence only after it has re-read and
+verified the GitHub marker. A structured reviewer result with
+`type = "rate_limit"` writes `pr.review.refused` instead; prose mentioning a
+rate limit is deliberately not evidence. Gatekeeper scans one bounded page of
+recent merged PRs and writes `pr.review.unreviewed` for above-threshold commits
+that lack either record. These are durable `pull_request` events, visible via
+the existing `/api/v1/events` and `/api/v1/events/pull_request/{repo%23number}`
+routes; the periodic digest proposed in #117 can consume the same event stream
+without another status store.
 
 ### The owned comment and its lifecycle
 

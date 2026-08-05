@@ -291,34 +291,19 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 		validateDeployerRoleConfig(role, fmt.Sprintf("projects[%d].roles.deployer", i), issues)
 	}
 	for i, project := range config.Projects {
-		if project.Roles == nil || project.Roles.Auditor == nil {
+		if project.Roles == nil || project.Roles.Gatekeeper == nil || (project.Roles.Gatekeeper.Trust == nil && project.Roles.Gatekeeper.RequiredReviewChangedLines == nil) {
 			continue
 		}
-		role := config.Roles.Auditor
-		if project.Roles.Auditor.Enabled != nil {
-			role.Enabled = *project.Roles.Auditor.Enabled
-		}
-		if project.Roles.Auditor.WindowMinutes != nil {
-			role.WindowMinutes = *project.Roles.Auditor.WindowMinutes
-		}
-		validateAuditorRoleConfig(role, fmt.Sprintf("projects[%d].roles.auditor", i), issues)
-	}
-	for i, project := range config.Projects {
-		if project.Roles == nil || project.Roles.Gatekeeper == nil || (project.Roles.Gatekeeper.Trust == nil && project.Roles.Gatekeeper.DiffBudget == nil) {
-			continue
-		}
-		reviewerAutoMerge := config.Roles.Reviewer.AutoMerge.Enabled
-		if project.Roles.Reviewer != nil && project.Roles.Reviewer.AutoMerge != nil && project.Roles.Reviewer.AutoMerge.Enabled != nil {
-			reviewerAutoMerge = *project.Roles.Reviewer.AutoMerge.Enabled
-		}
+		role := GatekeeperRoleConfig{}
 		if project.Roles.Gatekeeper.Trust != nil {
-			validateGatekeeperRoleConfig(
-				GatekeeperRoleConfig{Trust: *project.Roles.Gatekeeper.Trust},
-				fmt.Sprintf("projects[%d].roles.gatekeeper", i), reviewerAutoMerge, issues)
+			role.Trust = *project.Roles.Gatekeeper.Trust
 		}
-		validatePartialGatekeeperDiffBudget(
-			project.Roles.Gatekeeper.DiffBudget,
-			fmt.Sprintf("projects[%d].roles.gatekeeper.diffBudget", i), issues)
+		if project.Roles.Gatekeeper.RequiredReviewChangedLines != nil {
+			role.RequiredReviewChangedLines = *project.Roles.Gatekeeper.RequiredReviewChangedLines
+		}
+		validateGatekeeperRoleConfig(
+			role,
+			fmt.Sprintf("projects[%d].roles.gatekeeper", i), issues)
 	}
 	validateIntakeConfig(config, issues)
 	validateDaemonConfig(config.Daemon, issues)
@@ -665,6 +650,9 @@ func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, 
 			Path:    path + ".trust",
 			Message: fmt.Sprintf("must be one of: %s, %s, %s", GatekeeperTrustObserve, GatekeeperTrustAdvise, GatekeeperTrustAuto),
 		})
+	}
+	if gatekeeper.RequiredReviewChangedLines < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".requiredReviewChangedLines", Message: "must be zero (use the default) or a positive integer"})
 	}
 }
 

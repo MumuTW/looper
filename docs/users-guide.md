@@ -337,6 +337,9 @@ For current-head Codex-review enforcement, set `roles.gatekeeper.trust = "auto"`
 and require the `Looper Gatekeeper` status in the target branch's protection
 rule. Gatekeeper binds the status to the current commit: a push has no inherited
 success status, so GitHub and Mergify wait until Codex reviews that new head.
+By default this applies at 200 changed lines (additions plus deletions); set
+`roles.gatekeeper.requiredReviewChangedLines` or the project override to make
+the throughput-versus-review-capacity policy explicit.
 
 Comment markers used by this flow:
 

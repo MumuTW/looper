@@ -46,6 +46,17 @@ func TestGatekeeperTrustAcceptsAuto(t *testing.T) {
 	}
 }
 
+func TestGatekeeperReviewThresholdAcceptsDefaultAndRejectsNegative(t *testing.T) {
+	t.Parallel()
+	if issues := gatekeeperIssues(Config{Roles: RoleConfigs{Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto}}}); len(issues) != 0 {
+		t.Fatalf("default threshold issues = %+v", issues)
+	}
+	issues := gatekeeperIssues(Config{Roles: RoleConfigs{Gatekeeper: GatekeeperRoleConfig{RequiredReviewChangedLines: -1}}})
+	if len(issues) != 1 || issues[0].Path != "roles.gatekeeper.requiredReviewChangedLines" {
+		t.Fatalf("issues = %+v, want negative threshold rejected", issues)
+	}
+}
+
 func TestGatekeeperTrustRejectsUnknownLevel(t *testing.T) {
 	t.Parallel()
 
@@ -85,12 +96,16 @@ func TestMergePartialGatekeeperTrust(t *testing.T) {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
 	advise := GatekeeperTrustAdvise
+	threshold := 350
 	mergeConfig(&cfg, PartialConfig{Roles: &PartialRoleConfigs{
-		Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &advise},
+		Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &advise, RequiredReviewChangedLines: &threshold},
 	}})
 
 	if cfg.Roles.Gatekeeper.Trust != GatekeeperTrustAdvise {
 		t.Fatalf("merged trust = %q, want advise", cfg.Roles.Gatekeeper.Trust)
+	}
+	if cfg.Roles.Gatekeeper.RequiredReviewChangedLines != threshold {
+		t.Fatalf("merged threshold = %d, want %d", cfg.Roles.Gatekeeper.RequiredReviewChangedLines, threshold)
 	}
 }
 
@@ -100,7 +115,8 @@ func TestMergePartialGatekeeperTrust(t *testing.T) {
 func TestClonePartialRoleConfigsPreservesGatekeeperTrust(t *testing.T) {
 	t.Parallel()
 	advise := GatekeeperTrustAdvise
-	original := &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &advise}}
+	threshold := 350
+	original := &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &advise, RequiredReviewChangedLines: &threshold}}
 
 	cloned := clonePartialRoleConfigs(original)
 
@@ -110,12 +126,19 @@ func TestClonePartialRoleConfigsPreservesGatekeeperTrust(t *testing.T) {
 	if *cloned.Gatekeeper.Trust != GatekeeperTrustAdvise {
 		t.Fatalf("cloned trust = %q, want advise", *cloned.Gatekeeper.Trust)
 	}
+	if cloned.Gatekeeper.RequiredReviewChangedLines == nil || *cloned.Gatekeeper.RequiredReviewChangedLines != threshold {
+		t.Fatalf("cloned threshold = %#v, want %d", cloned.Gatekeeper.RequiredReviewChangedLines, threshold)
+	}
 	// A shallow copy of the pointer would let a later edit of one layer rewrite
 	// another.
 	observe := GatekeeperTrustObserve
 	*original.Gatekeeper.Trust = observe
 	if *cloned.Gatekeeper.Trust != GatekeeperTrustAdvise {
 		t.Fatal("clone aliases the original trust pointer")
+	}
+	threshold = 500
+	if *cloned.Gatekeeper.RequiredReviewChangedLines != 350 {
+		t.Fatal("clone aliases the original threshold pointer")
 	}
 }
 

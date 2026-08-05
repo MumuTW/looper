@@ -869,41 +869,11 @@ const (
 // GatekeeperRoleConfig configures the agent-free Merge Gatekeeper.
 type GatekeeperRoleConfig struct {
 	// Trust is the merge authority level. Empty defaults to observe.
-	Trust      GatekeeperTrustLevel  `json:"trust,omitempty"`
-	DiffBudget *GatekeeperDiffBudget `json:"diffBudget,omitempty"`
-}
-
-// GatekeeperDiffBudget is a boolean change-size gate. A zero bound is
-// unlimited; non-zero bounds are enforced independently. The two bounds are
-// independent: configuring only maxDeletions leaves changedFiles unlimited, so a
-// very large addition concentrated in a few files can still pass.
-//
-// Remaining blind spots reviewers should weigh before relying on this gate:
-//
-//   - Only changed-file count and deletion count are bounded. There is no
-//     maxAdditions or total-line bound, so a massive purely-additive diff passes
-//     whenever maxDeletions is the only configured bound.
-//   - Counts are whole-PR totals from GitHub, computed against the current merge
-//     base. There is no per-file or per-path budget, so one very large file
-//     passes whenever the file count is under limit, and generated or vendored
-//     files are not excluded.
-//   - The gate is boolean per bound, not a score. It reports observed counts and
-//     configured limits as evidence; it does not model review effort or risk.
-//
-// What it still does not catch is the price of a cheap, deterministic,
-// provider-authoritative guard; a heuristic or inferred diff layer would be less
-// authoritative and is deliberately not built here.
-type GatekeeperDiffBudget struct {
-	MaxChangedFiles int `json:"maxChangedFiles"`
-	MaxDeletions    int `json:"maxDeletions"`
-}
-
-// AuditorRoleConfig configures the opt-in Post-merge Auditor. It remains
-// disabled by default because watching default-branch checks changes operator
-// workload even though the Auditor never merges or pushes a revert itself.
-type AuditorRoleConfig struct {
-	Enabled       bool `json:"enabled"`
-	WindowMinutes int  `json:"windowMinutes"`
+	Trust GatekeeperTrustLevel `json:"trust,omitempty"`
+	// RequiredReviewChangedLines is the smallest additions+deletions total that
+	// needs a completed current-head review when trust is auto. Zero inherits the
+	// deliberate 200-line default rather than disabling the policy.
+	RequiredReviewChangedLines int `json:"requiredReviewChangedLines,omitempty"`
 }
 
 type ProjectRefConfig struct {
@@ -1538,27 +1508,8 @@ type PartialDeployerRoleConfig struct {
 }
 
 type PartialGatekeeperRoleConfig struct {
-	Trust      *GatekeeperTrustLevel        `json:"trust,omitempty"`
-	DiffBudget *PartialGatekeeperDiffBudget `json:"diffBudget,omitempty"`
-}
-
-type PartialGatekeeperDiffBudget struct {
-	MaxChangedFiles *int `json:"maxChangedFiles,omitempty"`
-	MaxDeletions    *int `json:"maxDeletions,omitempty"`
-}
-
-type PartialEscalatorRoleConfig struct {
-	Enabled               *bool  `json:"enabled,omitempty"`
-	CadenceSeconds        *int   `json:"cadenceSeconds,omitempty"`
-	RetryAttemptThreshold *int64 `json:"retryAttemptThreshold,omitempty"`
-	UnroutedAfterSeconds  *int   `json:"unroutedAfterSeconds,omitempty"`
-	StaleHeadAfterSeconds *int   `json:"staleHeadAfterSeconds,omitempty"`
-	MaxItems              *int   `json:"maxItems,omitempty"`
-}
-
-type PartialAuditorRoleConfig struct {
-	Enabled       *bool `json:"enabled,omitempty"`
-	WindowMinutes *int  `json:"windowMinutes,omitempty"`
+	Trust                      *GatekeeperTrustLevel `json:"trust,omitempty"`
+	RequiredReviewChangedLines *int                  `json:"requiredReviewChangedLines,omitempty"`
 }
 
 type PartialRoleConfigs struct {

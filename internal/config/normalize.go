@@ -1284,58 +1284,13 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 	if partial.Deployer != nil {
 		mergeDeployerRoleConfig(&config.Deployer, *partial.Deployer)
 	}
-	if partial.Auditor != nil {
-		if partial.Auditor.Enabled != nil {
-			config.Auditor.Enabled = *partial.Auditor.Enabled
-		}
-		if partial.Auditor.WindowMinutes != nil {
-			config.Auditor.WindowMinutes = *partial.Auditor.WindowMinutes
-		}
-	}
 	if partial.Gatekeeper != nil {
 		if partial.Gatekeeper.Trust != nil {
 			config.Gatekeeper.Trust = GatekeeperTrustLevel(strings.TrimSpace(string(*partial.Gatekeeper.Trust)))
 		}
-		if partial.Gatekeeper.DiffBudget != nil {
-			budget := config.Gatekeeper.DiffBudget
-			if budget == nil {
-				budget = &GatekeeperDiffBudget{}
-			} else {
-				cloned := *budget
-				budget = &cloned
-			}
-			if partial.Gatekeeper.DiffBudget.MaxChangedFiles != nil {
-				budget.MaxChangedFiles = *partial.Gatekeeper.DiffBudget.MaxChangedFiles
-			}
-			if partial.Gatekeeper.DiffBudget.MaxDeletions != nil {
-				budget.MaxDeletions = *partial.Gatekeeper.DiffBudget.MaxDeletions
-			}
-			config.Gatekeeper.DiffBudget = budget
+		if partial.Gatekeeper.RequiredReviewChangedLines != nil {
+			config.Gatekeeper.RequiredReviewChangedLines = *partial.Gatekeeper.RequiredReviewChangedLines
 		}
-	}
-	if partial.Escalator != nil {
-		mergeEscalatorRoleConfig(&config.Escalator, *partial.Escalator)
-	}
-}
-
-func mergeEscalatorRoleConfig(config *EscalatorRoleConfig, partial PartialEscalatorRoleConfig) {
-	if partial.Enabled != nil {
-		config.Enabled = *partial.Enabled
-	}
-	if partial.CadenceSeconds != nil {
-		config.CadenceSeconds = *partial.CadenceSeconds
-	}
-	if partial.RetryAttemptThreshold != nil {
-		config.RetryAttemptThreshold = *partial.RetryAttemptThreshold
-	}
-	if partial.UnroutedAfterSeconds != nil {
-		config.UnroutedAfterSeconds = *partial.UnroutedAfterSeconds
-	}
-	if partial.StaleHeadAfterSeconds != nil {
-		config.StaleHeadAfterSeconds = *partial.StaleHeadAfterSeconds
-	}
-	if partial.MaxItems != nil {
-		config.MaxItems = *partial.MaxItems
 	}
 }
 
@@ -2235,8 +2190,9 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			trust := *configs.Gatekeeper.Trust
 			gatekeeper.Trust = &trust
 		}
-		if configs.Gatekeeper.DiffBudget != nil {
-			gatekeeper.DiffBudget = clonePartialGatekeeperDiffBudget(configs.Gatekeeper.DiffBudget)
+		if configs.Gatekeeper.RequiredReviewChangedLines != nil {
+			threshold := *configs.Gatekeeper.RequiredReviewChangedLines
+			gatekeeper.RequiredReviewChangedLines = &threshold
 		}
 		cloned.Gatekeeper = &gatekeeper
 	}
