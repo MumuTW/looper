@@ -1893,7 +1893,7 @@ func TestVerifyTimeoutProgressBeforeReplacementReobservesAfterFailedRetry(t *tes
 	inspect := InspectHeadResult{HeadSHA: "head", Branch: "feature/test", ChangedFiles: []string{"tracked.go"}, DiffFingerprint: "status", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index"}
 	git := &fakeGitGateway{inspectResult: inspect}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
-	baseline := &worktreeProgress{HeadSHA: "head", WorktreeID: "wt_1", Branch: "feature/test", ChangedFiles: []string{"tracked.go"}, ChangedFileCount: 1, DiffFingerprint: "status", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index"}
+	baseline := &worktreeProgress{HeadSHA: "head", WorktreeID: "wt_1", Branch: "feature/test", ChangedFiles: []string{"tracked.go"}, ChangedFileCount: 1, ChangedFileBytes: pathByteList([]string{"tracked.go"}), DiffFingerprint: "status", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index"}
 	checkpoint := workerCheckpoint{
 		Execution:    &checkpointExecution{RunID: run.ID, ExecutionID: "agent_failed", Status: "failed", ProgressSnapshotError: "previous drift"},
 		Continuation: &checkpointContinuation{PredecessorRunID: "run_timeout", PredecessorExecutionID: "agent_timeout", Mode: "native_resume", Outcome: "changed", AfterRestart: baseline},

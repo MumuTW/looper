@@ -2737,10 +2737,6 @@ func (r *Runner) verifyTimeoutProgressBeforeReplacement(ctx context.Context, pro
 		return nil
 	}
 	if checkpoint.Execution.ProgressBeforeTimeout == nil {
-		return nil
-	}
-	before := checkpoint.Execution.ProgressBeforeTimeout
-	if before == nil {
 		if strings.TrimSpace(checkpoint.Execution.ProgressSnapshotError) == "" {
 			return nil
 		}
@@ -2751,6 +2747,7 @@ func (r *Runner) verifyTimeoutProgressBeforeReplacement(ctx context.Context, pro
 		}
 		return &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
 	}
+	before := checkpoint.Execution.ProgressBeforeTimeout
 	current, err := r.captureWorktreeProgress(ctx, project, work, worktree, agent.TimeoutObservation{}, before)
 	if err != nil {
 		message := fmt.Sprintf("worker timeout progress verification before retry failed: %v", err)
