@@ -16,7 +16,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/infra/shell"
 	"github.com/MumuTW/looper/internal/processcontainment"
-	"golang.org/x/sys/unix"
+	"github.com/MumuTW/looper/internal/processsandbox/trustmanifest"
 )
 
 type workspaceAccess string
@@ -26,14 +26,14 @@ const (
 	workspaceWritable workspaceAccess = "writable"
 )
 
-// Available verifies that the pinned runtime and its pre-sandbox support
-// executables are installed outside caller-writable storage.
+// Available verifies the pinned runtime and its complete executable closure
+// against the root-sealed content manifest written at installation time.
 func Available() error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("process sandbox: resolve current directory: %w", err)
 	}
-	_, err = installedRuntime(cwd)
+	_, err = installedRuntime(cwd, nil)
 	return err
 }
 
@@ -144,7 +144,7 @@ func Run(ctx context.Context, options Options) (shell.Result, error) {
 	runtimePaths := runtimePaths{command: strings.TrimSpace(options.runtimeCommand)}
 	if runtimePaths.command == "" {
 		var runtimeErr error
-		runtimePaths, runtimeErr = installedRuntime(cwd)
+		runtimePaths, runtimeErr = installedRuntime(cwd, options.Environment.PrependPath)
 		if runtimeErr != nil {
 			return shell.Result{}, runtimeErr
 		}
@@ -234,7 +234,7 @@ func Run(ctx context.Context, options Options) (shell.Result, error) {
 		Command: runtimePaths.command,
 		Args:    args,
 		CWD:     cwd,
-		Env:     isolatedEnvironment(tempRoot, options.Environment, runtimePaths.directories()),
+		Env:     isolatedEnvironment(tempRoot, options.Environment, runtimePaths.executableDirectories()),
 		Timeout: options.Timeout,
 		Tracker: options.Tracker,
 	})
@@ -246,24 +246,52 @@ const (
 )
 
 type runtimePaths struct {
-	command string
-	node    string
-	ripgrep string
-	bwrap   string
-	socat   string
+	command            string
+	moduleRoot         string
+	closureDirectories []string
+	node               string
+	ripgrep            string
+	bwrap              string
+	socat              string
 }
 
 func (p runtimePaths) directories() []string {
-	result := make([]string, 0, 5)
+	result := make([]string, 0, 6+len(p.closureDirectories))
 	for _, path := range []string{p.command, p.node, p.ripgrep, p.bwrap, p.socat} {
 		if path != "" {
 			result = append(result, filepath.Dir(path))
 		}
 	}
+	if p.moduleRoot != "" {
+		result = append(result, p.moduleRoot)
+	}
+	result = append(result, p.closureDirectories...)
 	return compact(result)
 }
 
-func installedRuntime(cwd string) (runtimePaths, error) {
+// executableDirectories preserves the sealed Node directory as the first PATH
+// entry. SRT and package scripts commonly use #!/usr/bin/env node; sorting all
+// support directories would let a different node binary win lookup.
+func (p runtimePaths) executableDirectories() []string {
+	ordered := []string{p.node, p.command, p.ripgrep, p.bwrap, p.socat}
+	seen := make(map[string]struct{})
+	result := make([]string, 0, len(ordered))
+	for _, path := range ordered {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		dir := filepath.Dir(path)
+		if _, ok := seen[dir]; ok {
+			continue
+		}
+		seen[dir] = struct{}{}
+		result = append(result, dir)
+	}
+	return result
+}
+
+func installedRuntime(cwd string, prependPath []string) (runtimePaths, error) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		return runtimePaths{}, fmt.Errorf("process sandbox: unsupported platform %s", runtime.GOOS)
 	}
@@ -310,10 +338,8 @@ func installedRuntime(cwd string) (runtimePaths, error) {
 		}
 		moduleRoot = parent
 	}
-	if err := requireTrustedTree(moduleRoot); err != nil {
-		return runtimePaths{}, fmt.Errorf("process sandbox: untrusted srt installation: %w", err)
-	}
-	paths := runtimePaths{command: path}
+	paths := runtimePaths{command: resolved, moduleRoot: moduleRoot}
+	resolvedRoots := map[string]string{"srt": resolved}
 	required := []struct {
 		name   string
 		target *string
@@ -345,58 +371,24 @@ func installedRuntime(cwd string) (runtimePaths, error) {
 		if pathContains(cwd, resolvedCommand) {
 			return runtimePaths{}, fmt.Errorf("process sandbox: support tool %s resolves inside cwd", requiredCommand.name)
 		}
-		if err := requireTrustedPath(resolvedCommand); err != nil {
-			return runtimePaths{}, fmt.Errorf("process sandbox: untrusted support tool %s: %w", requiredCommand.name, err)
-		}
 		*requiredCommand.target = resolvedCommand
+		resolvedRoots[requiredCommand.name] = resolvedCommand
 	}
 	if pathContains(cwd, resolved) {
 		return runtimePaths{}, fmt.Errorf("process sandbox: srt runtime resolves inside cwd")
 	}
-	paths.command = resolved
-	return paths, nil
-}
-
-func requireTrustedTree(root string) error {
-	if os.Geteuid() == 0 {
-		return fmt.Errorf("sandboxed execution is not supported as root")
-	}
-	if err := requireTrustedPath(root); err != nil {
-		return err
-	}
-	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			resolved, err := filepath.EvalSymlinks(path)
-			if err != nil {
-				return err
-			}
-			if !pathContains(root, resolved) {
-				return fmt.Errorf("%s links outside the trusted module tree", path)
-			}
-		}
-		if unix.Access(path, unix.W_OK) == nil {
-			return fmt.Errorf("%s is writable by the daemon user", path)
-		}
-		return nil
+	launchPath := append([]string(nil), prependPath...)
+	launchPath = append(launchPath, filepath.SplitList(os.Getenv("PATH"))...)
+	manifest, err := trustmanifest.VerifyManifest(trustmanifest.ManifestPath(moduleRoot), trustmanifest.Input{
+		PackageRoot: moduleRoot,
+		Roots:       resolvedRoots,
+		LaunchPath:  launchPath,
 	})
-}
-
-func requireTrustedPath(path string) error {
-	if os.Geteuid() == 0 {
-		return fmt.Errorf("sandboxed execution is not supported as root")
+	if err != nil {
+		return runtimePaths{}, fmt.Errorf("process sandbox: untrusted srt installation: %w", err)
 	}
-	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
-		if unix.Access(current, unix.W_OK) == nil {
-			return fmt.Errorf("%s is writable by the daemon user", current)
-		}
-		parent := filepath.Dir(current)
-		if parent == current {
-			return nil
-		}
-	}
+	paths.closureDirectories = manifest.ClosureDirectories()
+	return paths, nil
 }
 
 func platformSystemReadRoots() []string {
