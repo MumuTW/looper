@@ -1,5 +1,7 @@
 package config
 
+import "strings"
+
 type AgentVendor string
 
 const (
@@ -11,6 +13,37 @@ const (
 	AgentVendorDevinExperimental AgentVendor = "devin-experimental"
 	AgentVendorHermes            AgentVendor = "hermes"
 )
+
+// ReasoningEffort is the typed effort level passed to vendor model invocation.
+// "none" explicitly disables reasoning effort (strip any inherited value).
+type ReasoningEffort string
+
+const (
+	ReasoningEffortLow      ReasoningEffort = "low"
+	ReasoningEffortMedium   ReasoningEffort = "medium"
+	ReasoningEffortHigh     ReasoningEffort = "high"
+	ReasoningEffortVeryHigh ReasoningEffort = "xhigh"
+	ReasoningEffortNone     ReasoningEffort = "none"
+)
+
+// ValidReasoningEfforts returns the recognized effort levels for validation.
+func ValidReasoningEfforts() []ReasoningEffort {
+	return []ReasoningEffort{
+		ReasoningEffortLow,
+		ReasoningEffortMedium,
+		ReasoningEffortHigh,
+		ReasoningEffortVeryHigh,
+		ReasoningEffortNone,
+	}
+}
+
+func ParseReasoningEffort(raw string) (ReasoningEffort, bool) {
+	switch ReasoningEffort(strings.ToLower(strings.TrimSpace(raw))) {
+	case ReasoningEffortLow, ReasoningEffortMedium, ReasoningEffortHigh, ReasoningEffortVeryHigh, ReasoningEffortNone:
+		return ReasoningEffort(strings.ToLower(strings.TrimSpace(raw))), true
+	}
+	return "", false
+}
 
 var supportedAgentVendors = []AgentVendor{
 	AgentVendorClaudeCode,
@@ -240,25 +273,28 @@ type ProviderConfig struct {
 
 // AgentBindingConfig is vendor+model only (profiles).
 type AgentBindingConfig struct {
-	Vendor *AgentVendor `json:"vendor,omitempty"`
-	Model  *string      `json:"model,omitempty"` // nil=inherit; non-nil empty=suppress model
+	Vendor          *AgentVendor     `json:"vendor,omitempty"`
+	Model           *string          `json:"model,omitempty"` // nil=inherit; non-nil empty=suppress model
+	ReasoningEffort *ReasoningEffort `json:"reasoningEffort,omitempty"`
 }
 
 // RoleAgentConfig is optional per-role overlay (planner/worker/reviewer/fixer only).
 type RoleAgentConfig struct {
-	Profile *string      `json:"profile,omitempty"`
-	Vendor  *AgentVendor `json:"vendor,omitempty"`
-	Model   *string      `json:"model,omitempty"`
+	Profile         *string          `json:"profile,omitempty"`
+	Vendor          *AgentVendor     `json:"vendor,omitempty"`
+	Model           *string          `json:"model,omitempty"`
+	ReasoningEffort *ReasoningEffort `json:"reasoningEffort,omitempty"`
 }
 
 type AgentConfig struct {
-	Vendor       *AgentVendor                  `json:"vendor,omitempty"`
-	Model        *string                       `json:"model,omitempty"`
-	Profiles     map[string]AgentBindingConfig `json:"profiles,omitempty"`
-	Params       map[string]any                `json:"params"`
-	Env          map[string]string             `json:"env"`
-	Timeouts     AgentTimeoutConfig            `json:"timeouts"`
-	NativeResume AgentNativeResumeConfig       `json:"nativeResume"`
+	Vendor          *AgentVendor                  `json:"vendor,omitempty"`
+	Model           *string                       `json:"model,omitempty"`
+	Profiles        map[string]AgentBindingConfig `json:"profiles,omitempty"`
+	Params          map[string]any                `json:"params"`
+	Env             map[string]string             `json:"env"`
+	Timeouts        AgentTimeoutConfig            `json:"timeouts"`
+	NativeResume    AgentNativeResumeConfig       `json:"nativeResume"`
+	ReasoningEffort *ReasoningEffort              `json:"reasoningEffort,omitempty"`
 }
 
 type AgentNativeResumeConfig struct {
@@ -1051,13 +1087,14 @@ type PartialWebhookConfig struct {
 }
 
 type PartialAgentConfig struct {
-	Vendor       *AgentVendor                    `json:"vendor,omitempty"`
-	Model        *string                         `json:"model,omitempty"`
-	Profiles     map[string]AgentBindingConfig   `json:"profiles,omitempty"`
-	Params       map[string]any                  `json:"params,omitempty"`
-	Env          map[string]string               `json:"env,omitempty"`
-	Timeouts     *PartialAgentTimeoutConfig      `json:"timeouts,omitempty"`
-	NativeResume *PartialAgentNativeResumeConfig `json:"nativeResume,omitempty"`
+	Vendor          *AgentVendor                    `json:"vendor,omitempty"`
+	Model           *string                         `json:"model,omitempty"`
+	Profiles        map[string]AgentBindingConfig   `json:"profiles,omitempty"`
+	Params          map[string]any                  `json:"params,omitempty"`
+	Env             map[string]string               `json:"env,omitempty"`
+	Timeouts        *PartialAgentTimeoutConfig      `json:"timeouts,omitempty"`
+	NativeResume    *PartialAgentNativeResumeConfig `json:"nativeResume,omitempty"`
+	ReasoningEffort *ReasoningEffort                `json:"reasoningEffort,omitempty"`
 }
 
 type PartialAgentNativeResumeConfig struct {

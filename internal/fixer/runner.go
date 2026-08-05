@@ -482,9 +482,10 @@ type AgentRunInput struct {
 	RestrictToolNetwork bool
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
-	UseSnapshot    bool
-	SnapshotVendor string
-	SnapshotModel  *string
+	UseSnapshot             bool
+	SnapshotVendor          string
+	SnapshotModel           *string
+	SnapshotReasoningEffort *config.ReasoningEffort
 }
 
 type AgentResult struct {
@@ -568,6 +569,7 @@ type Options struct {
 	Disclosure                  *config.DisclosureConfig
 	AgentRuntime                string
 	AgentProfileID              string
+	AgentReasoningEffort        *config.ReasoningEffort
 	CustomInstructions          *config.Config
 	AgentModel                  *string
 	Sleep                       func(time.Duration)
@@ -617,6 +619,7 @@ type Runner struct {
 	disclosure                  config.DisclosureConfig
 	agentRuntime                string
 	agentProfileID              string
+	agentReasoningEffort        *config.ReasoningEffort
 	customInstructions          config.Config
 	projectRoleConfig           *config.Config
 	agentModel                  *string
@@ -1757,6 +1760,7 @@ func New(options Options) *Runner {
 		disclosure:                  disclosureCfg,
 		agentRuntime:                strings.TrimSpace(options.AgentRuntime),
 		agentProfileID:              strings.TrimSpace(options.AgentProfileID),
+		agentReasoningEffort:        cloneReasoningEffortPtr(options.AgentReasoningEffort),
 		customInstructions:          customInstructionConfig(options.CustomInstructions),
 		projectRoleConfig:           options.CustomInstructions,
 		agentModel:                  cloneStringPtr(options.AgentModel),
@@ -3630,7 +3634,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	executionID := eventlog.NewEventID("agent")
-	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+	agentVendor, agentModel, _, agentReasoningEffort, useSnapshot, err := r.identityFromRun(input.Run)
 	if err != nil {
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
@@ -3650,13 +3654,13 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	} else if held {
 		return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 	}
-	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
+	useSnap, snapVendor, snapModel, snapReasoningEffort := agentRunSnapshotFields(agentVendor, agentModel, agentReasoningEffort, useSnapshot)
 	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
 		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 		Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 		Metadata: metadata, IdempotencyKey: fmt.Sprintf("fixer:%s:%s:%s", input.Loop.ID, firstNonEmpty(checkpoint.FixItemsHash, "unknown"), firstNonEmpty(detailHeadSHA(checkpoint.Detail), "unknown")),
 		RestrictToolNetwork: len(validationCommands) > 0,
-		UseSnapshot:         useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+		UseSnapshot:         useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
 	})
 	if err != nil {
 		return checkpoint, err
@@ -9243,7 +9247,7 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky,
 	if previous != nil {
 		previousSnapshot = previous.AgentSnapshotJSON
 	}
-	snapshotJSON, refreshed, legacyResume, err := config.ResolveRunAgentSnapshotJSONForValidationGate(previousSnapshot, sticky, requireToolNetworkDenial, replaysAgentStep, r.agentRuntime, r.agentModel, r.agentProfileID)
+	snapshotJSON, refreshed, legacyResume, err := config.ResolveRunAgentSnapshotJSONForValidationGate(previousSnapshot, sticky, requireToolNetworkDenial, replaysAgentStep, r.agentRuntime, r.agentModel, r.agentProfileID, r.agentReasoningEffort)
 	if err != nil {
 		return nil, err
 	}
@@ -9270,15 +9274,15 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky,
 // identityFromRun returns the vendor/model/profile that must drive this run.
 // When the run has AgentSnapshotJSON, that identity is execution authority.
 // model is a pointer so nil (unset) and non-nil empty (suppress) stay distinct.
-func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, useSnapshot bool, err error) {
-	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, reasoningEffort *config.ReasoningEffort, useSnapshot bool, err error) {
+	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID, r.agentReasoningEffort)
 }
 
 // disclosureIdentity returns agent/model for disclosure stamps from the run
 // snapshot when present; falls back to runner identity on empty snapshot or
 // parse errors (stamp-only paths must not fail the run).
 func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string) {
-	vendor, modelPtr, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+	vendor, modelPtr, _, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID, r.agentReasoningEffort)
 	if err != nil {
 		// Present but invalid snapshot must not fall back to live runner identity.
 		return "", ""
@@ -9286,13 +9290,13 @@ func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string)
 	return vendor, derefString(modelPtr)
 }
 
-func agentRunSnapshotFields(vendor string, model *string, useSnapshot bool) (bool, string, *string) {
+func agentRunSnapshotFields(vendor string, model *string, reasoningEffort *config.ReasoningEffort, useSnapshot bool) (bool, string, *string, *config.ReasoningEffort) {
 	if !useSnapshot {
-		return false, "", nil
+		return false, "", nil, nil
 	}
 	// Pass through including non-nil empty suppress so SnapshotModel stays
 	// distinct from unset and ParamsForRoleVendor can strip params --model/-m.
-	return true, vendor, model
+	return true, vendor, model, reasoningEffort
 }
 
 func cloneStringPtr(value *string) *string {
@@ -9301,6 +9305,14 @@ func cloneStringPtr(value *string) *string {
 	}
 	trimmed := strings.TrimSpace(*value)
 	return &trimmed
+}
+
+func cloneReasoningEffortPtr(value *config.ReasoningEffort) *config.ReasoningEffort {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func derefString(value *string) string {

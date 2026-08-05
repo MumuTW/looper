@@ -7,12 +7,13 @@ import (
 )
 
 // AgentSnapshot is the durable identity of the agent used for a run.
-// It stores only vendor/model/profile identity — never params or env.
+// It stores only vendor/model/profile/reasoning identity — never params or env.
 //
 // Authority: when runs.agent_snapshot_json is non-empty with a vendor, this
-// snapshot is execution authority for spawn, prompts, HITL, and disclosure on
-// that run lineage. It is not the agent's structured output: vendor/model is
-// operator/config policy captured at run create, not something the agent emits.
+// snapshot is execution authority for spawn, prompts, HITL, disclosure, and
+// interactive takeover on that run lineage. It is not the agent's structured
+// output: vendor/model/reasoning effort is operator/config policy captured at
+// run create, not something the agent emits.
 //
 // Trade-off: costs a persisted column, sticky copy across failed/interrupted
 // retries, parse validation, and a legacy-null fallback path. Simpler options
@@ -20,17 +21,19 @@ import (
 // switch CLI vendor after hot reload (breaking native resume and params
 // ownership), and agent output cannot authoritatively choose the executable.
 type AgentSnapshot struct {
-	Vendor    string  `json:"vendor"`
-	Model     *string `json:"model,omitempty"`
-	ProfileID string  `json:"profileId,omitempty"`
+	Vendor          string           `json:"vendor"`
+	Model           *string          `json:"model,omitempty"`
+	ProfileID       string           `json:"profileId,omitempty"`
+	ReasoningEffort *ReasoningEffort `json:"reasoningEffort,omitempty"`
 }
 
 // AgentSnapshotFromResolved builds a snapshot from a resolved coding-role agent.
 func AgentSnapshotFromResolved(r ResolvedAgent) AgentSnapshot {
 	return AgentSnapshot{
-		Vendor:    string(r.Vendor),
-		Model:     r.Model,
-		ProfileID: strings.TrimSpace(r.ProfileID),
+		Vendor:          string(r.Vendor),
+		Model:           r.Model,
+		ProfileID:       strings.TrimSpace(r.ProfileID),
+		ReasoningEffort: r.ReasoningEffort,
 	}
 }
 
@@ -38,7 +41,7 @@ func AgentSnapshotFromResolved(r ResolvedAgent) AgentSnapshot {
 // model is a pointer so nil (unset) and non-nil empty (explicit suppress to the
 // vendor default) stay distinct through freeze; collapsing empty to omitempty
 // nil would make ParamsForRoleVendor preserve params --model/-m on thaw.
-func AgentSnapshotFromIdentity(vendor string, model *string, profileID string) AgentSnapshot {
+func AgentSnapshotFromIdentity(vendor string, model *string, profileID string, reasoningEffort *ReasoningEffort) AgentSnapshot {
 	snapshot := AgentSnapshot{
 		Vendor:    strings.TrimSpace(vendor),
 		ProfileID: strings.TrimSpace(profileID),
@@ -47,6 +50,7 @@ func AgentSnapshotFromIdentity(vendor string, model *string, profileID string) A
 		trimmed := strings.TrimSpace(*model)
 		snapshot.Model = &trimmed
 	}
+	snapshot.ReasoningEffort = reasoningEffort
 	return snapshot
 }
 
@@ -69,6 +73,13 @@ func ParseAgentSnapshot(raw string) (AgentSnapshot, error) {
 	if err := json.Unmarshal([]byte(trimmed), &snapshot); err != nil {
 		return AgentSnapshot{}, fmt.Errorf("parse agent snapshot: %w", err)
 	}
+	if snapshot.ReasoningEffort != nil {
+		canonical, ok := ParseReasoningEffort(string(*snapshot.ReasoningEffort))
+		if !ok {
+			return AgentSnapshot{}, fmt.Errorf("invalid reasoning effort %q in agent snapshot", *snapshot.ReasoningEffort)
+		}
+		snapshot.ReasoningEffort = &canonical
+	}
 	return snapshot, nil
 }
 
@@ -81,7 +92,7 @@ func ParseAgentSnapshot(raw string) (AgentSnapshot, error) {
 // model is a pointer so explicit empty suppress survives freeze.
 // legacyResume is true when continuing a predecessor that had no snapshot (pre-migration).
 // Marshal failures return an error so callers can fail run creation loudly.
-func ResolveRunAgentSnapshotJSON(predecessorSnapshot *string, sticky bool, vendor string, model *string, profileID string) (snapshotJSON *string, legacyResume bool, err error) {
+func ResolveRunAgentSnapshotJSON(predecessorSnapshot *string, sticky bool, vendor string, model *string, profileID string, reasoningEffort *ReasoningEffort) (snapshotJSON *string, legacyResume bool, err error) {
 	if sticky {
 		if predecessorSnapshot != nil {
 			if trimmed := strings.TrimSpace(*predecessorSnapshot); trimmed != "" {
@@ -103,7 +114,7 @@ func ResolveRunAgentSnapshotJSON(predecessorSnapshot *string, sticky bool, vendo
 		// can fall back to the runner's live fields (tests / unconfigured agent).
 		return nil, legacyResume, nil
 	}
-	encoded, marshalErr := MarshalAgentSnapshot(AgentSnapshotFromIdentity(vendor, model, profileID))
+	encoded, marshalErr := MarshalAgentSnapshot(AgentSnapshotFromIdentity(vendor, model, profileID, reasoningEffort))
 	if marshalErr != nil {
 		return nil, legacyResume, marshalErr
 	}
@@ -157,7 +168,7 @@ func ResolveRunAgentSnapshotJSON(predecessorSnapshot *string, sticky bool, vendo
 //
 // refreshed is true when the predecessor snapshot was replaced; legacyResume is
 // true when continuing a predecessor that had no snapshot (pre-migration).
-func ResolveRunAgentSnapshotJSONForValidationGate(predecessorSnapshot *string, sticky, requireToolNetworkDenial, replaysAgentStep bool, vendor string, model *string, profileID string) (snapshotJSON *string, refreshed, legacyResume bool, err error) {
+func ResolveRunAgentSnapshotJSONForValidationGate(predecessorSnapshot *string, sticky, requireToolNetworkDenial, replaysAgentStep bool, vendor string, model *string, profileID string, reasoningEffort ...*ReasoningEffort) (snapshotJSON *string, refreshed, legacyResume bool, err error) {
 	if sticky && requireToolNetworkDenial && replaysAgentStep && predecessorSnapshot != nil {
 		if trimmed := strings.TrimSpace(*predecessorSnapshot); trimmed != "" {
 			predecessor, parseErr := ParseAgentSnapshot(trimmed)
@@ -167,7 +178,11 @@ func ResolveRunAgentSnapshotJSONForValidationGate(predecessorSnapshot *string, s
 			predecessorVendor := AgentVendor(strings.TrimSpace(predecessor.Vendor))
 			currentVendor := AgentVendor(strings.TrimSpace(vendor))
 			if predecessorVendor != "" && !VendorSupportsToolNetworkDenial(predecessorVendor) && VendorSupportsToolNetworkDenial(currentVendor) {
-				encoded, marshalErr := MarshalAgentSnapshot(AgentSnapshotFromIdentity(vendor, model, profileID))
+				var effort *ReasoningEffort
+				if len(reasoningEffort) > 0 {
+					effort = reasoningEffort[0]
+				}
+				encoded, marshalErr := MarshalAgentSnapshot(AgentSnapshotFromIdentity(vendor, model, profileID, effort))
 				if marshalErr != nil {
 					return nil, false, false, marshalErr
 				}
@@ -175,38 +190,43 @@ func ResolveRunAgentSnapshotJSONForValidationGate(predecessorSnapshot *string, s
 			}
 		}
 	}
-	base, legacy, err := ResolveRunAgentSnapshotJSON(predecessorSnapshot, sticky, vendor, model, profileID)
+	var effort *ReasoningEffort
+	if len(reasoningEffort) > 0 {
+		effort = reasoningEffort[0]
+	}
+	base, legacy, err := ResolveRunAgentSnapshotJSON(predecessorSnapshot, sticky, vendor, model, profileID, effort)
 	if err != nil {
 		return nil, false, false, err
 	}
 	return base, false, legacy, nil
 }
 
-// IdentityFromRunSnapshot returns the vendor/model/profile that should drive a run.
+// IdentityFromRunSnapshot returns the vendor/model/profile/reasoning effort that
+// should drive a run.
 // When snapshotJSON is non-empty and has a non-empty vendor it is the authority
 // (fromSnapshot=true). Malformed non-empty snapshots, or snapshots with an empty
 // vendor, return an error (do not fall back to live identity).
 // Only empty/null snapshots fall back to the runner's frozen identity
 // (fromSnapshot=false) for pre-migration legacy runs.
 // model is a pointer so nil (unset) and non-nil empty (suppress) stay distinct.
-func IdentityFromRunSnapshot(snapshotJSON *string, fallbackVendor string, fallbackModel *string, fallbackProfile string) (vendor string, model *string, profile string, fromSnapshot bool, err error) {
+func IdentityFromRunSnapshot(snapshotJSON *string, fallbackVendor string, fallbackModel *string, fallbackProfile string, fallbackReasoningEffort *ReasoningEffort) (vendor string, model *string, profile string, reasoningEffort *ReasoningEffort, fromSnapshot bool, err error) {
 	fallbackVendor = strings.TrimSpace(fallbackVendor)
 	fallbackProfile = strings.TrimSpace(fallbackProfile)
 	if snapshotJSON == nil || strings.TrimSpace(*snapshotJSON) == "" {
-		return fallbackVendor, fallbackModel, fallbackProfile, false, nil
+		return fallbackVendor, fallbackModel, fallbackProfile, fallbackReasoningEffort, false, nil
 	}
 	snapshot, parseErr := ParseAgentSnapshot(*snapshotJSON)
 	if parseErr != nil {
-		return "", nil, "", false, parseErr
+		return "", nil, "", nil, false, parseErr
 	}
 	vendor = strings.TrimSpace(snapshot.Vendor)
 	if vendor == "" {
-		return "", nil, "", false, fmt.Errorf("agent snapshot missing vendor")
+		return "", nil, "", nil, false, fmt.Errorf("agent snapshot missing vendor")
 	}
 	if snapshot.Model != nil {
 		m := strings.TrimSpace(*snapshot.Model)
 		model = &m
 	}
 	profile = strings.TrimSpace(snapshot.ProfileID)
-	return vendor, model, profile, true, nil
+	return vendor, model, profile, snapshot.ReasoningEffort, true, nil
 }

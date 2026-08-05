@@ -1465,6 +1465,49 @@ describe("ConfigPage", { timeout: 30_000 }, () => {
     expect(JSON.stringify(body)).not.toMatch(/params/i);
   });
 
+  it("allows undoing a newly staged profile reasoning effort", async () => {
+    const initial = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5-mini" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${String(input)}`);
+      }
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    const effort = (await screen.findByLabelText(
+      "agent.profiles.fast.reasoningEffort",
+    )) as HTMLSelectElement;
+    expect(effort.value).toBe("");
+    fireEvent.change(effort, { target: { value: "high" } });
+    expect(effort.value).toBe("high");
+
+    // The effort is not published yet, but the draft still needs an explicit
+    // control so the operator can discard it without reloading the page.
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Unset agent.profiles.fast.reasoningEffort",
+      }),
+    );
+    expect(effort.value).toBe("");
+    expect(
+      screen.queryByRole("button", {
+        name: "Unset agent.profiles.fast.reasoningEffort",
+      }),
+    ).toBeNull();
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+      false,
+    );
+  });
+
   it("retains cleared role profile draft so Save sends unset", async () => {
     // Clearing the text control stages only an unset (no set). onDraft must
     // keep the empty draft; otherwise the field snaps back and Save is a no-op.
