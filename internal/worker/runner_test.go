@@ -1,7 +1,9 @@
 package worker
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1604,10 +1606,11 @@ func TestRunExecuteStepPersistsProgressBeforeTimeoutTermination(t *testing.T) {
 	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	git := &fakeGitGateway{inspectResult: InspectHeadResult{
+	progressInspect := InspectHeadResult{
 		HeadSHA: "after-head", Branch: "looper/issue-27", HasUncommittedChanges: true,
-		ChangedFiles: []string{"modified.go", "staged.go", "new.txt"}, StagedFiles: []string{"staged.go"}, UntrackedFiles: []string{"new.txt"}, DiffFingerprint: "status-only-sha",
-	}}
+		ChangedFiles: []string{"modified.go", "staged.go", "new.txt"}, StagedFiles: []string{"staged.go"}, UntrackedFiles: []string{"new.txt"}, DiffFingerprint: "status-only-sha", ContentFingerprint: "content-sha", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index-sha",
+	}
+	git := &fakeGitGateway{inspectResults: []InspectHeadResult{progressInspect, progressInspect}}
 	agentExecutor := &timeoutObservingAgentExecutor{result: AgentResult{Status: "timeout", Summary: "agent became idle", TimeoutType: "idle", LastProgressAt: "2026-04-11T12:00:01.000Z"}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agentExecutor, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
 
@@ -1644,8 +1647,291 @@ func TestRunExecuteStepPersistsProgressBeforeTimeoutTermination(t *testing.T) {
 	if storedCheckpoint.Execution == nil || storedCheckpoint.Execution.ProgressBeforeTimeout == nil || storedCheckpoint.Execution.ProgressBeforeTimeout.DiffFingerprint != "status-only-sha" {
 		t.Fatalf("stored timeout snapshot = %#v, want persisted progress", storedCheckpoint.Execution)
 	}
-	if len(git.inspectCalls) != 1 || git.inspectCalls[0].BaseRef != "" {
-		t.Fatalf("InspectHead calls = %#v, want one snapshot without unused history traversal", git.inspectCalls)
+	if len(git.inspectCalls) != 2 {
+		t.Fatalf("InspectHead calls = %#v, want pre-timeout and post-termination observations", git.inspectCalls)
+	}
+}
+
+func TestRunExecuteStepStopsBeforeReplacementWhenTimeoutProgressDrifts(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	worktreeRoot, err := workerWorktreeRoot(*project)
+	if err != nil {
+		t.Fatalf("workerWorktreeRoot() error = %v", err)
+	}
+	if err := os.MkdirAll(project.RepoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repo) error = %v", err)
+	}
+	worktreePath := filepath.Join(worktreeRoot, "worker-timeout-drift")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(worktree) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, ".git"), []byte("gitdir: /tmp/test\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(.git) error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_timeout_drift", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{HeadSHA: "same-head", Branch: "looper/issue-27", ChangedFiles: []string{"tracked.go"}, DiffFingerprint: "different-status", ContentFingerprint: "after-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "after-index"}}
+	agentExecutor := &fakeAgentExecutor{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agentExecutor, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+
+	checkpoint, err := runner.runExecuteStep(context.Background(), stepInput{
+		Project: *project, Loop: *loop, Run: run,
+		Checkpoint: workerCheckpoint{
+			Work:      &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree:  &checkpointWorktree{ID: "worktree_27", Path: worktreePath, Branch: "looper/issue-27", BaseBranch: "main", HeadSHA: "same-head"},
+			Plan:      &checkpointPlan{Summary: "Implement worker loop"},
+			Execution: &checkpointExecution{Status: "timeout", ProgressBeforeTimeout: &worktreeProgress{HeadSHA: "same-head", Branch: "looper/issue-27", ChangedFileCount: 1, DiffFingerprint: "before-status", ContentFingerprint: "before-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "before-index"}},
+		},
+	})
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureManualIntervention {
+		t.Fatalf("runExecuteStep() error = %v, want manual intervention", err)
+	}
+	if len(agentExecutor.starts) != 0 {
+		t.Fatalf("replacement agent starts = %#v, want no second writer after progress drift", agentExecutor.starts)
+	}
+	if checkpoint.Execution == nil || checkpoint.Execution.ProgressSnapshotError == "" || checkpoint.ResumePolicy != loops.ResumePolicyManualIntervention {
+		t.Fatalf("checkpoint = %#v, want persisted drift evidence and manual intervention", checkpoint)
+	}
+}
+
+func TestVerifyTimeoutProgressBeforeReplacementFailsClosedForObservingCheckpoint(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	run := storage.RunRecord{ID: "run_timeout_observing", LoopID: "loop_worker_1", Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := workerCheckpoint{Execution: &checkpointExecution{Status: "timeout_observing", ProgressBeforeTimeout: &worktreeProgress{HeadSHA: "head-before", Branch: "feature/test", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index"}}}
+	err = runner.verifyTimeoutProgressBeforeReplacement(context.Background(), *project, run.ID, workerInput{}, checkpointWorktree{}, &checkpoint)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureManualIntervention {
+		t.Fatalf("verifyTimeoutProgressBeforeReplacement() error = %v, want fail-closed manual intervention", err)
+	}
+	if checkpoint.Execution.ProgressSnapshotError == "" || checkpoint.ResumePolicy != loops.ResumePolicyManualIntervention {
+		t.Fatalf("checkpoint = %#v, want persisted containment gate", checkpoint)
+	}
+	storedRun, err := fixture.repos.Runs.GetByID(context.Background(), run.ID)
+	if err != nil || storedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want persisted run", storedRun, err)
+	}
+	storedCheckpoint, err := parseCheckpoint(storedRun.CheckpointJSON)
+	if err != nil || storedCheckpoint.Execution == nil || storedCheckpoint.Execution.Status != "timeout_observing" || storedCheckpoint.ResumePolicy != loops.ResumePolicyManualIntervention {
+		t.Fatalf("stored checkpoint = %#v, err=%v, want fail-closed observing state", storedCheckpoint, err)
+	}
+}
+
+func TestVerifyTimeoutProgressBeforeReplacementFailsClosedForTerminalTimeoutWithoutSnapshot(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	run := storage.RunRecord{ID: "run_timeout_without_snapshot", LoopID: "loop_worker_1", Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := workerCheckpoint{Execution: &checkpointExecution{Status: "timeout", ProgressSnapshotError: "git status unavailable"}}
+	err = runner.verifyTimeoutProgressBeforeReplacement(context.Background(), *project, run.ID, workerInput{}, checkpointWorktree{}, &checkpoint)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureManualIntervention {
+		t.Fatalf("verifyTimeoutProgressBeforeReplacement() error = %v, want manual intervention", err)
+	}
+	if checkpoint.ResumePolicy != loops.ResumePolicyManualIntervention || checkpoint.Execution.ProgressSnapshotError == "" {
+		t.Fatalf("checkpoint = %#v, want durable no-snapshot containment gate", checkpoint)
+	}
+}
+
+func TestVerifyTimeoutProgressAfterTerminationRejectsDrift(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	runner := New(Options{Git: &fakeGitGateway{inspectResult: InspectHeadResult{HeadSHA: "after-head", Branch: "feature/test", DiffFingerprint: "after-status"}}, Logger: fixture.logger, Now: fixture.now})
+	err = runner.verifyTimeoutProgressAfterTermination(context.Background(), *project, workerInput{BaseBranch: "main"}, checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/test"}, worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", DiffFingerprint: "before-status"})
+	if err == nil || !strings.Contains(err.Error(), "changed after termination") {
+		t.Fatalf("verifyTimeoutProgressAfterTermination() error = %v, want drift rejection", err)
+	}
+}
+
+func TestPreservesWorktreeProgressRequiresContentAndCommitEvidence(t *testing.T) {
+	t.Parallel()
+
+	before := worktreeProgress{
+		HeadSHA:                   "before-head",
+		Branch:                    "feature/test",
+		ChangedFiles:              []string{"tracked.go", "new.txt"},
+		ChangedFileBytes:          [][]byte{[]byte("tracked.go"), []byte("new.txt")},
+		ChangedFileCount:          2,
+		StagedFiles:               []string{"tracked.go"},
+		StagedFileBytes:           [][]byte{[]byte("tracked.go")},
+		StagedFileCount:           1,
+		UntrackedFiles:            []string{"new.txt"},
+		UntrackedFileBytes:        [][]byte{[]byte("new.txt")},
+		UntrackedFileCount:        1,
+		UnstagedFileCount:         0,
+		DiffFingerprint:           "before-status",
+		ContentFingerprint:        "before-content",
+		ContentFingerprintVersion: worktreeFingerprintVersion,
+		IndexFingerprint:          "before-index",
+	}
+	for _, tc := range []struct {
+		name  string
+		after worktreeProgress
+		want  bool
+	}{
+		{
+			name:  "preserves identical content and status at the same head",
+			after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "new.txt"}, ChangedFileBytes: [][]byte{[]byte("tracked.go"), []byte("new.txt")}, StagedFiles: []string{"tracked.go"}, StagedFileBytes: [][]byte{[]byte("tracked.go")}, UntrackedFiles: []string{"new.txt"}, UntrackedFileBytes: [][]byte{[]byte("new.txt")}, ChangedFileCount: 2, DiffFingerprint: "before-status", ContentFingerprint: "before-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "before-index"},
+			want:  true,
+		},
+		{
+			name:  "rejects an unchanged legacy status-only checkpoint after upgrade",
+			after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "new.txt"}, StagedFiles: []string{"tracked.go"}, UntrackedFiles: []string{"new.txt"}, ChangedFileCount: 2, DiffFingerprint: "before-status", ContentFingerprint: "new-content-fingerprint"},
+			want:  false,
+		},
+		{
+			name:  "rejects content replacement with unchanged status",
+			after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "new.txt"}, StagedFiles: []string{"tracked.go"}, UntrackedFiles: []string{"new.txt"}, ChangedFileCount: 2, DiffFingerprint: "before-status", ContentFingerprint: "replacement-content"},
+			want:  false,
+		},
+		{
+			name:  "rejects partial disappearance",
+			after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go"}, StagedFiles: []string{"tracked.go"}, ChangedFileCount: 1, DiffFingerprint: "remaining-status", ContentFingerprint: "remaining-content"},
+			want:  false,
+		},
+		{
+			name:  "rejects unrelated clean head even when content happens to match",
+			after: worktreeProgress{HeadSHA: "unrelated-head", Branch: "feature/test", ContentFingerprint: "before-content"},
+			want:  false,
+		},
+		{
+			name:  "accepts a clean descendant containing the recorded contents",
+			after: worktreeProgress{HeadSHA: "committed-head", Branch: "feature/test", ContentFingerprint: "before-content", ContentFingerprintVersion: worktreeFingerprintVersion, HeadDescendsFromCompare: true},
+			want:  true,
+		},
+		{
+			name:  "accepts staged-index-only content committed by descendant",
+			after: worktreeProgress{HeadSHA: "committed-head", Branch: "feature/test", ContentFingerprint: "staged-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "before-index", WorktreeMatchesHead: true, HeadDescendsFromCompare: true},
+			want:  true,
+		},
+		{
+			name:  "rejects mixed staged and unstaged content committed by descendant",
+			after: worktreeProgress{HeadSHA: "committed-head", Branch: "feature/test", ContentFingerprint: "staged-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "before-index", HeadDescendsFromCompare: true},
+			want:  false,
+		},
+		{
+			name:  "rejects mixed staged and unstaged content despite equal working content",
+			after: worktreeProgress{HeadSHA: "committed-head", Branch: "feature/test", ContentFingerprint: "before-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "different-index", HeadDescendsFromCompare: true},
+			want:  false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			progress := before
+			if tc.name == "accepts staged-index-only content committed by descendant" {
+				progress.WorktreeMatchesHead = true
+			}
+			if tc.name == "rejects an unchanged legacy status-only checkpoint after upgrade" {
+				progress.ContentFingerprint = ""
+				progress.ContentFingerprintVersion = ""
+			}
+			if tc.name == "rejects mixed staged and unstaged content despite equal working content" {
+				progress.UnstagedFileCount = 1
+			}
+			if got := preservesWorktreeProgress(progress, tc.after); got != tc.want {
+				t.Fatalf("preservesWorktreeProgress() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPreservesWorktreeProgressRequiresCleanHeadEvidence(t *testing.T) {
+	t.Parallel()
+	before := worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ContentFingerprint: "clean-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "clean-index"}
+	for _, tc := range []struct {
+		name  string
+		after worktreeProgress
+		want  bool
+	}{
+		{name: "same clean head", after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ContentFingerprint: "clean-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "clean-index"}, want: true},
+		{name: "same clean head rejects legacy evidence", after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test"}, want: false},
+		{name: "unrelated clean head", after: worktreeProgress{HeadSHA: "other-head", Branch: "feature/test", ContentFingerprint: "clean-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "clean-index"}, want: false},
+		{name: "descendant clean head", after: worktreeProgress{HeadSHA: "descendant-head", Branch: "feature/test", ContentFingerprint: "different-clean-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "different-clean-index", HeadDescendsFromCompare: true}, want: true},
+		{name: "different branch descendant", after: worktreeProgress{HeadSHA: "descendant-head", Branch: "other-branch", HeadDescendsFromCompare: true}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := preservesWorktreeProgress(before, tc.after); got != tc.want {
+				t.Fatalf("preservesWorktreeProgress() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWorktreeProgressJSONPreservesNonUTF8Paths(t *testing.T) {
+	t.Parallel()
+	rawPath := string([]byte{'d', 0xff, 'r'})
+	before := worktreeProgress{
+		HeadSHA: "head", Branch: "feature/test", ChangedFiles: []string{rawPath}, ChangedFileCount: 1,
+		ChangedFileBytes: [][]byte{[]byte(rawPath)}, ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion,
+		IndexFingerprint: "index", DiffFingerprint: "diff",
+	}
+	encoded, err := json.Marshal(before)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	var after worktreeProgress
+	if err := json.Unmarshal(encoded, &after); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if len(after.ChangedFileBytes) != 1 || !bytes.Equal(after.ChangedFileBytes[0], []byte(rawPath)) {
+		t.Fatalf("ChangedFileBytes = %#v, want lossless non-UTF-8 path", after.ChangedFileBytes)
+	}
+	if !sameWorktreeProgress(before, after) {
+		t.Fatalf("sameWorktreeProgress() = false after JSON round trip: before=%#v after=%#v", before, after)
+	}
+}
+
+func TestRewindCheckpointForExecuteRetryPreservesTimeoutSnapshot(t *testing.T) {
+	t.Parallel()
+	progress := &worktreeProgress{HeadSHA: "head", Branch: "feature/test", DiffFingerprint: "status"}
+	got := rewindCheckpointForExecuteRetry(workerCheckpoint{Execution: &checkpointExecution{Status: "timeout", ProgressBeforeTimeout: progress}, Validation: &ValidationResult{}, PullRequest: &checkpointPullPR{Number: 1}, SkipReason: "retry"})
+	if got.Execution == nil || got.Execution.ProgressBeforeTimeout != progress {
+		t.Fatalf("rewindCheckpointForExecuteRetry().Execution = %#v, want timeout snapshot retained", got.Execution)
+	}
+	if got.Validation != nil || got.PullRequest != nil || got.SkipReason != "" {
+		t.Fatalf("rewindCheckpointForExecuteRetry() = %#v, want execute-only checkpoint", got)
+	}
+}
+
+func TestRewindCheckpointForExecuteRetryPreservesTimeoutObservingSnapshot(t *testing.T) {
+	t.Parallel()
+	progress := &worktreeProgress{HeadSHA: "head", Branch: "feature/test", DiffFingerprint: "status"}
+	got := rewindCheckpointForExecuteRetry(workerCheckpoint{Execution: &checkpointExecution{Status: "timeout_observing", ProgressBeforeTimeout: progress}, Validation: &ValidationResult{}, PullRequest: &checkpointPullPR{Number: 1}, SkipReason: "retry"})
+	if got.Execution == nil || got.Execution.ProgressBeforeTimeout != progress {
+		t.Fatalf("rewindCheckpointForExecuteRetry().Execution = %#v, want timeout_observing snapshot retained", got.Execution)
+	}
+	if got.Validation != nil || got.PullRequest != nil || got.SkipReason != "" {
+		t.Fatalf("rewindCheckpointForExecuteRetry() = %#v, want execute-only checkpoint", got)
 	}
 }
 
@@ -5502,6 +5788,10 @@ func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullReq
 		detail.URL = fmt.Sprintf("https://example/pr/%d", input.PRNumber)
 	}
 	return detail, nil
+}
+
+func (f *fakeGitHubGateway) ViewPullRequestForDiscovery(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	return f.ViewPullRequest(ctx, input)
 }
 
 func (f *fakeGitHubGateway) ViewIssue(_ context.Context, input ViewIssueInput) (IssueDetail, error) {

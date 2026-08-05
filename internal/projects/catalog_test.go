@@ -1,6 +1,7 @@
 package projects
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -264,8 +265,8 @@ func TestMaterializeCatalogUsesRecordsAsProjectAuthority(t *testing.T) {
 	if project.Provider != "ghes-main" || project.Repo != "core/odcrew" {
 		t.Fatalf("project binding = (%q, %q), want stored binding", project.Provider, project.Repo)
 	}
-	if project.Network.Mode != config.NetworkModeRouted {
-		t.Fatalf("project policy network mode = %q, want imported routed policy", project.Network.Mode)
+	if project.Network.Mode != "" {
+		t.Fatalf("project policy network mode = %q, want legacy routed metadata ignored", project.Network.Mode)
 	}
 }
 
@@ -363,14 +364,22 @@ func TestConfiguredProjectMetadataRoundTripsRuntimePolicy(t *testing.T) {
 		Repo:            "core/odcrew",
 		RepoPath:        "/repos/odcrew",
 		Path:            "nested/path",
-		Network:         config.ProjectNetworkConfig{Mode: config.NetworkModeRouted},
 		Webhook:         config.ProjectWebhookConfig{Mode: config.WebhookModeTunnel},
 		Roles:           &config.PartialRoleConfigs{},
 	}
 	repo := project.Repo
-	metadata, err := buildProjectMetadataJSON(nil, project, &repo)
+	existingMetadata := `{"network":{"mode":"routed"},"legacy":"preserve"}`
+	existing := storage.ProjectRecord{MetadataJSON: &existingMetadata}
+	metadata, err := buildProjectMetadataJSON(&existing, project, &repo)
 	if err != nil {
 		t.Fatalf("buildProjectMetadataJSON() error = %v", err)
+	}
+	var rebuilt map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(metadata), &rebuilt); err != nil {
+		t.Fatalf("rebuilt metadata is invalid JSON: %v", err)
+	}
+	if _, ok := rebuilt["network"]; ok {
+		t.Fatalf("rebuilt metadata = %s, want legacy network key removed", metadata)
 	}
 	global := config.Config{Providers: []config.ProviderConfig{{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://ghe.example.test"}}}
 	got, err := MaterializeCatalog(global, []storage.ProjectRecord{{
@@ -386,7 +395,7 @@ func TestConfiguredProjectMetadataRoundTripsRuntimePolicy(t *testing.T) {
 	if materialized.Provider != project.Provider || materialized.Repo != project.Repo || materialized.Path != project.Path || !materialized.PersonalProject {
 		t.Fatalf("materialized binding = %#v, want %#v", materialized, project)
 	}
-	if materialized.Network.Mode != project.Network.Mode || materialized.Webhook.Mode != project.Webhook.Mode || materialized.Roles == nil {
+	if materialized.Network.Mode != "" || materialized.Webhook.Mode != project.Webhook.Mode || materialized.Roles == nil {
 		t.Fatalf("materialized policy = %#v, want persisted project policy", materialized)
 	}
 }

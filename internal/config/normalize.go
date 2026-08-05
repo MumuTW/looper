@@ -360,10 +360,6 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		mergeWebhookConfig(&config.Webhook, *partial.Webhook)
 	}
 
-	if partial.Network != nil {
-		mergeNetworkConfig(&config.Network, *partial.Network)
-	}
-
 	if partial.Agent != nil {
 		mergeAgentConfig(&config.Agent, *partial.Agent)
 	}
@@ -599,24 +595,6 @@ func mergeWebhookConfig(config *WebhookConfig, partial PartialWebhookConfig) {
 
 	if partial.FallbackPollIntervalSeconds != nil {
 		config.FallbackPollIntervalSeconds = *partial.FallbackPollIntervalSeconds
-	}
-}
-
-func mergeNetworkConfig(config *NetworkConfig, partial PartialNetworkConfig) {
-	if partial.Enrolled != nil {
-		config.Enrolled = *partial.Enrolled
-	}
-	if partial.LoopernetBaseURL != nil {
-		config.LoopernetBaseURL = *partial.LoopernetBaseURL
-	}
-	if partial.NodeName != nil {
-		config.NodeName = *partial.NodeName
-	}
-	if partial.GitHubLogin != nil {
-		config.GitHubLogin = *partial.GitHubLogin
-	}
-	if partial.GitHubUserID != nil {
-		config.GitHubUserID = *partial.GitHubUserID
 	}
 }
 
@@ -1790,10 +1768,6 @@ func cloneStrings(values []string) []string {
 
 func clonePartialConfig(partial PartialConfig) PartialConfig {
 	cloned := partial
-	if partial.Network != nil {
-		network := *partial.Network
-		cloned.Network = &network
-	}
 	if partial.Agent != nil {
 		cloned.Agent = clonePartialAgentConfig(partial.Agent)
 	}
@@ -1865,7 +1839,6 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 			Path:            project.Path,
 			BaseBranch:      cloneStringPtr(project.BaseBranch),
 			WorktreeRoot:    cloneStringPtr(project.WorktreeRoot),
-			Network:         clonePartialProjectNetworkConfig(project.Network),
 			Webhook:         clonePartialProjectWebhookConfig(project.Webhook),
 			Validation:      clonePartialProjectValidationConfig(project.Validation),
 			Instructions:    cloneStringMap(project.Instructions),
@@ -1873,14 +1846,6 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 		}
 	}
 	return cloned
-}
-
-func clonePartialProjectNetworkConfig(config *PartialProjectNetworkConfig) *PartialProjectNetworkConfig {
-	if config == nil {
-		return nil
-	}
-	cloned := *config
-	return &cloned
 }
 
 func clonePartialProjectWebhookConfig(config *PartialProjectWebhookConfig) *PartialProjectWebhookConfig {
@@ -1974,9 +1939,6 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 		}
 		if project.Repo != nil {
 			cloned[index].Repo = strings.TrimSpace(*project.Repo)
-		}
-		if project.Network != nil && project.Network.Mode != nil {
-			cloned[index].Network.Mode = *project.Network.Mode
 		}
 		if project.Webhook != nil && project.Webhook.Mode != nil {
 			cloned[index].Webhook.Mode = *project.Webhook.Mode

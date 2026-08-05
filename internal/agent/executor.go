@@ -158,11 +158,17 @@ type RunInput struct {
 	HeartbeatTimeout   time.Duration
 	GracefulShutdown   time.Duration
 	MaxOutputBytes     int
-	Metadata           map[string]any
-	IdempotencyKey     string
-	Env                map[string]string
-	// OnBeforeTimeout runs synchronously before this execution signals its
-	// process group for an idle or max-runtime timeout. It is for daemon-owned
+	// TimeoutObservationBudget bounds the daemon-owned observation callback
+	// that runs after a timeout process group is contained. A zero value keeps
+	// the conservative default; callers that need a larger Git observation
+	// window must set it explicitly rather than relying on a hidden constant.
+	TimeoutObservationBudget time.Duration
+	Metadata                 map[string]any
+	IdempotencyKey           string
+	Env                      map[string]string
+	// OnBeforeTimeout runs synchronously after an idle or max-runtime timeout
+	// terminates this execution's process group and that group is confirmed dead,
+	// and before terminal timeout persistence. It is for daemon-owned
 	// durability observations, never for business policy or process control.
 	// Its error is reported in Result but cannot prevent termination.
 	OnBeforeTimeout func(context.Context, TimeoutObservation) error
@@ -956,10 +962,8 @@ func (x *execution) run(ctx context.Context) {
 			if killReason == "" {
 				killReason = fmt.Sprintf("agent max runtime timed out after %s", x.timeout)
 			}
-			preTimeoutError = x.observeBeforeTimeout("max_runtime")
 			select {
 			case reason := <-x.killCh:
-				preTimeoutError = ""
 				killed = true
 				killReason = reason
 				x.setStatus("killed")
@@ -968,7 +972,6 @@ func (x *execution) run(ctx context.Context) {
 			default:
 			}
 			if runCtx.Err() != nil {
-				preTimeoutError = ""
 				killed = true
 				killReason = runCtx.Err().Error()
 				x.setStatus("killed")
@@ -977,7 +980,6 @@ func (x *execution) run(ctx context.Context) {
 			}
 			select {
 			case waitErr = <-waitCh:
-				preTimeoutError = ""
 				waiting = false
 				continue
 			default:
@@ -1002,10 +1004,8 @@ func (x *execution) run(ctx context.Context) {
 			if killReason == "" {
 				killReason = fmt.Sprintf("agent idle timed out after %s without observable progress", x.heartbeatTimeout)
 			}
-			preTimeoutError = x.observeBeforeTimeout("idle")
 			select {
 			case reason := <-x.killCh:
-				preTimeoutError = ""
 				killed = true
 				killReason = reason
 				x.setStatus("killed")
@@ -1014,7 +1014,6 @@ func (x *execution) run(ctx context.Context) {
 			default:
 			}
 			if runCtx.Err() != nil {
-				preTimeoutError = ""
 				killed = true
 				killReason = runCtx.Err().Error()
 				x.setStatus("killed")
@@ -1023,13 +1022,11 @@ func (x *execution) run(ctx context.Context) {
 			}
 			select {
 			case waitErr = <-waitCh:
-				preTimeoutError = ""
 				waiting = false
 				continue
 			default:
 			}
 			if x.timeSinceLastOutput() < x.heartbeatTimeout {
-				preTimeoutError = ""
 				continue
 			}
 			timedOut = true
@@ -1059,6 +1056,16 @@ func (x *execution) run(ctx context.Context) {
 	}
 	if termDelivered && (killed || timedOut) {
 		_ = x.killProcessGroup()
+	}
+	if timedOut {
+		// The callback persists the timeout snapshot. Run it only after the
+		// process group is confirmed dead, so no writer can change the worktree
+		// between the snapshot and the retry preservation check.
+		if err := x.ensureConfirmedDeadBeforeTerminal(); err != nil {
+			preTimeoutError = err.Error()
+		} else {
+			preTimeoutError = x.observeBeforeTimeout(timeoutType)
+		}
 	}
 
 	stdout, stderr := x.resolveOutputLogs()
@@ -1197,7 +1204,11 @@ func (x *execution) observeBeforeTimeout(timeoutType string) string {
 	if callback == nil {
 		return ""
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	budget := x.input.TimeoutObservationBudget
+	if budget <= 0 {
+		budget = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	if err := callback(ctx, TimeoutObservation{TimeoutType: timeoutType, LastProgressAt: x.lastProgressAtISO()}); err != nil {
 		return err.Error()
@@ -1456,10 +1467,8 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 			default:
 			}
 			killReason = fmt.Sprintf("agent max runtime timed out after %s", x.timeout)
-			preTimeoutError = x.observeBeforeTimeout("max_runtime")
 			select {
 			case reason := <-x.killCh:
-				preTimeoutError = ""
 				killed = true
 				killReason = reason
 				terminate()
@@ -1467,7 +1476,6 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 			default:
 			}
 			if ctx.Err() != nil {
-				preTimeoutError = ""
 				killed = true
 				killReason = ctx.Err().Error()
 				terminate()
@@ -1475,7 +1483,6 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 			}
 			select {
 			case waitErr = <-waitCh:
-				preTimeoutError = ""
 				waiting = false
 				continue
 			default:
@@ -1488,10 +1495,8 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 				continue
 			}
 			killReason = fmt.Sprintf("agent idle timed out after %s without observable progress", x.heartbeatTimeout)
-			preTimeoutError = x.observeBeforeTimeout("idle")
 			select {
 			case reason := <-x.killCh:
-				preTimeoutError = ""
 				killed = true
 				killReason = reason
 				terminate()
@@ -1499,7 +1504,6 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 			default:
 			}
 			if ctx.Err() != nil {
-				preTimeoutError = ""
 				killed = true
 				killReason = ctx.Err().Error()
 				terminate()
@@ -1507,13 +1511,11 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 			}
 			select {
 			case waitErr = <-waitCh:
-				preTimeoutError = ""
 				waiting = false
 				continue
 			default:
 			}
 			if x.timeSinceLastOutput() < x.heartbeatTimeout {
-				preTimeoutError = ""
 				continue
 			}
 			timedOut = true
@@ -1538,6 +1540,15 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		ctx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
 		_ = handle.Kill(ctx)
 		cancel()
+	}
+	if timedOut {
+		// A native-resume fallback has a fresh containment handle. Do not let
+		// its timeout snapshot race descendants that survived the leader exit.
+		if err := x.ensureConfirmedDeadBeforeTerminal(); err != nil {
+			preTimeoutError = err.Error()
+		} else {
+			preTimeoutError = x.observeBeforeTimeout(timeoutType)
+		}
 	}
 	stdout := x.stdoutString()
 	stderr := x.stderrString()

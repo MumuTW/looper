@@ -69,6 +69,10 @@ func (g *contractPlannerGitHub) ViewPullRequest(_ context.Context, input planner
 	return planner.PullRequestDetail{Number: input.PRNumber, URL: "https://example.test/pr/101", State: "OPEN", HeadRefName: g.branch, BaseRefName: "main"}, nil
 }
 
+func (g *contractPlannerGitHub) ViewPullRequestForDiscovery(_ context.Context, input planner.ViewPullRequestInput) (planner.PullRequestDetail, error) {
+	return g.ViewPullRequest(context.Background(), input)
+}
+
 func (g *contractPlannerGitHub) CreatePullRequest(_ context.Context, input planner.CreatePullRequestInput) (planner.CreatePullRequestResult, error) {
 	g.branch = input.HeadBranch
 	return planner.CreatePullRequestResult{Number: 101, URL: "https://example.test/pr/101"}, nil

@@ -176,6 +176,55 @@ func TestHandlerLoopRetryDiscardWorktreeChangesDirtyFixer(t *testing.T) {
 	}
 }
 
+func TestHandlerLoopRetryDiscardClearsWorkerTimeoutEvidence(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_worker_timeout", LoopID: "loop_retry_discard_worker_timeout", LoopSeq: 31081,
+		LoopType: "worker", Branch: "feature/discard-worker-timeout", NowISO: nowISO, Dirty: true,
+	})
+	previous, err := services.Repositories.Runs.GetLatestByLoopID(context.Background(), fixture.LoopID)
+	if err != nil || previous == nil {
+		t.Fatalf("Runs.GetLatestByLoopID() = (%#v, %v)", previous, err)
+	}
+	worktree, err := services.Repositories.Worktrees.GetByPath(context.Background(), fixture.WorktreePath)
+	if err != nil || worktree == nil {
+		t.Fatalf("Worktrees.GetByPath() = (%#v, %v)", worktree, err)
+	}
+	checkpoint := fmt.Sprintf(`{"worktree":{"id":%q,"path":%q,"branch":"feature/discard-worker-timeout"},"execution":{"status":"timeout","progressBeforeTimeout":{"headSha":"before","contentFingerprint":"preserve-me"},"progressSnapshotError":"operator action required"}}`, worktree.ID, fixture.WorktreePath)
+	previous.CheckpointJSON = &checkpoint
+	if err := services.Repositories.Runs.Upsert(context.Background(), *previous); err != nil {
+		t.Fatalf("Runs.Upsert(timeout checkpoint) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/31081/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	cleared, err := services.Repositories.Runs.GetByID(context.Background(), previous.ID)
+	if err != nil || cleared == nil || cleared.CheckpointJSON == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want checkpoint", cleared, err)
+	}
+	var stored map[string]any
+	if err := json.Unmarshal([]byte(*cleared.CheckpointJSON), &stored); err != nil {
+		t.Fatalf("Unmarshal(cleared checkpoint) error = %v", err)
+	}
+	execution, ok := stored["execution"].(map[string]any)
+	if !ok || execution["status"] != "timeout" {
+		t.Fatalf("execution = %#v, want timeout execution retained", stored["execution"])
+	}
+	if _, ok := execution["progressBeforeTimeout"]; ok {
+		t.Fatalf("progressBeforeTimeout remained after operator discard: %#v", execution)
+	}
+	if _, ok := execution["progressSnapshotError"]; ok {
+		t.Fatalf("progressSnapshotError remained after operator discard: %#v", execution)
+	}
+}
+
 func TestHandlerLoopRetryDiscardWorktreeChangesResolvesBranchOnlyCheckpoint(t *testing.T) {
 	// Worker dirty prepare leaves work.branch without checkpoint.worktree.
 	rt, cfg := startTestRuntime(t)

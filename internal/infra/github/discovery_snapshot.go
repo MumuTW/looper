@@ -41,7 +41,8 @@ type DiscoverySnapshot struct {
 	openIssuesFetchCWD  string
 	openIssuesLimit     int
 
-	prDetails map[string]PullRequestDetail
+	prDetails  map[string]PullRequestDetail
+	prMetadata map[string]PullRequestDetail
 }
 
 func NewDiscoveryTickState() *DiscoveryTickState {
@@ -55,7 +56,7 @@ func NewDiscoverySnapshot(gateway *Gateway, tick *DiscoveryTickState, options Di
 	if tick == nil {
 		tick = NewDiscoveryTickState()
 	}
-	return &DiscoverySnapshot{gateway: gateway, tick: tick, prLimit: max(defaultLimit(options.PullRequestLimit), 30), issueLimit: max(defaultLimit(options.IssueLimit), 30), reviewRequestedPRs: map[string]reviewRequestedPullRequestSnapshotEntry{}, prDetails: map[string]PullRequestDetail{}}
+	return &DiscoverySnapshot{gateway: gateway, tick: tick, prLimit: max(defaultLimit(options.PullRequestLimit), 30), issueLimit: max(defaultLimit(options.IssueLimit), 30), reviewRequestedPRs: map[string]reviewRequestedPullRequestSnapshotEntry{}, prDetails: map[string]PullRequestDetail{}, prMetadata: map[string]PullRequestDetail{}}
 }
 
 func ContextWithDiscoverySnapshot(ctx context.Context, snapshot *DiscoverySnapshot) context.Context {
@@ -208,6 +209,35 @@ func (s *DiscoverySnapshot) viewPullRequest(ctx context.Context, input ViewPullR
 	}
 	s.mu.Lock()
 	s.prDetails[key] = detail
+	s.mu.Unlock()
+	return detail, nil
+}
+
+// viewPullRequestMetadata returns the lightweight metadata tier of a pull
+// request (no statusCheckRollup, no reviews, no review threads, no issue
+// comments). It is the discovery-path view: callers that only need
+// IsDraft/Author/ReviewRequests/Labels/State must use this instead of
+// viewPullRequest, whose heavy ViewPullRequestForFixer fields
+// (statusCheckRollup in particular) are the single most expensive GraphQL
+// query looperd issues per tick.
+//
+// The metadata tier is cached separately from the full tier so a metadata
+// hit never blocks a full fetch and a full fetch never poisons the
+// lightweight cache with rollup-laden rows.
+func (s *DiscoverySnapshot) viewPullRequestMetadata(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	key := snapshotPullRequestMetadataKey(input)
+	s.mu.Lock()
+	if detail, ok := s.prMetadata[key]; ok {
+		s.mu.Unlock()
+		return detail, nil
+	}
+	s.mu.Unlock()
+	detail, err := s.gateway.viewPullRequestWithFields(ctx, input, prViewMetadataJSONFields, false, false)
+	if err != nil {
+		return PullRequestDetail{}, err
+	}
+	s.mu.Lock()
+	s.prMetadata[key] = detail
 	s.mu.Unlock()
 	return detail, nil
 }
@@ -548,6 +578,14 @@ func cloneJSONLikeValue(value any) any {
 
 func snapshotPullRequestDetailKey(input ViewPullRequestInput) string {
 	return fmt.Sprintf("%s|%s|%d", input.Repo, input.CWD, input.PRNumber)
+}
+
+// snapshotPullRequestMetadataKey separates the lightweight metadata tier
+// from the full-detail tier in the per-tick discovery snapshot. A PR viewed
+// through the metadata path (no statusCheckRollup) must never collide with
+// the full-detail cache entry, and vice versa.
+func snapshotPullRequestMetadataKey(input ViewPullRequestInput) string {
+	return "md|" + snapshotPullRequestDetailKey(input)
 }
 
 func hasPullRequestFilters(input ListOpenPullRequestsInput) bool {

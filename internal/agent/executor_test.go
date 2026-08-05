@@ -1725,14 +1725,16 @@ func TestExecutorHeartbeatTimeoutPreservesOriginalTimeoutTypeDuringGracefulShutd
 	}
 }
 
-func TestExecutorObservesBeforeTimeoutSignal(t *testing.T) {
+func TestExecutorObservesTimeoutOnlyAfterProcessGroupTermination(t *testing.T) {
 	t.Parallel()
 
-	marker := filepath.Join(t.TempDir(), "pre-timeout-observed")
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `trap 'test -f "$MARKER" || exit 42; exit 0' TERM; while :; do sleep 0.01; done`}}}, ParamsOwnerVendor: customOwner()})
+	markerDir := t.TempDir()
+	marker := filepath.Join(markerDir, "timeout-observed")
+	terminationState := filepath.Join(markerDir, "termination-state")
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `trap 'if test -f "$MARKER"; then echo observed > "$TERMINATION_STATE"; else echo clean > "$TERMINATION_STATE"; fi; exit 0' TERM; while :; do sleep 0.01; done`}}}, ParamsOwnerVendor: customOwner()})
 	execHandle, err := executor.Start(context.Background(), RunInput{
 		ExecutionID: "agent_pre_timeout_observation", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 150 * time.Millisecond, HeartbeatTimeout: time.Second, GracefulShutdown: 50 * time.Millisecond,
-		Env: map[string]string{"MARKER": marker},
+		Env: map[string]string{"MARKER": marker, "TERMINATION_STATE": terminationState},
 		OnBeforeTimeout: func(_ context.Context, observation TimeoutObservation) error {
 			if observation.TimeoutType != "max_runtime" {
 				return errors.New("expected max_runtime timeout observation")
@@ -1751,11 +1753,33 @@ func TestExecutorObservesBeforeTimeoutSignal(t *testing.T) {
 		t.Fatalf("result = %#v, want timeout with successful observation", result)
 	}
 	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("timeout observer did not run before SIGTERM: %v", err)
+		t.Fatalf("timeout observer did not run after termination: %v", err)
+	}
+	if got, err := os.ReadFile(terminationState); err != nil || string(got) != "clean\n" {
+		t.Fatalf("agent observed timeout marker before termination: state=%q err=%v", got, err)
 	}
 }
 
-func TestExecutorReportsCompletionWhenProcessExitsDuringTimeoutObservation(t *testing.T) {
+func TestExecutorTimeoutObservationUsesConfiguredBudget(t *testing.T) {
+	t.Parallel()
+	const budget = 25 * time.Millisecond
+	x := &execution{input: RunInput{
+		TimeoutObservationBudget: budget,
+		OnBeforeTimeout: func(ctx context.Context, _ TimeoutObservation) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}}
+	started := time.Now()
+	if got := x.observeBeforeTimeout("max_runtime"); got == "" {
+		t.Fatal("observeBeforeTimeout() error = empty, want configured deadline error")
+	}
+	if elapsed := time.Since(started); elapsed < budget || elapsed > time.Second {
+		t.Fatalf("observation elapsed = %s, want approximately configured budget %s", elapsed, budget)
+	}
+}
+
+func TestExecutorReportsTimeoutWhenDeadlineWinsBeforeTermination(t *testing.T) {
 	t.Parallel()
 
 	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "sleep 0.08"}}}, ParamsOwnerVendor: customOwner()})
@@ -1773,73 +1797,33 @@ func TestExecutorReportsCompletionWhenProcessExitsDuringTimeoutObservation(t *te
 	if err != nil {
 		t.Fatalf("Wait() error = %v", err)
 	}
-	if result.Status != "completed" || result.PreTimeoutError != "" {
-		t.Fatalf("result = %#v, want completion without a timeout observation error", result)
+	if result.Status != "timeout" {
+		t.Fatalf("result.Status = %q, want timeout after deadline terminates process", result.Status)
 	}
 }
 
 func TestExecutorHonorsKillDuringTimeoutObservation(t *testing.T) {
 	t.Parallel()
 
-	observing := make(chan struct{})
-	releaseObservation := make(chan struct{})
 	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "trap '' TERM; while :; do sleep 0.01; done"}}}, ParamsOwnerVendor: customOwner()})
 	execHandle, err := executor.Start(context.Background(), RunInput{
 		ExecutionID: "agent_killed_during_timeout_observation", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 25 * time.Millisecond, GracefulShutdown: 10 * time.Millisecond,
 		OnBeforeTimeout: func(context.Context, TimeoutObservation) error {
-			close(observing)
-			<-releaseObservation
 			return errors.New("observation should not survive an operator stop")
 		},
 	})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
-	<-observing
 	if err := execHandle.Kill("operator stop"); err != nil {
 		t.Fatalf("Kill() error = %v", err)
 	}
-	close(releaseObservation)
 	result, err := execHandle.Wait(context.Background())
 	if err != nil {
 		t.Fatalf("Wait() error = %v", err)
 	}
 	if result.Status != "killed" || result.PreTimeoutError != "" {
 		t.Fatalf("result = %#v, want killed without a timeout observation error", result)
-	}
-}
-
-func TestExecutorDoesNotIdleTimeoutActivityDuringObservation(t *testing.T) {
-	t.Parallel()
-
-	marker := filepath.Join(t.TempDir(), "activity-produced")
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "sleep 0.15; printf 'active\\n'; touch \"$MARKER\"; sleep 0.04"}}}, ParamsOwnerVendor: customOwner()})
-	execHandle, err := executor.Start(context.Background(), RunInput{
-		ExecutionID: "agent_activity_during_timeout_observation", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second, HeartbeatTimeout: 100 * time.Millisecond, GracefulShutdown: 10 * time.Millisecond,
-		Env: map[string]string{"MARKER": marker},
-		OnBeforeTimeout: func(ctx context.Context, _ TimeoutObservation) error {
-			for {
-				if _, err := os.Stat(marker); err == nil {
-					time.Sleep(20 * time.Millisecond)
-					return nil
-				}
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(5 * time.Millisecond):
-				}
-			}
-		},
-	})
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	result, err := execHandle.Wait(context.Background())
-	if err != nil {
-		t.Fatalf("Wait() error = %v", err)
-	}
-	if result.Status != "completed" || result.PreTimeoutError != "" {
-		t.Fatalf("result = %#v, want activity during observation to cancel the idle timeout", result)
 	}
 }
 

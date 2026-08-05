@@ -521,6 +521,17 @@ func (a plannerGitHubAdapter) ViewPullRequest(ctx context.Context, input planner
 	return planner.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.URL, State: pr.State, Labels: append([]string(nil), pr.Labels...), HeadRefName: pr.HeadRefName, BaseRefName: pr.BaseRefName}, nil
 }
 
+func (a plannerGitHubAdapter) ViewPullRequestForDiscovery(ctx context.Context, input planner.ViewPullRequestInput) (planner.PullRequestDetail, error) {
+	if a.gateway == nil {
+		return planner.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
+	}
+	pr, err := a.gateway.ViewPullRequestForDiscovery(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return planner.PullRequestDetail{}, err
+	}
+	return planner.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.URL, State: pr.State, Labels: append([]string(nil), pr.Labels...), HeadRefName: pr.HeadRefName, BaseRefName: pr.BaseRefName}, nil
+}
+
 func (a plannerGitHubAdapter) CreatePullRequest(ctx context.Context, input planner.CreatePullRequestInput) (planner.CreatePullRequestResult, error) {
 	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "planner", disclosure.ChannelPullRequest)
 	if a.gateway == nil {
@@ -666,6 +677,26 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 		return reviewer.PullRequestDetail{}, err
 	}
 	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(detail.ReviewRequestUsers), HasConflicts: detail.HasConflicts, ChecksSummary: summarizeCheckStates(detail.Checks), Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Reviews: detail.Reviews}, nil
+}
+
+// ViewPullRequestForDiscovery is the lightweight metadata tier: no
+// statusCheckRollup, no reviews, no review threads, no issue comments.
+// It serves discovery/pending/assignment paths that only inspect
+// IsDraft/Author/ReviewRequests/Labels/State, and never consumes
+// detail.Checks or detail.Reviews.
+func (a reviewerGitHubAdapter) ViewPullRequestForDiscovery(ctx context.Context, input reviewer.ViewPullRequestInput) (reviewer.PullRequestDetail, error) {
+	if a.gateway == nil {
+		return reviewer.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
+	}
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return reviewer.PullRequestDetail{}, err
+	}
+	detail, err := a.gateway.ViewPullRequestForDiscovery(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return reviewer.PullRequestDetail{}, err
+	}
+	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(detail.ReviewRequestUsers), HasConflicts: detail.HasConflicts}, nil
 }
 
 func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
@@ -1164,6 +1195,24 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
 }
 
+// ViewPullRequestForDiscovery is the lightweight metadata tier: no
+// statusCheckRollup, no reviews, no review threads, no issue comments.
+// Fixer discovery paths that need failing-check evidence must keep using
+// ViewPullRequest (full tier); this method is only for callers that
+// inspect State/IsDraft/Labels/HeadSHA/HeadRefName/BaseRefName/BaseSHA/
+// ReviewDecision/HasConflicts/Author.
+func (a fixerGitHubAdapter) ViewPullRequestForDiscovery(ctx context.Context, input fixer.ViewPullRequestInput) (fixer.PullRequestDetail, error) {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return fixer.PullRequestDetail{}, err
+	}
+	detail, err := a.gateway.ViewPullRequestForDiscovery(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return fixer.PullRequestDetail{}, err
+	}
+	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+}
+
 func (a fixerGitHubAdapter) ViewIssue(ctx context.Context, input fixer.ViewIssueInput) (fixer.IssueDetail, error) {
 	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
 	if err != nil {
@@ -1611,6 +1660,22 @@ func (a workerGitHubAdapter) ViewPullRequest(ctx context.Context, input worker.V
 	return worker.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, URL: detail.URL, State: detail.State, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, HeadSHA: detail.HeadSHA, Labels: append([]string(nil), detail.Labels...), ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(detail.ReviewRequestUsers)}, nil
 }
 
+// ViewPullRequestForDiscovery is the lightweight metadata tier, identical
+// to ViewPullRequest for the worker adapter (which never consumes
+// detail.Checks or detail.Reviews). It exists so discovery-path callers
+// can express the metadata intent explicitly and share the per-tick
+// snapshot's thin cache.
+func (a workerGitHubAdapter) ViewPullRequestForDiscovery(ctx context.Context, input worker.ViewPullRequestInput) (worker.PullRequestDetail, error) {
+	if a.gateway == nil {
+		return worker.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
+	}
+	detail, err := a.gateway.ViewPullRequestForDiscovery(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return worker.PullRequestDetail{}, err
+	}
+	return worker.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, URL: detail.URL, State: detail.State, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, HeadSHA: detail.HeadSHA, Labels: append([]string(nil), detail.Labels...), ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(detail.ReviewRequestUsers)}, nil
+}
+
 func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIssueInput) (worker.IssueDetail, error) {
 	if a.gateway == nil {
 		return worker.IssueDetail{}, fmt.Errorf("github gateway is not configured")
@@ -1734,11 +1799,11 @@ func (a workerGitAdapter) PrepareWorktree(ctx context.Context, input worker.Prep
 }
 
 func (a workerGitAdapter) InspectHead(ctx context.Context, input worker.InspectHeadInput) (worker.InspectHeadResult, error) {
-	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
+	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, BaseRef: input.BaseRef, ContentPaths: input.ContentPaths, CompareHeadSHA: input.CompareHeadSHA})
 	if err != nil {
 		return worker.InspectHeadResult{}, err
 	}
-	return worker.InspectHeadResult{HeadSHA: result.HeadSHA, Branch: result.Branch, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles, StagedFiles: result.StagedFiles, UntrackedFiles: result.UntrackedFiles, DiffFingerprint: result.DiffFingerprint}, nil
+	return worker.InspectHeadResult{HeadSHA: result.HeadSHA, Branch: result.Branch, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles, StagedFiles: result.StagedFiles, UntrackedFiles: result.UntrackedFiles, UnstagedFileCount: result.UnstagedFileCount, RenameSourceFiles: result.RenameSourceFiles, DiffFingerprint: result.DiffFingerprint, ContentFingerprint: result.ContentFingerprint, ContentFingerprintVersion: result.ContentFingerprintVersion, IndexFingerprint: result.IndexFingerprint, WorktreeMatchesHead: result.WorktreeMatchesHead, HeadDescendsFromCompare: result.HeadDescendsFromCompare}, nil
 }
 
 func (a workerGitAdapter) VerifyWorktreeIdentity(ctx context.Context, input worker.VerifyWorktreeIdentityInput) error {
@@ -1779,7 +1844,8 @@ func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.Agen
 		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
 		Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID,
 		WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
-		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
+		TimeoutObservationBudget: input.TimeoutObservationBudget,
+		Metadata:                 input.Metadata, IdempotencyKey: input.IdempotencyKey,
 		RestrictToolNetwork: input.RestrictToolNetwork,
 		OnBeforeTimeout:     input.OnBeforeTimeout,
 		UseSnapshot:         input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,

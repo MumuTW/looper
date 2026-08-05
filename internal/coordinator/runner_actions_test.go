@@ -1545,7 +1545,7 @@ func newCoordinatorFixture(t *testing.T, configure ...func(*config.Config)) coor
 	for _, fn := range configure {
 		fn(&cfg)
 	}
-	github := &stubCoordinatorGitHub{details: map[int64]githubinfra.IssueDetail{}, issueRevalidations: map[int64]githubinfra.IssueDetail{}, issueDetailReads: map[int64]int{}, comments: map[int64][][]githubinfra.CommentInfo{}, timeline: map[int64][]map[string]any{}, blockedBy: map[int64][]githubinfra.DependencyIssue{}, subIssues: map[int64][]githubinfra.DependencyIssue{}, linkedPullRequests: map[int64][]githubinfra.LinkedPullRequest{}, pullRequests: map[int64]githubinfra.PullRequestDetail{}, subIssueErr: map[int64]error{}, prDetails: map[int64]githubinfra.PullRequestDetail{}, prCheckRuns: map[string]githubinfra.PullRequestCheckRuns{}, prCheckRunRevalidations: map[string]githubinfra.PullRequestCheckRuns{}, prCheckRunReads: map[string]int{}, branchProtection: map[string]githubinfra.BranchProtection{}, branchProtectionRevalidations: map[string]githubinfra.BranchProtection{}, branchProtectionReads: map[string]int{}, prDetailRevalidations: map[int64]githubinfra.PullRequestDetail{}, prDetailReads: map[int64]int{}, prCommits: map[int64][]githubinfra.PullRequestCommit{}, prCommitRevalidations: map[int64][]githubinfra.PullRequestCommit{}, prCommitReads: map[int64]int{}, failPRCommits: map[int64]error{}, prDraftEvents: map[int64][]githubinfra.PullRequestDraftEvent{}, prDraftEventRevalidations: map[int64][]githubinfra.PullRequestDraftEvent{}, prDraftEventReads: map[int64]int{}, failPRDraftEvents: map[int64]error{}, failMarkReady: map[int64]error{}}
+	github := &stubCoordinatorGitHub{details: map[int64]githubinfra.IssueDetail{}, issueRevalidations: map[int64]githubinfra.IssueDetail{}, issueDetailReads: map[int64]int{}, comments: map[int64][][]githubinfra.CommentInfo{}, timeline: map[int64][]map[string]any{}, timelineErr: map[int64]error{}, blockedBy: map[int64][]githubinfra.DependencyIssue{}, subIssues: map[int64][]githubinfra.DependencyIssue{}, linkedPullRequests: map[int64][]githubinfra.LinkedPullRequest{}, pullRequests: map[int64]githubinfra.PullRequestDetail{}, subIssueErr: map[int64]error{}, prDetails: map[int64]githubinfra.PullRequestDetail{}, prCheckRuns: map[string]githubinfra.PullRequestCheckRuns{}, prCheckRunRevalidations: map[string]githubinfra.PullRequestCheckRuns{}, prCheckRunReads: map[string]int{}, branchProtection: map[string]githubinfra.BranchProtection{}, branchProtectionRevalidations: map[string]githubinfra.BranchProtection{}, branchProtectionReads: map[string]int{}, prDetailRevalidations: map[int64]githubinfra.PullRequestDetail{}, prDetailReads: map[int64]int{}, prCommits: map[int64][]githubinfra.PullRequestCommit{}, prCommitRevalidations: map[int64][]githubinfra.PullRequestCommit{}, prCommitReads: map[int64]int{}, failPRCommits: map[int64]error{}, prDraftEvents: map[int64][]githubinfra.PullRequestDraftEvent{}, prDraftEventRevalidations: map[int64][]githubinfra.PullRequestDraftEvent{}, prDraftEventReads: map[int64]int{}, failPRDraftEvents: map[int64]error{}, failMarkReady: map[int64]error{}}
 	network := &stubCoordinatorNetwork{}
 	runner := New(Options{Repos: repos, GitHub: github, Config: &cfg, Now: func() time.Time { return now }, TriageLLM: stubCoordinatorLLM{}, Inspector: stubCoordinatorInspector{}, Network: network})
 	return coordinatorFixture{runner: runner, github: github, network: network, cfg: &cfg, projectID: projectID, now: now, coord: coord}
@@ -1591,6 +1591,7 @@ type stubCoordinatorGitHub struct {
 	details                       map[int64]githubinfra.IssueDetail
 	comments                      map[int64][][]githubinfra.CommentInfo
 	timeline                      map[int64][]map[string]any
+	timelineErr                   map[int64]error
 	blockedBy                     map[int64][]githubinfra.DependencyIssue
 	subIssues                     map[int64][]githubinfra.DependencyIssue
 	linkedPullRequests            map[int64][]githubinfra.LinkedPullRequest
@@ -1695,6 +1696,9 @@ func (s *stubCoordinatorGitHub) ViewPullRequest(_ context.Context, input githubi
 	}
 	return githubinfra.PullRequestDetail{}, nil
 }
+func (s *stubCoordinatorGitHub) ViewPullRequestForDiscovery(_ context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
+	return s.ViewPullRequest(context.Background(), input)
+}
 func (s *stubCoordinatorGitHub) GetIssueState(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueState, error) {
 	detail := s.details[input.IssueNumber]
 	return githubinfra.IssueState{State: detail.State, StateReason: detail.StateReason}, nil
@@ -1735,6 +1739,9 @@ func (s *stubCoordinatorGitHub) GetCurrentUserLoginForRepo(context.Context, stri
 }
 func (s *stubCoordinatorGitHub) ListIssueTimeline(_ context.Context, input githubinfra.IssueTimelineInput) ([]map[string]any, error) {
 	s.timelineReads++
+	if err := s.timelineErr[input.IssueNumber]; err != nil {
+		return nil, err
+	}
 	return s.timeline[input.IssueNumber], nil
 }
 func (s *stubCoordinatorGitHub) GetRepositoryPermission(_ context.Context, input githubinfra.RepositoryPermissionInput) (string, error) {

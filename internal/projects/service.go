@@ -1207,7 +1207,7 @@ func buildProjectMetadataJSON(existing *storage.ProjectRecord, project config.Pr
 		existingMetadata := parseMetadata(existing.MetadataJSON)
 		for key, value := range existingMetadata {
 			switch key {
-			case "repo", "worktreeRoot", "source":
+			case "repo", "worktreeRoot", "source", "network":
 				continue
 			case registrationDiscoveryMetadataKey:
 				if reclaimingArchivedAPIProject {
@@ -1247,9 +1247,6 @@ func buildProjectMetadataJSON(existing *storage.ProjectRecord, project config.Pr
 		return "", err
 	}
 	if err := setProjectMetadata("path", strings.TrimSpace(project.Path), strings.TrimSpace(project.Path) != ""); err != nil {
-		return "", err
-	}
-	if err := setProjectMetadata("network", project.Network, project.Network.Mode != ""); err != nil {
 		return "", err
 	}
 	if err := setProjectMetadata("webhook", project.Webhook, project.Webhook.Mode != ""); err != nil {

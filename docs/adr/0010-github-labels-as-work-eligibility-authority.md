@@ -1,5 +1,7 @@
 # GitHub state remains the work Authority; cloud audit log is observability only
 
+> Status: withdrawn from the supported product by #84. This ADR is retained as historical design context; Routed configuration and runtime maintenance are unavailable.
+
 ## Context
 
 The Network design introduces a `loopernet` service holding registry, lease, event, and audit-log state. A natural temptation is to make `loopernet` the source of truth for admission or assignment decisions: "node red is assigned issue #42 because the cloud's audit log says so." This would parallel the kind of central dispatch service common in distributed work-queue systems.
