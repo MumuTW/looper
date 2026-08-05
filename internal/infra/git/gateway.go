@@ -119,10 +119,12 @@ type InspectHeadResult struct {
 	UnstagedFileCount int
 	// DiffFingerprint fingerprints porcelain status codes and paths only (not
 	// file contents), so content-only edits of untracked files stay stable.
-	DiffFingerprint           string
-	ContentFingerprint        string
-	ContentFingerprintVersion string
-	IndexFingerprint          string
+	DiffFingerprint            string
+	ContentFingerprint         string
+	ComparedContentFingerprint string
+	ComparedIndexFingerprint   string
+	ContentFingerprintVersion  string
+	IndexFingerprint           string
 	// WorktreeMatchesHead is true when the working-tree bytes still equal HEAD
 	// for the observed checkout. It distinguishes a staged-index-only change
 	// from a mixed staged/unstaged edit during a clean descendant transition.
@@ -954,6 +956,18 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 			return InspectHeadResult{}, err
 		}
 	}
+	comparedContentFingerprint := ""
+	comparedIndexFingerprint := ""
+	if input.ContentPaths != nil {
+		comparedContentFingerprint, err = g.contentFingerprint(ctx, input.WorktreePath, input.ContentPaths)
+		if err != nil {
+			return InspectHeadResult{}, err
+		}
+		comparedIndexFingerprint, err = g.indexFingerprint(ctx, input.WorktreePath, input.ContentPaths)
+		if err != nil {
+			return InspectHeadResult{}, err
+		}
+	}
 	worktreeMatchesHead := true
 	if len(status) > 0 {
 		worktreeMatchesHead, err = g.worktreeMatchesHead(ctx, input.WorktreePath, contentPaths)
@@ -974,21 +988,23 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 	}
 
 	return InspectHeadResult{
-		HeadSHA:                   headSHA,
-		Branch:                    branch,
-		NewCommitSHAs:             newCommitSHAs,
-		HasUncommittedChanges:     len(status) > 0,
-		ChangedFiles:              changedFiles,
-		StagedFiles:               stagedFiles,
-		UntrackedFiles:            untrackedFiles,
-		UnstagedFileCount:         unstagedFileCount,
-		RenameSourceFiles:         renameSourceFiles,
-		DiffFingerprint:           diffFingerprint,
-		ContentFingerprint:        contentFingerprint,
-		ContentFingerprintVersion: WorktreeFingerprintVersion,
-		IndexFingerprint:          indexFingerprint,
-		WorktreeMatchesHead:       worktreeMatchesHead,
-		HeadDescendsFromCompare:   headDescendsFromCompare,
+		HeadSHA:                    headSHA,
+		Branch:                     branch,
+		NewCommitSHAs:              newCommitSHAs,
+		HasUncommittedChanges:      len(status) > 0,
+		ChangedFiles:               changedFiles,
+		StagedFiles:                stagedFiles,
+		UntrackedFiles:             untrackedFiles,
+		UnstagedFileCount:          unstagedFileCount,
+		RenameSourceFiles:          renameSourceFiles,
+		DiffFingerprint:            diffFingerprint,
+		ContentFingerprint:         contentFingerprint,
+		ComparedContentFingerprint: comparedContentFingerprint,
+		ComparedIndexFingerprint:   comparedIndexFingerprint,
+		ContentFingerprintVersion:  WorktreeFingerprintVersion,
+		IndexFingerprint:           indexFingerprint,
+		WorktreeMatchesHead:        worktreeMatchesHead,
+		HeadDescendsFromCompare:    headDescendsFromCompare,
 	}, nil
 }
 

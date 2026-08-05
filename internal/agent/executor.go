@@ -226,6 +226,8 @@ type Result struct {
 	ElapsedRuntimeSeconds        int64
 	LastProgressAt               string
 	PreTimeoutError              string
+	NativeResumeMode             string
+	NativeResumeStatus           string
 	PID                          int
 }
 
@@ -1112,6 +1114,7 @@ func (x *execution) run(ctx context.Context) {
 	}
 	endedAtISO := eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
 	lastProgressAt := x.lastProgressAtISO()
+	_, nativeResumeMode, nativeResumeStatus, _ := x.nativeResumeSnapshot()
 	result := Result{
 		Status:                       status,
 		Summary:                      completion.Summary,
@@ -1131,6 +1134,8 @@ func (x *execution) run(ctx context.Context) {
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               lastProgressAt,
 		PreTimeoutError:              preTimeoutError,
+		NativeResumeMode:             nativeResumeMode,
+		NativeResumeStatus:           nativeResumeStatus,
 		PID:                          x.leaderPID(),
 	}
 	if x.shouldFallbackNativeResume(status, stdout, stderr) {
@@ -1153,6 +1158,8 @@ func (x *execution) run(ctx context.Context) {
 			}
 		}
 	}
+	x.finalizeNativeResumeStatus(status, errorMessage, result.Stderr)
+	_, result.NativeResumeMode, result.NativeResumeStatus, _ = x.nativeResumeSnapshot()
 
 	// No terminal observation before containment is confirmed dead for owned
 	// executions (ties to #574/#576 / ADR-0015 R5).
@@ -1166,6 +1173,10 @@ func (x *execution) run(ctx context.Context) {
 	}
 
 	persistErr := x.persistFinal(status, result, errorMessage, endedAtISO)
+	// persistFinal may promote a session id extracted from terminal output from
+	// unavailable to captured. Refresh the returned metadata after that durable
+	// normalization so Worker checkpoints never lag the AgentExecution record.
+	_, result.NativeResumeMode, result.NativeResumeStatus, _ = x.nativeResumeSnapshot()
 	if hard := x.classifyPersistError(persistErr); hard != nil {
 		x.reportHardPersistFailure(hard)
 		persistErr = errors.Join(ErrExecutionPersistence, fmt.Errorf("persist terminal agent execution: %w", hard))
@@ -1202,6 +1213,20 @@ func (x *execution) run(ctx context.Context) {
 	}
 
 	x.doneCh <- execOutcome{result: result, err: persistErr}
+}
+
+// finalizeNativeResumeStatus makes the returned terminal result agree with the
+// native-resume state that persistFinal records. Fallbacks have already
+// replaced this state before this point, so only an attached native session
+// that terminates without fallback is finalized here.
+func (x *execution) finalizeNativeResumeStatus(status, errorMessage, stderr string) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.nativeResumeMode != "native_resume" || status != "failed" {
+		return
+	}
+	x.nativeResumeStatus = "failed"
+	x.nativeResumeError = firstNonEmpty(x.nativeResumeError, errorMessage, strings.TrimSpace(stderr))
 }
 
 func (x *execution) observeBeforeTimeout(timeoutType string) string {
@@ -1402,6 +1427,8 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 				ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
 				ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 				LastProgressAt:               x.lastProgressAtISO(),
+				NativeResumeMode:             "checkpoint_restart",
+				NativeResumeStatus:           "fallback_failed",
 				PID:                          x.leaderPID(),
 			}, errMsg, true, nil
 		}
@@ -1598,6 +1625,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		x.nativeResumeStatus = "fallback_failed"
 	}
 	x.mu.Unlock()
+	_, nativeResumeMode, nativeResumeStatus, _ := x.nativeResumeSnapshot()
 	return Result{
 		Status:                       status,
 		Summary:                      completion.Summary,
@@ -1617,6 +1645,8 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               x.lastProgressAtISO(),
 		PreTimeoutError:              preTimeoutError,
+		NativeResumeMode:             nativeResumeMode,
+		NativeResumeStatus:           nativeResumeStatus,
 		PID:                          x.leaderPID(),
 	}, errorMessage, true, nil
 }
@@ -1894,13 +1924,21 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 		// Fail closed: assessments never persist a resumable native session id.
 		nativeSessionID = ""
 	}
-	if nativeResumeMode == "native_resume" && status == "failed" {
-		nativeResumeStatus = "failed"
-		nativeResumeError = firstNonEmpty(nativeResumeError, errorMessage, strings.TrimSpace(result.Stderr))
-	}
 	if nativeSessionID != "" && (nativeResumeStatus == "" || nativeResumeStatus == "unavailable") {
 		nativeResumeStatus = "captured"
 	}
+	// Keep the in-memory authority in sync with the terminal record. The result
+	// is refreshed by run() after persistFinal returns, including when the
+	// session id was discovered only while assembling the terminal payload.
+	x.mu.Lock()
+	if !x.input.Assessment {
+		if nativeSessionID != "" {
+			x.nativeSessionID = nativeSessionID
+		}
+		x.nativeResumeStatus = nativeResumeStatus
+		x.nativeResumeError = nativeResumeError
+	}
+	x.mu.Unlock()
 	cfg := x.executor.effectiveConfig(x.input)
 	record := storage.AgentExecutionRecord{
 		ID:                 x.executionID,

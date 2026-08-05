@@ -581,6 +581,10 @@ func TestHandlerLoopDetailAndListSurfaceAttemptsAndFailureReason(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
+	checkpoint := `{"continuation":{"predecessorRunId":"run_timeout","predecessorExecutionId":"agent_timeout","mode":"native_resume","outcome":"preserved","beforeTimeout":{"headSha":"before"},"afterRestart":{"headSha":"before"}}}`
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_loop_diag", LoopID: loopID, Status: "success", CheckpointJSON: &checkpoint, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
 
 	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/569", nil)
 	detailRec := httptest.NewRecorder()
@@ -594,6 +598,9 @@ func TestHandlerLoopDetailAndListSurfaceAttemptsAndFailureReason(t *testing.T) {
 	assertEqual(t, detail["maxAttempts"], float64(-1))
 	assertEqual(t, detail["lastFailureKind"], "retryable_transient")
 	assertEqual(t, detail["lastFailureReason"], lastError)
+	continuation := detail["continuation"].(map[string]any)
+	assertEqual(t, continuation["mode"], "native_resume")
+	assertEqual(t, continuation["outcome"], "preserved")
 
 	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops?status=failed", nil)
 	listRec := httptest.NewRecorder()

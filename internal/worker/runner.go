@@ -319,21 +319,25 @@ type InspectHeadInput struct {
 }
 
 type InspectHeadResult struct {
-	HeadSHA                   string
-	Branch                    string
-	NewCommitSHAs             []string
-	HasUncommittedChanges     bool
-	ChangedFiles              []string
-	StagedFiles               []string
-	UntrackedFiles            []string
-	UnstagedFileCount         int
-	RenameSourceFiles         []string
-	DiffFingerprint           string
-	ContentFingerprint        string
-	ContentFingerprintVersion string
-	IndexFingerprint          string
-	WorktreeMatchesHead       bool
-	HeadDescendsFromCompare   bool
+	HeadSHA               string
+	Branch                string
+	NewCommitSHAs         []string
+	HasUncommittedChanges bool
+	ChangedFiles          []string
+	StagedFiles           []string
+	UntrackedFiles        []string
+	UnstagedFileCount     int
+	RenameSourceFiles     []string
+	DiffFingerprint       string
+	ContentFingerprint    string
+	// Compared* fingerprints are scoped to InspectHeadInput.ContentPaths. They
+	// prove that predecessor paths survived while a replacement adds new paths.
+	ComparedContentFingerprint string
+	ComparedIndexFingerprint   string
+	ContentFingerprintVersion  string
+	IndexFingerprint           string
+	WorktreeMatchesHead        bool
+	HeadDescendsFromCompare    bool
 }
 
 type VerifyWorktreeIdentityInput struct {
@@ -404,6 +408,8 @@ type AgentResult struct {
 	ElapsedRuntimeSeconds        int64
 	LastProgressAt               string
 	PreTimeoutError              string
+	NativeResumeMode             string
+	NativeResumeStatus           string
 }
 
 const validationGatedLocalOnlyPrompt = `
@@ -715,6 +721,8 @@ type checkpointExecution struct {
 	ConfiguredMaxRuntimeSeconds  int64             `json:"configuredMaxRuntimeSeconds,omitempty"`
 	ElapsedRuntimeSeconds        int64             `json:"elapsedRuntimeSeconds,omitempty"`
 	LastProgressAt               string            `json:"lastProgressAt,omitempty"`
+	NativeResumeMode             string            `json:"nativeResumeMode,omitempty"`
+	NativeResumeStatus           string            `json:"nativeResumeStatus,omitempty"`
 	ProgressBeforeTimeout        *worktreeProgress `json:"progressBeforeTimeout,omitempty"`
 	ProgressSnapshotError        string            `json:"progressSnapshotError,omitempty"`
 }
@@ -750,19 +758,21 @@ type worktreeProgress struct {
 	// The string path fields are kept for human-facing diagnostics. The byte
 	// fields are the lossless comparison authority: encoding/json base64-encodes
 	// []byte so Git paths that are not valid UTF-8 survive checkpoint round trips.
-	ChangedFileBytes          [][]byte `json:"changedFileBytes,omitempty"`
-	StagedFileBytes           [][]byte `json:"stagedFileBytes,omitempty"`
-	UntrackedFileBytes        [][]byte `json:"untrackedFileBytes,omitempty"`
-	RenameSourceFileBytes     [][]byte `json:"renameSourceFileBytes,omitempty"`
-	DiffFingerprint           string   `json:"diffFingerprint,omitempty"`
-	ContentFingerprint        string   `json:"contentFingerprint,omitempty"`
-	ContentFingerprintVersion string   `json:"contentFingerprintVersion,omitempty"`
-	IndexFingerprint          string   `json:"indexFingerprint,omitempty"`
-	WorktreeMatchesHead       bool     `json:"worktreeMatchesHead"`
-	HeadDescendsFromCompare   bool     `json:"-"`
-	TimeoutType               string   `json:"timeoutType,omitempty"`
-	LastProgressAt            string   `json:"lastProgressAt,omitempty"`
-	CapturedAt                string   `json:"capturedAt,omitempty"`
+	ChangedFileBytes            [][]byte `json:"changedFileBytes,omitempty"`
+	StagedFileBytes             [][]byte `json:"stagedFileBytes,omitempty"`
+	UntrackedFileBytes          [][]byte `json:"untrackedFileBytes,omitempty"`
+	RenameSourceFileBytes       [][]byte `json:"renameSourceFileBytes,omitempty"`
+	DiffFingerprint             string   `json:"diffFingerprint,omitempty"`
+	ContentFingerprint          string   `json:"contentFingerprint,omitempty"`
+	PreservedContentFingerprint string   `json:"preservedContentFingerprint,omitempty"`
+	PreservedIndexFingerprint   string   `json:"preservedIndexFingerprint,omitempty"`
+	ContentFingerprintVersion   string   `json:"contentFingerprintVersion,omitempty"`
+	IndexFingerprint            string   `json:"indexFingerprint,omitempty"`
+	WorktreeMatchesHead         bool     `json:"worktreeMatchesHead"`
+	HeadDescendsFromCompare     bool     `json:"-"`
+	TimeoutType                 string   `json:"timeoutType,omitempty"`
+	LastProgressAt              string   `json:"lastProgressAt,omitempty"`
+	CapturedAt                  string   `json:"capturedAt,omitempty"`
 }
 
 type checkpointPullPR struct {
@@ -1134,8 +1144,33 @@ func checkpointExecutionFromAgentResult(result AgentResult, runID, executionID s
 		ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle, Stdout: result.Stdout,
 		TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds,
 		ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt,
+		NativeResumeMode: result.NativeResumeMode, NativeResumeStatus: result.NativeResumeStatus,
 		ProgressSnapshotError: result.PreTimeoutError,
 	}
+}
+
+func (c *workerCheckpoint) recordContinuationResumeMode(result AgentResult) {
+	if c == nil || c.Continuation == nil || strings.TrimSpace(result.NativeResumeMode) == "" {
+		return
+	}
+	c.Continuation.Mode = result.NativeResumeMode
+}
+
+func workerContinuationPrompt(continuation *checkpointContinuation) string {
+	if continuation == nil || continuation.BeforeTimeout == nil || continuation.AfterRestart == nil {
+		return ""
+	}
+	return fmt.Sprintf(`CONTINUATION CONTEXT:
+This is a retry in the same recorded worktree, not a fresh task. The predecessor run was %s and its agent execution was %s. The daemon classified the handoff as %s. Before timeout: HEAD %s with changed/staged/untracked counts %d/%d/%d. Immediately before this replacement: HEAD %s with counts %d/%d/%d.
+Inspect the existing worktree and continue its changes. Do not reset, clean, checkout over, recreate, or discard the existing worktree.`,
+		firstNonEmpty(continuation.PredecessorRunID, "unknown"),
+		firstNonEmpty(continuation.PredecessorExecutionID, "unknown"),
+		firstNonEmpty(continuation.Outcome, "unknown"),
+		firstNonEmpty(continuation.BeforeTimeout.HeadSHA, "unknown"),
+		continuation.BeforeTimeout.ChangedFileCount, continuation.BeforeTimeout.StagedFileCount, continuation.BeforeTimeout.UntrackedFileCount,
+		firstNonEmpty(continuation.AfterRestart.HeadSHA, "unknown"),
+		continuation.AfterRestart.ChangedFileCount, continuation.AfterRestart.StagedFileCount, continuation.AfterRestart.UntrackedFileCount,
+	)
 }
 
 func New(options Options) *Runner {
@@ -2347,6 +2382,10 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if len(validationCommands) > 0 {
 			prompt += validationGatedLocalOnlyPrompt
 		}
+		continuationPrompt := workerContinuationPrompt(checkpoint.Continuation)
+		if continuationPrompt != "" {
+			prompt += "\n\n" + continuationPrompt
+		}
 		if work.Reproduction != nil {
 			prompt += "\n\n" + work.Reproduction.PromptInstruction()
 		}
@@ -2395,6 +2434,9 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 					nativeSessionID = r.latestNativeSessionID(ctx, input.Loop.ID, agentVendor)
 				}
 			}
+		}
+		if continuationPrompt != "" && nativeResumePrompt != "" {
+			nativeResumePrompt += "\n\n" + continuationPrompt
 		}
 		executionID := eventlog.NewEventID("agent")
 		metadata := map[string]any{"loopType": "worker", "title": work.Title, "repo": work.Repo, "baseBranch": work.BaseBranch}
@@ -2477,6 +2519,16 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if err != nil {
 			return checkpoint, err
 		}
+		// The executor owns the native-resume decision. Persist the continuation
+		// projection before any completed-result gate can suspend or reject this
+		// run. A HITL suspension deliberately cannot set Execution: doing so
+		// would make the resumed run skip the agent turn that consumes the answer.
+		checkpoint.recordContinuationResumeMode(result)
+		if checkpoint.Continuation != nil {
+			if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+			}
+		}
 		// HITL (gated): after the agent turn, if it wrote an ask sentinel, suspend
 		// the run so a human can answer. Returned as a typed error the step loop
 		// converts into an awaiting_human suspension (not a failure).
@@ -2488,6 +2540,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			}
 		}
 		if result.Status != "completed" {
+			checkpoint.recordContinuationResumeMode(result)
 			checkpoint.Execution = checkpointExecutionFromAgentResult(result, input.Run.ID, executionID)
 			checkpoint.Execution.ProgressBeforeTimeout = preTimeoutProgress
 			if result.PreTimeoutError != "" {
@@ -2528,15 +2581,19 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		} else if held {
 			return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 		}
-		// HITL (gated): the resumed turn completed without asking again, so the human
-		// answer that seeded it has been acted on. Flip it to "consumed" now — after
-		// the turn, never before — so a failed/timed-out turn re-reads the answer on
-		// retry, while a successful one never re-injects it on a later run.
-		r.acknowledgePostTurnMetadata(ctx, &input.Loop, includedHumanInbox)
-		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
+		checkpoint.recordContinuationResumeMode(result)
+		checkpoint.Execution = checkpointExecutionFromAgentResult(result, input.Run.ID, executionID)
+		checkpoint.Execution.ProgressBeforeTimeout = preTimeoutProgress
+		if err := validateCompletedExecutionCheckpoint(checkpoint.Execution); err != nil {
+			if persistErr := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); persistErr != nil {
+				return checkpoint, &runpipe.LoopError{Message: persistErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
+			}
 			return checkpoint, err
 		}
-		checkpoint.Execution = checkpointExecutionFromAgentResult(result, input.Run.ID, executionID)
+		// HITL (gated): only consume the human context after the completed result
+		// passes validation. Invalid structured output is replayed in a fresh
+		// execute turn and must still receive the answer/message that authorized it.
+		r.acknowledgePostTurnMetadata(ctx, &input.Loop, includedHumanInbox)
 		checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
 		if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {
 			return checkpoint, err
@@ -2574,6 +2631,10 @@ func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.Pr
 	contentPaths := []string(nil)
 	compareHeadSHA := ""
 	if compare != nil {
+		// Keep an explicit empty slice for a clean predecessor. Nil means that
+		// no scoped comparison was requested; an empty scope still has a
+		// deterministic content/index digest.
+		contentPaths = make([]string, 0, len(compare.ChangedFiles)+len(compare.RenameSourceFiles))
 		contentPaths = append(contentPaths, compare.ChangedFiles...)
 		contentPaths = append(contentPaths, compare.RenameSourceFiles...)
 		compareHeadSHA = compare.HeadSHA
@@ -2581,6 +2642,14 @@ func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.Pr
 	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: firstNonEmpty(worktree.HeadSHA, worktree.BaseBranch, work.BaseBranch), ContentPaths: contentPaths, CompareHeadSHA: compareHeadSHA})
 	if err != nil {
 		return worktreeProgress{}, err
+	}
+	preservedContentFingerprint := inspect.ComparedContentFingerprint
+	preservedIndexFingerprint := inspect.ComparedIndexFingerprint
+	if compare == nil {
+		// The first timeout observation has no predecessor scope; its complete
+		// aggregate becomes the scope for a later additive replacement.
+		preservedContentFingerprint = inspect.ContentFingerprint
+		preservedIndexFingerprint = inspect.IndexFingerprint
 	}
 	return worktreeProgress{
 		HeadSHA:               inspect.HeadSHA,
@@ -2599,6 +2668,7 @@ func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.Pr
 		UntrackedFileBytes:    pathByteList(boundPathList(inspect.UntrackedFiles, worktreeProgressPathCap)),
 		RenameSourceFileBytes: pathByteList(boundPathList(inspect.RenameSourceFiles, worktreeProgressPathCap)),
 		DiffFingerprint:       inspect.DiffFingerprint, ContentFingerprint: inspect.ContentFingerprint,
+		PreservedContentFingerprint: preservedContentFingerprint, PreservedIndexFingerprint: preservedIndexFingerprint,
 		ContentFingerprintVersion: firstNonEmpty(inspect.ContentFingerprintVersion, worktreeFingerprintVersion),
 		IndexFingerprint:          inspect.IndexFingerprint, HeadDescendsFromCompare: inspect.HeadDescendsFromCompare,
 		WorktreeMatchesHead: inspect.WorktreeMatchesHead,
@@ -2643,6 +2713,9 @@ func (r *Runner) verifyTimeoutProgressAfterTermination(ctx context.Context, proj
 
 func (r *Runner) verifyTimeoutProgressBeforeReplacement(ctx context.Context, project storage.ProjectRecord, runID string, work workerInput, worktree checkpointWorktree, checkpoint *workerCheckpoint) error {
 	if checkpoint.Execution == nil {
+		if checkpoint.Continuation != nil && checkpoint.Continuation.AfterRestart != nil {
+			return r.reobserveContinuationBeforeReplacement(ctx, project, runID, work, worktree, checkpoint)
+		}
 		return nil
 	}
 	if checkpoint.Execution.Status == "timeout_observing" {
@@ -2658,10 +2731,12 @@ func (r *Runner) verifyTimeoutProgressBeforeReplacement(ctx context.Context, pro
 		return &runpipe.LoopError{Message: checkpoint.Execution.ProgressSnapshotError, Kind: runpipe.FailureManualIntervention}
 	}
 	if checkpoint.Execution.Status != "timeout" {
+		if checkpoint.Continuation != nil && checkpoint.Continuation.AfterRestart != nil {
+			return r.reobserveContinuationBeforeReplacement(ctx, project, runID, work, worktree, checkpoint)
+		}
 		return nil
 	}
-	before := checkpoint.Execution.ProgressBeforeTimeout
-	if before == nil {
+	if checkpoint.Execution.ProgressBeforeTimeout == nil {
 		if strings.TrimSpace(checkpoint.Execution.ProgressSnapshotError) == "" {
 			return nil
 		}
@@ -2672,6 +2747,7 @@ func (r *Runner) verifyTimeoutProgressBeforeReplacement(ctx context.Context, pro
 		}
 		return &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
 	}
+	before := checkpoint.Execution.ProgressBeforeTimeout
 	current, err := r.captureWorktreeProgress(ctx, project, work, worktree, agent.TimeoutObservation{}, before)
 	if err != nil {
 		message := fmt.Sprintf("worker timeout progress verification before retry failed: %v", err)
@@ -2706,6 +2782,85 @@ func (r *Runner) verifyTimeoutProgressBeforeReplacement(ctx context.Context, pro
 		return nil
 	}
 	return &runpipe.LoopError{Message: checkpoint.Execution.ProgressSnapshotError, Kind: runpipe.FailureManualIntervention}
+}
+
+func (r *Runner) reobserveContinuationBeforeReplacement(ctx context.Context, project storage.ProjectRecord, runID string, work workerInput, worktree checkpointWorktree, checkpoint *workerCheckpoint) error {
+	continuation := checkpoint.Continuation
+	if continuation == nil || continuation.AfterRestart == nil {
+		return nil
+	}
+	baseline := continuation.AfterRestart
+	current, err := r.captureWorktreeProgress(ctx, project, work, worktree, agent.TimeoutObservation{}, baseline)
+	if err != nil {
+		message := fmt.Sprintf("worker continuation progress verification before retry failed: %v", err)
+		if checkpoint.Execution == nil {
+			checkpoint.Execution = &checkpointExecution{RunID: runID, Status: "failed"}
+		}
+		checkpoint.Execution.ProgressSnapshotError = message
+		continuation.Outcome = "observation failed"
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		if persistErr := r.persistCheckpoint(ctx, runID, *checkpoint); persistErr != nil {
+			return &runpipe.LoopError{Message: persistErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		}
+		return &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
+	}
+	preserved := preservesWorktreeProgress(*baseline, current)
+	if !preserved && continuation.Outcome == "preserved" {
+		// A replacement may add work only after the previous observation proved
+		// this baseline. Compare scoped digests for the baseline paths instead of
+		// requiring the aggregate fingerprint to remain unchanged. The scoped
+		// proof composes across repeated failed replacement attempts and rejects
+		// same-path destructive rewrites.
+		preserved = preservesAdditiveWorktreeProgress(*baseline, current)
+	}
+	continuation.AfterRestart = &current
+	if !preserved {
+		if checkpoint.Execution == nil {
+			checkpoint.Execution = &checkpointExecution{RunID: runID, Status: "failed"}
+		}
+		checkpoint.Execution.ProgressSnapshotError = "worker continuation progress changed before replacement; operator action is required before retry"
+		continuation.Outcome = "changed"
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+	} else {
+		// A previous drift outcome is historical once a fresh observation proves
+		// the checkout safe again; leave the next retry eligible instead of
+		// returning the same manual-intervention error forever.
+		continuation.Outcome = "preserved"
+		if checkpoint.Execution != nil {
+			checkpoint.Execution.ProgressSnapshotError = ""
+		}
+		checkpoint.ResumePolicy = "retry_from_timeout_context"
+	}
+	if err := r.persistCheckpoint(ctx, runID, *checkpoint); err != nil {
+		return &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+	}
+	if !preserved {
+		return &runpipe.LoopError{Message: checkpoint.Execution.ProgressSnapshotError, Kind: runpipe.FailureManualIntervention}
+	}
+	return nil
+}
+
+// preservesAdditiveWorktreeProgress proves that a failed replacement changed
+// only by adding work to the already-proven checkout. The current observation
+// carries fingerprints scoped to the previous baseline paths; comparing them
+// with the baseline's full fingerprints is content/index authority, while the
+// same-head check prevents a replacement from smuggling an unrelated commit.
+func preservesAdditiveWorktreeProgress(before, after worktreeProgress) bool {
+	if before.HeadSHA == "" || after.HeadSHA == "" || before.HeadSHA != after.HeadSHA || before.Branch != after.Branch {
+		return false
+	}
+	if before.ContentFingerprintVersion != worktreeFingerprintVersion || after.ContentFingerprintVersion != worktreeFingerprintVersion || before.ContentFingerprint == "" || before.IndexFingerprint == "" || after.ContentFingerprint == "" || after.PreservedContentFingerprint == "" || after.PreservedIndexFingerprint == "" {
+		return false
+	}
+	// Path evidence is capped in checkpoints. If the baseline was truncated,
+	// the scoped digest cannot cover every predecessor path, so fail closed.
+	if before.ChangedFileCount != len(before.ChangedFileBytes) || before.StagedFileCount != len(before.StagedFileBytes) || before.UntrackedFileCount != len(before.UntrackedFileBytes) || before.ChangedFileCount != len(before.ChangedFiles) || before.StagedFileCount != len(before.StagedFiles) || before.UntrackedFileCount != len(before.UntrackedFiles) {
+		return false
+	}
+	if before.RenameSourceFiles != nil && len(before.RenameSourceFileBytes) != len(before.RenameSourceFiles) {
+		return false
+	}
+	return after.PreservedContentFingerprint == before.ContentFingerprint && after.PreservedIndexFingerprint == before.IndexFingerprint
 }
 
 func sameWorktreeProgress(before, after worktreeProgress) bool {
@@ -4528,7 +4683,7 @@ func shouldReplayExecuteOnResume(status string, failedStep WorkerStep, checkpoin
 		return false
 	}
 	switch failedStep {
-	case stepValidate, stepOpenPR:
+	case stepExecute, stepValidate, stepOpenPR:
 	default:
 		return false
 	}
@@ -4550,7 +4705,14 @@ func executeStepAlreadyCompleted(checkpoint workerCheckpoint) bool {
 }
 
 func rewindCheckpointForExecuteRetry(checkpoint workerCheckpoint) workerCheckpoint {
-	if checkpoint.Execution == nil || (checkpoint.Execution.Status != "timeout" && checkpoint.Execution.Status != "timeout_observing") {
+	// Keep timeout_observing durable through the execute replay decision. A
+	// daemon can crash after the observation intent is persisted but before the
+	// executor returns; clearing that marker would let the replacement bypass
+	// verifyTimeoutProgressBeforeReplacement's fail-closed containment gate.
+	execution := checkpoint.Execution
+	preserveTimeoutObservation := execution != nil && execution.Status == "timeout_observing"
+	preserveTimeout := execution != nil && execution.Status == "timeout" && execution.ProgressBeforeTimeout != nil
+	if !preserveTimeoutObservation && !preserveTimeout {
 		checkpoint.Execution = nil
 	}
 	checkpoint.Validation = nil

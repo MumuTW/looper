@@ -1818,7 +1818,7 @@ func (a workerGitAdapter) InspectHead(ctx context.Context, input worker.InspectH
 	if err != nil {
 		return worker.InspectHeadResult{}, err
 	}
-	return worker.InspectHeadResult{HeadSHA: result.HeadSHA, Branch: result.Branch, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles, StagedFiles: result.StagedFiles, UntrackedFiles: result.UntrackedFiles, UnstagedFileCount: result.UnstagedFileCount, RenameSourceFiles: result.RenameSourceFiles, DiffFingerprint: result.DiffFingerprint, ContentFingerprint: result.ContentFingerprint, ContentFingerprintVersion: result.ContentFingerprintVersion, IndexFingerprint: result.IndexFingerprint, WorktreeMatchesHead: result.WorktreeMatchesHead, HeadDescendsFromCompare: result.HeadDescendsFromCompare}, nil
+	return worker.InspectHeadResult{HeadSHA: result.HeadSHA, Branch: result.Branch, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles, StagedFiles: result.StagedFiles, UntrackedFiles: result.UntrackedFiles, UnstagedFileCount: result.UnstagedFileCount, RenameSourceFiles: result.RenameSourceFiles, DiffFingerprint: result.DiffFingerprint, ContentFingerprint: result.ContentFingerprint, ComparedContentFingerprint: result.ComparedContentFingerprint, ComparedIndexFingerprint: result.ComparedIndexFingerprint, ContentFingerprintVersion: result.ContentFingerprintVersion, IndexFingerprint: result.IndexFingerprint, WorktreeMatchesHead: result.WorktreeMatchesHead, HeadDescendsFromCompare: result.HeadDescendsFromCompare}, nil
 }
 
 func (a workerGitAdapter) VerifyWorktreeIdentity(ctx context.Context, input worker.VerifyWorktreeIdentityInput) error {
@@ -1876,7 +1876,7 @@ func (a workerAgentExecutionAdapter) Wait(ctx context.Context) (worker.AgentResu
 	if err != nil {
 		return worker.AgentResult{}, err
 	}
-	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt, PreTimeoutError: result.PreTimeoutError}, nil
+	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt, PreTimeoutError: result.PreTimeoutError, NativeResumeMode: result.NativeResumeMode, NativeResumeStatus: result.NativeResumeStatus}, nil
 }
 
 func (a workerAgentExecutionAdapter) Kill(reason string) error {

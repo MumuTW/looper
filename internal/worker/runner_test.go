@@ -77,6 +77,39 @@ func TestShouldRetryQueueFailureRespectsMaxAttempts(t *testing.T) {
 	}
 }
 
+func TestCheckpointExecutionRecordsActualContinuationResumeMode(t *testing.T) {
+	t.Parallel()
+
+	result := AgentResult{Status: "completed", ParseStatus: "parsed", NativeResumeMode: "native_resume", NativeResumeStatus: "started"}
+	execution := checkpointExecutionFromAgentResult(result, "run_1", "agent_1")
+	if execution.NativeResumeMode != "native_resume" || execution.NativeResumeStatus != "started" {
+		t.Fatalf("execution = %#v, want native resume fields", execution)
+	}
+	checkpoint := workerCheckpoint{Continuation: &checkpointContinuation{Mode: "checkpoint_same_worktree"}}
+	checkpoint.recordContinuationResumeMode(result)
+	if checkpoint.Continuation.Mode != "native_resume" {
+		t.Fatalf("Continuation.Mode = %q, want actual native_resume", checkpoint.Continuation.Mode)
+	}
+}
+
+func TestWorkerContinuationPromptIncludesRetryEvidenceWithoutPaths(t *testing.T) {
+	prompt := workerContinuationPrompt(&checkpointContinuation{
+		PredecessorRunID:       "run_timeout",
+		PredecessorExecutionID: "agent_timeout",
+		Outcome:                "preserved",
+		BeforeTimeout:          &worktreeProgress{HeadSHA: "before", ChangedFileCount: 2, StagedFileCount: 1, UntrackedFileCount: 1},
+		AfterRestart:           &worktreeProgress{HeadSHA: "before", ChangedFileCount: 2, StagedFileCount: 1, UntrackedFileCount: 1},
+	})
+	for _, want := range []string{"run_timeout", "agent_timeout", "preserved", "HEAD before", "2/1/1", "Do not reset"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt = %q, want %q", prompt, want)
+		}
+	}
+	if strings.Contains(prompt, "private.go") {
+		t.Fatalf("prompt = %q, must not expose source paths", prompt)
+	}
+}
+
 func TestBackoffDelayCapsInfiniteRetryOverflow(t *testing.T) {
 	t.Parallel()
 
@@ -1277,9 +1310,24 @@ func testBoolPtr(value bool) *bool { return &value }
 func TestProcessClaimedItemFailsWhenAgentCompletionResultMissing(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	worktreeRoot, err := workerWorktreeRoot(*project)
+	if err != nil {
+		t.Fatalf("workerWorktreeRoot() error = %v", err)
+	}
+	worktreePath := filepath.Join(worktreeRoot, "wt")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(worktree) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, ".git"), []byte("gitdir: /tmp/test\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(.git) error = %v", err)
+	}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: worktreePath, Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
 	github := &fakeGitHubGateway{}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "upstream server_error", Stdout: "server_error", ParseStatus: "missing"}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "upstream server_error", Stdout: "server_error", ParseStatus: "missing", NativeResumeMode: "native_resume", NativeResumeStatus: "failed"}}}
 	validationCalls := 0
 	completed := make([]RunCompletedInput, 0, 1)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
@@ -1330,6 +1378,13 @@ func TestProcessClaimedItemFailsWhenAgentCompletionResultMissing(t *testing.T) {
 	}
 	if run == nil || run.Status != "failed" || run.CurrentStep == nil || *run.CurrentStep != string(stepExecute) {
 		t.Fatalf("run = %#v, want failed run at execute step", run)
+	}
+	checkpoint, err := parseCheckpoint(run.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint() error = %v", err)
+	}
+	if checkpoint.Execution == nil || checkpoint.Execution.NativeResumeMode != "native_resume" || checkpoint.Execution.NativeResumeStatus != "failed" {
+		t.Fatalf("checkpoint.Execution = %#v, want persisted finalized native-resume result after invalid completion", checkpoint.Execution)
 	}
 	if run.LastCompletedStep != nil && *run.LastCompletedStep == string(stepOpenPR) {
 		t.Fatalf("run = %#v, want open-pr to remain incomplete", run)
@@ -1440,6 +1495,52 @@ func TestRunExecuteStepFailsResumedCompletedCheckpointWithoutParsedResult(t *tes
 	want := "Worker completed without a valid structured result (parse status: missing). See Looper logs for details."
 	if err.Error() != want {
 		t.Fatalf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+func TestRunExecuteStepRetainsHumanContextWhenCompletedResultIsInvalid(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	project := fixture.project(t)
+	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	metadata, err := loops.WriteHITLAsk(loop.MetadataJSON, loops.HITLAsk{Question: "Continue?", Answer: "yes", Status: "answered", Vendor: "codex", SessionID: "session-1"})
+	if err != nil {
+		t.Fatalf("WriteHITLAsk() error = %v", err)
+	}
+	loop.MetadataJSON = &metadata
+	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_invalid_human_context", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	worktreePath := fixture.usableWorktree(t, "invalid-human-context")
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{HeadSHA: "abc123", Branch: "looper/feature", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "invalid", ParseStatus: "missing"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, HITLEnabled: true, AllowAutoCommit: true, AgentRuntime: "codex"})
+	_, err = runner.runExecuteStep(ctx, stepInput{
+		Project: project, Loop: *loop, Run: run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "wt_1", Path: worktreePath, Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	if err == nil {
+		t.Fatal("runExecuteStep() error = nil, want invalid structured result")
+	}
+	updated, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() after invalid result = (%#v, %v)", updated, err)
+	}
+	ask, ok := loops.ReadHITLAsk(updated.MetadataJSON)
+	if !ok || ask.Status != "answered" {
+		t.Fatalf("HITL ask = %#v (ok=%t), want answered context retained for replay", ask, ok)
 	}
 }
 
@@ -1775,6 +1876,109 @@ func TestVerifyTimeoutProgressBeforeReplacementPersistsPreservedEvidence(t *test
 	storedCheckpoint, err := parseCheckpoint(storedRun.CheckpointJSON)
 	if err != nil || storedCheckpoint.Continuation == nil || storedCheckpoint.Continuation.Outcome != "preserved" || storedCheckpoint.Continuation.AfterRestart == nil {
 		t.Fatalf("stored checkpoint = %#v, err=%v, want persisted preserved evidence", storedCheckpoint, err)
+	}
+}
+
+func TestVerifyTimeoutProgressBeforeReplacementReobservesAfterFailedRetry(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	run := storage.RunRecord{ID: "run_retry_after_failure", LoopID: "loop_worker_1", Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	inspect := InspectHeadResult{HeadSHA: "head", Branch: "feature/test", ChangedFiles: []string{"tracked.go"}, DiffFingerprint: "status", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index"}
+	git := &fakeGitGateway{inspectResult: inspect}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	baseline := &worktreeProgress{HeadSHA: "head", WorktreeID: "wt_1", Branch: "feature/test", ChangedFiles: []string{"tracked.go"}, ChangedFileCount: 1, ChangedFileBytes: pathByteList([]string{"tracked.go"}), DiffFingerprint: "status", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index"}
+	checkpoint := workerCheckpoint{
+		Execution:    &checkpointExecution{RunID: run.ID, ExecutionID: "agent_failed", Status: "failed", ProgressSnapshotError: "previous drift"},
+		Continuation: &checkpointContinuation{PredecessorRunID: "run_timeout", PredecessorExecutionID: "agent_timeout", Mode: "native_resume", Outcome: "changed", AfterRestart: baseline},
+	}
+	worktree := checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "worktree"), Branch: "feature/test", BaseBranch: "main"}
+	if err := runner.verifyTimeoutProgressBeforeReplacement(context.Background(), *project, run.ID, workerInput{BaseBranch: "main"}, worktree, &checkpoint); err != nil {
+		t.Fatalf("verifyTimeoutProgressBeforeReplacement() error = %v, want fresh preserved observation", err)
+	}
+	if len(git.inspectCalls) != 1 || checkpoint.Continuation.AfterRestart == nil || checkpoint.Continuation.Outcome != "preserved" || checkpoint.Execution.ProgressSnapshotError != "" || checkpoint.ResumePolicy != "retry_from_timeout_context" {
+		t.Fatalf("inspectCalls=%d checkpoint=%#v, want refreshed preserved evidence and reset outcome", len(git.inspectCalls), checkpoint)
+	}
+}
+
+func TestVerifyTimeoutProgressBeforeReplacementFailsClosedForUnprovenReplacementEdits(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	run := storage.RunRecord{ID: "run_retry_after_edit", LoopID: "loop_worker_1", Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	baseline := &worktreeProgress{
+		HeadSHA: "head", WorktreeID: "wt_1", Branch: "feature/test", ChangedFiles: []string{"tracked.go"}, ChangedFileBytes: [][]byte{[]byte("tracked.go")}, ChangedFileCount: 1,
+		DiffFingerprint: "status", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index",
+	}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{
+		HeadSHA: "head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "replacement.go"}, DiffFingerprint: "replacement-status", ContentFingerprint: "replacement-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "replacement-index",
+	}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := workerCheckpoint{
+		Execution: &checkpointExecution{RunID: run.ID, ExecutionID: "agent_failed", Status: "failed"},
+		Continuation: &checkpointContinuation{
+			PredecessorRunID: "run_timeout", PredecessorExecutionID: "agent_timeout", Mode: "checkpoint_same_worktree", Outcome: "preserved",
+			BeforeTimeout: baseline, AfterRestart: baseline,
+		},
+	}
+	worktree := checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "worktree"), Branch: "feature/test", BaseBranch: "main"}
+	err = runner.verifyTimeoutProgressBeforeReplacement(context.Background(), *project, run.ID, workerInput{BaseBranch: "main"}, worktree, &checkpoint)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureManualIntervention {
+		t.Fatalf("verifyTimeoutProgressBeforeReplacement() error = %v, want manual intervention for unproven replacement edits", err)
+	}
+	if checkpoint.Continuation == nil || checkpoint.Continuation.Outcome != "changed" || checkpoint.Continuation.AfterRestart == nil || len(checkpoint.Continuation.AfterRestart.ChangedFiles) != 2 || checkpoint.Execution == nil || checkpoint.Execution.ProgressSnapshotError == "" {
+		t.Fatalf("checkpoint.Continuation = %#v, execution = %#v, want fail-closed changed evidence", checkpoint.Continuation, checkpoint.Execution)
+	}
+}
+
+func TestVerifyTimeoutProgressBeforeReplacementAcceptsVerifiedAdditiveEdits(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	run := storage.RunRecord{ID: "run_retry_after_verified_edit", LoopID: "loop_worker_1", Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	baseline := &worktreeProgress{
+		HeadSHA: "head", WorktreeID: "wt_1", Branch: "feature/test",
+		ChangedFiles: []string{"tracked.go"}, ChangedFileBytes: [][]byte{[]byte("tracked.go")}, ChangedFileCount: 1,
+		ContentFingerprint: "before-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "before-index",
+	}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{
+		HeadSHA: "head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "replacement.go"},
+		ContentFingerprint: "after-content", ComparedContentFingerprint: "before-content", ComparedIndexFingerprint: "before-index",
+		ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "after-index",
+	}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := workerCheckpoint{
+		Execution: &checkpointExecution{RunID: run.ID, ExecutionID: "agent_failed", Status: "failed"},
+		Continuation: &checkpointContinuation{
+			PredecessorRunID: "run_timeout", PredecessorExecutionID: "agent_timeout", Mode: "checkpoint_same_worktree", Outcome: "preserved",
+			AfterRestart: baseline,
+		},
+	}
+	worktree := checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "worktree"), Branch: "feature/test", BaseBranch: "main"}
+	if err := runner.verifyTimeoutProgressBeforeReplacement(context.Background(), *project, run.ID, workerInput{BaseBranch: "main"}, worktree, &checkpoint); err != nil {
+		t.Fatalf("verifyTimeoutProgressBeforeReplacement() error = %v, want verified additive edits accepted", err)
+	}
+	if checkpoint.Continuation == nil || checkpoint.Continuation.Outcome != "preserved" || checkpoint.Continuation.AfterRestart == nil || len(checkpoint.Continuation.AfterRestart.ChangedFiles) != 2 {
+		t.Fatalf("checkpoint.Continuation = %#v, want updated preserved evidence", checkpoint.Continuation)
 	}
 }
 
@@ -2889,6 +3093,90 @@ func TestCreateRunContextReplaysExecuteWhenResumeCheckpointParseStatusIsInvalid(
 	}
 	if resumed.Run.LastCompletedStep == nil || *resumed.Run.LastCompletedStep != string(stepPlan) {
 		t.Fatalf("run.LastCompletedStep = %#v, want plan", resumed.Run.LastCompletedStep)
+	}
+}
+
+func TestCreateRunContextReplaysExecuteWhenExecuteCheckpointIsInvalid(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	checkpointJSON := runpipe.MustMarshalJSON(workerCheckpoint{
+		Work:      &workerInput{Title: "Worker task"},
+		Worktree:  &checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/test"},
+		Plan:      &checkpointPlan{Summary: "plan"},
+		Execution: &checkpointExecution{Status: "completed", Summary: "invalid structured output"},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_in_execute",
+		LoopID:            "loop_worker_1",
+		Status:            "failed",
+		CurrentStep:       runpipe.StringPtr(string(stepExecute)),
+		LastCompletedStep: runpipe.StringPtr(string(stepPlan)),
+		CheckpointJSON:    &checkpointJSON,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want worker loop", loop, err)
+	}
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if !resumed.Resumed || resumed.StartStep != stepExecute {
+		t.Fatalf("resumed = %#v, want execute replay for invalid execute checkpoint", resumed)
+	}
+	if resumed.Checkpoint.Execution != nil {
+		t.Fatalf("Execution = %#v, want cleared invalid execution checkpoint", resumed.Checkpoint.Execution)
+	}
+}
+
+func TestCreateRunContextPreservesTimeoutObservationOnExecuteReplay(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	checkpointJSON := runpipe.MustMarshalJSON(workerCheckpoint{
+		Work:     &workerInput{Title: "Worker task"},
+		Worktree: &checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/test"},
+		Plan:     &checkpointPlan{Summary: "plan"},
+		Execution: &checkpointExecution{
+			Status:                "timeout_observing",
+			ExecutionID:           "agent_1",
+			ProgressSnapshotError: "worker timeout observation in progress",
+		},
+		ResumePolicy: "retry_from_timeout_context",
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_interrupted_during_timeout_observation",
+		LoopID:            "loop_worker_1",
+		Status:            "interrupted",
+		CurrentStep:       runpipe.StringPtr(string(stepExecute)),
+		LastCompletedStep: runpipe.StringPtr(string(stepPlan)),
+		CheckpointJSON:    &checkpointJSON,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want worker loop", loop, err)
+	}
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if !resumed.Resumed || resumed.StartStep != stepExecute {
+		t.Fatalf("resumed = %#v, want execute replay for timeout observation", resumed)
+	}
+	if resumed.Checkpoint.Execution == nil || resumed.Checkpoint.Execution.Status != "timeout_observing" {
+		t.Fatalf("Execution = %#v, want timeout_observing marker preserved", resumed.Checkpoint.Execution)
 	}
 }
 
