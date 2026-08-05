@@ -39,7 +39,7 @@ var (
 	prViewMetadataJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
 	prViewFixerJSONFields      = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "statusCheckRollup", "mergeStateStatus"}
 	prViewReviewerJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "statusCheckRollup", "mergeStateStatus"}
-	prViewGatekeeperJSONFields = []string{"number", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "mergeStateStatus", "changedFiles", "deletions"}
+	prViewGatekeeperJSONFields = []string{"number", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "mergeStateStatus", "changedFiles", "deletions", "closingIssuesReferences"}
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
@@ -173,6 +173,8 @@ type PullRequestDetail struct {
 	Mergeable          *bool
 	MergeableState     MergeabilityState
 	MergedAt           string
+	MergeCommitSHA     string
+	ClosingIssues      []IssueReference
 	AutoMerge          *PullRequestAutoMerge
 }
 
@@ -183,6 +185,13 @@ type PullRequestDiffStats struct {
 	Deletions    int `json:"deletions"`
 }
 
+// IssueReference is GitHub's explicit pull-request-to-issue relationship.
+// It is deliberately not derived from PR title or body text.
+type IssueReference struct {
+	Number int64  `json:"number"`
+	Repo   string `json:"repo"`
+	URL    string `json:"url"`
+}
 type PullRequestAutoMerge struct {
 	EnabledBy   string
 	MergeMethod string
@@ -212,7 +221,8 @@ type PullRequestStatus struct {
 }
 
 type CheckRunAnnotation struct {
-	Path string
+	Path  string
+	Level string
 }
 
 type CommentInfo struct {
@@ -1841,7 +1851,33 @@ func (g *Gateway) ViewPullRequestForReviewer(ctx context.Context, input ViewPull
 func (g *Gateway) ViewPullRequestForGatekeeper(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
 	// Gate decisions must bypass the per-tick discovery snapshot: this method
 	// is the fresh provider read that binds a report to the current head.
-	return g.viewPullRequestWithFields(ctx, input, prViewGatekeeperJSONFields, false, false)
+	detail, err := g.viewPullRequestWithFields(ctx, input, prViewGatekeeperJSONFields, false, false)
+	if err == nil {
+		return detail, nil
+	}
+	// closingIssuesReferences is provenance enrichment, not merge authority.
+	// Older GitHub Enterprise APIs may reject the optional field; retry the
+	// authoritative gate read without it rather than blocking every evaluation.
+	if !isUnsupportedClosingIssuesFieldError(err) {
+		return PullRequestDetail{}, err
+	}
+	return g.viewPullRequestWithFields(ctx, input, withoutJSONField(prViewGatekeeperJSONFields, "closingIssuesReferences"), false, false)
+}
+
+func isUnsupportedClosingIssuesFieldError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if !strings.Contains(message, "closingissuesreferences") {
+		return false
+	}
+	for _, marker := range []string{"unknown field", "unknown argument", "unsupported field", "doesn't exist", "does not exist", "cannot query field", "could not resolve to a field"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Gateway) viewPullRequestWithFields(ctx context.Context, input ViewPullRequestInput, fields []string, includeReviewThreads bool, includeIssueComments bool) (PullRequestDetail, error) {
@@ -1900,6 +1936,8 @@ func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, 
 		Mergeable:          boolPtrFromValue(row["mergeable"]),
 		MergeableState:     ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),
 		MergedAt:           asString(row["merged_at"]),
+		MergeCommitSHA:     nestedString(row, "mergeCommit", "oid"),
+		ClosingIssues:      extractIssueReferences(row["closingIssuesReferences"]),
 		AutoMerge:          extractAutoMerge(row["auto_merge"]),
 	}
 }
@@ -1960,6 +1998,7 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		IsDraft:        asBool(row["draft"]),
 		Author:         extractAuthor(row["user"]),
 		MergedAt:       firstNonEmpty(asString(row["merged_at"]), asString(row["mergedAt"])),
+		MergeCommitSHA: firstNonEmpty(asString(row["merge_commit_sha"]), nestedString(row, "mergeCommit", "oid")),
 		Labels:         extractLabelNames(row["labels"]),
 		HeadRefName:    nestedString(row, "head", "ref"),
 		BaseRefName:    nestedString(row, "base", "ref"),
@@ -1970,6 +2009,26 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		MergeableState: ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),
 		AutoMerge:      extractAutoMerge(row["auto_merge"]),
 	}, nil
+}
+
+func extractIssueReferences(value any) []IssueReference {
+	references := make([]IssueReference, 0)
+	for _, issue := range toObjectSlice(value) {
+		owner := nestedString(issue, "repository", "owner", "login")
+		name := nestedString(issue, "repository", "name")
+		nameWithOwner := strings.Trim(strings.TrimSpace(owner)+"/"+strings.TrimSpace(name), "/")
+		repo := hostQualifiedRepo(nameWithOwner, asString(issue["url"]))
+		if number := asInt64(issue["number"]); number > 0 && repo != "" {
+			references = append(references, IssueReference{Number: number, Repo: repo, URL: asString(issue["url"])})
+		}
+	}
+	sort.Slice(references, func(i, j int) bool {
+		if !strings.EqualFold(references[i].Repo, references[j].Repo) {
+			return strings.ToLower(references[i].Repo) < strings.ToLower(references[j].Repo)
+		}
+		return references[i].Number < references[j].Number
+	})
+	return references
 }
 
 func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullRequestCheckRunsInput) (PullRequestCheckRuns, error) {
@@ -2042,7 +2101,8 @@ func (g *Gateway) ListCheckRunAnnotations(ctx context.Context, input CheckRunAnn
 	annotations := make([]CheckRunAnnotation, 0, len(rows))
 	for _, row := range rows {
 		if path := strings.TrimSpace(asString(row["path"])); path != "" {
-			annotations = append(annotations, CheckRunAnnotation{Path: path})
+			level := firstNonEmpty(asString(row["annotation_level"]), asString(row["level"]))
+			annotations = append(annotations, CheckRunAnnotation{Path: path, Level: strings.ToLower(strings.TrimSpace(level))})
 		}
 	}
 	return annotations, nil
