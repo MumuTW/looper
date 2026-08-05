@@ -108,6 +108,14 @@ type gatekeeperScheduler interface {
 	EvaluatePullRequest(context.Context, gatekeeper.EvaluationInput) (gatekeeper.Report, error)
 }
 
+// gatekeeperLegacyRetirementScheduler is optional so normal Gatekeeper
+// discovery tests and callers remain focused on open-PR evaluation. Production
+// runners use it as a migration-maintenance pass over archived as well as
+// active projects.
+type gatekeeperLegacyRetirementScheduler interface {
+	ReconcileLegacyVerdictComments(context.Context) error
+}
+
 type workerScheduler interface {
 	ProcessNext(context.Context, string) (*runpipe.ProcessResult, error)
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*runpipe.ProcessResult, error)
@@ -2060,12 +2068,6 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Repos:  repos,
 			GitHub: gatekeeperGitHubAdapter{Gateway: githubGateway, config: &cfg},
 			Now:    now,
-			TrustForProject: func(projectID string) config.GatekeeperTrustLevel {
-				return gatekeeperTrustForProject(cfg, projectID)
-			},
-			DiffBudgetForProject: func(projectID string) config.GatekeeperDiffBudget {
-				return gatekeeperDiffBudgetForProject(cfg, projectID)
-			},
 			LogWarn: func(msg string, fields map[string]any) {
 				if logger != nil {
 					logger.Warn(msg, fields)
@@ -2845,6 +2847,18 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		appendErr(err)
 		retErr = errors.Join(errs...)
 		return retErr
+	}
+	if maintenance, ok := input.Gatekeeper.(gatekeeperLegacyRetirementScheduler); ok {
+		if err := admissionRefuseWork(input); err != nil {
+			if len(errs) == 0 {
+				return nil
+			}
+			retErr = errors.Join(errs...)
+			return retErr
+		}
+		appendErr(runSchedulerLane(input, "gatekeeper legacy verdict retirement", "", "", func() error {
+			return maintenance.ReconcileLegacyVerdictComments(ctx)
+		}))
 	}
 	if !catalogCurrent {
 		return nil

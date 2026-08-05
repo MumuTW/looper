@@ -606,6 +606,143 @@ func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityI
 	return scanEventLogs(rows)
 }
 
+// LatestByLogicalProjectAndEventTypeAndPayloadMode returns the newest event per
+// logical project for an event type and payload mode. The logical project is
+// the project_id column when present, or the projectId extracted from the
+// payload JSON for events whose project row was deleted (SQLite sets project_id
+// to NULL in that case).
+func (r *EventsRepository) LatestByLogicalProjectAndEventTypeAndPayloadMode(ctx context.Context, eventType, mode string) (map[string]EventLogRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT e.*
+		FROM event_logs e
+		JOIN (
+			SELECT
+				CASE
+					WHEN project_id IS NOT NULL THEN project_id
+					WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.projectId')
+					ELSE NULL
+				END AS logical_project_id,
+				MAX(rowid) AS latest_rowid
+			FROM event_logs
+			WHERE event_type = ?
+			  AND CASE WHEN json_valid(payload_json) THEN CAST(COALESCE(json_extract(payload_json, '$.version'), 0) AS INTEGER) ELSE 0 END >= 2
+			  AND CASE WHEN json_valid(payload_json) THEN lower(trim(COALESCE(json_extract(payload_json, '$.mode'), ''))) ELSE '' END = lower(trim(?))
+			  AND CASE
+					WHEN project_id IS NOT NULL THEN project_id
+					WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.projectId')
+					ELSE NULL
+				END IS NOT NULL
+			GROUP BY logical_project_id
+		) latest ON latest.latest_rowid = e.rowid
+	`, eventType, mode)
+	if err != nil {
+		return nil, fmt.Errorf("list latest logical project event logs by payload mode: %w", err)
+	}
+	defer rows.Close()
+
+	latest := make(map[string]EventLogRecord)
+	for rows.Next() {
+		record, err := scanEventLog(rows)
+		if err != nil {
+			return nil, err
+		}
+		projectID := ""
+		if record.ProjectID != nil {
+			projectID = strings.TrimSpace(*record.ProjectID)
+		} else {
+			var payload struct {
+				ProjectID string `json:"projectId"`
+			}
+			if err := json.Unmarshal([]byte(record.PayloadJSON), &payload); err == nil {
+				projectID = strings.TrimSpace(payload.ProjectID)
+			}
+		}
+		if projectID == "" {
+			continue
+		}
+		latest[projectID] = record
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate latest logical project event logs by payload mode: %w", err)
+	}
+	return latest, nil
+}
+
+// LatestByEntityAndEventType returns the newest event for an entity without
+// relying on a project foreign key. This is also usable for events whose
+// project row was deleted and SQLite set project_id to NULL.
+func (r *EventsRepository) LatestByEntityAndEventType(ctx context.Context, entityType, entityID, eventType string) (*EventLogRecord, error) {
+	row := r.q.QueryRowContext(ctx, `
+		SELECT * FROM event_logs
+		WHERE entity_type = ? AND entity_id = ? AND event_type = ?
+		ORDER BY rowid DESC
+		LIMIT 1
+	`, entityType, entityID, eventType)
+	record, err := scanEventLog(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("latest event log by entity and type: %w", err)
+	}
+	return &record, nil
+}
+
+// ListProjectIDsByEventType lists project IDs that have at least one event of
+// eventType. It includes archived or deleted-from-catalog projects whose
+// historical reports still require migration maintenance.
+func (r *EventsRepository) ListProjectIDsByEventType(ctx context.Context, eventType string) ([]string, error) {
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT DISTINCT project_id
+		FROM event_logs
+		WHERE event_type = ? AND project_id IS NOT NULL
+		ORDER BY project_id
+	`, eventType)
+	if err != nil {
+		return nil, fmt.Errorf("list project ids by event type: %w", err)
+	}
+	defer rows.Close()
+	ids := make([]string, 0)
+	for rows.Next() {
+		var projectID string
+		if err := rows.Scan(&projectID); err != nil {
+			return nil, fmt.Errorf("scan project id by event type: %w", err)
+		}
+		if strings.TrimSpace(projectID) != "" {
+			ids = append(ids, projectID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate project ids by event type: %w", err)
+	}
+	return ids, nil
+}
+
+// ListByProjectOrPayloadProjectAndEntityTypeAppendOrder reads all events for a
+// logical project (project_id column OR projectId in payload JSON) in rowid
+// append order, so callers can reconstruct the lifecycle even after a project
+// row was deleted and project_id was set to NULL.
+func (r *EventsRepository) ListByProjectOrPayloadProjectAndEntityTypeAppendOrder(ctx context.Context, projectID, entityType string) ([]EventLogRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT * FROM event_logs
+		WHERE entity_type = ?
+		  AND (
+			project_id = ?
+			OR (
+				project_id IS NULL
+				AND CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.projectId') ELSE NULL END = ?
+			)
+		  )
+		ORDER BY rowid ASC
+	`, entityType, projectID, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("list event logs by logical project and entity type in append order: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
 // ListByEntityAndEventTypes reads only the requested event types for one entity.
 // Callers that project a single durable event (e.g. the Reviewer review marker)
 // use this to avoid loading the entity's entire event history on every poll.

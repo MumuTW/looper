@@ -269,6 +269,63 @@ func TestRunDefaultSchedulerTickSkipsCoordinatorWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestRunDefaultSchedulerTickRetiresLegacyVerdictsForArchivedProjects(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-archived-gatekeeper.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	baseBranch := "main"
+	metadata := `{"repo":"MumuTW/looper"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "archived", Name: "Archived", RepoPath: filepath.Join(workingDir, "repo"), BaseBranch: &baseBranch,
+		Archived: true, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	gatekeeperRunner := &fakeGatekeeperScheduler{}
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos: repos, Now: func() time.Time { return now }, Gatekeeper: gatekeeperRunner,
+	}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if gatekeeperRunner.retirementCalls != 1 {
+		t.Fatalf("legacy retirement calls = %d, want one for archived project maintenance", gatekeeperRunner.retirementCalls)
+	}
+}
+
+func TestRunDefaultSchedulerTickQuietlyStopsMaintenanceWhenAdmissionCloses(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-admission-maintenance.sqlite"), t.TempDir())
+	t.Cleanup(func() { _ = coordinator.Close() })
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	insertSchedulerProject(t, repos, workingDir, formatJavaScriptISOString(now))
+	gatekeeperRunner := &fakeGatekeeperScheduler{}
+	staleErr := errors.New("stale reconciliation failed")
+	var allowCalls atomic.Int64
+	err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos: repos, Now: func() time.Time { return now }, Gatekeeper: gatekeeperRunner,
+		ReconcileStaleRuns: func(context.Context) (StaleRunReconcileSummary, error) {
+			return StaleRunReconcileSummary{}, staleErr
+		},
+		AllowClaim: func() error {
+			if allowCalls.Add(1) <= 2 {
+				return nil
+			}
+			return ErrAdmissionStopping
+		},
+	})
+	if !errors.Is(err, staleErr) {
+		t.Fatalf("runDefaultSchedulerTick() error = %v, want accumulated stale reconciliation error", err)
+	}
+	if gatekeeperRunner.retirementCalls != 0 {
+		t.Fatalf("legacy retirement calls = %d, want none after admission closes", gatekeeperRunner.retirementCalls)
+	}
+}
+
 func TestRunDefaultSchedulerTickSecondClaimPassDoesNotExceedAvailableSlots(t *testing.T) {
 	t.Parallel()
 

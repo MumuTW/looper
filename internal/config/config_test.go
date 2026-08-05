@@ -1086,6 +1086,32 @@ func TestLegacyReviewerConfigStillValidatesAgainstCanonicalRules(t *testing.T) {
 	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.scope", "must be one of: full_pr, changed_files, changed_ranges")
 }
 
+func TestNormalizeRejectsUnsupportedDeprecatedGatekeeperTrust(t *testing.T) {
+	value := "auto"
+	_, err := Normalize(t.TempDir(), PartialConfig{Roles: &PartialRoleConfigs{
+		Gatekeeper: &DeprecatedGatekeeperRoleConfig{Trust: &value},
+	}})
+	if err == nil {
+		t.Fatal("Normalize() error = nil, want deprecated trust validation error")
+	}
+	validationErr, ok := err.(*ConfigValidationError)
+	if !ok {
+		t.Fatalf("Normalize() error = %T, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "roles.gatekeeper.trust", "must be one of: observe, advise")
+}
+
+func TestNormalizeAcceptsHistoricalDeprecatedGatekeeperTrustValues(t *testing.T) {
+	for _, value := range []string{"", "observe", "advise", " ADVISE "} {
+		value := value
+		if _, err := Normalize(t.TempDir(), PartialConfig{Roles: &PartialRoleConfigs{
+			Gatekeeper: &DeprecatedGatekeeperRoleConfig{Trust: &value},
+		}}); err != nil {
+			t.Fatalf("Normalize(%q) error = %v, want historical value accepted", value, err)
+		}
+	}
+}
+
 func TestMixedSchemaConfigRejectsStructurallyIncompatibleTargets(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
