@@ -91,9 +91,9 @@ Later layers override earlier ones. Objects are merged deeply, arrays are replac
 
 The hot-safe surface is an explicit allowlist (see [ADR-0014](adr/0014-config-file-is-global-runtime-policy-authority.md) for field classification):
 
-- `agent.vendor` (including adding the first vendor after daemon startup), `agent.model`, individual `agent.env` entries, and the canonical idle/max-runtime fields under `agent.timeouts.*`
-- named `agent.profiles.<id>` entries and their `vendor` / `model` leaves (whole-map `agent.profiles` is not a dashboard path; profile ids match `[A-Za-z0-9_-]+`)
-- coding-role agent bindings: `roles.{planner,worker,reviewer,fixer}.agent.{profile,vendor,model}`
+- `agent.vendor` (including adding the first vendor after daemon startup), `agent.model`, `agent.reasoningEffort`, individual `agent.env` entries, and the canonical idle/max-runtime fields under `agent.timeouts.*`
+- named `agent.profiles.<id>` entries and their `vendor` / `model` / `reasoningEffort` leaves (whole-map `agent.profiles` is not a dashboard path; profile ids match `[A-Za-z0-9_-]+`)
+- coding-role agent bindings: `roles.{planner,worker,reviewer,fixer}.agent.{profile,vendor,model,reasoningEffort}`
 - `scheduler.maxConcurrentRuns` and `scheduler.slowLaneWarnThresholdMs`
 - `notifications.inApp` and the current `notifications.osascript.*` fields; notification webhooks and Feishu notification transport are restart-bound
 - the current `disclosure.*` fields
@@ -102,7 +102,7 @@ The hot-safe surface is an explicit allowlist (see [ADR-0014](adr/0014-config-fi
 - the current Planner discovery/trigger/instruction fields; all current Worker and Fixer discovery/trigger/instruction fields; Reviewer discovery, most behavior, and instructions; and Coordinator polling, triage, dispatch, and merge-watch policy except `mergeWatch.transientRetries`
 - `tools.looperPath` and `tools.osascriptPath`
 
-Profile and role agent vendor/model fields are hot-safe curated identity fields: a claim made after publication resolves against the new config; an already active run keeps the frozen agent snapshot it started with (resume/retry lineages copy that predecessor snapshot rather than re-resolving live config).
+Profile and role agent vendor/model/reasoning-effort fields are hot-safe curated identity fields: a claim made after publication resolves against the new config; an already active run keeps the frozen agent snapshot it started with (resume/retry lineages copy that predecessor snapshot rather than re-resolving live config).
 
 `agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and no explicit model is being silently carried across vendors. If `agent.model` is set, change or unset it in the same candidate; an unchanged explicit model blocks that vendor-to-vendor switch. Clearing a configured vendor uses the same guard, so a retained profile cannot be laundered through an intermediate `null`. The same leave/switch guards apply to each coding role's *resolved* vendor after global → profile → role overlay. Configuring the first vendor may use an already prepared model/params profile. Continuations of failed or interrupted runs copy the predecessor's durable `agent_snapshot_json` (sticky identity across the retry lineage) while retaining checkpoint, worktree, HITL answer, and queued human instructions. Only legacy predecessors with a null snapshot adopt the runner's current resolved identity. Looper never sends an old vendor's native session ID to a different CLI.
 
@@ -238,11 +238,11 @@ closed or use the documented fresh-session fallback.
 
 ## Multi-role agent vendor and model
 
-Coding roles can share one global agent or override vendor/model per role. Overrides are identity-only (vendor + model). Shared executor settings such as `agent.params`, `agent.env`, timeouts, and `agent.nativeResume` stay global.
+Coding roles can share one global agent or override vendor/model/reasoning effort per role. These are identity fields captured in the run snapshot. Shared executor settings such as `agent.params`, `agent.env`, timeouts, and `agent.nativeResume` stay global.
 
 ### Named profiles (`agent.profiles`)
 
-Define reusable vendor/model pairs under `agent.profiles.<id>`. Each profile may set `vendor`, `model`, or both (at least one is required). Profile ids are non-empty, trimmed, and match `[A-Za-z0-9_-]+`.
+Define reusable vendor/model/reasoning-effort bindings under `agent.profiles.<id>`. Each profile may set `vendor`, `model`, `reasoningEffort`, or any combination (at least one is required). Profile ids are non-empty, trimmed, and match `[A-Za-z0-9_-]+`.
 
 Profiles do not carry params, env, or timeouts.
 
@@ -257,8 +257,9 @@ This named form remains compatibility input. For new canonical registry configur
 | `profile` | Name of an entry in `agent.profiles` |
 | `vendor` | Inline vendor override |
 | `model` | Inline model override |
+| `reasoningEffort` | Inline reasoning-effort override (`low`, `medium`, `high`, `xhigh`, or `none`) |
 
-A role may use a profile ref, inline vendor/model, or both (inline wins over the selected profile for the same field).
+A role may use a profile ref, inline vendor/model/reasoningEffort, or both (inline wins over the selected profile for the same field).
 
 Project-level `projects[].roles.*.agent` bindings are **not supported**. Agent identity is global-only; project role partials that set agent fields fail validation.
 
@@ -266,9 +267,9 @@ Project-level `projects[].roles.*.agent` bindings are **not supported**. Agent i
 
 For each coding role, Looper overlays identity in this order:
 
-1. **Global** `agent.vendor` / `agent.model`
+1. **Global** `agent.vendor` / `agent.model` / `agent.reasoningEffort`
 2. **Role profile** — from the effective canonical registry (projected from `roles.<role>.agent` and then overlaid by `roles.coding.<role>.agent`)
-3. **Role inline** — the registry's inline vendor/model fields win over the selected profile
+3. **Role inline** — the registry's inline vendor/model/reasoningEffort fields win over the selected profile
 
 A role is runnable only when the overlay leaves a non-empty vendor. Missing global vendor is fine when a profile or role inline supplies one.
 
@@ -282,9 +283,15 @@ A role is runnable only when the overlay leaves a non-empty vendor. Missing glob
 
 After the full overlay, an empty-string model is kept as an explicit empty binding (not the same as unset): the vendor CLI uses its own default, and any global `agent.params` `--model`/`-m` flags are stripped so they cannot override the suppression.
 
+### Reasoning-effort semantics
+
+`reasoningEffort` accepts `low`, `medium`, `high`, `xhigh`, or `none`. Values are trimmed and case-insensitive in config input, then stored in their lowercase canonical form. An omitted value inherits from the previous layer; an explicit `none` suppresses an inherited effort setting. Vendor adapters translate the resolved value only where that vendor exposes a corresponding CLI setting.
+
+The resolved effort is part of the durable `agent_snapshot_json` created for each run. A retry, resume, native resume, or interactive takeover uses that snapshot instead of the current live role configuration, so changing a role's effort cannot silently change an in-flight run or its human handback command.
+
 ### Coordinator triage
 
-Coordinator triage LLM uses the **global** agent only (`agent.vendor` / `agent.model`, plus global params/env/timeouts). It does not read `roles.coordinator.agent` or coding-role profile bindings. If global `agent.vendor` is unset, triage LLM is skipped; coding roles that resolve via profile or role bindings can still run.
+Coordinator triage LLM uses the **global** agent only (`agent.vendor` / `agent.model` / `agent.reasoningEffort`, plus global params/env/timeouts). It does not read `roles.coordinator.agent` or coding-role profile bindings. If global `agent.vendor` is unset, triage LLM is skipped; coding roles that resolve via profile or role bindings can still run.
 
 ### Hot reload and frozen runs
 
@@ -301,15 +308,18 @@ TOML:
 [agent]
 vendor = "codex"
 model = "gpt-5"
+reasoningEffort = "medium"
 
-# Shared identity presets (vendor + model only).
+# Shared identity presets (vendor + model + reasoning effort).
 [agent.profiles.fast]
 vendor = "codex"
 model = "gpt-5-mini"
+reasoningEffort = "low"
 
 [agent.profiles.strong]
 vendor = "claude-code"
 model = "claude-sonnet"
+reasoningEffort = "high"
 
 # Worker keeps the global codex/gpt-5 binding (no roles.worker.agent block).
 
@@ -317,13 +327,15 @@ model = "claude-sonnet"
 profile = "strong"
 # Optional inline pin on top of the profile:
 # model = "claude-opus"
+# reasoningEffort = "xhigh"
 
 [roles.fixer.agent]
 profile = "fast"
 
-# Suppress model so the vendor CLI default is used:
+# Suppress model and reasoning so the vendor defaults are used:
 # [roles.planner.agent]
 # model = ""
+# reasoningEffort = "none"
 ```
 
 Equivalent JSON:
@@ -333,9 +345,10 @@ Equivalent JSON:
   "agent": {
     "vendor": "codex",
     "model": "gpt-5",
+    "reasoningEffort": "medium",
     "profiles": {
-      "fast": { "vendor": "codex", "model": "gpt-5-mini" },
-      "strong": { "vendor": "claude-code", "model": "claude-sonnet" }
+      "fast": { "vendor": "codex", "model": "gpt-5-mini", "reasoningEffort": "low" },
+      "strong": { "vendor": "claude-code", "model": "claude-sonnet", "reasoningEffort": "high" }
     }
   },
   "roles": {
@@ -1203,17 +1216,16 @@ retryMaxAttempts = 5
 retryBaseDelayMs = 5000
 
 [agent]
-vendor = "opencode"
+vendor = "codex"
 model = "your-model-if-needed"
+reasoningEffort = "medium"
 
-# Optional named identity presets (vendor + model only). See
+# Optional named identity presets (vendor + model + reasoning effort). See
 # "Multi-role agent vendor and model" above.
 # [agent.profiles.fast]
-# vendor = "opencode"
+# vendor = "codex"
 # model = "cheaper-model"
-
-[agent.params]
-reasoning = "medium"
+# reasoningEffort = "low"
 
 [agent.env]
 OPENAI_API_KEY = "replace-me"
@@ -1455,7 +1467,7 @@ Canonical replacement:
 [roles.reviewer]
 instructions = "Review for correctness, regressions, and migration safety."
 
-# Optional per-role agent identity (profile and/or inline vendor/model).
+# Optional per-role agent identity (profile and/or inline vendor/model/reasoningEffort).
 # [roles.reviewer.agent]
 # profile = "strong"
 

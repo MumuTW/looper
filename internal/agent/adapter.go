@@ -15,7 +15,7 @@ type runtimeAdapter struct {
 	contract                 RuntimeContract
 	resolveStartArgs         func(ExecutorConfig, []string, string, string) []string
 	resolveNativeResumeArgs  func(ExecutorConfig, []string, string, string, string) []string
-	resolveInteractiveResume func(string, string) string
+	resolveInteractiveResume func(string, ExecutorConfig, string) string
 	// enforceToolNetworkDenied rewrites spawn args for a validation-gated run so
 	// the agent's tool subprocesses cannot reach the network while the parent
 	// agent keeps the connection it needs for model transport. A nil hook means
@@ -35,7 +35,7 @@ var runtimeAdapters = map[config.AgentVendor]runtimeAdapter{
 			return resolveClaudeArgs(cfg, args, prompt)
 		},
 		resolveNativeResumeArgs: resolveClaudeNativeResumeArgs,
-		resolveInteractiveResume: func(command, sessionID string) string {
+		resolveInteractiveResume: func(command string, _ ExecutorConfig, sessionID string) string {
 			return command + " --resume " + shellSingleQuote(sessionID)
 		},
 	},
@@ -51,8 +51,10 @@ var runtimeAdapters = map[config.AgentVendor]runtimeAdapter{
 			return resolveCodexArgs(cfg, args, prompt)
 		},
 		resolveNativeResumeArgs: resolveCodexNativeResumeArgs,
-		resolveInteractiveResume: func(command, sessionID string) string {
-			return command + " resume " + shellSingleQuote(sessionID)
+		resolveInteractiveResume: func(command string, cfg ExecutorConfig, sessionID string) string {
+			args := appendReasoningEffortFlag(nil, cfg.ReasoningEffort)
+			args = append(args, "resume", shellSingleQuote(sessionID))
+			return strings.TrimSpace(command + " " + strings.Join(args, " "))
 		},
 		enforceToolNetworkDenied: func(args []string, prompt string, sandbox *validationcmd.Sandbox) ([]string, error) {
 			return enforceCodexToolNetworkDenied(args, prompt, sandbox), nil
@@ -152,7 +154,8 @@ func resolveCodexNativeResumeArgs(cfg ExecutorConfig, args []string, _ string, s
 	resolved = removeFirstArg(resolved, "resume")
 	withModel := prependModelFlag(append([]string{"exec"}, resolved...), cfg.Model, "--model", []string{"--model", "-m"})
 	withModel = appendCodexSandboxDefaults(withModel)
-	base := append(withModel, "resume")
+	withReasoning := appendReasoningEffortFlag(withModel, cfg.ReasoningEffort)
+	base := append(withReasoning, "resume")
 	base = append(base, sessionID)
 	if containsArg(withModel, "-") {
 		return base

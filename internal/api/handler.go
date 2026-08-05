@@ -146,10 +146,11 @@ type PullRequestTarget struct {
 // vendor of the loop's last run, so the caller can hand a human the exact resume
 // command.
 type TakeoverResult struct {
-	LoopID       string
-	Vendor       string
-	SessionID    string
-	WorktreePath string
+	LoopID          string
+	Vendor          string
+	ReasoningEffort *config.ReasoningEffort
+	SessionID       string
+	WorktreePath    string
 }
 
 type Handler struct {
@@ -1306,14 +1307,15 @@ type configServerResponse struct {
 }
 
 type configAgentResponse struct {
-	Vendor       *config.AgentVendor                  `json:"vendor,omitempty"`
-	Model        *string                              `json:"model,omitempty"`
-	Profiles     map[string]config.AgentBindingConfig `json:"profiles,omitempty"`
-	Params       map[string]any                       `json:"params"`
-	Env          map[string]string                    `json:"env"`
-	EnvKeys      []string                             `json:"envKeys"`
-	Timeouts     config.AgentTimeoutConfig            `json:"timeouts"`
-	NativeResume config.AgentNativeResumeConfig       `json:"nativeResume"`
+	Vendor          *config.AgentVendor                  `json:"vendor,omitempty"`
+	Model           *string                              `json:"model,omitempty"`
+	ReasoningEffort *config.ReasoningEffort              `json:"reasoningEffort,omitempty"`
+	Profiles        map[string]config.AgentBindingConfig `json:"profiles,omitempty"`
+	Params          map[string]any                       `json:"params"`
+	Env             map[string]string                    `json:"env"`
+	EnvKeys         []string                             `json:"envKeys"`
+	Timeouts        config.AgentTimeoutConfig            `json:"timeouts"`
+	NativeResume    config.AgentNativeResumeConfig       `json:"nativeResume"`
 }
 
 type configDaemonResponse struct {
@@ -1351,14 +1353,15 @@ func (h *Handler) buildConfigResponse() configResponse {
 		Scheduler: cfg.Scheduler,
 		Webhook:   cfg.Webhook,
 		Agent: configAgentResponse{
-			Vendor:       cfg.Agent.Vendor,
-			Model:        cfg.Agent.Model,
-			Profiles:     cloneAgentProfiles(cfg.Agent.Profiles),
-			Params:       map[string]any{},
-			Env:          map[string]string{},
-			EnvKeys:      sortedMapKeys(cfg.Agent.Env),
-			Timeouts:     cfg.Agent.Timeouts,
-			NativeResume: cfg.Agent.NativeResume,
+			Vendor:          cfg.Agent.Vendor,
+			Model:           cfg.Agent.Model,
+			ReasoningEffort: cfg.Agent.ReasoningEffort,
+			Profiles:        cloneAgentProfiles(cfg.Agent.Profiles),
+			Params:          map[string]any{},
+			Env:             map[string]string{},
+			EnvKeys:         sortedMapKeys(cfg.Agent.Env),
+			Timeouts:        cfg.Agent.Timeouts,
+			NativeResume:    cfg.Agent.NativeResume,
 		},
 		Logging:       cfg.Logging,
 		Notifications: cfg.Notifications,
@@ -1438,6 +1441,10 @@ func cloneAgentProfiles(profiles map[string]config.AgentBindingConfig) map[strin
 		if binding.Model != nil {
 			model := *binding.Model
 			entry.Model = &model
+		}
+		if binding.ReasoningEffort != nil {
+			effort := *binding.ReasoningEffort
+			entry.ReasoningEffort = &effort
 		}
 		cloned[id] = entry
 	}
@@ -6016,7 +6023,7 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 	// Role runs already filter via ParamsForRoleVendor; takeover must do the same
 	// so a Claude role session is not handed a global Codex wrapper resume line.
 	params := agent.ParamsForRoleVendor(h.context.Config.Agent.Params, h.context.Config.Agent.Vendor, vendor, nil)
-	cmdLine, ok := agent.InteractiveResumeCommandLine(agent.ExecutorConfig{Vendor: vendor, Params: params}, result.WorktreePath, result.SessionID)
+	cmdLine, ok := agent.InteractiveResumeCommandLine(agent.ExecutorConfig{Vendor: vendor, ReasoningEffort: result.ReasoningEffort, Params: params}, result.WorktreePath, result.SessionID)
 	resp.Supported = ok
 	if ok {
 		resp.ResumeCommand = cmdLine

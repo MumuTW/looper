@@ -2316,6 +2316,114 @@ func TestCreateRunContextCopiesPredecessorAgentSnapshotOnFirstStepRetry(t *testi
 	}
 }
 
+func TestRetryRunExecuteUsesPersistedReasoningEffortSnapshot(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+
+	worktreeRoot := t.TempDir()
+	worktreePath := filepath.Join(worktreeRoot, "retry-worktree")
+	if err := os.MkdirAll(filepath.Join(worktreePath, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(worktree) error = %v", err)
+	}
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	project.RepoPath = t.TempDir()
+	project.MetadataJSON = runpipe.StringPtr(fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot))
+
+	stickyModel := "sticky-model"
+	stickyEffort := config.ReasoningEffortVeryHigh
+	encodedSnapshot, err := config.MarshalAgentSnapshot(config.AgentSnapshot{
+		Vendor:          string(config.AgentVendorCodex),
+		Model:           &stickyModel,
+		ProfileID:       "sticky-profile",
+		ReasoningEffort: &stickyEffort,
+	})
+	if err != nil {
+		t.Fatalf("MarshalAgentSnapshot() error = %v", err)
+	}
+	checkpointJSON := runpipe.MustMarshalJSON(workerCheckpoint{
+		Work: &workerInput{
+			Title:         "Retry worker",
+			Repo:          "acme/looper",
+			IssueNumber:   27,
+			BaseBranch:    "main",
+			ExecutionMode: "create-pr",
+		},
+		ClaimedLockKey: "issue:acme/looper:27",
+		Worktree:       &checkpointWorktree{Path: worktreePath, Branch: "looper/retry", BaseBranch: "main"},
+		Plan:           &checkpointPlan{Summary: "retry", Items: []string{"retry"}},
+	})
+	currentStep := string(stepExecute)
+	lastCompletedStep := string(stepPlan)
+	predecessor := storage.RunRecord{
+		ID:                "run_failed_reasoning_snapshot",
+		LoopID:            loop.ID,
+		Status:            "failed",
+		CurrentStep:       &currentStep,
+		LastCompletedStep: &lastCompletedStep,
+		CheckpointJSON:    &checkpointJSON,
+		AgentSnapshotJSON: &encodedSnapshot,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}
+	if err := fixture.repos.Runs.Upsert(ctx, predecessor); err != nil {
+		t.Fatalf("Runs.Upsert(predecessor) error = %v", err)
+	}
+
+	liveModel := "live-model"
+	liveEffort := config.ReasoningEffortLow
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "failed", Summary: "retry requested"}}}
+	runner := New(Options{
+		DB:                   fixture.coordinator.DB(),
+		Repos:                fixture.repos,
+		Git:                  &fakeGitGateway{},
+		AgentExecutor:        agent,
+		Logger:               fixture.logger,
+		Now:                  fixture.now,
+		AllowAutoCommit:      true,
+		AgentRuntime:         string(config.AgentVendorClaudeCode),
+		AgentModel:           &liveModel,
+		AgentReasoningEffort: &liveEffort,
+	})
+	resumed, err := runner.createRunContext(ctx, *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if !resumed.Resumed || resumed.StartStep != stepExecute {
+		t.Fatalf("resumed context = %#v, want execute retry", resumed)
+	}
+
+	_, err = runner.runExecuteStep(ctx, stepInput{Project: *project, Loop: *loop, Run: resumed.Run, Checkpoint: resumed.Checkpoint})
+	if err == nil {
+		t.Fatal("runExecuteStep() error = nil, want failed agent result")
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("agent starts = %d, want one retry spawn", len(agent.starts))
+	}
+	started := agent.starts[0]
+	if !started.UseSnapshot {
+		t.Fatal("retry spawn UseSnapshot = false, want persisted snapshot authority")
+	}
+	if started.SnapshotVendor != string(config.AgentVendorCodex) {
+		t.Fatalf("SnapshotVendor = %q, want codex", started.SnapshotVendor)
+	}
+	if started.SnapshotModel == nil || *started.SnapshotModel != stickyModel {
+		t.Fatalf("SnapshotModel = %v, want %q", started.SnapshotModel, stickyModel)
+	}
+	if started.SnapshotReasoningEffort == nil || *started.SnapshotReasoningEffort != stickyEffort {
+		t.Fatalf("SnapshotReasoningEffort = %v, want %q", started.SnapshotReasoningEffort, stickyEffort)
+	}
+}
+
 func TestCreateRunContextRefreshesUnsupportedSnapshotWhenValidationGateEnabled(t *testing.T) {
 	t.Parallel()
 
@@ -2387,7 +2495,7 @@ func TestCreateRunContextRefreshesUnsupportedSnapshotWhenValidationGateEnabled(t
 	}
 	// The refreshed snapshot must be execution authority at spawn: identityFromRun
 	// resolves the codex vendor from it, not the live fallback.
-	vendor, _, _, useSnapshot, err := runner.identityFromRun(resumed.Run)
+	vendor, _, _, _, useSnapshot, err := runner.identityFromRun(resumed.Run)
 	if err != nil {
 		t.Fatalf("identityFromRun() error = %v", err)
 	}
@@ -3688,6 +3796,9 @@ func TestProcessClaimedItemDeterministicValidationFailurePauses(t *testing.T) {
 	}
 	if !slices.Equal(validatedCommands, []string{"project-check"}) {
 		t.Fatalf("validated commands = %#v, want project-specific command", validatedCommands)
+	}
+	if len(agent.starts) != 1 || !agent.starts[0].RestrictToolNetwork {
+		t.Fatalf("agent starts = %#v, want project-specific validation to enable tool-network restriction", agent.starts)
 	}
 	if len(git.pushCalls) != 0 || len(github.createPRCalls) != 0 {
 		t.Fatalf("push/create PR calls = %d/%d, want failed project validation to block publication", len(git.pushCalls), len(github.createPRCalls))

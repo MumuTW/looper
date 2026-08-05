@@ -60,6 +60,47 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 	}
 }
 
+func TestLoadFileNormalizesReasoningEffortAcrossGlobalProfileAndRole(t *testing.T) {
+	loaded := loadConfigFixture(t, "config.toml", `
+[agent]
+vendor = "codex"
+reasoningEffort = " High "
+
+[agent.profiles.performance]
+reasoningEffort = " XHIGH "
+
+[roles.coding.reviewer.agent]
+profile = "performance"
+
+[roles.coding.fixer.agent]
+reasoningEffort = " LoW "
+`, nil, nil)
+
+	assertResolvedEffort := func(role string, want ReasoningEffort) {
+		t.Helper()
+		resolved, ok := ResolveAgent(loaded.Config, "", role)
+		if !ok || resolved.ReasoningEffort == nil || *resolved.ReasoningEffort != want {
+			got := ReasoningEffort("")
+			if resolved.ReasoningEffort != nil {
+				got = *resolved.ReasoningEffort
+			}
+			t.Fatalf("ResolveAgent(%q) effort = %q, ok=%v; want %q", role, got, ok, want)
+		}
+	}
+	assertResolvedEffort(CodingRolePlanner, ReasoningEffortHigh)
+	assertResolvedEffort(CodingRoleReviewer, ReasoningEffortVeryHigh)
+	assertResolvedEffort(CodingRoleFixer, ReasoningEffortLow)
+	if loaded.Config.Agent.ReasoningEffort == nil || *loaded.Config.Agent.ReasoningEffort != ReasoningEffortHigh {
+		t.Fatalf("global normalized effort = %v, want %q", loaded.Config.Agent.ReasoningEffort, ReasoningEffortHigh)
+	}
+	if got := loaded.Config.Agent.Profiles["performance"].ReasoningEffort; got == nil || *got != ReasoningEffortVeryHigh {
+		t.Fatalf("profile normalized effort = %v, want %q", got, ReasoningEffortVeryHigh)
+	}
+	if got := loaded.Config.Roles.Coding["fixer"].Agent.ReasoningEffort; got == nil || *got != ReasoningEffortLow {
+		t.Fatalf("role normalized effort = %v, want %q", got, ReasoningEffortLow)
+	}
+}
+
 func TestLoadFileAcceptsIgnoredDeprecatedPackageAutoUpgradeEnabledAcrossFormats(t *testing.T) {
 	tests := []struct {
 		name string

@@ -23,14 +23,28 @@ const SCHEDULER_PATHS = new Set([
 const agentPath = (path: string) =>
   path === "agent.vendor" ||
   path === "agent.model" ||
+  path === "agent.reasoningEffort" ||
   path.startsWith("agent.timeouts.");
 
-/** Coding roles that accept optional agent profile/vendor/model bindings. */
+/** Coding roles that accept optional agent identity bindings. */
 export const CODING_ROLES = ["planner", "worker", "reviewer", "fixer"] as const;
 export type CodingRole = (typeof CODING_ROLES)[number];
 
-export const ROLE_AGENT_FIELDS = ["profile", "vendor", "model"] as const;
+export const ROLE_AGENT_FIELDS = [
+  "profile",
+  "vendor",
+  "model",
+  "reasoningEffort",
+] as const;
 export type RoleAgentField = (typeof ROLE_AGENT_FIELDS)[number];
+
+export const AGENT_REASONING_EFFORT_OPTIONS = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "none",
+] as const;
 
 export const AGENT_VENDOR_OPTIONS = [
   "claude-code",
@@ -47,9 +61,10 @@ export function agentVendorOptionLabel(vendor: string): string {
     : vendor;
 }
 
-const agentProfileLeafPath = /^agent\.profiles\.[A-Za-z0-9_-]+\.(vendor|model)$/;
+const agentProfileLeafPath =
+  /^agent\.profiles\.[A-Za-z0-9_-]+\.(vendor|model|reasoningEffort)$/;
 const roleAgentLeafPath =
-  /^roles\.(planner|worker|reviewer|fixer)\.agent\.(profile|vendor|model)$/;
+  /^roles\.(planner|worker|reviewer|fixer)\.agent\.(profile|vendor|model|reasoningEffort)$/;
 
 const agentProfileWholePath = /^agent\.profiles\.[A-Za-z0-9_-]+$/;
 
@@ -80,7 +95,7 @@ export function roleAgentPath(role: CodingRole, field: RoleAgentField): string {
 
 export function agentProfilePath(
   id: string,
-  field: "vendor" | "model",
+  field: "vendor" | "model" | "reasoningEffort",
 ): string {
   return `agent.profiles.${id}.${field}`;
 }
@@ -98,6 +113,7 @@ export function isValidAgentProfileId(id: string): boolean {
 export const ESSENTIAL_PATHS = [
   "agent.vendor",
   "agent.model",
+  "agent.reasoningEffort",
   "scheduler.maxConcurrentRuns",
   "defaults.baseBranch",
   "defaults.openPrStrategy",
@@ -166,7 +182,7 @@ export const CONFIG_GROUPS: ConfigGroup[] = [
     id: "roles",
     title: "Roles",
     description:
-      "Global planner, worker, reviewer, fixer, and coordinator policy, including optional agent profile/vendor/model bindings.",
+      "Global planner, worker, reviewer, fixer, and coordinator policy, including optional agent identity bindings.",
     accepts: (path) => path.startsWith("roles."),
   },
 ];
@@ -222,6 +238,7 @@ const BOOLEAN_NAMES = new Set([
 
 const SELECT_OPTIONS: Record<string, string[]> = {
   "agent.vendor": [...AGENT_VENDOR_OPTIONS],
+  "agent.reasoningEffort": [...AGENT_REASONING_EFFORT_OPTIONS],
   "defaults.openPrStrategy": ["all_done", "first_commit", "manual"],
   "defaults.addSnapshotMode": ["async", "full", "off"],
   "roles.coordinator.dispatch.mode": ["human-gated", "autonomous"],
@@ -378,6 +395,13 @@ export function configSelectOptions(path: string): string[] | undefined {
   ) {
     return [...AGENT_VENDOR_OPTIONS];
   }
+  if (
+    path === "agent.reasoningEffort" ||
+    (isAgentProfileLeafPath(path) && path.endsWith(".reasoningEffort")) ||
+    (isRoleAgentLeafPath(path) && path.endsWith(".reasoningEffort"))
+  ) {
+    return [...AGENT_REASONING_EFFORT_OPTIONS];
+  }
   return undefined;
 }
 
@@ -425,7 +449,7 @@ function valuesEqual(a: unknown, b: unknown): boolean {
  * only nullish means absent.
  */
 function profileIdentityValuePresent(
-  field: "vendor" | "model",
+  field: "vendor" | "model" | "reasoningEffort",
   value: unknown,
 ): boolean {
   if (value == null) return false;
@@ -442,7 +466,7 @@ function profileLeafPresentAfterPatch(
   set: Record<string, ConfigValue>,
   unset: Set<string>,
   profileId: string,
-  field: "vendor" | "model",
+  field: "vendor" | "model" | "reasoningEffort",
 ): boolean {
   const wholePath = `agent.profiles.${profileId}`;
   if (unset.has(wholePath)) return false;
@@ -468,22 +492,25 @@ function collapseEmptyProfileLeafOps(
   for (const path of unset) {
     const whole = /^agent\.profiles\.([A-Za-z0-9_-]+)$/.exec(path);
     if (whole) profileIds.add(whole[1]);
-    const leaf = /^agent\.profiles\.([A-Za-z0-9_-]+)\.(vendor|model)$/.exec(path);
+    const leaf = /^agent\.profiles\.([A-Za-z0-9_-]+)\.(vendor|model|reasoningEffort)$/.exec(path);
     if (leaf) profileIds.add(leaf[1]);
   }
   for (const path of Object.keys(set)) {
-    const leaf = /^agent\.profiles\.([A-Za-z0-9_-]+)\.(vendor|model)$/.exec(path);
+    const leaf = /^agent\.profiles\.([A-Za-z0-9_-]+)\.(vendor|model|reasoningEffort)$/.exec(path);
     if (leaf) profileIds.add(leaf[1]);
   }
   for (const id of profileIds) {
     const wholePath = `agent.profiles.${id}`;
     const vendorPath = agentProfilePath(id, "vendor");
     const modelPath = agentProfilePath(id, "model");
+    const effortPath = agentProfilePath(id, "reasoningEffort");
     if (unset.has(wholePath)) {
       unset.delete(vendorPath);
       unset.delete(modelPath);
+      unset.delete(effortPath);
       delete set[vendorPath];
       delete set[modelPath];
+      delete set[effortPath];
       continue;
     }
     const hasVendor = profileLeafPresentAfterPatch(
@@ -500,14 +527,23 @@ function collapseEmptyProfileLeafOps(
       id,
       "model",
     );
-    if (hasVendor || hasModel) continue;
+    const hasEffort = profileLeafPresentAfterPatch(
+      data,
+      set,
+      unset,
+      id,
+      "reasoningEffort",
+    );
+    if (hasVendor || hasModel || hasEffort) continue;
 
     const published = data.agent?.profiles?.[id];
     const profileExists = published != null && typeof published === "object";
     unset.delete(vendorPath);
     unset.delete(modelPath);
+    unset.delete(effortPath);
     delete set[vendorPath];
     delete set[modelPath];
+    delete set[effortPath];
     if (profileExists) {
       unset.add(wholePath);
     }
@@ -532,7 +568,8 @@ export function buildConfigPatch(
       errors[path] = parsed.error;
       continue;
     }
-    // Role/profile .profile: empty draft means inherit (omit leaf), not set "".
+    // Role/profile .profile and .reasoningEffort: empty drafts mean inherit
+    // (omit leaf), not an invalid empty binding.
     // Backend validateRoleAgentBindings rejects empty profile when sibling
     // vendor/model keeps the role agent object alive.
     //
@@ -542,7 +579,7 @@ export function buildConfigPatch(
     if (
       parsed.value === "" &&
       (isAgentProfileLeafPath(path) || isRoleAgentLeafPath(path)) &&
-      path.endsWith(".profile")
+      (path.endsWith(".profile") || path.endsWith(".reasoningEffort"))
     ) {
       const current = getConfigValue(data, path);
       if (current != null && current !== "") {
@@ -577,6 +614,13 @@ export function buildConfigPatch(
       }
       // Profile / role model: create or replace with suppress even if absent.
       set[path] = "";
+      continue;
+    }
+    if (parsed.value === "" && path === "agent.reasoningEffort") {
+      const current = getConfigValue(data, path);
+      if (current != null && current !== "") {
+        unset.add(path);
+      }
       continue;
     }
     if (!valuesEqual(parsed.value, getConfigValue(data, path))) {
@@ -873,7 +917,7 @@ export function draftStagesConfigChange(
   if (candidate.body.unset.includes(path)) return true;
   // Dual empty profile leaves collapse to agent.profiles.<id> unset.
   if (isAgentProfileLeafPath(path)) {
-    const wholePath = path.replace(/\.(vendor|model)$/, "");
+    const wholePath = path.replace(/\.(vendor|model|reasoningEffort)$/, "");
     if (candidate.body.unset.includes(wholePath)) return true;
   }
   return false;
@@ -893,35 +937,38 @@ export function profileLeafUnsetWouldEmpty(
   drafts: Record<string, ConfigDraft>,
   unsetPaths: Iterable<string>,
   profileId: string,
-  field: "vendor" | "model",
+  field: "vendor" | "model" | "reasoningEffort",
 ): boolean {
   const wholePath = `agent.profiles.${profileId}`;
   const unset = new Set(unsetPaths);
   if (unset.has(wholePath)) return false;
 
-  const otherField: "vendor" | "model" =
-    field === "vendor" ? "model" : "vendor";
-  const otherPath = agentProfilePath(profileId, otherField);
-  if (unset.has(otherPath)) return true;
-
-  if (Object.hasOwn(drafts, otherPath)) {
-    const draft = drafts[otherPath];
-    const trimmed = String(draft ?? "").trim();
-    if (otherField === "model") {
-      // Non-empty draft keeps a model. Empty draft stages inherit-unset only
-      // when the published model is non-empty; published "" suppress remains.
-      if (trimmed !== "") return false;
-      return !profileIdentityValuePresent(
-        "model",
-        getConfigValue(data, otherPath),
-      );
+  const fields: Array<"vendor" | "model" | "reasoningEffort"> = [
+    "vendor",
+    "model",
+    "reasoningEffort",
+  ];
+  for (const otherField of fields) {
+    if (otherField === field) continue;
+    const otherPath = agentProfilePath(profileId, otherField);
+    if (unset.has(otherPath)) continue;
+    if (Object.hasOwn(drafts, otherPath)) {
+      const draft = String(drafts[otherPath] ?? "").trim();
+      if (otherField === "model") {
+        if (draft !== "") return false;
+        if (profileIdentityValuePresent("model", getConfigValue(data, otherPath))) {
+          return false;
+        }
+      } else if (draft !== "") {
+        return false;
+      }
+      continue;
     }
-    return trimmed === "";
+    if (profileIdentityValuePresent(otherField, getConfigValue(data, otherPath))) {
+      return false;
+    }
   }
-  return !profileIdentityValuePresent(
-    otherField,
-    getConfigValue(data, otherPath),
-  );
+  return true;
 }
 
 export type HighImpactChange = { path: string; label: string };

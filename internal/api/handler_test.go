@@ -1190,6 +1190,24 @@ func TestBuildConfigResponseExposesCanonicalCodingRoles(t *testing.T) {
 	}
 }
 
+func TestBuildConfigResponseExposesReasoningEffort(t *testing.T) {
+	_, cfg := startTestRuntime(t)
+	effort := config.ReasoningEffortVeryHigh
+	cfg.Agent.ReasoningEffort = &effort
+	cfg.Agent.Profiles = map[string]config.AgentBindingConfig{
+		"deep": {ReasoningEffort: &effort},
+	}
+
+	response := NewHandler(Context{Config: cfg}).buildConfigResponse()
+	if response.Agent.ReasoningEffort == nil || *response.Agent.ReasoningEffort != effort {
+		t.Fatalf("agent.reasoningEffort = %v, want xhigh", response.Agent.ReasoningEffort)
+	}
+	profile := response.Agent.Profiles["deep"]
+	if profile.ReasoningEffort == nil || *profile.ReasoningEffort != effort {
+		t.Fatalf("agent.profiles.deep.reasoningEffort = %v, want xhigh", profile.ReasoningEffort)
+	}
+}
+
 func TestStatusDegradedReasonsIncludesKnownDisabledPublishWithoutLooperPath(t *testing.T) {
 	reasons := statusDegradedReasons(looperdruntime.ReviewPublishReadiness{
 		Known:              true,
@@ -3182,18 +3200,20 @@ func TestTakeoverLoopFiltersCrossVendorResumeParams(t *testing.T) {
 
 	// Same-vendor takeover keeps the global wrapper binary.
 	h.context.TakeoverLoop = func(_ context.Context, loopID, _ string) (TakeoverResult, error) {
+		effort := config.ReasoningEffortHigh
 		return TakeoverResult{
-			LoopID:       loopID,
-			Vendor:       string(config.AgentVendorCodex),
-			SessionID:    "session_codex",
-			WorktreePath: "/tmp/wt-codex",
+			LoopID:          loopID,
+			Vendor:          string(config.AgentVendorCodex),
+			ReasoningEffort: &effort,
+			SessionID:       "session_codex",
+			WorktreePath:    "/tmp/wt-codex",
 		}, nil
 	}
 	resp, err = h.takeoverLoop(context.Background(), "loop_same")
 	if err != nil {
 		t.Fatalf("same-vendor takeoverLoop error = %v", err)
 	}
-	wantSame := "cd /tmp/wt-codex && /opt/codex-wrapper resume session_codex"
+	wantSame := "cd /tmp/wt-codex && /opt/codex-wrapper -c model_reasoning_effort=high resume session_codex"
 	if !resp.Supported || resp.ResumeCommand != wantSame {
 		t.Fatalf("same-vendor resume = %q (supported=%v), want %q", resp.ResumeCommand, resp.Supported, wantSame)
 	}

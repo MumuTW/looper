@@ -424,12 +424,13 @@ export type ConfigMetadata = {
 export type ConfigAgentProfileView = {
   vendor?: string | null;
   model?: string | null;
+  reasoningEffort?: string | null;
 };
 
 export type ConfigAgentView = {
   vendor?: string | null;
   model?: string | null;
-  /** Named vendor/model profiles (no params). */
+  /** Named vendor/model/reasoning-effort profiles (no params). */
   profiles?: Record<string, ConfigAgentProfileView>;
   nativeResume?: { enabled?: boolean };
   timeouts?: Record<string, number>;

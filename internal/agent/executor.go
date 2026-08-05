@@ -97,6 +97,7 @@ var inheritedAgentEnvKeys = []string{
 type ExecutorConfig struct {
 	Vendor              config.AgentVendor
 	Model               *string
+	ReasoningEffort     *config.ReasoningEffort
 	Params              map[string]any
 	Env                 map[string]string
 	NativeResumeEnabled bool
@@ -183,7 +184,7 @@ type RunInput struct {
 	Assessment      bool
 	NativeSessionID string
 	// UseSnapshot, when true with a non-empty SnapshotVendor, overrides the
-	// executor's configured vendor/model for this start only (spawn, native
+	// executor's configured vendor/model/reasoning effort for this start only (spawn, native
 	// resume vendor checks, and persisted execution vendor). Env and
 	// NativeResumeEnabled still come from the executor config. Identity-bearing
 	// params are filtered against the frozen vendor: wrappers are kept when the
@@ -194,6 +195,9 @@ type RunInput struct {
 	// SnapshotModel is used only when UseSnapshot is true. nil means no model
 	// flag; a non-nil value (including empty) sets the model override.
 	SnapshotModel *string
+	// SnapshotReasoningEffort is used only when UseSnapshot is true. nil means
+	// no reasoning-effort override.
+	SnapshotReasoningEffort *config.ReasoningEffort
 }
 
 // TimeoutObservation identifies the timeout that is about to terminate an
@@ -293,6 +297,7 @@ func (e *ConfiguredExecutor) effectiveConfig(input RunInput) ExecutorConfig {
 		if vendor := strings.TrimSpace(input.SnapshotVendor); vendor != "" {
 			cfg.Vendor = config.AgentVendor(vendor)
 			cfg.Model = input.SnapshotModel
+			cfg.ReasoningEffort = input.SnapshotReasoningEffort
 		}
 	}
 
@@ -2282,12 +2287,11 @@ func InteractiveResumeCommandLine(cfg ExecutorConfig, workingDirectory, sessionI
 	if sessionID == "" || !InteractiveTakeoverSupported(cfg.Vendor) {
 		return "", false
 	}
-	command := resolveCommand(cfg)
 	adapter, ok := runtimeAdapterFor(cfg.Vendor)
 	if !ok || adapter.resolveInteractiveResume == nil {
 		return "", false
 	}
-	resume := adapter.resolveInteractiveResume(command, sessionID)
+	resume := adapter.resolveInteractiveResume(resolveCommand(cfg), cfg, sessionID)
 	if workingDirectory != "" {
 		return "cd " + shellSingleQuote(workingDirectory) + " && " + resume, true
 	}
@@ -2356,10 +2360,71 @@ func resolveCodexArgs(cfg ExecutorConfig, args []string, prompt string) []string
 	// to the worktree and the temporary directories.
 	resolved = appendCodexSandboxDefaults(resolved)
 	withModel := prependModelFlag(resolved, cfg.Model, "--model", []string{"--model", "-m"})
-	if hasAnyFlag(withModel, []string{"-"}) {
-		return withModel
+	withReasoning := appendReasoningEffortFlag(withModel, cfg.ReasoningEffort)
+	if hasAnyFlag(withReasoning, []string{"-"}) {
+		return withReasoning
 	}
-	return append(withModel, prompt)
+	return append(withReasoning, prompt)
+}
+
+// appendReasoningEffortFlag appends `-c model_reasoning_effort=<value>` when the
+// operator configured a Codex-supported effort level. "none" is a Looper
+// overlay sentinel that suppresses an inherited setting; it is not a value
+// accepted by the Codex CLI, so it must never be forwarded as a literal.
+func appendReasoningEffortFlag(args []string, effort *config.ReasoningEffort) []string {
+	if effort == nil {
+		return args
+	}
+	if *effort == config.ReasoningEffortNone {
+		return stripReasoningEffortFlags(args)
+	}
+	flag := []string{"-c", fmt.Sprintf("model_reasoning_effort=%s", string(*effort))}
+	for i, arg := range args {
+		if arg == "-" {
+			withFlag := make([]string, 0, len(args)+len(flag))
+			withFlag = append(withFlag, args[:i]...)
+			withFlag = append(withFlag, flag...)
+			return append(withFlag, args[i:]...)
+		}
+	}
+	return append(args, flag...)
+}
+
+// stripReasoningEffortFlags removes inherited Codex config assignments when
+// the Looper overlay explicitly suppresses reasoning effort. It accepts the
+// separate and equals forms supported by Codex without treating unrelated -c
+// settings as identity-bearing.
+func stripReasoningEffortFlags(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "-c" || arg == "--config" {
+			if i+1 < len(args) && isReasoningEffortConfig(args[i+1]) {
+				i++
+				continue
+			}
+			out = append(out, arg)
+			continue
+		}
+		if strings.HasPrefix(arg, "-c=") && isReasoningEffortConfig(strings.TrimPrefix(arg, "-c=")) {
+			continue
+		}
+		if strings.HasPrefix(arg, "--config=") && isReasoningEffortConfig(strings.TrimPrefix(arg, "--config=")) {
+			continue
+		}
+		if strings.HasPrefix(arg, "-c") && isReasoningEffortConfig(strings.TrimPrefix(arg, "-c")) {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
+func isReasoningEffortConfig(arg string) bool {
+	return strings.HasPrefix(strings.TrimSpace(arg), "model_reasoning_effort=")
 }
 
 // enforceCodexToolNetworkDenied overrides all operator-supplied Codex sandbox

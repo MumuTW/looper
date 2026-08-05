@@ -529,10 +529,11 @@ func TestOperationViewFromConfigDetachesCodingRolePolicy(t *testing.T) {
 	t.Parallel()
 
 	profile := "fast"
+	effort := config.ReasoningEffortHigh
 	input := config.Config{Roles: config.RoleConfigs{Coding: map[string]config.CodingRoleConfig{
 		"auditor": {
 			Discovery: config.RoleDiscoveryConfig{Labels: []string{"audit"}},
-			Agent:     &config.RoleAgentConfig{Profile: &profile},
+			Agent:     &config.RoleAgentConfig{Profile: &profile, ReasoningEffort: &effort},
 		},
 	}}}
 	view := OperationViewFromConfig(input)
@@ -542,6 +543,7 @@ func TestOperationViewFromConfigDetachesCodingRolePolicy(t *testing.T) {
 	first := view.RolePolicy("")
 	first.Roles.Coding["auditor"].Discovery.Labels[0] = "mutated-view"
 	*first.Roles.Coding["auditor"].Agent.Profile = "mutated-view"
+	*first.Roles.Coding["auditor"].Agent.ReasoningEffort = config.ReasoningEffortNone
 
 	got := view.RolePolicy("").Roles.Coding["auditor"]
 	if len(got.Discovery.Labels) != 1 || got.Discovery.Labels[0] != "audit" {
@@ -549,6 +551,9 @@ func TestOperationViewFromConfigDetachesCodingRolePolicy(t *testing.T) {
 	}
 	if got.Agent == nil || got.Agent.Profile == nil || *got.Agent.Profile != "fast" {
 		t.Fatalf("coding role agent = %#v, want detached fast profile", got.Agent)
+	}
+	if got.Agent.ReasoningEffort == nil || *got.Agent.ReasoningEffort != config.ReasoningEffortHigh {
+		t.Fatalf("coding role reasoning effort = %#v, want detached high effort", got.Agent.ReasoningEffort)
 	}
 
 	policy := RolePolicyView{Roles: config.RoleConfigs{

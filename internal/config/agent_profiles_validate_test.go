@@ -45,7 +45,7 @@ func TestValidate_AgentProfilesAndRoleBindings(t *testing.T) {
 		if !asConfigValidationError(err, &validationErr) {
 			t.Fatalf("Validate() error = %v, want ConfigValidationError", err)
 		}
-		assertValidationIssue(t, validationErr, "agent.profiles.empty", "must set at least one of vendor or model")
+		assertValidationIssue(t, validationErr, "agent.profiles.empty", "must set at least one of vendor, model, or reasoningEffort")
 	})
 
 	t.Run("project-level agent binding", func(t *testing.T) {
@@ -105,6 +105,37 @@ func TestValidate_InvalidVendorInProfileAndRoleBinding(t *testing.T) {
 	wantMsg := agentVendorValidationMessage()
 	assertValidationIssue(t, validationErr, "agent.profiles.bad.vendor", wantMsg)
 	assertValidationIssue(t, validationErr, "roles.coding.worker.agent.vendor", wantMsg)
+}
+
+func TestValidate_RejectsInvalidReasoningEffortAtEveryScope(t *testing.T) {
+	t.Parallel()
+
+	invalid := ReasoningEffort("max")
+	cfg := mustDefaultConfig(t)
+	cfg.Agent.ReasoningEffort = &invalid
+	cfg.Agent.Profiles = map[string]AgentBindingConfig{
+		"bad": {ReasoningEffort: &invalid},
+	}
+	cfg.Roles.Worker.Agent = &RoleAgentConfig{ReasoningEffort: &invalid}
+	cfg.Projects = []ProjectRefConfig{{
+		ID:       "demo",
+		Name:     "Demo",
+		RepoPath: t.TempDir(),
+		Roles: &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{
+			Agent: &RoleAgentConfig{ReasoningEffort: &invalid},
+		}},
+	}}
+
+	err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	var validationErr *ConfigValidationError
+	if !asConfigValidationError(err, &validationErr) {
+		t.Fatalf("ValidateWithOptions() error = %v, want ConfigValidationError", err)
+	}
+	want := "must be one of: low, medium, high, xhigh, none"
+	assertValidationIssue(t, validationErr, "agent.reasoningEffort", want)
+	assertValidationIssue(t, validationErr, "agent.profiles.bad.reasoningEffort", want)
+	assertValidationIssue(t, validationErr, "roles.coding.worker.agent.reasoningEffort", want)
+	assertValidationIssue(t, validationErr, "projects[0].roles.worker.agent", "project-level agent bindings are not supported")
 }
 
 func asConfigValidationError(err error, target **ConfigValidationError) bool {

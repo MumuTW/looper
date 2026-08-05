@@ -551,6 +551,7 @@ func validateAgentConfig(config Config, issues *[]ValidationIssue) {
 	if config.Agent.Vendor != nil && !isValidAgentVendor(*config.Agent.Vendor) {
 		*issues = append(*issues, ValidationIssue{Path: "agent.vendor", Message: agentVendorValidationMessage()})
 	}
+	validateReasoningEffort("agent.reasoningEffort", config.Agent.ReasoningEffort, issues)
 	validateAgentProfiles(config.Agent.Profiles, issues)
 	validateEnvironmentNames(config.Agent.Env, "agent.env", issues)
 	validateAgentTimeouts(config.Agent.Timeouts, "agent.timeouts", issues)
@@ -1469,12 +1470,22 @@ func validateAgentProfiles(profiles map[string]AgentBindingConfig, issues *[]Val
 			continue
 		}
 		binding := profiles[id]
-		if binding.Vendor == nil && binding.Model == nil {
-			*issues = append(*issues, ValidationIssue{Path: path, Message: "must set at least one of vendor or model"})
+		if binding.Vendor == nil && binding.Model == nil && binding.ReasoningEffort == nil {
+			*issues = append(*issues, ValidationIssue{Path: path, Message: "must set at least one of vendor, model, or reasoningEffort"})
 		}
 		if binding.Vendor != nil && !isValidAgentVendor(*binding.Vendor) {
 			*issues = append(*issues, ValidationIssue{Path: path + ".vendor", Message: agentVendorValidationMessage()})
 		}
+		validateReasoningEffort(path+".reasoningEffort", binding.ReasoningEffort, issues)
+	}
+}
+
+func validateReasoningEffort(path string, effort *ReasoningEffort, issues *[]ValidationIssue) {
+	if effort == nil {
+		return
+	}
+	if _, ok := ParseReasoningEffort(string(*effort)); !ok {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must be one of: low, medium, high, xhigh, none"})
 	}
 }
 
@@ -1534,6 +1545,7 @@ func validateRoleAgentBinding(config Config, prefix string, agent *RoleAgentConf
 	if agent.Vendor != nil && !isValidAgentVendor(*agent.Vendor) {
 		*issues = append(*issues, ValidationIssue{Path: prefix + ".vendor", Message: agentVendorValidationMessage()})
 	}
+	validateReasoningEffort(prefix+".reasoningEffort", agent.ReasoningEffort, issues)
 }
 
 func validateProjectRoleAgentBindings(roles *PartialRoleConfigs, prefix string, issues *[]ValidationIssue) {
@@ -1572,7 +1584,7 @@ func roleAgentBindingSet(agent *RoleAgentConfig) bool {
 	if agent == nil {
 		return false
 	}
-	return agent.Profile != nil || agent.Vendor != nil || agent.Model != nil
+	return agent.Profile != nil || agent.Vendor != nil || agent.Model != nil || agent.ReasoningEffort != nil
 }
 
 func isValidAuthMode(mode AuthMode) bool {
