@@ -17,8 +17,7 @@ import (
 func CandidatesFromMergeOutcomes(events []storage.EventLogRecord) ([]MergeCandidate, error) {
 	candidates := make([]MergeCandidate, 0, len(events))
 	for _, event := range events {
-		var projectID, repo, headSHA string
-		var prNumber int64
+		var candidate MergeCandidate
 		var mergedAtText string
 		switch event.EventType {
 		case gatekeeper.MergeOutcomeEventType:
@@ -29,7 +28,13 @@ func CandidatesFromMergeOutcomes(events []storage.EventLogRecord) ([]MergeCandid
 			if !outcome.Merged {
 				continue
 			}
-			projectID, repo, prNumber, headSHA, mergedAtText = outcome.ProjectID, outcome.Repo, outcome.PRNumber, outcome.HeadSHA, outcome.AttemptedAt
+			// Version 1 did not persist the availability bit. A legacy event that
+			// already carries a non-empty file list can be safely enriched from its
+			// own authoritative snapshot; an empty or absent list remains blocked
+			// until the confirmation lane re-reads the PR files from GitHub.
+			filesAvailable := outcome.TouchedFilesAvailable || (outcome.Version < 2 && len(outcome.TouchedFiles) > 0)
+			candidate = MergeCandidate{ProjectID: outcome.ProjectID, Repo: outcome.Repo, PRNumber: outcome.PRNumber, HeadSHA: outcome.HeadSHA, MergeCommitSHA: outcome.MergeCommitSHA, SourceIssue: outcome.SourceIssue, TouchedFiles: append([]string(nil), outcome.TouchedFiles...), TouchedFilesAvailable: filesAvailable}
+			mergedAtText = outcome.AttemptedAt
 			if strings.TrimSpace(mergedAtText) == "" {
 				mergedAtText = event.CreatedAt
 			}
@@ -38,20 +43,21 @@ func CandidatesFromMergeOutcomes(events []storage.EventLogRecord) ([]MergeCandid
 			if err := json.Unmarshal([]byte(event.PayloadJSON), &outcome); err != nil {
 				return nil, fmt.Errorf("decode coordinator merge event %s: %w", event.ID, err)
 			}
-			projectID, repo, prNumber, headSHA, mergedAtText = outcome.ProjectID, outcome.Repo, outcome.PRNumber, outcome.HeadSHA, outcome.MergedAt
-			if strings.TrimSpace(projectID) == "" && event.ProjectID != nil {
+			candidate = MergeCandidate{ProjectID: outcome.ProjectID, Repo: outcome.Repo, PRNumber: outcome.PRNumber, HeadSHA: outcome.HeadSHA}
+			mergedAtText = outcome.MergedAt
+			if strings.TrimSpace(candidate.ProjectID) == "" && event.ProjectID != nil {
 				// Legacy coordinator payloads stored the project only on the
 				// EventLog row. Preserve that exact key for project-scoped
 				// attribution; only the emptiness check is trimmed.
-				projectID = *event.ProjectID
+				candidate.ProjectID = *event.ProjectID
 			}
 		default:
 			continue
 		}
-		if strings.TrimSpace(projectID) == "" && event.ProjectID != nil {
-			projectID = *event.ProjectID
+		if strings.TrimSpace(candidate.ProjectID) == "" && event.ProjectID != nil {
+			candidate.ProjectID = *event.ProjectID
 		}
-		if strings.TrimSpace(projectID) == "" || strings.TrimSpace(repo) == "" || prNumber <= 0 || strings.TrimSpace(headSHA) == "" {
+		if strings.TrimSpace(candidate.ProjectID) == "" || strings.TrimSpace(candidate.Repo) == "" || candidate.PRNumber <= 0 || strings.TrimSpace(candidate.HeadSHA) == "" {
 			return nil, fmt.Errorf("merge event %s is missing merged pull request identity", event.ID)
 		}
 		mergedAt, err := time.Parse(time.RFC3339Nano, mergedAtText)
@@ -65,12 +71,8 @@ func CandidatesFromMergeOutcomes(events []storage.EventLogRecord) ([]MergeCandid
 				return nil, fmt.Errorf("parse merge event %s timestamp: %w", event.ID, err)
 			}
 		}
-		// Version 1 did not persist the availability bit. A legacy event that
-		// already carries a non-empty file list can be safely enriched from its
-		// own authoritative snapshot; an empty or absent list remains blocked
-		// until the confirmation lane re-reads the PR files from GitHub.
-		filesAvailable := outcome.TouchedFilesAvailable || (outcome.Version < 2 && len(outcome.TouchedFiles) > 0)
-		candidates = append(candidates, MergeCandidate{ProjectID: outcome.ProjectID, Repo: outcome.Repo, PRNumber: outcome.PRNumber, HeadSHA: outcome.HeadSHA, MergeCommitSHA: outcome.MergeCommitSHA, SourceIssue: outcome.SourceIssue, MergedAt: mergedAt.UTC(), TouchedFiles: append([]string(nil), outcome.TouchedFiles...), TouchedFilesAvailable: filesAvailable})
+		candidate.MergedAt = mergedAt.UTC()
+		candidates = append(candidates, candidate)
 	}
 	return candidates, nil
 }

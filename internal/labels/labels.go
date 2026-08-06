@@ -347,14 +347,6 @@ const (
 	HoldReviewer = "looper:hold:reviewer"
 )
 
-// DoNotMerge is the widely-used community label that is not in Looper's
-// namespace and that Looper therefore never creates, never removes, and never
-// lists in Standard() — it is read-only authority in exactly the way the holds
-// above are. It lives here anyway because the alternative is each reader
-// spelling the string itself, which is the drift this package exists to
-// prevent.
-const DoNotMerge = "do-not-merge"
-
 // Network target labels (looper:target:<node_name>) are deliberately NOT here.
 // Constructing or parsing one requires validating the node name, which is a
 // Network concept, so the whole family lives with that validation in

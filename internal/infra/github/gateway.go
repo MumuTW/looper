@@ -2384,68 +2384,124 @@ func (g *Gateway) GetPullRequestHeadAndBaseSHA(ctx context.Context, input ViewPu
 	return asString(row["headRefOid"]), asString(row["baseRefOid"]), nil
 }
 
-// ValidateMergifyRouting checks the repository-owned Mergify contract before
-// Gatekeeper publishes an auto-merge label. The repository file is the
-// authority for how that label is consumed; Gatekeeper fails closed when the
-// file is absent, misses the vetoes protecting manual queue entries, or has no
-// queue rule applicable to the evaluated base branch.
-func (g *Gateway) ValidateMergifyRouting(ctx context.Context, input ValidateMergifyRoutingInput) error {
+func (g *Gateway) SetCommitStatus(ctx context.Context, input CommitStatusInput) error {
+	sha := strings.TrimSpace(input.SHA)
+	contextName := strings.TrimSpace(input.Context)
+	state := strings.ToLower(strings.TrimSpace(input.State))
+	if sha == "" {
+		return fmt.Errorf("commit status SHA is required")
+	}
+	if contextName == "" {
+		return fmt.Errorf("commit status context is required")
+	}
+	switch state {
+	case "error", "failure", "pending", "success":
+	default:
+		return fmt.Errorf("commit status state %q is invalid", input.State)
+	}
 	hostname, repo := splitRepoHostname(input.Repo)
-	args := []string{"api", fmt.Sprintf("repos/%s/contents/.mergify.yml", repo), "--jq", ".content", "-H", "Accept: application/vnd.github+json"}
+	args := []string{"api", fmt.Sprintf("repos/%s/statuses/%s", repo, encodeURIComponent(sha)), "--method", "POST", "-f", "state=" + state, "-f", "context=" + contextName}
+	if description := strings.TrimSpace(input.Description); description != "" {
+		args = append(args, "-f", "description="+description)
+	}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
+	return err
+}
+
+// MarkPullRequestReady takes a draft Pull Request out of draft.
+//
+// It is idempotent by re-reading rather than by pre-checking: a human clicking
+// "Ready for review" between the caller's decision and this call makes gh fail
+// with a "not a draft" error, which is the outcome the caller wanted, not a
+// failure. Only a PR that is still a draft after a failed attempt is reported
+// as an error. GitHub offers no --match-head-commit equivalent for this
+// mutation, so the caller — not the gateway — is responsible for re-reading the
+// Pull Request immediately beforehand and confirming the head its evidence was
+// gathered against is still the head being published.
+func (g *Gateway) MarkPullRequestReady(ctx context.Context, input MarkPullRequestReadyInput) error {
+	_, err := g.runGh(ctx, input.CWD, "", "pr", "ready", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo)
+	if err == nil {
+		return nil
+	}
+	draft, draftErr := g.viewPullRequestDraft(ctx, input.Repo, input.PRNumber, input.CWD)
+	if draftErr == nil && !draft {
+		return nil
+	}
+	return err
+}
+
+// ListPullRequestCommits returns every commit on a Pull Request branch with the
+// forge accounts each is attributed to. The REST endpoint is paginated because
+// authorship is a safety gate: silently dropping a later commit can turn a
+// human-pushed branch into an apparently daemon-only branch.
+func (g *Gateway) ListPullRequestCommits(ctx context.Context, input ListPullRequestCommitsInput) ([]PullRequestCommit, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/commits?per_page=100", repo, input.PRNumber), "-H", "Accept: application/vnd.github+json"}
 	if hostname != "" {
 		args = append(args, "--hostname", hostname)
 	}
 	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
-		return fmt.Errorf("read .mergify.yml: %w", err)
+		return nil, err
 	}
-	encoded := strings.Map(func(r rune) rune {
-		switch r {
-		case ' ', '\t', '\r', '\n':
-			return -1
-		default:
-			return r
-		}
-	}, result.Stdout)
-	content, err := base64.StdEncoding.DecodeString(encoded)
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
 	if err != nil {
-		return fmt.Errorf("decode .mergify.yml: %w", err)
+		return nil, err
 	}
-	var contract struct {
-		QueueRules []struct {
-			QueueConditions []string `yaml:"queue_conditions"`
-		} `yaml:"queue_rules"`
-		// merge_protections is the list of protection rules that activates
-		// auto_merge_conditions. Mergify does not honor auto_merge_conditions
-		// unless at least one merge_protections entry exists, so the validator
-		// must require it rather than accept an inactive contract.
-		MergeProtections []struct {
-			Name string `yaml:"name"`
-		} `yaml:"merge_protections"`
-		MergeProtectionsSettings struct {
-			AutoMergeConditions []string `yaml:"auto_merge_conditions"`
-		} `yaml:"merge_protections_settings"`
-	}
-	if err := yaml.Unmarshal(content, &contract); err != nil {
-		return fmt.Errorf("parse .mergify.yml: %w", err)
-	}
-	if len(contract.QueueRules) == 0 {
-		return fmt.Errorf(".mergify.yml has no queue_rules")
-	}
-	for index, rule := range contract.QueueRules {
-		for _, condition := range []string{"label != " + labels.NeedsHumanReview, "label != " + labels.DoNotMerge} {
-			if !hasMergifyCondition(rule.QueueConditions, condition) {
-				return fmt.Errorf(".mergify.yml queue_rules[%d] queue_conditions missing %q", index, condition)
+	out := make([]PullRequestCommit, 0, len(rows))
+	for _, commitRow := range rows {
+		commit := PullRequestCommit{OID: firstNonEmpty(asString(commitRow["sha"]), asString(commitRow["oid"]))}
+		if author := strings.TrimSpace(extractAuthor(commitRow["author"])); author != "" {
+			commit.Authors = append(commit.Authors, author)
+		}
+		if _, present := commitRow["committer"]; present {
+			commit.CommitterKnown = true
+			if committer := strings.TrimSpace(extractAuthor(commitRow["committer"])); committer != "" {
+				commit.Committers = append(commit.Committers, committer)
 			}
 		}
+		out = append(out, commit)
 	}
-	if len(contract.MergeProtections) == 0 {
-		return fmt.Errorf(".mergify.yml has no merge_protections; auto_merge_conditions require at least one active merge-protection rule")
+	return out, nil
+}
+
+// ListPullRequestDraftEvents returns a Pull Request's convert_to_draft and
+// ready_for_review timeline events, oldest first, each with the account that
+// performed it.
+//
+// A Pull Request is an Issue to this endpoint, which is why it reads the same
+// path ListIssueTimeline does with the Pull Request number. Everything that is
+// not a draft-lifecycle event is dropped here rather than by the caller: the
+// timeline of a long-lived Pull Request is mostly commits and comments, and
+// this is the only question the gateway is being asked.
+func (g *Gateway) ListPullRequestDraftEvents(ctx context.Context, input PullRequestDraftEventsInput) ([]PullRequestDraftEvent, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/timeline", repo, input.PRNumber), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
 	}
-	if !hasMergifyCondition(contract.MergeProtectionsSettings.AutoMergeConditions, "label = "+labels.AutoMerge) {
-		return fmt.Errorf(".mergify.yml has no auto-merge label contract")
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PullRequestDraftEvent, 0, len(rows))
+	for _, row := range rows {
+		event := asString(row["event"])
+		if event != "convert_to_draft" && event != "ready_for_review" {
+			continue
+		}
+		actor := strings.TrimSpace(extractAuthor(row["actor"]))
+		createdAt := strings.TrimSpace(asString(row["created_at"]))
+		out = append(out, PullRequestDraftEvent{Event: event, Actor: actor, CreatedAt: createdAt})
+	}
+	return out, nil
 }
 
 // ValidateMergifyRouting checks the repository-owned Mergify contract before

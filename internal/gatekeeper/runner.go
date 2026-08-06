@@ -246,7 +246,6 @@ type GitHubGateway interface {
 	SetCommitStatus(context.Context, githubinfra.CommitStatusInput) error
 	AddPullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
 	RemovePullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
-	SetCommitStatus(context.Context, githubinfra.CommitStatusInput) error
 	ValidateMergifyRouting(context.Context, githubinfra.ValidateMergifyRoutingInput) error
 }
 
@@ -259,6 +258,14 @@ const RequiredStatusContext = "Looper Gatekeeper"
 // operator has not set a project override. An explicit zero disables the
 // threshold after configuration normalization.
 const DefaultRequiredReviewChangedLines = 200
+// RequiredStatusContext is the GitHub status context an operator adds to branch
+// protection when promoting Gatekeeper to auto. GitHub branch protection is the
+// merge authority; this runner reports policy for one commit.
+const RequiredStatusContext = "Looper Gatekeeper"
+
+type mergifyContractFingerprinter interface {
+	MergifyRoutingContractFingerprint(context.Context, githubinfra.ValidateMergifyRoutingInput) (string, error)
+}
 
 type Options struct {
 	Repos  *storage.Repositories
@@ -399,8 +406,6 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	ctx = withDeferCommitStatus(ctx)
-	trust := r.trustFor(input.ProjectID)
 	contractFingerprint := r.mergifyContractFingerprint(ctx, input)
 	result := DiscoveryResult{Reports: make([]Report, 0, len(pullRequests))}
 	// Deferred commit statuses must still publish on abort: a blocked report that
@@ -412,6 +417,14 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 	}
 	reviewThreshold := r.requiredReviewChangedLinesFor(input.ProjectID)
+	// Deferred commit statuses must still publish on abort: a blocked report that
+	// was already evaluated this tick is durable in result.Reports, and leaving
+	// without publishing would keep a prior success visible to branch protection.
+	publishDeferredStatuses := func() {
+		if trust == config.GatekeeperTrustAuto {
+			r.publishDiscoveryCommitStatuses(ctx, input.ProjectID, input.Repo, input.CWD, result.Reports)
+		}
+	}
 	var evaluationErrs []error
 	stillOpen := make(map[string]struct{}, len(pullRequests))
 	for _, pullRequest := range pullRequests {
@@ -527,6 +540,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.UnreviewedMerged = unreviewed
 		}
 	}
+	publishDeferredStatuses()
 	publishDeferredStatuses()
 	if len(evaluationErrs) > 0 {
 		return result, errors.Join(evaluationErrs...)
@@ -855,6 +869,7 @@ func (r *Runner) sourceFingerprintForProject(pullRequest githubinfra.PullRequest
 	reviewPolicyEnabled := trust == config.GatekeeperTrustAuto && reviewThreshold > 0
 	return sourceFingerprint(pullRequest, budgetEnabled, reviewPolicyEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions) + fmt.Sprintf("\x1fgatekeeper-trust=%s", string(trust)) + fmt.Sprintf("\x1fconfigured-target=%s", configuredTarget) + fmt.Sprintf("\x1fpolicy-permits-target=%t", permitsTarget) + fmt.Sprintf("\x1freview-threshold=%d", reviewThreshold)
 	return sourceFingerprint(pullRequest, budgetEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions) + fmt.Sprintf("\x1fgatekeeper-trust=%s", string(r.trustFor(projectID))) + fmt.Sprintf("\x1fconfigured-target=%s", configuredTarget) + fmt.Sprintf("\x1fpolicy-permits-target=%t", permitsTarget)
+}
 
 func (r *Runner) mergifyContractFingerprint(ctx context.Context, input DiscoveryInput) string {
 	if r == nil || r.trustFor(input.ProjectID) != config.GatekeeperTrustAuto {
@@ -1197,6 +1212,17 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	sort.Strings(report.Evidence.UnresolvedReviewThreadIDs)
 
+	convergenceEvidence, hasConvergence, err := latestReviewerConvergence(ctx, r.repos, input.ProjectID, input.Repo, input.PRNumber, report.ObservedHeadSHA)
+	if err != nil {
+		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "reviewer_convergence")
+	}
+	if hasConvergence {
+		report.Evidence.ReviewerConvergence = &convergenceEvidence
+		if reviewerConvergenceBlocks(convergenceEvidence) {
+			report.Reasons = append(report.Reasons, Reason{Code: ReasonReviewerConvergence, Subject: reviewerConvergenceReasonSubject(convergenceEvidence)})
+		}
+	}
+
 	// The final revalidation read confirms the head has not moved between the
 	// evaluation and persistence. When the diff budget is enabled it also
 	// returns the base ref OID so a gate whose verdict depends on the merge
@@ -1208,12 +1234,6 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		finalHead, finalBase, err = r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
 	} else {
 		finalHead, err = r.github.GetPullRequestHeadSHA(ctx, viewInput)
-	}
-	if hasConvergence {
-		report.Evidence.ReviewerConvergence = &convergenceEvidence
-		if reviewerConvergenceBlocks(convergenceEvidence) {
-			report.Reasons = append(report.Reasons, Reason{Code: ReasonReviewerConvergence, Subject: reviewerConvergenceReasonSubject(convergenceEvidence)})
-		}
 	}
 
 	if r.trustFor(input.ProjectID) == config.GatekeeperTrustAuto {
@@ -1272,6 +1292,41 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "review_capacity_base")
 	}
 	return r.persist(ctx, report)
+}
+
+// observeReviewProvenance reads who reviewed this pull request and whether a
+// reviewer refused it. It never changes eligibility: an unavailable forge is
+// recorded as unknown rather than silently treated as unreviewed.
+func (r *Runner) observeReviewProvenance(ctx context.Context, input EvaluationInput) ReviewProvenance {
+	unknown := ReviewProvenance{Status: ReviewProvenanceUnknown, Reviewers: []ReviewerObservation{}, Refusals: []ReviewRefusal{}}
+	reviews, err := r.github.ListPullRequestReviews(ctx, githubinfra.ViewPullRequestInput{
+		Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD,
+	})
+	if err != nil {
+		r.warnReviewProvenance(input, "reviews", err)
+		return unknown
+	}
+	observed := reviewsObservedFrom(reviews)
+	comments, err := r.github.ListIssueCommentsContaining(ctx, githubinfra.ViewIssueInput{
+		Repo: input.Repo, IssueNumber: input.PRNumber, CWD: input.CWD,
+	}, RefusalCommentMarkers())
+	if err != nil {
+		r.warnReviewProvenance(input, "comments", err)
+		if observed.CompletedReviews > 0 {
+			return observed
+		}
+		return unknown
+	}
+	return withRefusalsFrom(observed, comments)
+}
+
+func (r *Runner) warnReviewProvenance(input EvaluationInput, subject string, err error) {
+	if r.logWarn == nil {
+		return
+	}
+	r.logWarn("gatekeeper: could not observe review provenance", map[string]any{
+		"repo": input.Repo, "pr": input.PRNumber, "subject": subject, "error": err.Error(),
+	})
 }
 
 func (r *Runner) projectCWD(ctx context.Context, projectID string) string {
@@ -1384,200 +1439,6 @@ func isConfirming(ctx context.Context) bool {
 	return confirming
 }
 
-type deferCommitStatusKey struct{}
-
-func withDeferCommitStatus(ctx context.Context) context.Context {
-	return context.WithValue(ctx, deferCommitStatusKey{}, true)
-}
-
-func deferCommitStatus(ctx context.Context) bool {
-	deferred, _ := ctx.Value(deferCommitStatusKey{}).(bool)
-	return deferred
-}
-
-func reportCommitSHA(report Report) string {
-	sha := strings.TrimSpace(report.ObservedHeadSHA)
-	if sha == "" {
-		sha = strings.TrimSpace(report.ExpectedHeadSHA)
-	}
-	return sha
-}
-
-func reportIsOpenForStatusAggregation(report Report) bool {
-	state := strings.ToUpper(strings.TrimSpace(report.Evidence.PullRequestState))
-	return state == "" || state == "OPEN"
-}
-
-func commitStatusSeverity(state string) int {
-	switch state {
-	case "failure":
-		return 3
-	case "error":
-		return 2
-	case "pending":
-		return 1
-	default:
-		return 0
-	}
-}
-
-func aggregatedCommitStatus(reports []Report) (string, string) {
-	if len(reports) == 0 {
-		return "error", "Gatekeeper could not verify current merge state"
-	}
-	for _, report := range reports {
-		if hasReasonCode(report.Reasons, ReasonGatekeeperCheckRequired) {
-			return "error", "Looper Gatekeeper is not configured as a required status on the target branch"
-		}
-	}
-	blocked := make([]Report, 0, len(reports))
-	for _, report := range reports {
-		if !report.Eligible {
-			blocked = append(blocked, report)
-		}
-	}
-	if len(blocked) > 0 {
-		state, description := gatekeeperCommitStatus(blocked[0])
-		for _, report := range blocked[1:] {
-			nextState, nextDescription := gatekeeperCommitStatus(report)
-			if commitStatusSeverity(nextState) > commitStatusSeverity(state) {
-				state, description = nextState, nextDescription
-			}
-		}
-		if len(blocked) < len(reports) {
-			description = "Another open pull request on this commit failed Gatekeeper"
-		}
-		return state, description
-	}
-	return gatekeeperCommitStatus(reports[0])
-}
-
-func (r *Runner) publishDiscoveryCommitStatuses(ctx context.Context, projectID, repo, cwd string, reports []Report) {
-	bySHA := make(map[string][]Report)
-	for _, report := range reports {
-		if !reportIsOpenForStatusAggregation(report) {
-			continue
-		}
-		sha := reportCommitSHA(report)
-		if sha == "" {
-			continue
-		}
-		bySHA[sha] = append(bySHA[sha], report)
-	}
-	for sha, group := range bySHA {
-		state, description := aggregatedCommitStatus(group)
-		if err := r.setCommitStatusIfChanged(ctx, repo, cwd, sha, RequiredStatusContext, state, description); err != nil {
-			if r.logWarn != nil {
-				r.logWarn("gatekeeper: could not publish aggregated commit status", map[string]any{
-					"repo": repo, "sha": sha, "error": err.Error(),
-				})
-			}
-			for _, report := range group {
-				if strings.TrimSpace(report.SourceFingerprint) == "" {
-					continue
-				}
-				if err := r.clearReportCacheability(ctx, report); err != nil && r.logWarn != nil {
-					r.logWarn("gatekeeper: could not mark report non-cacheable after status failure", map[string]any{
-						"repo": report.Repo, "pr": report.PRNumber, "error": err.Error(),
-					})
-				}
-			}
-		}
-	}
-}
-
-func (r *Runner) tryPublishAggregatedCommitStatus(ctx context.Context, report Report) bool {
-	if r.trustFor(report.ProjectID) != config.GatekeeperTrustAuto {
-		return true
-	}
-	sha := reportCommitSHA(report)
-	if sha == "" {
-		return true
-	}
-	group, err := r.openReportsForHeadSHA(ctx, report.ProjectID, report.Repo, sha, report)
-	if err != nil {
-		if r.logWarn != nil {
-			r.logWarn("gatekeeper: could not load reports for status aggregation", map[string]any{
-				"repo": report.Repo, "sha": sha, "error": err.Error(),
-			})
-		}
-		group = []Report{report}
-	}
-	state, description := aggregatedCommitStatus(group)
-	if err := r.setCommitStatusIfChanged(ctx, report.Repo, r.projectCWD(ctx, report.ProjectID), sha, RequiredStatusContext, state, description); err != nil {
-		if r.logWarn != nil {
-			r.logWarn("gatekeeper: could not publish aggregated commit status", map[string]any{
-				"repo": report.Repo, "sha": sha, "error": err.Error(),
-			})
-		}
-		return false
-	}
-	return true
-}
-
-func (r *Runner) openReportsForHeadSHA(ctx context.Context, projectID, repo, sha string, current Report) ([]Report, error) {
-	previousReports, err := latestGateReports(ctx, r.repos, projectID)
-	if err != nil {
-		return nil, err
-	}
-	currentEntityID := fmt.Sprintf("%s#%d", current.Repo, current.PRNumber)
-	group := make([]Report, 0)
-	seenCurrent := false
-	for entityID, report := range previousReports {
-		if report.Repo != repo || !reportIsOpenForStatusAggregation(report) || reportCommitSHA(report) != sha {
-			continue
-		}
-		if entityID == currentEntityID {
-			report = current
-			seenCurrent = true
-		}
-		group = append(group, report)
-	}
-	if !seenCurrent && reportIsOpenForStatusAggregation(current) {
-		group = append(group, current)
-	}
-	return group, nil
-}
-
-func (r *Runner) setCommitStatusIfChanged(ctx context.Context, repo, cwd, sha, contextName, state, description string) error {
-	signature := state + "\x1f" + description
-	key := repo + "\x1f" + sha + "\x1f" + contextName
-	r.lastPublishedStatusMu.Lock()
-	if r.lastPublishedStatus == nil {
-		r.lastPublishedStatus = make(map[string]string)
-	}
-	if r.lastPublishedStatus[key] == signature {
-		r.lastPublishedStatusMu.Unlock()
-		return nil
-	}
-	r.lastPublishedStatusMu.Unlock()
-
-	if err := r.github.SetCommitStatus(ctx, githubinfra.CommitStatusInput{
-		Repo: repo, SHA: sha, Context: contextName,
-		State: state, Description: description, CWD: cwd,
-	}); err != nil {
-		r.lastPublishedStatusMu.Lock()
-		delete(r.lastPublishedStatus, key)
-		r.lastPublishedStatusMu.Unlock()
-		return err
-	}
-	r.lastPublishedStatusMu.Lock()
-	r.lastPublishedStatus[key] = signature
-	r.lastPublishedStatusMu.Unlock()
-	return nil
-}
-
-func (r *Runner) clearReportCacheability(ctx context.Context, report Report) error {
-	report.SourceFingerprint = ""
-	entityType := "pull_request"
-	entityID := fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
-	projectID := report.ProjectID
-	return eventlog.Append(ctx, r.repos, eventlog.AppendInput{
-		EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
-		Payload: report, CreatedAt: r.now(),
-	})
-}
-
 // persist records a report. The confirming pass writes its report — the evidence
 // behind a merge has to be durable — but publishes no verdict, because it
 // describes the same head as the verdict already on the pull request.
@@ -1610,19 +1471,6 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	}
 	if !confirming {
 		action = decideVerdictAction(r.trustFor(report.ProjectID), previous, report)
-	}
-
-	statusSHA := strings.TrimSpace(report.ObservedHeadSHA)
-	if statusSHA == "" {
-		statusSHA = strings.TrimSpace(report.ExpectedHeadSHA)
-	}
-	if !confirming && r.trustFor(report.ProjectID) == config.GatekeeperTrustAuto && statusSHA != "" && !deferCommitStatus(ctx) {
-		if !r.tryPublishAggregatedCommitStatus(ctx, report) {
-			// A failed publication must not be cacheable: the next tick must
-			// re-evaluate and retry rather than reuse a report while branch
-			// protection still sees a stale success.
-			report.SourceFingerprint = ""
-		}
 	}
 
 	entityType := "pull_request"
@@ -1871,15 +1719,6 @@ func sortReasons(reasons []Reason) {
 	})
 }
 
-func hasReasonCode(reasons []Reason, code ReasonCode) bool {
-	for _, reason := range reasons {
-		if reason.Code == code {
-			return true
-		}
-	}
-	return false
-}
-
 func withoutReasonCodes(reasons []Reason, codes ...ReasonCode) []Reason {
 	if len(reasons) == 0 || len(codes) == 0 {
 		return reasons
@@ -1894,6 +1733,26 @@ func withoutReasonCodes(reasons []Reason, codes ...ReasonCode) []Reason {
 			continue
 		}
 		out = append(out, reason)
+	}
+	return out
+}
+
+func containsRequiredCheck(checks []string, want string) bool {
+	for _, check := range checks {
+		if strings.EqualFold(strings.TrimSpace(check), strings.TrimSpace(want)) {
+			return true
+		}
+	}
+	return false
+}
+
+func withoutRequiredCheck(rules []githubinfra.RequiredCheckRule, name string) []githubinfra.RequiredCheckRule {
+	out := make([]githubinfra.RequiredCheckRule, 0, len(rules))
+	for _, rule := range rules {
+		if strings.EqualFold(strings.TrimSpace(rule.Context), strings.TrimSpace(name)) && rule.AppID == 0 {
+			continue
+		}
+		out = append(out, rule)
 	}
 	return out
 }

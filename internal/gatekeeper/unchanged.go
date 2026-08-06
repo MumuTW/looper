@@ -256,5 +256,5 @@ func previousConvergenceRevision(report Report) string {
 	if report.Evidence.ReviewerConvergence == nil {
 		return ""
 	}
-	return false
+	return convergenceRevision(*report.Evidence.ReviewerConvergence)
 }
