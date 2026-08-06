@@ -200,7 +200,9 @@
             "assignTo": ""
           }
         },
-        "gatekeeper": {},
+        "gatekeeper": {
+          "requiredReviewChangedLines": 200
+        },
         "deployer": {
           "enabled": false
         },

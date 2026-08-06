@@ -873,6 +873,10 @@ type GatekeeperRoleConfig struct {
 	// Trust is the merge authority level. Empty defaults to observe.
 	Trust      GatekeeperTrustLevel  `json:"trust,omitempty"`
 	DiffBudget *GatekeeperDiffBudget `json:"diffBudget,omitempty"`
+	// RequiredReviewChangedLines is the smallest additions+deletions total that
+	// triggers a review-capacity gate. The normalized default is 200; an explicit
+	// zero disables the threshold.
+	RequiredReviewChangedLines int `json:"requiredReviewChangedLines,omitempty"`
 }
 
 // GatekeeperDiffBudget is a boolean change-size gate. A zero bound is
@@ -1540,8 +1544,9 @@ type PartialDeployerRoleConfig struct {
 }
 
 type PartialGatekeeperRoleConfig struct {
-	Trust      *GatekeeperTrustLevel        `json:"trust,omitempty"`
-	DiffBudget *PartialGatekeeperDiffBudget `json:"diffBudget,omitempty"`
+	Trust                      *GatekeeperTrustLevel        `json:"trust,omitempty"`
+	DiffBudget                 *PartialGatekeeperDiffBudget `json:"diffBudget,omitempty"`
+	RequiredReviewChangedLines *int                         `json:"requiredReviewChangedLines,omitempty"`
 }
 
 type PartialGatekeeperDiffBudget struct {

@@ -948,9 +948,30 @@ must add the required check before relying on `auto`.
 ```toml
 [roles.gatekeeper]
 trust = "auto"
+# additions + deletions; omitted uses the normalized default of 200
+requiredReviewChangedLines = 200
 ```
 
-Project overrides use `projects[].roles.gatekeeper.trust`.
+`requiredReviewChangedLines` is the additions-plus-deletions threshold for the
+current pull request head. When the field is omitted, configuration normalizes
+it to `200`; an explicit global or project value of `0` disables the capacity
+requirement for that scope. A change at or above the effective threshold
+requires a verified current-head Reviewer marker. Below the threshold, Gatekeeper
+still checks all other merge conditions and still inspects blocking review
+markers, but it does not require a clean review to proceed. The counts and
+threshold are persisted as Gate evidence, and the provider's pull-request
+statistics plus merge-base SHA are the authority for the verdict.
+
+Project overrides use `projects[].roles.gatekeeper.trust` and
+`projects[].roles.gatekeeper.requiredReviewChangedLines`.
+
+Reviewer writes `pr.review.completed` only after it re-reads and verifies the
+GitHub marker. A structured `type = "rate_limit"` completion writes
+`pr.review.refused`; prose mentioning a rate limit is not evidence. Gatekeeper's
+bounded recent-merged-PR scan writes `pr.review.unreviewed` for merged pull
+requests at or above the threshold with no completed/refused evidence. These
+events describe merged **pull requests**, not commits, and remain queryable
+through the existing event API.
 
 ### The owned comment and its lifecycle
 

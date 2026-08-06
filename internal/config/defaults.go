@@ -246,6 +246,9 @@ func DefaultConfig(cwd string) (Config, error) {
 				},
 			},
 			Auditor: AuditorRoleConfig{Enabled: false, WindowMinutes: 60},
+			Gatekeeper: GatekeeperRoleConfig{
+				RequiredReviewChangedLines: 200,
+			},
 			Coordinator: CoordinatorRoleConfig{
 				Enabled:      false,
 				PollInterval: "5m",

@@ -39,7 +39,7 @@ var (
 	prViewMetadataJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
 	prViewFixerJSONFields      = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "statusCheckRollup", "mergeStateStatus"}
 	prViewReviewerJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "statusCheckRollup", "mergeStateStatus"}
-	prViewGatekeeperJSONFields = []string{"number", "state", "closedAt", "mergedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "mergeStateStatus", "changedFiles", "deletions", "closingIssuesReferences"}
+	prViewGatekeeperJSONFields = []string{"number", "state", "closedAt", "mergedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "additions", "deletions", "mergeStateStatus", "changedFiles", "closingIssuesReferences"}
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
@@ -128,6 +128,7 @@ type PullRequestSummary struct {
 	URL                string
 	State              string
 	UpdatedAt          string
+	MergedAt           string
 	IsDraft            bool
 	ReviewDecision     string
 	Labels             []string
@@ -141,6 +142,10 @@ type PullRequestSummary struct {
 	ReviewRequests     []string
 	ReviewRequestUsers []GitHubUser
 	Reviews            []map[string]any
+	Additions          int
+	Deletions          int
+	AdditionsKnown     bool
+	DeletionsKnown     bool
 }
 
 type PullRequestDetail struct {
@@ -159,6 +164,10 @@ type PullRequestDetail struct {
 	BaseRefName        string
 	HeadSHA            string
 	BaseSHA            string
+	Additions          int
+	Deletions          int
+	AdditionsKnown     bool
+	DeletionsKnown     bool
 	Author             string
 	AuthorAssociation  string
 	CommentCount       int
@@ -704,6 +713,12 @@ type ListOpenPullRequestsInput struct {
 	Timeout     time.Duration
 }
 
+type ListMergedPullRequestsInput struct {
+	Repo  string
+	CWD   string
+	Limit int
+}
+
 type ListReviewRequestedPullRequestsInput struct {
 	Repo     string
 	CWD      string
@@ -864,6 +879,34 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 	return g.listOpenPullRequestsRaw(ctx, input)
 }
 
+// ListMergedPullRequests returns the newest merged pull requests so Gatekeeper
+// can make the post-merge review backlog observable. It is not used as merge
+// authority; branch protection already decided the merge.
+func (g *Gateway) ListMergedPullRequests(ctx context.Context, input ListMergedPullRequestsInput) ([]PullRequestSummary, error) {
+	fields := []string{"number", "url", "state", "mergedAt", "headRefOid", "additions", "deletions"}
+	args := []string{"pr", "list", "--repo", input.Repo, "--state", "merged", "--limit", fmt.Sprintf("%d", defaultLimit(input.Limit)), "--json", strings.Join(fields, ",")}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArray(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PullRequestSummary, 0, len(rows))
+	for _, row := range rows {
+		_, additionsKnown := firstPresentRowValue(row, "additions")
+		_, deletionsKnown := firstPresentRowValue(row, "deletions")
+		out = append(out, PullRequestSummary{
+			Number: asInt64(row["number"]), URL: asString(row["url"]), State: asString(row["state"]),
+			MergedAt: asString(row["mergedAt"]), HeadSHA: asString(row["headRefOid"]),
+			Additions: int(asInt64(row["additions"])), Deletions: int(asInt64(row["deletions"])),
+			AdditionsKnown: additionsKnown, DeletionsKnown: deletionsKnown,
+		})
+	}
+	return out, nil
+}
+
 func (g *Gateway) ListReviewRequestedPullRequests(ctx context.Context, input ListReviewRequestedPullRequestsInput) ([]PullRequestSummary, error) {
 	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
 		return snapshot.listReviewRequestedPullRequests(ctx, input)
@@ -955,6 +998,8 @@ func (g *Gateway) listOpenPullRequestsWithFields(ctx context.Context, input List
 	}
 	out := make([]PullRequestSummary, 0, len(rows))
 	for _, row := range rows {
+		_, additionsKnown := firstPresentRowValue(row, "additions")
+		_, deletionsKnown := firstPresentRowValue(row, "deletions")
 		out = append(out, PullRequestSummary{
 			Number:             asInt64(row["number"]),
 			Title:              asString(row["title"]),
@@ -974,6 +1019,10 @@ func (g *Gateway) listOpenPullRequestsWithFields(ctx context.Context, input List
 			ReviewRequests:     extractReviewRequestLogins(row["reviewRequests"]),
 			ReviewRequestUsers: extractReviewRequestUsers(row["reviewRequests"]),
 			Reviews:            toObjectSlice(row["reviews"]),
+			Additions:          int(asInt64(row["additions"])),
+			Deletions:          int(asInt64(row["deletions"])),
+			AdditionsKnown:     additionsKnown,
+			DeletionsKnown:     deletionsKnown,
 		})
 	}
 	return out, nil
@@ -1908,6 +1957,8 @@ func (g *Gateway) viewPullRequestWithFields(ctx context.Context, input ViewPullR
 }
 
 func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, issueComments []CommentInfo) PullRequestDetail {
+	_, additionsKnown := firstPresentRowValue(row, "additions")
+	_, deletionsKnown := firstPresentRowValue(row, "deletions")
 	return PullRequestDetail{
 		Number:             asInt64(row["number"]),
 		Title:              asString(row["title"]),
@@ -1924,6 +1975,10 @@ func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, 
 		BaseRefName:        asString(row["baseRefName"]),
 		HeadSHA:            asString(row["headRefOid"]),
 		BaseSHA:            asString(row["baseRefOid"]),
+		Additions:          int(asInt64(row["additions"])),
+		Deletions:          int(asInt64(row["deletions"])),
+		AdditionsKnown:     additionsKnown,
+		DeletionsKnown:     deletionsKnown,
 		Author:             extractAuthor(row["author"]),
 		AuthorAssociation:  asString(row["authorAssociation"]),
 		CommentCount:       len(issueComments),
@@ -1988,6 +2043,8 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
+	_, additionsKnown := firstPresentRowValue(row, "additions")
+	_, deletionsKnown := firstPresentRowValue(row, "deletions")
 	return PullRequestDetail{
 		Number:         asInt64(row["number"]),
 		Title:          asString(row["title"]),
@@ -2006,6 +2063,10 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		BaseRefName:    nestedString(row, "base", "ref"),
 		HeadSHA:        nestedString(row, "head", "sha"),
 		BaseSHA:        nestedString(row, "base", "sha"),
+		Additions:      int(asInt64(row["additions"])),
+		Deletions:      int(asInt64(row["deletions"])),
+		AdditionsKnown: additionsKnown,
+		DeletionsKnown: deletionsKnown,
 		DiffStats:      pullRequestDiffStatsFromRow(row),
 		Mergeable:      boolPtrFromValue(row["mergeable"]),
 		MergeableState: ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),

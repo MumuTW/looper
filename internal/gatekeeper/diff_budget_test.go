@@ -109,8 +109,10 @@ func TestDiffBudgetFailsClosedWhenBaseSHAMissing(t *testing.T) {
 	t.Parallel()
 	fixture := newGatekeeperFixture(t)
 	fixture.github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 5}
-	// detail.BaseSHA and mergeable.BaseSHA are left empty (the fixture default),
-	// so the provider returns stats without a base to anchor them.
+	// Clear both observed base SHAs so the provider returns stats without a base
+	// to anchor them; the fixture normally supplies a realistic base anchor.
+	fixture.github.detail.BaseSHA = ""
+	fixture.github.mergeable.BaseSHA = ""
 	runner := diffBudgetRunner(t, fixture, config.GatekeeperDiffBudget{MaxChangedFiles: 20}, config.GatekeeperTrustAuto)
 
 	report, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
