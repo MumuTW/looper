@@ -17,7 +17,11 @@ const (
 var pathPattern = regexp.MustCompile(`(?mi)^Spec:\s*(.+)$`)
 
 func ResolvePullRequestPhase(prLabels []string) PullRequestPhase {
-	if labels.Has(prLabels, labels.SpecReviewing) {
+	return ResolvePullRequestPhaseForNamespace(prLabels, labels.DefaultNamespace())
+}
+
+func ResolvePullRequestPhaseForNamespace(prLabels []string, namespace labels.Namespace) PullRequestPhase {
+	if labels.Has(prLabels, namespace.SpecReviewing()) {
 		return PhaseSpec
 	}
 	return PhaseImplementation

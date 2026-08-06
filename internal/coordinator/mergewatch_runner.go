@@ -28,7 +28,7 @@ type mergeWatchComment struct {
 	Body    string
 }
 
-func (r *Runner) applyMergeWatch(ctx context.Context, projectID, repo, cwd string, loaded []loadedIssue, roles config.RoleConfigs) (map[int64]struct{}, error) {
+func (r *Runner) applyMergeWatch(ctx context.Context, projectID, repo, cwd string, loaded []loadedIssue, roles config.RoleConfigs, namespace labels.Namespace) (map[int64]struct{}, error) {
 	result := map[int64]struct{}{}
 	if r.github == nil {
 		return result, nil
@@ -41,17 +41,18 @@ func (r *Runner) applyMergeWatch(ctx context.Context, projectID, repo, cwd strin
 	if err != nil {
 		return nil, err
 	}
+	triagedLabel := triageCompletionLabel(roles.Coordinator.Triage.TriagedLabel, namespace)
 	markReadyDrafts := r.markReadyCandidates(ctx, repo, cwd, roles)
 	for _, issue := range loaded {
-		if !issueHasCoordinatorTracking(issue.detail.Labels, roles.Coordinator.Triage.TriagedLabel) {
+		if !issueHasCoordinatorTracking(issue.detail.Labels, triagedLabel, namespace) {
 			continue
 		}
 		removed, applyErr := func() (bool, error) {
 			lock := r.watchLock(repo, issue.detail.Number)
 			lock.Lock()
 			defer lock.Unlock()
-			r.applyMarkReady(ctx, repo, cwd, issue, currentLogin, markReadyDrafts, roles.Coordinator.Triage.TriagedLabel)
-			return r.applyMergeWatchLocked(ctx, projectID, repo, cwd, issue, roles, currentLogin, budget)
+			r.applyMarkReady(ctx, repo, cwd, issue, currentLogin, markReadyDrafts, roles.Coordinator.Triage.TriagedLabel, namespace)
+			return r.applyMergeWatchLocked(ctx, projectID, repo, cwd, issue, roles, namespace, triagedLabel, currentLogin, budget)
 		}()
 		if applyErr != nil {
 			return nil, applyErr
@@ -63,16 +64,16 @@ func (r *Runner) applyMergeWatch(ctx context.Context, projectID, repo, cwd strin
 	return result, nil
 }
 
-func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd string, issue loadedIssue, roles config.RoleConfigs, currentLogin string, maxIndeterminateDuration time.Duration) (bool, error) {
+func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd string, issue loadedIssue, roles config.RoleConfigs, namespace labels.Namespace, triagedLabel, currentLogin string, maxIndeterminateDuration time.Duration) (bool, error) {
 	marker := findMergeWatchComment(issue.detail.Comments, currentLogin)
-	watchedPR, ok, err := r.resolveWatchedPR(ctx, repo, cwd, issue, marker, currentLogin)
+	watchedPR, ok, err := r.resolveWatchedPR(ctx, repo, cwd, issue, marker, namespace, currentLogin)
 	if err != nil || !ok {
 		return false, err
 	}
 	if marker != nil && marker.Marker.NextRetryAt != nil && r.now().UTC().Before(marker.Marker.NextRetryAt.UTC()) {
 		return false, nil
 	}
-	snapshot, tempErr, err := r.mergeWatchSnapshot(ctx, repo, cwd, issue.detail.Number, watchedPR, currentLogin)
+	snapshot, tempErr, err := r.mergeWatchSnapshot(ctx, repo, cwd, issue.detail.Number, watchedPR, namespace, currentLogin)
 	if err != nil {
 		return false, err
 	}
@@ -109,9 +110,9 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 		return false, r.upsertMergeWatchComment(ctx, repo, cwd, issue.detail.Number, marker, baseMarker, "")
 	case mergewatch.ActionConflict, mergewatch.ActionRedCI:
 		fixer := config.EffectiveCodingRoles(roles)[config.CodingRoleFixer]
-		labels := requiredDiscoveryLabels(fixer.Discovery.Labels, fixer.Discovery.LabelMode)
-		if len(labels) > 0 {
-			if err := r.github.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: snapshot.PRNumber, Labels: labels, CWD: cwd}); err != nil {
+		fixerLabels := namespace.RemapAll(requiredDiscoveryLabels(fixer.Discovery.Labels, fixer.Discovery.LabelMode))
+		if len(fixerLabels) > 0 {
+			if err := r.github.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: snapshot.PRNumber, Labels: fixerLabels, LabelNamespace: namespace, CWD: cwd}); err != nil {
 				return false, err
 			}
 		}
@@ -122,7 +123,7 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 		return false, r.upsertMergeWatchComment(ctx, repo, cwd, issue.detail.Number, marker, baseMarker, summary)
 	case mergewatch.ActionTransientError:
 		if action.Exhausted {
-			if err := r.removeIssueLabels(ctx, repo, cwd, issue.detail.Number, issue.detail.Labels, retriageCleanupPatterns(roles, roles.Coordinator.Triage.TriagedLabel)); err != nil {
+			if err := r.removeIssueLabels(ctx, repo, cwd, issue.detail.Number, issue.detail.Labels, retriageCleanupPatterns(roles, triagedLabel, namespace)); err != nil {
 				return false, err
 			}
 			return true, r.deleteMergeWatchComment(ctx, repo, cwd, marker)
@@ -135,7 +136,7 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 		baseMarker.Retries = action.RetriesLeft
 		return false, r.upsertMergeWatchComment(ctx, repo, cwd, issue.detail.Number, marker, baseMarker, "")
 	case mergewatch.ActionBranchProtectionChanged:
-		if err := r.removeIssueLabels(ctx, repo, cwd, issue.detail.Number, issue.detail.Labels, retriageCleanupPatterns(roles, roles.Coordinator.Triage.TriagedLabel)); err != nil {
+		if err := r.removeIssueLabels(ctx, repo, cwd, issue.detail.Number, issue.detail.Labels, retriageCleanupPatterns(roles, triagedLabel, namespace)); err != nil {
 			return false, err
 		}
 		return true, r.deleteMergeWatchComment(ctx, repo, cwd, marker)
@@ -187,7 +188,7 @@ func nilIfBlank(value string) *string {
 	return &value
 }
 
-func (r *Runner) resolveWatchedPR(ctx context.Context, repo, cwd string, issue loadedIssue, marker *mergeWatchComment, currentLogin string) (int64, bool, error) {
+func (r *Runner) resolveWatchedPR(ctx context.Context, repo, cwd string, issue loadedIssue, marker *mergeWatchComment, namespace labels.Namespace, currentLogin string) (int64, bool, error) {
 	linked := linkedPullRequestNumbers(issue.rawTimeline)
 	if marker != nil && marker.Marker.PRNumber > 0 {
 		for _, linkedPR := range linked {
@@ -205,7 +206,7 @@ func (r *Runner) resolveWatchedPR(ctx context.Context, repo, cwd string, issue l
 		if err != nil {
 			continue
 		}
-		if detail.AutoMerge == nil || !strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin)) || !labels.AnyLooperOwned(detail.Labels) || !prLinksIssue(repo, issue.detail.Number, detail.Body) {
+		if detail.AutoMerge == nil || !strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin)) || !namespace.AnyOwned(detail.Labels) || !prLinksIssue(repo, issue.detail.Number, detail.Body) {
 			continue
 		}
 		eligible = append(eligible, prNumber)
@@ -219,7 +220,7 @@ func (r *Runner) resolveWatchedPR(ctx context.Context, repo, cwd string, issue l
 	return eligible[0], true, nil
 }
 
-func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issueNumber, prNumber int64, currentLogin string) (mergewatch.PRSnapshot, *mergewatch.TemporaryError, error) {
+func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issueNumber, prNumber int64, namespace labels.Namespace, currentLogin string) (mergewatch.PRSnapshot, *mergewatch.TemporaryError, error) {
 	detail, err := r.github.ViewPullRequestMergeWatch(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		if isTransientMergeWatchError(err) {
@@ -238,7 +239,7 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 	protection, err := r.github.GetBranchProtection(ctx, githubinfra.BranchProtectionInput{Repo: repo, Branch: detail.BaseRefName, CWD: cwd})
 	if err != nil {
 		if isTransientMergeWatchError(err) {
-			return mergeWatchPartialSnapshot(repo, issueNumber, prNumber, detail, currentLogin), &mergewatch.TemporaryError{SuggestedDelay: time.Minute}, nil
+			return mergeWatchPartialSnapshot(repo, issueNumber, prNumber, detail, namespace, currentLogin), &mergewatch.TemporaryError{SuggestedDelay: time.Minute}, nil
 		}
 		return mergewatch.PRSnapshot{}, nil, err
 	}
@@ -254,7 +255,7 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		Open:                   open,
 		AutoMergeEnabled:       detail.AutoMerge != nil,
 		AutoMergeOwnedByLooper: detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin)),
-		HasLooperLabel:         labels.AnyLooperOwned(detail.Labels),
+		HasLooperLabel:         namespace.AnyOwned(detail.Labels),
 		Mergeable:              detail.Mergeable,
 		MergeableState:         mergeableState,
 		RequiredChecks:         checks,
@@ -408,7 +409,7 @@ func failedCheckRunConclusion(conclusion string) bool {
 	}
 }
 
-func mergeWatchPartialSnapshot(repo string, issueNumber, prNumber int64, detail githubinfra.PullRequestDetail, currentLogin string) mergewatch.PRSnapshot {
+func mergeWatchPartialSnapshot(repo string, issueNumber, prNumber int64, detail githubinfra.PullRequestDetail, namespace labels.Namespace, currentLogin string) mergewatch.PRSnapshot {
 	return mergewatch.PRSnapshot{
 		Repo:                   repo,
 		PRNumber:               prNumber,
@@ -418,7 +419,7 @@ func mergeWatchPartialSnapshot(repo string, issueNumber, prNumber int64, detail 
 		Open:                   strings.EqualFold(detail.State, "open"),
 		AutoMergeEnabled:       detail.AutoMerge != nil,
 		AutoMergeOwnedByLooper: detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin)),
-		HasLooperLabel:         labels.AnyLooperOwned(detail.Labels),
+		HasLooperLabel:         namespace.AnyOwned(detail.Labels),
 		Mergeable:              detail.Mergeable,
 		MergeableState:         detail.MergeableState,
 	}
@@ -439,13 +440,13 @@ func markerState(marker *mergeWatchComment) *mergewatch.PriorWatchMarker {
 	return &copy
 }
 
-func retriageCleanupPatterns(roles config.RoleConfigs, triagedLabel string) []string {
-	patterns := []string{triagedLabel, "dispatch/*"}
+func retriageCleanupPatterns(roles config.RoleConfigs, triagedLabel string, namespace labels.Namespace) []string {
+	patterns := append([]string{triagedLabel}, namespace.DispatchLabels()...)
 	registry := config.EffectiveCodingRoles(roles)
 	planner := registry[config.CodingRolePlanner]
 	worker := registry[config.CodingRoleWorker]
-	patterns = append(patterns, requiredDiscoveryLabels(planner.Discovery.Labels, planner.Discovery.LabelMode)...)
-	patterns = append(patterns, requiredDiscoveryLabels(worker.Discovery.Labels, worker.Discovery.LabelMode)...)
+	patterns = append(patterns, namespace.RemapAll(requiredDiscoveryLabels(planner.Discovery.Labels, planner.Discovery.LabelMode))...)
+	patterns = append(patterns, namespace.RemapAll(requiredDiscoveryLabels(worker.Discovery.Labels, worker.Discovery.LabelMode))...)
 	return patterns
 }
 
@@ -644,10 +645,10 @@ func prLinksIssue(repo string, issueNumber int64, body string) bool {
 	return false
 }
 
-func issueHasCoordinatorTracking(labels []string, triagedLabel string) bool {
+func issueHasCoordinatorTracking(labels []string, triagedLabel string, namespace labels.Namespace) bool {
 	for _, label := range labels {
 		normalized := strings.ToLower(strings.TrimSpace(label))
-		if normalized == strings.ToLower(strings.TrimSpace(triagedLabel)) || strings.HasPrefix(normalized, "dispatch/") {
+		if normalized == strings.ToLower(strings.TrimSpace(triagedLabel)) || namespace.IsDispatch(normalized) {
 			return true
 		}
 	}

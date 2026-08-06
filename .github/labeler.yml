@@ -1,6 +1,6 @@
 # Path-based area labels for PRs, applied by .github/workflows/labeler.yml.
 #
-# These are descriptive labels only. Control-plane labels (looper:*, dispatch/*)
+# These are descriptive labels only. Control-plane labels (looper:*, namespaced dispatch labels)
 # are owned by the looper daemon and humans; no workflow may write them.
 #
 # The area vocabulary follows the role boundaries in CONTEXT.md and extends the

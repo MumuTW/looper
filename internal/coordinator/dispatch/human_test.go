@@ -86,6 +86,15 @@ func TestHumanGatedMissingDispatchFails(t *testing.T) {
 	}
 }
 
+func TestHumanGatedDispatchIgnoresForeignBareDispatchLabel(t *testing.T) {
+	t.Parallel()
+
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", "dispatch/plan"}, Comments: []Comment{{ID: 51, Author: "octo", HasWriteAccess: true, Body: "/plan"}}}, testConfig(), time.Now(), nil)
+	if !action.NoOp || action.ReactionContent != ReactionFailure {
+		t.Fatalf("Decide() = %#v, want foreign bare dispatch label to fail closed", action)
+	}
+}
+
 func TestHumanGatedBlockedByUnsatisfiedFails(t *testing.T) {
 	t.Parallel()
 	graph := dependencyGraph("acme/looper", 1, depgraph.IssueRef{Repo: "acme/looper", Number: 9}, depgraph.IssueState{State: "open"})

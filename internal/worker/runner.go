@@ -1361,9 +1361,10 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
+	namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)
 	eligible := 0
 	for _, issue := range issues {
-		if domain.IsAutoLaneHeld(domain.LoopTypeWorker, issue.Labels) {
+		if domain.IsAutoLaneHeldForNamespace(domain.LoopTypeWorker, issue.Labels, namespace) {
 			result.Skipped++
 			continue
 		}
@@ -1445,7 +1446,8 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	if !ok {
 		return r.discoveryPolicy
 	}
-	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
+	namespace := config.ProjectLabelNamespace(r.projectRoleConfig, projectID)
+	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: namespace.RemapAll(role.Discovery.Labels), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
 }
 
 func (r *Runner) isPersonalProject(projectID string) bool {
@@ -2035,7 +2037,8 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 		}
 	}
 	if input.Loop.TargetType == "pull_request" && work.Repo != "" && work.PRNumber > 0 && r.github != nil {
-		_ = r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: work.Repo, PRNumber: work.PRNumber, Labels: []string{labels.SpecReady}, CWD: input.Project.RepoPath})
+		namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)
+		_ = r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: work.Repo, PRNumber: work.PRNumber, Labels: []string{namespace.SpecReady()}, CWD: input.Project.RepoPath})
 	}
 	checkpoint.Work = &work
 	checkpoint.ClaimedLockKey = lockKey
@@ -3471,7 +3474,8 @@ func (r *Runner) workerHoldSummaryForWork(ctx context.Context, project storage.P
 		if err != nil {
 			return false, "", err
 		}
-		if domain.IsAutoLaneHeld(domain.LoopTypeWorker, detail.Labels) {
+		namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)
+		if domain.IsAutoLaneHeldForNamespace(domain.LoopTypeWorker, detail.Labels, namespace) {
 			return true, fmt.Sprintf("Worker stopped because %s#%d is currently held", work.Repo, work.PRNumber), nil
 		}
 		if len(retargetedToPullRequest) > 0 && retargetedToPullRequest[0] {
@@ -3486,7 +3490,8 @@ func (r *Runner) workerHoldSummaryForWork(ctx context.Context, project storage.P
 		if err != nil {
 			return false, "", err
 		}
-		if domain.IsAutoLaneHeld(domain.LoopTypeWorker, detail.Labels) {
+		namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)
+		if domain.IsAutoLaneHeldForNamespace(domain.LoopTypeWorker, detail.Labels, namespace) {
 			return true, fmt.Sprintf("Worker stopped because %s is currently held", formatIssueReference(issueLookupRepo(work), work.IssueNumber)), nil
 		}
 	}

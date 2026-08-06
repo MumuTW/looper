@@ -205,6 +205,27 @@ See [ADR-0012](adr/0012-sqlite-project-authority.md) for the Authority and lifec
 
 To move an existing API-managed project into `[[projects]]`, first remove its new config entry so the daemon can start, then verify the exact target project ID and send `DELETE /api/v1/projects/<id>` while the daemon is running. Stop the daemon, restore the complete `[[projects]]` entry (including any `provider` and `repo`), and restart. The DELETE archives the API record, terminates its old loops, and retires its worktree registrations without touching their physical checkouts; that archived bit is the durable, explicit ownership handoff that permits config import to claim the same ID. Do not delete SQLite rows directly.
 
+### Project label namespace
+
+Each project may set `projects[].labelNamespace` to isolate Looper's forge
+labels from another Looper instance. It must be a 1–31 character prefix ending
+in `:` and may contain only letters, numbers, `.`, `_`, or `-`; the limit leaves
+room for the longest standard suffix within GitHub's 50-character label-name
+limit. The default is
+`looper:`. Built-in dispatch and ownership checks use this namespace, and the
+legacy bare `dispatch/plan` and `dispatch/implement` labels are read-only
+compatibility inputs and are never emitted. Classification-label projection is
+kept as a separate opt-in policy; set `projects[].classificationLabels = true`
+to project `kind/*`, `area/*`, and `complexity/*` into a custom namespace. This
+setting does not make host-repository classification labels Looper-owned.
+
+```toml
+[[projects]]
+id = "client-app"
+repoPath = "/absolute/path/to/client-app"
+labelNamespace = "client.looper:"
+classificationLabels = true
+```
 Legacy top-level `reviewer.*` input is compatibility-only. The canonical reviewer behavior home is `roles.reviewer.behavior.*`.
 
 Schema migration is independent from config-file format migration: precedence stays `defaults → config file → environment variables → CLI flags` regardless of whether a file still uses legacy reviewer paths or legacy JSON defaults.
@@ -546,7 +567,7 @@ The historic gate remains configurable under `roles.triager.legacy`: `autoRouteC
 
 ## Coordinator config reference
 
-Coordinator is the proactive, stateless issue-intake role. It owns both Triage and Dispatch. Triage writes `triaged` plus the coordinator-owned label namespace. Dispatch consumes `triaged` + `dispatch/*` and derives the actual trigger label from Planner or Worker config instead of redeclaring those labels.
+Coordinator is the proactive, stateless issue-intake role. It owns both Triage and Dispatch. Triage writes the project-scoped completion marker (`triaged` in the default namespace, `<namespace>triaged` for a custom namespace) plus the coordinator-owned label namespace. Dispatch consumes that same completion marker and the namespaced `<namespace>dispatch:plan` / `<namespace>dispatch:implement` labels and derives the actual trigger label from Planner or Worker config instead of redeclaring those labels. Bare `dispatch/*` labels are foreign host state: they are read-only compatibility leftovers and are never triggers or cleanup targets.
 
 Triage LLM calls use the **global** `agent.vendor` / `agent.model` only (not coding-role profiles or `roles.*.agent` overlays). See [Multi-role agent vendor and model](#multi-role-agent-vendor-and-model).
 
@@ -565,7 +586,7 @@ Coordinator triage lives under `roles.coordinator.triage.*`:
 | `roles.coordinator.triage.disposition.unclearLabel` | Label used for `unclear` | `"needs-info"` |
 | `roles.coordinator.triage.disposition.reTriageOnAuthorReply` | Re-opens the triage loop when the original author clarifies a `needs-info` issue | `true` |
 
-Coordinator clears and rewrites its own label namespace on each successful triage pass: `kind/*`, `area/*`, `complexity/*`, `dispatch/*`, `wontfix`, and `needs-info`. It then posts or edits the marker comment and writes `triaged` last.
+Coordinator clears and rewrites its own label namespace on each successful triage pass: `kind/*`, `area/*`, `complexity/*`, `<namespace>dispatch:*`, `wontfix`, and `needs-info`. Bare `dispatch/*` labels are foreign host state and are never removed. It then posts or edits the marker comment and writes the project-scoped completion marker last.
 
 ### Dispatch settings
 
@@ -613,7 +634,7 @@ Behavior notes:
 
 - `/plan` maps to the first planner trigger label at `roles.planner.triggers.labels[0]`
 - `/implement` maps to the first worker trigger label at `roles.worker.triggers.labels[0]`
-- autonomous mode uses the existing `dispatch/*` label to choose the same derived trigger labels
+- autonomous mode uses the existing namespaced dispatch label to choose the same derived trigger labels
 - Coordinator never stores its own dispatch state; the authority chain stays on GitHub labels, comments, and timeline events
 - `roles.coordinator.dispatch.autonomous.holdLabel` is compatibility-only for coordinator autonomous dispatch; the official global hold contract is `looper:hold`
 
@@ -669,6 +690,8 @@ Semantics:
 - only explicit manual `looper work/review/fix --force` or API create requests with `force=true` can bypass hold.
 
 Planner is special: only `looper:hold` blocks planner. There is no planner-specific hold label.
+
+For a project with `projects[].labelNamespace` set (see [Project label namespace](#project-label-namespace)), the hold labels use that namespace instead: with `labelNamespace = "client.looper:"`, the effective labels are `client.looper:hold`, `client.looper:hold:worker`, `client.looper:hold:fixer`, and `client.looper:hold:reviewer`. The default-namespace `looper:hold*` labels do not apply to such projects, and a custom namespace never matches the default namespace's ownership checks.
 
 Manual CLI/API create-time hold validation is best-effort only when the local project repo path or configured `gh` path needed for remote inspection is unavailable. If those are present but `gh` inspection itself fails, create-time validation fails.
 

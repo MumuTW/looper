@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops"
 	"github.com/MumuTW/looper/internal/loops/runpipe"
@@ -551,11 +552,11 @@ func (r *Runner) hitlTransportGitHub() bool {
 	return t == "" || t == "github"
 }
 
-func (r *Runner) hitlAwaitingLabel() string {
+func (r *Runner) hitlAwaitingLabelForNamespace(namespace labels.Namespace) string {
 	if l := strings.TrimSpace(r.hitlGitHub.AwaitingLabel); l != "" {
 		return l
 	}
-	return labels.AwaitingHuman
+	return namespace.AwaitingHuman()
 }
 
 // deliverAskToGitHub posts a marked question and records its correlation. Normal
@@ -626,7 +627,8 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, checkp
 	if err != nil {
 		return err
 	}
-	if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: repo, PRNumber: prNumber, Labels: []string{r.hitlAwaitingLabel()}, CWD: cwd}); err != nil && r.logger != nil {
+	namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)
+	if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: repo, PRNumber: prNumber, Labels: []string{r.hitlAwaitingLabelForNamespace(namespace)}, CWD: cwd}); err != nil && r.logger != nil {
 		r.logger.Warn("hitl github: failed to add awaiting-human label", map[string]any{"repo": repo, "pr": prNumber, "error": err.Error()})
 	}
 

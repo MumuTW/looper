@@ -914,13 +914,15 @@ type ProjectRefConfig struct {
 	// PersonalProject opts this repository into self-authored issue admission.
 	// It is never inferred from repository ownership: shared/contributing
 	// repositories remain unchanged unless an operator explicitly enables it.
-	PersonalProject bool    `json:"personalProject,omitempty"`
-	Provider        string  `json:"provider,omitempty"`
-	Repo            string  `json:"repo,omitempty"`
-	RepoPath        string  `json:"repoPath"`
-	Path            string  `json:"path,omitempty"`
-	BaseBranch      *string `json:"baseBranch,omitempty"`
-	WorktreeRoot    *string `json:"worktreeRoot,omitempty"`
+	PersonalProject      bool    `json:"personalProject,omitempty"`
+	Provider             string  `json:"provider,omitempty"`
+	Repo                 string  `json:"repo,omitempty"`
+	RepoPath             string  `json:"repoPath"`
+	Path                 string  `json:"path,omitempty"`
+	LabelNamespace       string  `json:"labelNamespace,omitempty"`
+	ClassificationLabels bool    `json:"classificationLabels,omitempty"`
+	BaseBranch           *string `json:"baseBranch,omitempty"`
+	WorktreeRoot         *string `json:"worktreeRoot,omitempty"`
 	// Network is retained only for dormant routed internals. There is no
 	// supported enrollment producer, so it is not a public config/API field.
 	Network    ProjectNetworkConfig     `json:"-"`
@@ -934,19 +936,21 @@ type ProjectWebhookConfig struct {
 }
 
 type PartialProjectRefConfig struct {
-	ID              string                          `json:"id"`
-	Name            string                          `json:"name"`
-	PersonalProject *bool                           `json:"personalProject,omitempty"`
-	Provider        *string                         `json:"provider,omitempty"`
-	Repo            *string                         `json:"repo,omitempty"`
-	RepoPath        string                          `json:"repoPath"`
-	Path            string                          `json:"path,omitempty"`
-	BaseBranch      *string                         `json:"baseBranch,omitempty"`
-	WorktreeRoot    *string                         `json:"worktreeRoot,omitempty"`
-	Webhook         *PartialProjectWebhookConfig    `json:"webhook,omitempty"`
-	Validation      *PartialProjectValidationConfig `json:"validation,omitempty"`
-	Instructions    map[string]string               `json:"instructions,omitempty"`
-	Roles           *PartialRoleConfigs             `json:"roles,omitempty"`
+	ID                   string                          `json:"id"`
+	Name                 string                          `json:"name"`
+	PersonalProject      *bool                           `json:"personalProject,omitempty"`
+	Provider             *string                         `json:"provider,omitempty"`
+	Repo                 *string                         `json:"repo,omitempty"`
+	RepoPath             string                          `json:"repoPath"`
+	Path                 string                          `json:"path,omitempty"`
+	LabelNamespace       *string                         `json:"labelNamespace,omitempty"`
+	ClassificationLabels *bool                           `json:"classificationLabels,omitempty"`
+	BaseBranch           *string                         `json:"baseBranch,omitempty"`
+	WorktreeRoot         *string                         `json:"worktreeRoot,omitempty"`
+	Webhook              *PartialProjectWebhookConfig    `json:"webhook,omitempty"`
+	Validation           *PartialProjectValidationConfig `json:"validation,omitempty"`
+	Instructions         map[string]string               `json:"instructions,omitempty"`
+	Roles                *PartialRoleConfigs             `json:"roles,omitempty"`
 }
 
 type PartialProjectWebhookConfig struct {

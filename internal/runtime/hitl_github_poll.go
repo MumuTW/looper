@@ -6,9 +6,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/eventlog"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
-	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops"
 	"github.com/MumuTW/looper/internal/storage"
 )
@@ -322,7 +322,7 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 		return
 	}
 
-	awaitingLabel := labels.AwaitingHuman
+	awaitingLabel := config.ProjectLabelNamespaceForMetadata(input.Config, project.ID, project.MetadataJSON).AwaitingHuman()
 	var answerAuthors []string
 	if gh := input.Config.HITL.GitHub; gh != nil {
 		if strings.TrimSpace(gh.AwaitingLabel) != "" {

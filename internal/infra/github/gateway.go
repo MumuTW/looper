@@ -431,10 +431,11 @@ type IssueAssigneesInput struct {
 }
 
 type IssueLabelsInput struct {
-	Repo        string
-	IssueNumber int64
-	Labels      []string
-	CWD         string
+	Repo           string
+	IssueNumber    int64
+	Labels         []string
+	LabelNamespace labels.Namespace
+	CWD            string
 }
 
 type IssueCommentResult struct {
@@ -635,10 +636,11 @@ type PullRequestCommentInput struct {
 }
 
 type PullRequestLabelsInput struct {
-	Repo     string
-	PRNumber int64
-	Labels   []string
-	CWD      string
+	Repo           string
+	PRNumber       int64
+	Labels         []string
+	LabelNamespace labels.Namespace
+	CWD            string
 }
 
 type PullRequestReviewersInput struct {
@@ -1614,7 +1616,7 @@ func (g *Gateway) AddIssueLabels(ctx context.Context, input IssueLabelsInput) er
 	if len(input.Labels) == 0 {
 		return nil
 	}
-	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD); err != nil {
+	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD, input.LabelNamespace); err != nil {
 		return err
 	}
 	hostname, repo := splitRepoHostname(input.Repo)
@@ -3364,7 +3366,7 @@ func (g *Gateway) AddPullRequestLabels(ctx context.Context, input PullRequestLab
 	if len(input.Labels) == 0 {
 		return nil
 	}
-	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD); err != nil {
+	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD, input.LabelNamespace); err != nil {
 		return err
 	}
 	hostname, repo := splitRepoHostname(input.Repo)
@@ -4064,7 +4066,7 @@ func (g *Gateway) getReviewThread(ctx context.Context, threadID, cwd string, hos
 // Presentation comes from labels.Standard when the label is one Looper owns,
 // and falls back to a neutral default for anything else — a project may
 // configure its own trigger labels, and those have no entry in the table.
-func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, wanted []string, cwd string) error {
+func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, wanted []string, cwd string, namespace labels.Namespace) error {
 	definitions := make([]labels.Definition, 0, len(wanted))
 	seen := map[string]struct{}{}
 	for _, label := range wanted {
@@ -4076,7 +4078,7 @@ func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, wanted []s
 			continue
 		}
 		seen[normalized] = struct{}{}
-		definitions = append(definitions, labelPresentation(label))
+		definitions = append(definitions, labelPresentationForNamespace(label, namespace))
 	}
 	return g.ensureLabels(ctx, repo, cwd, definitions)
 }
@@ -4094,13 +4096,22 @@ func isLabelAlreadyExistsError(err error) bool {
 
 // labelPresentation resolves the color and description to create a label with.
 func labelPresentation(label string) labels.Definition {
-	normalized := labels.Normalize(label)
-	for _, definition := range labels.Standard() {
-		if labels.Normalize(definition.Name) == normalized {
+	if namespace, ok := labels.NamespaceForLabel(label); ok {
+		if definition, ok := labels.DefinitionForNamespace(label, namespace); ok {
 			return definition
 		}
 	}
 	return labels.Definition{Name: label, Color: "5319e7", Description: "Managed by looper"}
+}
+
+func labelPresentationForNamespace(label string, namespace labels.Namespace) labels.Definition {
+	if strings.TrimSpace(namespace.Prefix) != "" {
+		if definition, ok := labels.DefinitionForNamespace(label, namespace); ok {
+			return definition
+		}
+		return labels.Definition{Name: label, Color: "5319e7", Description: "Managed by looper"}
+	}
+	return labelPresentation(label)
 }
 
 func (g *Gateway) listRepositoryLabels(ctx context.Context, repo string, cwd string) (map[string]labels.Definition, error) {

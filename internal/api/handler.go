@@ -5129,7 +5129,8 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 		if refreshErr != nil {
 			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", refreshErr)}
 		}
-		if domain.IsAutoLaneHeld(loopType, labels) {
+		namespace := config.ProjectLabelNamespaceForMetadata(&h.context.Config, projectID, project.MetadataJSON)
+		if domain.IsAutoLaneHeldForNamespace(loopType, labels, namespace) {
 			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}
 		}
 		return nil
@@ -5151,7 +5152,8 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	if refreshErr != nil {
 		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", refreshErr)}
 	}
-	if !domain.IsAutoLaneHeld(loopType, labels) {
+	namespace := config.ProjectLabelNamespaceForMetadata(&h.context.Config, projectID, project.MetadataJSON)
+	if !domain.IsAutoLaneHeldForNamespace(loopType, labels, namespace) {
 		return nil
 	}
 	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}

@@ -859,6 +859,55 @@ func TestServiceSyncConfiguredPreservesMetadataLayout(t *testing.T) {
 	}
 }
 
+func TestServiceSyncConfiguredClearsStaleLabelNamespaceFromCatalog(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	service := &Service{Repos: repos, Now: time.Now}
+	ctx := context.Background()
+	prefix := "team.looper:"
+	enabled := true
+	first := config.Config{Projects: []config.ProjectRefConfig{{ID: "project", Name: "Project", RepoPath: "/tmp/project", LabelNamespace: prefix, ClassificationLabels: enabled}}}
+	if err := service.SyncConfigured(ctx, first, time.Now()); err != nil {
+		t.Fatalf("initial SyncConfigured() error = %v", err)
+	}
+	stored, err := repos.Projects.GetByID(ctx, "project")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	initialMetadata := ""
+	if stored != nil && stored.MetadataJSON != nil {
+		initialMetadata = *stored.MetadataJSON
+	}
+	if stored == nil || !strings.Contains(initialMetadata, `"labelNamespace":"team.looper:"`) {
+		t.Fatalf("initial metadata = %#v, want persisted label namespace", stored)
+	}
+
+	second := config.Config{Projects: []config.ProjectRefConfig{{ID: "project", Name: "Project", RepoPath: "/tmp/project"}}}
+	if err := service.SyncConfigured(ctx, second, time.Now()); err != nil {
+		t.Fatalf("resync SyncConfigured() error = %v", err)
+	}
+	stored, err = repos.Projects.GetByID(ctx, "project")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() after resync error = %v", err)
+	}
+	resyncedMetadata := ""
+	if stored != nil && stored.MetadataJSON != nil {
+		resyncedMetadata = *stored.MetadataJSON
+	}
+	if stored == nil || strings.Contains(resyncedMetadata, "team.looper:") {
+		t.Fatalf("resynced metadata = %#v, want stale namespace removed", stored)
+	}
+	catalog, err := MaterializeCatalog(config.Config{}, []storage.ProjectRecord{*stored})
+	if err != nil {
+		t.Fatalf("MaterializeCatalog() after resync error = %v", err)
+	}
+	if len(catalog) != 1 || catalog[0].LabelNamespace != "" || catalog[0].ClassificationLabels {
+		t.Fatalf("materialized catalog = %#v, want no stale namespace policy", catalog)
+	}
+}
+
 func TestServiceSyncConfiguredRefreshesTransferredRepoMetadata(t *testing.T) {
 	t.Parallel()
 

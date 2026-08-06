@@ -29,6 +29,7 @@ import (
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/notify"
+	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops/runpipe"
 	networkclient "github.com/MumuTW/looper/internal/network/client"
 	"github.com/MumuTW/looper/internal/network/protocol"
@@ -447,6 +448,7 @@ func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string
 
 func runTrustedReviewSubmission(ctx context.Context, input forge.TrustedReviewSubmission, stdout, stderr io.Writer) error {
 	return reviewsubmit.RunTrusted(ctx, reviewsubmit.Options{
+		ProjectID:           input.ProjectID,
 		PRRef:               input.PRRef,
 		Event:               input.Event,
 		CommitID:            input.CommitID,
@@ -1016,7 +1018,7 @@ func reviewerAllowedPRRef(metadata map[string]any) string {
 // reviewerAllowedReviewPolicy extracts daemon-selected review policy, head,
 // and run identity from reviewer metadata. The runner authors these fields from
 // its immutable loop/run checkpoint; agent argv is never authoritative.
-func reviewerAllowedReviewPolicy(metadata map[string]any) forge.TrustedReviewProxyPolicy {
+func reviewerAllowedReviewPolicy(projectID string, metadata map[string]any) forge.TrustedReviewProxyPolicy {
 	if metadata == nil {
 		return forge.TrustedReviewProxyPolicy{}
 	}
@@ -1026,6 +1028,7 @@ func reviewerAllowedReviewPolicy(metadata map[string]any) forge.TrustedReviewPro
 	reviewerManual, _ := metadata["reviewerManual"].(bool)
 	reviewerRunID, _ := metadata["reviewerRunID"].(string)
 	return forge.TrustedReviewProxyPolicy{
+		ProjectID:        strings.TrimSpace(projectID),
 		Clean:            strings.TrimSpace(clean),
 		Blocking:         strings.TrimSpace(blocking),
 		ExpectedCommitID: strings.TrimSpace(expectedCommitID),
@@ -1106,7 +1109,7 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 	if reviewerAllowsTrustedReviewProxy(a.config, input.ProjectID, input.Metadata) {
 		allowedPR := reviewerAllowedPRRef(input.Metadata)
 		allowedCwd := strings.TrimSpace(input.WorkingDirectory)
-		policy := reviewerAllowedReviewPolicy(input.Metadata)
+		policy := reviewerAllowedReviewPolicy(input.ProjectID, input.Metadata)
 		if policy.ReviewerManual && policy.ReviewerRunID != strings.TrimSpace(input.RunID) {
 			return nil, fmt.Errorf("install run-bound trusted review proxy: reviewer run id does not match agent run")
 		}
@@ -2060,6 +2063,12 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Repos:  repos,
 			GitHub: gatekeeperGitHubAdapter{Gateway: githubGateway, config: &cfg},
 			Now:    now,
+			LabelNamespaceForProject: func(projectID string) (labels.Namespace, bool) {
+				if _, ok := runtimeProjectBinding(cfg, projectID); !ok {
+					return labels.Namespace{}, false
+				}
+				return config.ProjectLabelNamespace(&cfg, projectID), true
+			},
 			TrustForProject: func(projectID string) config.GatekeeperTrustLevel {
 				return gatekeeperTrustForProject(cfg, projectID)
 			},

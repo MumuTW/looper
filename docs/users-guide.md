@@ -136,7 +136,7 @@ For each fresh issue inside the configured bootstrap window, Coordinator picks o
 
 It then:
 
-1. clears any prior coordinator-owned labels (`kind/*`, `area/*`, `complexity/*`, `dispatch/*`, `wontfix`, `needs-info`)
+1. clears any prior coordinator-owned labels (`kind/*`, `area/*`, `complexity/*`, `<namespace>dispatch:*`, `wontfix`, `needs-info`); bare `dispatch/*` labels are foreign and remain untouched
 2. applies the new labels for the chosen Disposition
 3. posts or edits a triage comment marked with `<!-- looper:coordinator:triage -->`
 4. applies `triaged` last as the durability commit
@@ -145,7 +145,7 @@ The `triaged` label means Coordinator has formed an opinion about the issue. Bec
 
 ### Current triage outcomes
 
-- `valid` adds one each of `kind/*`, `area/*`, `complexity/*`, and `dispatch/*`
+- `valid` adds one each of the classification labels and exactly one namespaced dispatch label (`<namespace>dispatch:plan` or `<namespace>dispatch:implement`)
 - `out-of-scope` reuses the existing `wontfix` label and leaves the issue open
 - `unclear` adds `needs-info` and asks the author for clarification
 
@@ -155,7 +155,7 @@ If an issue is in the `unclear` state and the original author replies after `nee
 
 ### Dispatch after triage
 
-Once an issue is already `triaged` and carries exactly one `dispatch/*` label, Coordinator can hand it off in one of two modes:
+Once an issue is already `triaged` and carries exactly one namespaced dispatch label, Coordinator can hand it off in one of two modes:
 
 - **human-gated** (default)
 - **autonomous**
@@ -180,7 +180,7 @@ On success, Coordinator:
 
 If the trigger label is already present, Coordinator treats the command as an idempotent re-issue and still reacts 👍.
 
-If the issue is missing `triaged` or a matching `dispatch/*`, Coordinator reacts with GitHub's `confused` reaction and posts one short failure comment marked with `<!-- looper:coordinator:dispatch-failure -->`.
+If the issue is missing `triaged` or a matching namespaced dispatch label, Coordinator reacts with GitHub's `confused` reaction and posts one short failure comment marked with `<!-- looper:coordinator:dispatch-failure -->`.
 
 #### Autonomous mode
 
@@ -192,7 +192,7 @@ Autonomous dispatch still derives the trigger label from Planner or Worker confi
 
 Autonomous dispatch stops immediately when any veto signal is present:
 
-- the `dispatch/*` label is gone
+- the namespaced dispatch label is gone
 - the global hold label `looper:hold` (or the configured override) is present
 - the destination trigger label is already present because a human dispatched manually
 
@@ -436,7 +436,7 @@ These are the most important labels right now:
 | --- | --- | --- |
 | `triaged` | issue | Coordinator finished triage and committed a Disposition |
 | `needs-info` | issue | Coordinator marked the issue `unclear` and is waiting for the author |
-| `dispatch/*` | issue | Coordinator's durable dispatch intent for later hand-off |
+| `<namespace>dispatch:plan` / `<namespace>dispatch:implement` | issue | Coordinator's durable dispatch intent for later hand-off |
 | `looper:plan` | issue | This issue is eligible for planner auto-pickup |
 | `looper:spec-reviewing` | PR | This PR is in the spec review phase |
 | `looper:spec-ready` | PR | The spec is approved and ready for worker |
