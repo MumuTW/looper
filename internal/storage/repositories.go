@@ -128,6 +128,29 @@ type PlannerWorkGraphNodeRecord struct {
 	UpdatedAt              string
 }
 
+// WithTransaction runs a repository operation against one SQLite transaction.
+// Event-log projections that must be observed together (for example a Gate
+// report and its terminal agreement) use this boundary so a partial append
+// cannot become the durable source of truth.
+func (r *Repositories) WithTransaction(ctx context.Context, fn func(*Repositories) error) error {
+	if r == nil || r.q == nil {
+		return fmt.Errorf("repository transaction storage is not configured")
+	}
+	if fn == nil {
+		return fmt.Errorf("repository transaction callback is nil")
+	}
+	if _, ok := r.q.(*sql.Tx); ok {
+		return fn(r)
+	}
+	db, ok := r.q.(txBeginner)
+	if !ok {
+		return fmt.Errorf("repository transaction storage is not transactional")
+	}
+	return WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
+		return fn(NewRepositories(tx))
+	})
+}
+
 // RetireQueuedLoop pauses a queued loop and cancels its selected queued item
 // in one transaction. It returns false when either record stopped being queued
 // before the transaction established its status guard.
@@ -621,6 +644,80 @@ func (r *EventsRepository) ListByEntityAndEventTypes(ctx context.Context, entity
 	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE entity_type = ? AND entity_id = ? AND event_type IN (`+sqlPlaceholders(len(eventTypes))+`) ORDER BY created_at ASC, id ASC`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list event logs by entity and event types: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
+// ListByEventType returns the newest durable events of one type. The optional
+// project filter is applied in SQLite so a read-only projection cannot load an
+// unrelated project's full event history into the daemon before applying its
+// limit.
+func (r *EventsRepository) ListByEventType(ctx context.Context, eventType, projectID string, limit int64) ([]EventLogRecord, error) {
+	if strings.TrimSpace(eventType) == "" {
+		return []EventLogRecord{}, nil
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+
+	query := "SELECT " + eventLogColumns + " FROM event_logs WHERE event_type = ?"
+	args := []any{eventType}
+	if strings.TrimSpace(projectID) != "" {
+		query += " AND project_id = ?"
+		args = append(args, projectID)
+	}
+	query += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := r.q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list event logs by type: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
+// ListLatestByEventType returns the newest event for each durable entity in an
+// event family. The optional project filter is applied before the window so a
+// read-only projection can bound its scan without loading another project's
+// history. Entity identity includes project_id because the same pull request
+// can be observed by more than one registered project. A positive limit caps
+// the newest entities; zero or negative means all entities for callers that
+// need a complete state projection.
+func (r *EventsRepository) ListLatestByEventType(ctx context.Context, eventType, projectID string, limit int64) ([]EventLogRecord, error) {
+	if strings.TrimSpace(eventType) == "" {
+		return []EventLogRecord{}, nil
+	}
+
+	query := `SELECT ` + eventLogColumns + `
+		FROM (
+			SELECT ` + eventLogColumns + `, rowid AS event_rowid,
+				ROW_NUMBER() OVER (
+					PARTITION BY COALESCE(project_id, ''), COALESCE(entity_id, '')
+					ORDER BY created_at DESC, rowid DESC
+				) AS event_rank
+			FROM event_logs
+			WHERE event_type = ?`
+	args := []any{eventType}
+	if strings.TrimSpace(projectID) != "" {
+		query += " AND project_id = ?"
+		args = append(args, projectID)
+	}
+	query += `
+		) AS ranked
+		WHERE event_rank = 1
+		ORDER BY created_at DESC, event_rowid DESC`
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+
+	rows, err := r.q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list latest event logs by type: %w", err)
 	}
 	defer rows.Close()
 

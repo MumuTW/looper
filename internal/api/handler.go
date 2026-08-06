@@ -465,6 +465,32 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.writeSuccess(w, requestID, payload)
 		return
+	case apiBasePath + "/gatekeeper/agreements":
+		payload, err := h.buildGatekeeperAgreementsRouteResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+
+		h.writeSuccess(w, requestID, payload)
+		return
+	case apiBasePath + "/gatekeeper/verdicts":
+		payload, err := h.buildGatekeeperVerdictsRouteResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+
+		h.writeSuccess(w, requestID, payload)
+		return
 	case apiBasePath + "/pull-requests":
 		payload, err := h.buildPullRequestsRouteResponse(r)
 		if err != nil {
@@ -1909,6 +1935,56 @@ type entityEventsResponse struct {
 	Items      []eventResponse `json:"items"`
 }
 
+type gatekeeperAgreementsResponse struct {
+	Items []gatekeeperAgreementResponse `json:"items"`
+}
+
+type gatekeeperVerdictsResponse struct {
+	Items []gatekeeperVerdictResponse `json:"items"`
+}
+
+// gatekeeperAgreementResponse is a read-only projection of the immutable
+// agreement event. The event ID and verdict event ID keep the causal evidence
+// inspectable without exposing the generic event-log payload contract.
+type gatekeeperAgreementResponse struct {
+	ID              string `json:"id"`
+	ProjectID       string `json:"projectId"`
+	Repo            string `json:"repo"`
+	PRNumber        int64  `json:"prNumber"`
+	VerdictEventID  string `json:"verdictEventId"`
+	VerdictEligible bool   `json:"verdictEligible"`
+	VerdictHeadSHA  string `json:"verdictHeadSha,omitempty"`
+	Outcome         string `json:"outcome"`
+	Agreement       bool   `json:"agreement"`
+	TerminalState   string `json:"terminalState"`
+	TerminalHeadSHA string `json:"terminalHeadSha,omitempty"`
+	TerminalAt      string `json:"terminalAt"`
+	RecordedAt      string `json:"recordedAt"`
+	CreatedAt       string `json:"createdAt"`
+}
+
+// gatekeeperVerdictResponse is a read-only projection of the newest immutable
+// Gate report per project/pull request. The event remains the authority; this
+// typed shape keeps clients from decoding generic payloads or re-evaluating
+// merge eligibility from mutable forge state.
+type gatekeeperVerdictResponse struct {
+	ID                        string              `json:"id"`
+	ProjectID                 string              `json:"projectId"`
+	Repo                      string              `json:"repo"`
+	PRNumber                  int64               `json:"prNumber"`
+	Version                   int                 `json:"version"`
+	Mode                      string              `json:"mode"`
+	Status                    string              `json:"status"`
+	Eligible                  bool                `json:"eligible"`
+	ExpectedHeadSHA           string              `json:"expectedHeadSha,omitempty"`
+	ObservedHeadSHA           string              `json:"observedHeadSha,omitempty"`
+	RequiresFreshRevalidation bool                `json:"requiresFreshRevalidation"`
+	Reasons                   []gatekeeper.Reason `json:"reasons"`
+	Evidence                  gatekeeper.Evidence `json:"evidence"`
+	EvaluatedAt               string              `json:"evaluatedAt"`
+	CreatedAt                 string              `json:"createdAt"`
+}
+
 type eventResponse struct {
 	ID               string  `json:"id"`
 	EventType        string  `json:"eventType"`
@@ -2058,12 +2134,15 @@ type projectResponse struct {
 	BaseBranch string `json:"baseBranch"`
 	Archived   bool   `json:"archived"`
 	// Provider is the resolved provider kind for display.
-	Provider     string                     `json:"provider"`
-	Repo         *string                    `json:"repo"`
-	WorktreeRoot *string                    `json:"worktreeRoot"`
-	Validation   *projectValidationResponse `json:"validation,omitempty"`
-	CreatedAt    string                     `json:"createdAt"`
-	UpdatedAt    string                     `json:"updatedAt"`
+	Provider     string  `json:"provider"`
+	Repo         *string `json:"repo"`
+	WorktreeRoot *string `json:"worktreeRoot"`
+	// GatekeeperTrust is omitted for the default observe level; absence means
+	// observe while non-default levels remain visible to operators.
+	GatekeeperTrust string                     `json:"gatekeeperTrust,omitempty"`
+	Validation      *projectValidationResponse `json:"validation,omitempty"`
+	CreatedAt       string                     `json:"createdAt"`
+	UpdatedAt       string                     `json:"updatedAt"`
 	// Discovery reports post-commit worktree/PR discovery status when the
 	// project record carries it; omitted for records that predate it.
 	Discovery *discoveryResponse `json:"discovery,omitempty"`
@@ -2564,6 +2643,134 @@ func (h *Handler) buildPostMergeDigestResponse(ctx context.Context) (postMergeDi
 	}
 	response.Digest = digest
 	return response, nil
+}
+
+const maxGatekeeperAgreementsLimit int64 = 200
+
+func (h *Handler) buildGatekeeperAgreementsRouteResponse(r *http.Request) (gatekeeperAgreementsResponse, error) {
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Events == nil {
+		return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Events repository is not configured"}
+	}
+	if r.Method != http.MethodGet {
+		return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/gatekeeper/agreements")}
+	}
+
+	limit := int64(100)
+	if limitValue := strings.TrimSpace(r.URL.Query().Get("limit")); limitValue != "" {
+		parsed, err := strconv.ParseInt(limitValue, 10, 64)
+		if err != nil || parsed <= 0 || parsed > maxGatekeeperAgreementsLimit {
+			return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("limit must be a positive integer no greater than %d", maxGatekeeperAgreementsLimit)}
+		}
+		limit = parsed
+	}
+
+	projectID := exactOptionalQueryValue(r.URL.Query().Get("projectId"))
+	events, err := services.Repositories.Events.ListByEventType(r.Context(), gatekeeper.AdviceAgreementEventType, projectID, limit)
+	if err != nil {
+		return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+
+	items := make([]gatekeeperAgreementResponse, 0, len(events))
+	for _, event := range events {
+		var agreement gatekeeper.AdviceAgreement
+		if err := json.Unmarshal([]byte(event.PayloadJSON), &agreement); err != nil {
+			return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("decode advise agreement %s: %v", event.ID, err)}
+		}
+		if strings.TrimSpace(agreement.VerdictEventID) == "" || strings.TrimSpace(agreement.Repo) == "" || agreement.PRNumber <= 0 {
+			return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("advise agreement %s is missing its causal identity", event.ID)}
+		}
+		items = append(items, serializeGatekeeperAgreement(event, agreement))
+	}
+
+	return gatekeeperAgreementsResponse{Items: items}, nil
+}
+
+func serializeGatekeeperAgreement(event storage.EventLogRecord, agreement gatekeeper.AdviceAgreement) gatekeeperAgreementResponse {
+	projectID := agreement.ProjectID
+	if strings.TrimSpace(projectID) == "" && event.ProjectID != nil {
+		projectID = strings.TrimSpace(*event.ProjectID)
+	}
+	return gatekeeperAgreementResponse{
+		ID:              event.ID,
+		ProjectID:       projectID,
+		Repo:            agreement.Repo,
+		PRNumber:        agreement.PRNumber,
+		VerdictEventID:  agreement.VerdictEventID,
+		VerdictEligible: agreement.VerdictEligible,
+		VerdictHeadSHA:  agreement.VerdictHeadSHA,
+		Outcome:         string(agreement.Outcome),
+		Agreement:       agreement.Agreement,
+		TerminalState:   agreement.TerminalState,
+		TerminalHeadSHA: agreement.TerminalHeadSHA,
+		TerminalAt:      agreement.TerminalAt,
+		RecordedAt:      agreement.RecordedAt,
+		CreatedAt:       event.CreatedAt,
+	}
+}
+
+const maxGatekeeperVerdictsLimit int64 = 200
+
+func (h *Handler) buildGatekeeperVerdictsRouteResponse(r *http.Request) (gatekeeperVerdictsResponse, error) {
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Events == nil {
+		return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Events repository is not configured"}
+	}
+	if r.Method != http.MethodGet {
+		return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/gatekeeper/verdicts")}
+	}
+
+	limit := int64(100)
+	if limitValue := strings.TrimSpace(r.URL.Query().Get("limit")); limitValue != "" {
+		parsed, err := strconv.ParseInt(limitValue, 10, 64)
+		if err != nil || parsed <= 0 || parsed > maxGatekeeperVerdictsLimit {
+			return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("limit must be a positive integer no greater than %d", maxGatekeeperVerdictsLimit)}
+		}
+		limit = parsed
+	}
+
+	projectID := exactOptionalQueryValue(r.URL.Query().Get("projectId"))
+	events, err := services.Repositories.Events.ListLatestByEventType(r.Context(), gatekeeper.GateReportEventType, projectID, limit)
+	if err != nil {
+		return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+
+	items := make([]gatekeeperVerdictResponse, 0, len(events))
+	for _, event := range events {
+		var report gatekeeper.Report
+		if err := json.Unmarshal([]byte(event.PayloadJSON), &report); err != nil {
+			return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("decode gatekeeper verdict %s: %v", event.ID, err)}
+		}
+		if strings.TrimSpace(report.ProjectID) == "" && event.ProjectID != nil {
+			report.ProjectID = strings.TrimSpace(*event.ProjectID)
+		}
+		if strings.TrimSpace(report.ProjectID) == "" || strings.TrimSpace(report.Repo) == "" || report.PRNumber <= 0 {
+			return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("gatekeeper verdict %s is missing its causal identity", event.ID)}
+		}
+		items = append(items, serializeGatekeeperVerdict(event, report))
+	}
+
+	return gatekeeperVerdictsResponse{Items: items}, nil
+}
+
+func serializeGatekeeperVerdict(event storage.EventLogRecord, report gatekeeper.Report) gatekeeperVerdictResponse {
+	return gatekeeperVerdictResponse{
+		ID:                        event.ID,
+		ProjectID:                 report.ProjectID,
+		Repo:                      report.Repo,
+		PRNumber:                  report.PRNumber,
+		Version:                   report.Version,
+		Mode:                      report.Mode,
+		Status:                    report.Status,
+		Eligible:                  report.Eligible,
+		ExpectedHeadSHA:           report.ExpectedHeadSHA,
+		ObservedHeadSHA:           report.ObservedHeadSHA,
+		RequiresFreshRevalidation: report.RequiresFreshRevalidation,
+		Reasons:                   append([]gatekeeper.Reason{}, report.Reasons...),
+		Evidence:                  report.Evidence,
+		EvaluatedAt:               report.EvaluatedAt,
+		CreatedAt:                 event.CreatedAt,
+	}
 }
 
 func (h *Handler) buildEntityEventsRouteResponse(r *http.Request, path string) (entityEventsResponse, error) {
@@ -8097,11 +8304,12 @@ func (f *updateProjectStringField) UnmarshalJSON(raw []byte) error {
 }
 
 type updateProjectRequest struct {
-	Repo         updateProjectStringField        `json:"repo"`
-	Name         updateProjectStringField        `json:"name"`
-	BaseBranch   updateProjectStringField        `json:"baseBranch"`
-	WorktreeRoot updateProjectStringField        `json:"worktreeRoot"`
-	Validation   *config.ProjectValidationConfig `json:"validation"`
+	Repo            updateProjectStringField        `json:"repo"`
+	Name            updateProjectStringField        `json:"name"`
+	BaseBranch      updateProjectStringField        `json:"baseBranch"`
+	WorktreeRoot    updateProjectStringField        `json:"worktreeRoot"`
+	Validation      *config.ProjectValidationConfig `json:"validation"`
+	GatekeeperTrust updateProjectStringField        `json:"gatekeeperTrust"`
 }
 
 func updateProjectField(field updateProjectStringField) projects.UpdateStringField {
@@ -8114,9 +8322,12 @@ func (h *Handler) buildUpdateProjectResponse(r *http.Request, service projectSer
 		return nil, *aerr
 	}
 	updated, err := service.UpdateProject(r.Context(), identifier, projects.UpdateInput{
-		Repo: updateProjectField(body.Repo), Name: updateProjectField(body.Name),
-		BaseBranch: updateProjectField(body.BaseBranch), WorktreeRoot: updateProjectField(body.WorktreeRoot),
-		Validation: body.Validation,
+		Repo:            updateProjectField(body.Repo),
+		Name:            updateProjectField(body.Name),
+		BaseBranch:      updateProjectField(body.BaseBranch),
+		WorktreeRoot:    updateProjectField(body.WorktreeRoot),
+		Validation:      body.Validation,
+		GatekeeperTrust: updateProjectField(body.GatekeeperTrust),
 	})
 	if err != nil {
 		var notFound projects.ProjectNotFoundError
@@ -8245,11 +8456,46 @@ func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultB
 		CreatedAt:    project.CreatedAt,
 		UpdatedAt:    project.UpdatedAt,
 	}
+	if trust := projectGatekeeperTrust(project, cfg); trust != config.GatekeeperTrustObserve {
+		response.GatekeeperTrust = string(trust)
+	}
 	if state := projects.DiscoveryStateFromRecord(project); state.Status != "" {
 		serialized := serializeDiscovery(state)
 		response.Discovery = &serialized
 	}
 	return response
+}
+
+// projectGatekeeperTrust reads the effective catalog policy while allowing a
+// freshly updated API-managed record to be reflected before the caller's
+// handler snapshot is refreshed. Empty trust is the documented observe level.
+func projectGatekeeperTrust(project storage.ProjectRecord, cfg config.Config) config.GatekeeperTrustLevel {
+	trust := config.ProjectRoleConfigs(cfg, project.ID).Gatekeeper.Trust
+	metadata := parseProjectMetadata(project.MetadataJSON)
+	if roles, ok := metadata["roles"].(map[string]any); ok {
+		if gatekeeper, ok := roles["gatekeeper"].(map[string]any); ok {
+			if value, ok := gatekeeper["trust"].(string); ok && strings.TrimSpace(value) != "" {
+				trust = config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(value)))
+			}
+		}
+	}
+	switch normalized := config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(trust)))); normalized {
+	case config.GatekeeperTrustAdvise, config.GatekeeperTrustAuto:
+		return normalized
+	default:
+		return config.GatekeeperTrustObserve
+	}
+}
+
+// exactOptionalQueryValue preserves a configured project ID verbatim for the
+// repository filter. Whitespace-only input is treated as omitted, but valid
+// IDs with intentional surrounding whitespace must not be rewritten before the
+// exact SQLite equality check.
+func exactOptionalQueryValue(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	return value
 }
 
 func serializeProjectValidation(metadata map[string]any, cfg config.Config) *projectValidationResponse {

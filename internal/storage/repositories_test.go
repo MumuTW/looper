@@ -1419,6 +1419,121 @@ func TestEventsListByEntityAndEventTypesFiltersByType(t *testing.T) {
 	}
 }
 
+func TestEventsListByEventTypeScopesProjectAndLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+
+	projectA := "project_a"
+	projectB := "project_b"
+	entityType := "pull_request"
+	for _, projectID := range []string{projectA, projectB} {
+		if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z"}); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", projectID, err)
+		}
+	}
+	for _, event := range []EventLogRecord{
+		{ID: "agreement_a_old", EventType: "pull_request.merge_gate.advice_agreement_recorded", ProjectID: &projectA, EntityType: &entityType, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:00:00.000Z"},
+		{ID: "agreement_a_new", EventType: "pull_request.merge_gate.advice_agreement_recorded", ProjectID: &projectA, EntityType: &entityType, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:01:00.000Z"},
+		{ID: "agreement_b", EventType: "pull_request.merge_gate.advice_agreement_recorded", ProjectID: &projectB, EntityType: &entityType, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:02:00.000Z"},
+		{ID: "other_a", EventType: "pull_request.merge_gate.evaluated", ProjectID: &projectA, EntityType: &entityType, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:03:00.000Z"},
+	} {
+		if err := repos.Events.Append(ctx, event); err != nil {
+			t.Fatalf("Events.Append(%s) error = %v", event.ID, err)
+		}
+	}
+
+	got, err := repos.Events.ListByEventType(ctx, "pull_request.merge_gate.advice_agreement_recorded", projectA, 1)
+	if err != nil {
+		t.Fatalf("ListByEventType() error = %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "agreement_a_new" {
+		t.Fatalf("ListByEventType() = %#v, want newest project-a agreement only", got)
+	}
+
+	all, err := repos.Events.ListByEventType(ctx, "pull_request.merge_gate.advice_agreement_recorded", "", 10)
+	if err != nil {
+		t.Fatalf("ListByEventType(global) error = %v", err)
+	}
+	if len(all) != 3 || all[0].ID != "agreement_b" || all[1].ID != "agreement_a_new" || all[2].ID != "agreement_a_old" {
+		t.Fatalf("ListByEventType(global) = %#v, want newest-first agreements", all)
+	}
+}
+
+func TestEventsListLatestByEventTypeDeduplicatesEntities(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+
+	projectA := "project_a"
+	projectB := "project_b"
+	entityType := "pull_request"
+	entityA := "acme/looper#42"
+	entityB := "acme/looper#43"
+	for _, projectID := range []string{projectA, projectB} {
+		if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z"}); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", projectID, err)
+		}
+	}
+	for _, event := range []EventLogRecord{
+		{ID: "verdict_a_old", EventType: "pull_request.merge_gate.evaluated", ProjectID: &projectA, EntityType: &entityType, EntityID: &entityA, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:00:00.000Z"},
+		{ID: "verdict_b", EventType: "pull_request.merge_gate.evaluated", ProjectID: &projectA, EntityType: &entityType, EntityID: &entityB, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:01:00.000Z"},
+		{ID: "verdict_a_new", EventType: "pull_request.merge_gate.evaluated", ProjectID: &projectA, EntityType: &entityType, EntityID: &entityA, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:02:00.000Z"},
+		{ID: "verdict_other_project", EventType: "pull_request.merge_gate.evaluated", ProjectID: &projectB, EntityType: &entityType, EntityID: &entityA, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:03:00.000Z"},
+	} {
+		if err := repos.Events.Append(ctx, event); err != nil {
+			t.Fatalf("Events.Append(%s) error = %v", event.ID, err)
+		}
+	}
+
+	got, err := repos.Events.ListLatestByEventType(ctx, "pull_request.merge_gate.evaluated", projectA, 10)
+	if err != nil {
+		t.Fatalf("ListLatestByEventType() error = %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "verdict_a_new" || got[1].ID != "verdict_b" {
+		t.Fatalf("ListLatestByEventType() = %#v, want newest event per project-a entity", got)
+	}
+
+	global, err := repos.Events.ListLatestByEventType(ctx, "pull_request.merge_gate.evaluated", "", 10)
+	if err != nil {
+		t.Fatalf("ListLatestByEventType(global) error = %v", err)
+	}
+	if len(global) != 3 || global[0].ID != "verdict_other_project" || global[1].ID != "verdict_a_new" || global[2].ID != "verdict_b" {
+		t.Fatalf("ListLatestByEventType(global) = %#v, want newest event per project/entity", global)
+	}
+}
+
+func TestEventsListLatestByEventTypeZeroLimitReturnsAllEntities(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	projectID := "project_all"
+	entityType := "pull_request"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z"}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	for index := 0; index < 101; index++ {
+		entityID := fmt.Sprintf("acme/looper#%d", index+1)
+		if err := repos.Events.Append(ctx, EventLogRecord{
+			ID: fmt.Sprintf("all-verdict-%03d", index), EventType: "pull_request.merge_gate.evaluated",
+			ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+			PayloadJSON: `{}`, CreatedAt: fmt.Sprintf("2026-04-11T12:%02d:00.000Z", index/60),
+		}); err != nil {
+			t.Fatalf("Events.Append(%s) error = %v", entityID, err)
+		}
+	}
+	got, err := repos.Events.ListLatestByEventType(ctx, "pull_request.merge_gate.evaluated", projectID, 0)
+	if err != nil {
+		t.Fatalf("ListLatestByEventType() error = %v", err)
+	}
+	if len(got) != 101 {
+		t.Fatalf("ListLatestByEventType() returned %d entities, want 101", len(got))
+	}
+}
+
 func TestRunsListByStatusOrdersByStartedAtThenIDDesc(t *testing.T) {
 	t.Parallel()
 

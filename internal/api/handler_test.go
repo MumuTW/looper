@@ -2440,6 +2440,8 @@ func TestHandlerEventAndPullRequestRoutesMatchFrozenSuccessArtifacts(t *testing.
 	}{
 		{routeID: "events.list", method: http.MethodGet, path: "/api/v1/events?limit=1"},
 		{routeID: "events.entity", method: http.MethodGet, path: "/api/v1/events/loop/loop_1"},
+		{routeID: "gatekeeper.agreements", method: http.MethodGet, path: "/api/v1/gatekeeper/agreements?limit=1"},
+		{routeID: "gatekeeper.verdicts", method: http.MethodGet, path: "/api/v1/gatekeeper/verdicts?limit=1"},
 		{routeID: "pullRequests.list", method: http.MethodGet, path: "/api/v1/pull-requests"},
 		{routeID: "pullRequests.detail", method: http.MethodGet, path: "/api/v1/pull-requests/acme%2Flooper/42"},
 		{routeID: "pullRequests.status", method: http.MethodGet, path: "/api/v1/pull-requests/acme%2Flooper/42/status"},
@@ -2818,6 +2820,54 @@ func TestHandlerProjectsPatchDistinguishesNullFromOmittedFields(t *testing.T) {
 	}
 	if got.Name.Set || got.BaseBranch.Set || got.WorktreeRoot.Set {
 		t.Fatalf("omitted patch fields = %#v, want unset", got)
+	}
+}
+
+func TestHandlerProjectsPatchPromotesGatekeeperTrust(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	metadata := `{"repo":"acme/looper","source":"api","validation":{"optOut":true}}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "project_a", Name: "Project A", RepoPath: "/tmp/project-a", BaseBranch: stringPtr("main"),
+		MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPatch, "/api/v1/projects/project_a", bytes.NewReader([]byte(`{"gatekeeperTrust":"advise"}`))))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, data["id"], "project_a")
+	assertEqual(t, data["gatekeeperTrust"], "advise")
+	stored, err := fixture.runtime.Services().Repositories.Projects.GetByID(context.Background(), "project_a")
+	if err != nil || stored == nil || stored.MetadataJSON == nil {
+		t.Fatalf("Projects.GetByID() = %#v, %v, want promoted project", stored, err)
+	}
+	if !strings.Contains(*stored.MetadataJSON, `"trust":"advise"`) {
+		t.Fatalf("metadata = %s, want advise trust", *stored.MetadataJSON)
+	}
+}
+
+func TestHandlerProjectsPatchMapsGatekeeperPromotionValidation(t *testing.T) {
+	fixture := newTestFixture(t)
+	var got projects.UpdateInput
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, ProjectsService: fakeProjectService{
+		updateProject: func(_ context.Context, _ string, input projects.UpdateInput) (storage.ProjectRecord, error) {
+			got = input
+			return storage.ProjectRecord{ID: "project_a", Name: "Project A", RepoPath: "/tmp/project-a"}, projects.ProjectValidationError{Message: "project is managed by config"}
+		},
+	}})
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPatch, "/api/v1/projects/project_a", bytes.NewReader([]byte(`{"gatekeeperTrust":"auto"}`))))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !got.GatekeeperTrust.Set || got.GatekeeperTrust.Value == nil || *got.GatekeeperTrust.Value != "auto" {
+		t.Fatalf("gatekeeper trust input = %#v, want auto", got.GatekeeperTrust)
 	}
 }
 
@@ -8587,6 +8637,15 @@ func seedEventAndPullRequestRouteData(t *testing.T, rt *looperdruntime.Runtime) 
 		CreatedAt:        nowISO,
 	}); err != nil {
 		t.Fatalf("Events.Append(event_1) error = %v", err)
+	}
+
+	if err := rt.Services().Repositories.Events.Append(context.Background(), storage.EventLogRecord{
+		ID: "agreement_1", EventType: gatekeeper.AdviceAgreementEventType,
+		ProjectID: stringPtr("project_1"), EntityType: stringPtr("pull_request"), EntityID: stringPtr("acme/looper#42"),
+		CausationID: stringPtr("event_gate_1"), PayloadJSON: `{"version":1,"verdictEventId":"event_gate_1","projectId":"project_1","repo":"acme/looper","prNumber":42,"verdictEligible":true,"verdictHeadSha":"abc123","outcome":"merged_as_is","agreement":true,"terminalState":"MERGED","terminalHeadSha":"abc123","terminalAt":"2026-04-11T12:00:00.000Z","recordedAt":"2026-04-11T11:59:00.000Z"}`,
+		CreatedAt: "2026-04-11T11:59:00.000Z",
+	}); err != nil {
+		t.Fatalf("Events.Append(agreement_1) error = %v", err)
 	}
 
 	if err := rt.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{

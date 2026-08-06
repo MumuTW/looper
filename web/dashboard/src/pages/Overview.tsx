@@ -15,12 +15,14 @@ import { StatusChip } from "@/components/StatusChip";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
-  fetchPostMergeDigest,
+  fetchGatekeeperAgreements,
+  fetchGatekeeperVerdicts,
   fetchStatus,
   type ActiveRun,
+  type GatekeeperAgreement,
+  type GatekeeperVerdict,
   type LoopRoleCounts,
   type StatusData,
-  type PostMergeDigestData,
 } from "@/lib/api";
 import { useDashboardData } from "@/lib/DashboardDataContext";
 import {
@@ -30,6 +32,7 @@ import {
   truncateReason,
 } from "@/lib/format";
 import { useProjectFilter } from "@/lib/ProjectFilterContext";
+import { usePolling } from "@/lib/usePolling";
 
 const STATUS_SLOW_MS = 45_000;
 
@@ -120,6 +123,14 @@ function activeAgentLabel(run: ActiveRun): string {
   return `${vendor} · ${pid}`;
 }
 
+function agreementOutcomeColor(agreement: GatekeeperAgreement): string {
+  return agreement.agreement ? "var(--ok)" : "var(--warning)";
+}
+
+function verdictColor(verdict: GatekeeperVerdict): string {
+  return verdict.eligible ? "var(--ok)" : "var(--danger)";
+}
+
 export function OverviewPage({
   onHealthChange,
 }: {
@@ -129,41 +140,41 @@ export function OverviewPage({
   const { projectId } = useProjectFilter();
   const { health, healthy: sharedHealthy, activeRuns } = useDashboardData();
 
+  const agreementFetcher = useCallback(
+    (signal: AbortSignal) =>
+      fetchGatekeeperAgreements({
+        projectId: projectId || undefined,
+        limit: 20,
+        signal,
+      }),
+    [projectId],
+  );
+  const agreements = usePolling({
+    intervalMs: 60_000,
+    fetcher: agreementFetcher,
+    key: projectId,
+  });
+
+  const verdictFetcher = useCallback(
+    (signal: AbortSignal) =>
+      fetchGatekeeperVerdicts({
+        projectId: projectId || undefined,
+        limit: 20,
+        signal,
+      }),
+    [projectId],
+  );
+  const verdicts = usePolling({
+    intervalMs: 60_000,
+    fetcher: verdictFetcher,
+    key: projectId,
+  });
+
   const [status, setStatus] = useState<StatusData | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [statusLoading, setStatusLoading] = useState(true);
   const statusAbort = useRef<AbortController | null>(null);
   const statusInFlight = useRef(false);
-  const [postMergeDigest, setPostMergeDigest] = useState<PostMergeDigestData | null>(null);
-  const [postMergeDigestError, setPostMergeDigestError] = useState<string | null>(null);
-  const [postMergeDigestLoading, setPostMergeDigestLoading] = useState(true);
-  const digestAbort = useRef<AbortController | null>(null);
-  const digestInFlight = useRef(false);
-
-  const loadPostMergeDigest = useCallback(async () => {
-    if (digestInFlight.current) return;
-    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-    digestInFlight.current = true;
-    digestAbort.current?.abort();
-    const controller = new AbortController();
-    digestAbort.current = controller;
-    setPostMergeDigestLoading(true);
-    try {
-      const next = await fetchPostMergeDigest(controller.signal);
-      if (controller.signal.aborted) return;
-      setPostMergeDigest(next);
-      setPostMergeDigestError(null);
-    } catch (err) {
-      if (controller.signal.aborted) return;
-      if (err instanceof Error && err.name === "AbortError") return;
-      if (err instanceof DOMException && err.name === "AbortError") return;
-      setPostMergeDigestError(err instanceof Error ? err.message : String(err));
-      setPostMergeDigest(null);
-    } finally {
-      if (digestAbort.current === controller) digestInFlight.current = false;
-      if (!controller.signal.aborted) setPostMergeDigestLoading(false);
-    }
-  }, []);
 
   const loadStatus = useCallback(async () => {
     if (statusInFlight.current) return;
@@ -236,28 +247,6 @@ export function OverviewPage({
       statusAbort.current?.abort();
     };
   }, [loadStatus]);
-
-  useEffect(() => {
-    void loadPostMergeDigest();
-    const id = window.setInterval(() => {
-      void loadPostMergeDigest();
-    }, STATUS_SLOW_MS);
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") {
-        void loadPostMergeDigest();
-      } else {
-        digestAbort.current?.abort();
-        digestAbort.current = null;
-        digestInFlight.current = false;
-      }
-    };
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => {
-      window.clearInterval(id);
-      document.removeEventListener("visibilitychange", onVisibility);
-      digestAbort.current?.abort();
-    };
-  }, [loadPostMergeDigest]);
 
   useEffect(() => {
     onHealthChange?.(sharedHealthy, status?.service?.version);
@@ -432,7 +421,8 @@ export function OverviewPage({
           onClick={() => {
             health.refresh();
             void loadStatus();
-            void loadPostMergeDigest();
+            agreements.refresh();
+            verdicts.refresh();
           }}
         >
           Refresh
@@ -601,32 +591,136 @@ export function OverviewPage({
           )}
         </Card>
 
-        <Card title="Post-merge digest">
-          {postMergeDigestError && !postMergeDigest ? (
-            <p className="m-0 text-[12px] text-[var(--danger)]">
-              Unavailable: {postMergeDigestError}
-            </p>
-          ) : postMergeDigestLoading && !postMergeDigest ? (
+        <Card
+          title={
+            projectId
+              ? `Advise agreements · project ${projectId}`
+              : "Advise agreements"
+          }
+        >
+          {agreements.error && !agreements.data ? (
+            <div className="flex flex-col gap-2">
+              <p className="m-0 text-[12px] text-[var(--danger)]">
+                Unavailable: {agreements.error}
+              </p>
+              <Button variant="ghost" size="sm" onClick={agreements.refresh}>
+                Retry
+              </Button>
+            </div>
+          ) : agreements.loading && !agreements.data ? (
             <p className="m-0 text-[12px] text-[var(--text-muted)]">
-              Loading digest…
-            </p>
-          ) : postMergeDigest?.enabled === false ? (
-            <p className="m-0 text-[12px] text-[var(--text-muted)]">
-              Disabled (enable <code className="mono">roles.coordinator.postMergeDigest</code>)
+              Loading agreement history…
             </p>
           ) : (
-            <div className="flex flex-col gap-2 text-[12px]">
-              <dl className="m-0">
-                <Kv label="Date" value={postMergeDigest?.digest?.date ?? "—"} />
-                <Kv label="Merged" value={postMergeDigest?.digest?.merged?.length ?? 0} />
-                <Kv label="Regenerated" value={postMergeDigest?.digest?.closedAndRegenerated?.length ?? 0} />
-                <Kv label="Awaiting human" value={postMergeDigest?.digest?.awaitingHuman?.length ?? 0} />
-                <Kv label="Anomalies" value={postMergeDigest?.digest?.anomalies?.length ?? 0} />
-              </dl>
-              {postMergeDigest?.digest?.empty ? (
-                <p className="m-0 text-[var(--text-muted)]">No activity for this day.</p>
+            <>
+              {agreements.error ? (
+                <p className="m-0 mb-2 text-[12px] text-[var(--danger)]">
+                  Refresh failed: {agreements.error}
+                </p>
               ) : null}
+              {(agreements.data?.items ?? []).length === 0 ? (
+                <p className="m-0 text-[12px] text-[var(--text-muted)]">
+                  No advise agreements recorded.
+                </p>
+              ) : (
+                <div className="flex flex-col gap-1">
+                  {agreements.data?.items.map((agreement) => (
+                    <div
+                      className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px]"
+                      key={agreement.id}
+                    >
+                      <span className="mono">
+                        {agreement.repo}#{agreement.prNumber}
+                      </span>
+                      <span style={{ color: agreementOutcomeColor(agreement) }}>
+                        {agreement.outcome}
+                      </span>
+                      <span className="text-[var(--text-muted)]">
+                        {agreement.agreement ? "agreement" : "disagreement"}
+                      </span>
+                      <span className="mono text-[var(--text-muted)]">
+                        {agreement.recordedAt || agreement.createdAt || "—"}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </Card>
+
+        <Card
+          title={
+            projectId
+              ? `Latest Gatekeeper verdicts · project ${projectId}`
+              : "Latest Gatekeeper verdicts"
+          }
+        >
+          {verdicts.error && !verdicts.data ? (
+            <div className="flex flex-col gap-2">
+              <p className="m-0 text-[12px] text-[var(--danger)]">
+                Unavailable: {verdicts.error}
+              </p>
+              <Button variant="ghost" size="sm" onClick={verdicts.refresh}>
+                Retry
+              </Button>
             </div>
+          ) : verdicts.loading && !verdicts.data ? (
+            <p className="m-0 text-[12px] text-[var(--text-muted)]">
+              Loading Gatekeeper verdicts…
+            </p>
+          ) : (
+            <>
+              {verdicts.error ? (
+                <p className="m-0 mb-2 text-[12px] text-[var(--danger)]">
+                  Refresh failed: {verdicts.error}
+                </p>
+              ) : null}
+              {(verdicts.data?.items ?? []).length === 0 ? (
+                <p className="m-0 text-[12px] text-[var(--text-muted)]">
+                  No Gatekeeper verdicts recorded.
+                </p>
+              ) : (
+                <div className="flex flex-col gap-1">
+                  {verdicts.data?.items.map((verdict) => {
+                    const reasons = verdict.reasons
+                      .map((reason) =>
+                        reason.subject
+                          ? `${reason.code} (${reason.subject})`
+                          : reason.code,
+                      )
+                      .join(", ");
+                    return (
+                      <div
+                        className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px]"
+                        key={verdict.id}
+                      >
+                        <span className="mono">
+                          {verdict.repo}#{verdict.prNumber}
+                        </span>
+                        <span style={{ color: verdictColor(verdict) }}>
+                          {verdict.status || (verdict.eligible ? "eligible" : "blocked")}
+                        </span>
+                        {reasons ? (
+                          <span
+                            className="max-w-[22rem] truncate text-[var(--text-muted)]"
+                            title={reasons}
+                          >
+                            {reasons}
+                          </span>
+                        ) : null}
+                        <span
+                          className="mono text-[var(--text-muted)]"
+                          title={verdict.evaluatedAt}
+                        >
+                          {formatAge(verdict.evaluatedAt)}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </>
           )}
         </Card>
       </div>

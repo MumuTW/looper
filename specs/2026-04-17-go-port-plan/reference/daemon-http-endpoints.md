@@ -62,6 +62,26 @@ Source of truth inspected from:
 - Validation/status notes:
   - missing params return `400 VALIDATION_FAILED`
 
+### `GET /api/v1/gatekeeper/agreements`
+
+Returns the newest immutable Gatekeeper advise-agreement records. Supports the
+optional `projectId` filter and bounded `limit` query.
+
+- Returns the newest immutable Gatekeeper `advise` agreement outcomes for operator inspection.
+- Query params:
+  - `projectId` optional project scope
+  - `limit` optional positive integer, capped at 200 (default 100)
+- The response projects the causal agreement event (`id`, `verdictEventId`, outcome, agreement flag, terminal state, and timestamps); it does not infer outcomes from current pull-request state.
+- Invalid limits return `400 VALIDATION_FAILED`.
+
+### `GET /api/v1/gatekeeper/verdicts`
+
+Returns the newest immutable Gatekeeper verdict per project/pull request. Each
+item includes the eligible/blocked status, structured reasons, observed head,
+and evidence used by the Gatekeeper evaluation. Supports the optional
+`projectId` filter and bounded `limit` query. This is read-only evidence; it
+does not authorize or perform a merge.
+
 ### `GET /api/v1/pull-requests`
 
 - Route registration: `apps/looperd/src/server/index.ts:137-140`
@@ -178,6 +198,17 @@ Source of truth inspected from:
   - project management unavailable returns `500 PROJECTS_UNAVAILABLE`
   - invalid ids/body values return `400 VALIDATION_FAILED`
   - id collision returns `409 PROJECT_ID_CONFLICT`
+
+### `PATCH /api/v1/projects/:id`
+
+- Existing project field updates remain available for API-managed projects.
+- `gatekeeperTrust` is an optional explicit promotion target: `advise` or
+  `auto`. Promotion is monotonic (`observe → advise → auto`) and is persisted
+  in the existing project role metadata.
+- Config-managed projects reject this field with a validation error; their
+  declared configuration remains the authority.
+- The serialized project includes `gatekeeperTrust` for non-default levels;
+  an omitted value means `observe`.
 
 ### `GET /api/v1/runs`
 

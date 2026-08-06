@@ -119,6 +119,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return reportError(stderr, runDashboard(ctx, parsed.Global, parsed.Operands, stdout))
 	case "project":
 		return reportError(stderr, runProject(ctx, parsed.Global, parsed.Operands, stdout))
+	case "gatekeeper":
+		return reportError(stderr, runGatekeeper(ctx, parsed.Global, parsed.Operands, stdout))
 	case "provider":
 		return reportError(stderr, runProvider(ctx, parsed.Global, parsed.Operands, stdout))
 	}
@@ -847,6 +849,108 @@ func runProjectDiscover(ctx context.Context, global []string, identifier string,
 	return printProjectDiscoveryResult(result, stdout)
 }
 
+// runGatekeeper owns Gatekeeper operator views and the explicit trust-promotion
+// action. It routes through looperd rather than opening SQLite: the daemon is
+// authoritative for the project catalog and immutable Gatekeeper event stream.
+func runGatekeeper(ctx context.Context, global []string, operands []string, stdout io.Writer) error {
+	if len(operands) == 0 || (operands[0] != "agreements" && operands[0] != "verdicts" && operands[0] != "promote") {
+		return badUsage("gatekeeper requires the agreements, verdicts, or promote subcommand")
+	}
+	if operands[0] == "promote" {
+		if len(operands) != 3 || strings.TrimSpace(operands[1]) == "" || strings.TrimSpace(operands[2]) == "" {
+			return badUsage("gatekeeper promote requires a project id and target trust (advise or auto)")
+		}
+		target := strings.ToLower(strings.TrimSpace(operands[2]))
+		if target != "advise" && target != "auto" {
+			return badUsage("gatekeeper promote target must be advise or auto")
+		}
+		cfg, err := loadConfig(global)
+		if err != nil {
+			return err
+		}
+		body, err := json.Marshal(map[string]string{"gatekeeperTrust": target})
+		if err != nil {
+			return err
+		}
+		projectID := strings.TrimSpace(operands[1])
+		updated, err := requestJSON[projectResponse](ctx, cfg, http.MethodPatch, "/api/v1/projects/"+url.PathEscape(projectID), body)
+		if err != nil {
+			return err
+		}
+		trust := strings.TrimSpace(updated.GatekeeperTrust)
+		if trust == "" {
+			trust = "observe"
+		}
+		_, _ = fmt.Fprintf(stdout, "project %s  gatekeeper-trust=%s\n", updated.ID, trust)
+		return nil
+	}
+	if len(operands) > 2 || (len(operands) == 2 && strings.TrimSpace(operands[1]) == "") {
+		return badUsage(fmt.Sprintf("gatekeeper %s accepts at most one project id", operands[0]))
+	}
+
+	cfg, err := loadConfig(global)
+	if err != nil {
+		return err
+	}
+	path := "/api/v1/gatekeeper/" + operands[0]
+	if len(operands) == 2 {
+		// Project IDs are exact configuration keys; only the all-whitespace
+		// validation above treats surrounding whitespace as insignificant.
+		path += "?projectId=" + url.QueryEscape(operands[1])
+	}
+	if operands[0] == "agreements" {
+		agreements, err := requestJSON[gatekeeperAgreementsResponse](ctx, cfg, http.MethodGet, path, nil)
+		if err != nil {
+			return err
+		}
+		if len(agreements.Items) == 0 {
+			_, _ = fmt.Fprintln(stdout, "no advise agreements recorded")
+			return nil
+		}
+		for _, agreement := range agreements.Items {
+			outcome := strings.TrimSpace(agreement.Outcome)
+			if outcome == "" {
+				outcome = "unknown"
+			}
+			agreementLabel := "disagreement"
+			if agreement.Agreement {
+				agreementLabel = "agreement"
+			}
+			_, _ = fmt.Fprintf(stdout, "%s  %s#%d  %s  %s  %s  verdict=%s\n", agreement.ProjectID, agreement.Repo, agreement.PRNumber, outcome, agreementLabel, agreement.RecordedAt, agreement.VerdictEventID)
+		}
+		return nil
+	}
+
+	verdicts, err := requestJSON[gatekeeperVerdictsResponse](ctx, cfg, http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+	if len(verdicts.Items) == 0 {
+		_, _ = fmt.Fprintln(stdout, "no gatekeeper verdicts recorded")
+		return nil
+	}
+	for _, verdict := range verdicts.Items {
+		status := strings.TrimSpace(verdict.Status)
+		if status == "" {
+			status = "unknown"
+		}
+		reasons := make([]string, 0, len(verdict.Reasons))
+		for _, reason := range verdict.Reasons {
+			value := string(reason.Code)
+			if strings.TrimSpace(reason.Subject) != "" {
+				value += "(" + strings.TrimSpace(reason.Subject) + ")"
+			}
+			reasons = append(reasons, value)
+		}
+		reasonText := "-"
+		if len(reasons) > 0 {
+			reasonText = strings.Join(reasons, ",")
+		}
+		_, _ = fmt.Fprintf(stdout, "%s  %s#%d  %s  head=%s  evaluated=%s  reasons=%s\n", verdict.ProjectID, verdict.Repo, verdict.PRNumber, status, verdict.ObservedHeadSHA, verdict.EvaluatedAt, reasonText)
+	}
+	return nil
+}
+
 func printProjectDiscoveryResult(result createProjectResponse, stdout io.Writer) error {
 	if result.Discovery == nil {
 		_, _ = fmt.Fprintf(stdout, "discovery for project %s: unknown (daemon did not report discovery status)\n", result.ID)
@@ -966,6 +1070,11 @@ func canonicalRepoPath(path string) string {
 
 func describeProject(project projectResponse) string {
 	line := fmt.Sprintf("%s\t%s", project.ID, project.RepoPath)
+	trust := strings.TrimSpace(project.GatekeeperTrust)
+	if trust == "" {
+		trust = "observe"
+	}
+	line += "\tgatekeeper-trust=" + trust
 	if project.Archived {
 		line += "\t(archived)"
 	}
@@ -1203,13 +1312,14 @@ func quarantinedLoopLine(loop statusQuarantinedLoopView) string {
 }
 
 type projectResponse struct {
-	ID         string             `json:"id"`
-	Name       string             `json:"name"`
-	RepoPath   string             `json:"repoPath"`
-	BaseBranch string             `json:"baseBranch"`
-	Archived   bool               `json:"archived"`
-	Repo       *string            `json:"repo"`
-	Discovery  *discoveryResponse `json:"discovery"`
+	ID              string             `json:"id"`
+	Name            string             `json:"name"`
+	RepoPath        string             `json:"repoPath"`
+	BaseBranch      string             `json:"baseBranch"`
+	Archived        bool               `json:"archived"`
+	Repo            *string            `json:"repo"`
+	GatekeeperTrust string             `json:"gatekeeperTrust"`
+	Discovery       *discoveryResponse `json:"discovery"`
 }
 
 type projectsListResponse struct {
@@ -1228,6 +1338,40 @@ type discoveryResponse struct {
 	DiscoveredPullRequests int      `json:"discoveredPullRequests"`
 	DiscoveredWorktrees    int      `json:"discoveredWorktrees"`
 	Warnings               []string `json:"warnings"`
+}
+
+type gatekeeperAgreementsResponse struct {
+	Items []gatekeeperAgreement `json:"items"`
+}
+
+type gatekeeperVerdictsResponse struct {
+	Items []gatekeeperVerdict `json:"items"`
+}
+
+type gatekeeperAgreement struct {
+	Repo           string `json:"repo"`
+	ProjectID      string `json:"projectId"`
+	PRNumber       int64  `json:"prNumber"`
+	VerdictEventID string `json:"verdictEventId"`
+	Outcome        string `json:"outcome"`
+	Agreement      bool   `json:"agreement"`
+	RecordedAt     string `json:"recordedAt"`
+}
+
+type gatekeeperVerdictReason struct {
+	Code    string `json:"code"`
+	Subject string `json:"subject"`
+}
+
+type gatekeeperVerdict struct {
+	Repo            string                    `json:"repo"`
+	ProjectID       string                    `json:"projectId"`
+	PRNumber        int64                     `json:"prNumber"`
+	Status          string                    `json:"status"`
+	Eligible        bool                      `json:"eligible"`
+	ObservedHeadSHA string                    `json:"observedHeadSha"`
+	Reasons         []gatekeeperVerdictReason `json:"reasons"`
+	EvaluatedAt     string                    `json:"evaluatedAt"`
 }
 
 // daemonBaseURL is where this CLI expects the daemon to answer.
@@ -1446,6 +1590,12 @@ Usage:
   looper init                  Write a starter config file (never overwrites)
   looper status                Report config, daemon reachability, and projects
   looper dashboard             Print a dashboard URL authenticated for this session
+  looper gatekeeper agreements [project-id]
+                               Inspect immutable advise agreement outcomes
+  looper gatekeeper verdicts [project-id]
+                               Inspect the newest Gatekeeper verdict per PR
+  looper gatekeeper promote <project-id> <advise|auto>
+                               Explicitly promote an API-managed project
   looper project add <path>    Register a git repository root with the daemon
   looper project list          List registered projects
   looper project discover <id> Retry post-commit worktree/PR discovery for a project

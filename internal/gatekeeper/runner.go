@@ -109,6 +109,8 @@ type CodexReviewEvidence struct {
 
 type Evidence struct {
 	PullRequestState             string                       `json:"pullRequestState,omitempty"`
+	ClosedAt                     string                       `json:"closedAt,omitempty"`
+	MergedAt                     string                       `json:"mergedAt,omitempty"`
 	Draft                        bool                         `json:"draft"`
 	BaseRefName                  string                       `json:"baseRefName,omitempty"`
 	Mergeable                    *bool                        `json:"mergeable,omitempty"`
@@ -342,6 +344,12 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		stillOpen[entityID] = struct{}{}
 		previous, hasPrevious := previousReports[entityID]
+		if hasPrevious && strings.ToLower(strings.TrimSpace(previous.Mode)) != strings.ToLower(strings.TrimSpace(string(r.trustFor(input.ProjectID)))) {
+			// Trust promotion is a gate input even when the forge-visible PR
+			// fingerprint is unchanged; do not reuse an observe/advise report
+			// after the project policy moves up the ladder.
+			hasPrevious = false
+		}
 		// When the previous report is waiting on a current-head review, check
 		// the local event log cheaply before deciding to skip. This avoids a
 		// full forge evaluation every tick for PRs that may never receive a
@@ -491,6 +499,8 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	report.ObservedHeadSHA = strings.TrimSpace(detail.HeadSHA)
 	report.Evidence.PullRequestState = strings.ToUpper(strings.TrimSpace(detail.State))
+	report.Evidence.ClosedAt = strings.TrimSpace(detail.ClosedAt)
+	report.Evidence.MergedAt = strings.TrimSpace(detail.MergedAt)
 	report.Evidence.Draft = detail.IsDraft
 	report.Evidence.BaseRefName = strings.TrimSpace(detail.BaseRefName)
 	report.Evidence.ReviewDecision = strings.ToUpper(strings.TrimSpace(detail.ReviewDecision))
@@ -1135,11 +1145,31 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	entityType := "pull_request"
 	entityID := fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
 	projectID := report.ProjectID
-	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
-		EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
-		Payload: report, CreatedAt: r.now(),
+	reportEventID := eventlog.NewEventID("event")
+	if err := r.repos.WithTransaction(ctx, func(txRepos *storage.Repositories) error {
+		if err := eventlog.Append(ctx, txRepos, eventlog.AppendInput{
+			ID:        reportEventID,
+			EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+			Payload: report, CreatedAt: r.now(),
+		}); err != nil {
+			return fmt.Errorf("persist gate report: %w", err)
+		}
+		txRunner := &Runner{
+			repos:                  txRepos,
+			github:                 r.github,
+			now:                    r.now,
+			policyPermitsTarget:    r.policyPermitsTarget,
+			trustForProject:        r.trustForProject,
+			diffBudgetForProject:   r.diffBudgetForProject,
+			configuredTargetBranch: r.configuredTargetBranch,
+			logWarn:                r.logWarn,
+		}
+		if err := txRunner.recordTerminalAdviceOutcomes(ctx, report, reportEventID); err != nil {
+			return err
+		}
+		return nil
 	}); err != nil {
-		return Report{}, fmt.Errorf("persist gate report: %w", err)
+		return Report{}, err
 	}
 	// The owned comment is reconciled after the durable report: the report is the
 	// record, the comment is a convenience for whoever is deciding. A forge that

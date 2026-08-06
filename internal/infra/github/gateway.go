@@ -39,7 +39,7 @@ var (
 	prViewMetadataJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
 	prViewFixerJSONFields      = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "statusCheckRollup", "mergeStateStatus"}
 	prViewReviewerJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "statusCheckRollup", "mergeStateStatus"}
-	prViewGatekeeperJSONFields = []string{"number", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "mergeStateStatus", "changedFiles", "deletions", "closingIssuesReferences"}
+	prViewGatekeeperJSONFields = []string{"number", "state", "closedAt", "mergedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "mergeStateStatus", "changedFiles", "deletions", "closingIssuesReferences"}
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
@@ -1937,7 +1937,7 @@ func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, 
 		DiffStats:          pullRequestDiffStatsFromRow(row),
 		Mergeable:          boolPtrFromValue(row["mergeable"]),
 		MergeableState:     ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),
-		MergedAt:           asString(row["merged_at"]),
+		MergedAt:           firstNonEmpty(asString(row["mergedAt"]), asString(row["merged_at"])),
 		MergeCommitSHA:     nestedString(row, "mergeCommit", "oid"),
 		ClosingIssues:      extractIssueReferences(row["closingIssuesReferences"]),
 		AutoMerge:          extractAutoMerge(row["auto_merge"]),
