@@ -433,7 +433,6 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 	}
 	releaseMutation := worktreesafety.AcquireManagedMutationLock(worktreesafety.WorktreeMutationScope(mutationRoot))
 	defer releaseMutation()
-	hasStoredIdentity := false
 
 	if g.repos != nil {
 		var stored *storage.WorktreeRecord
@@ -448,7 +447,6 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		if err != nil {
 			return nil, err
 		}
-		hasStoredIdentity = stored != nil
 		if stored != nil && stored.Status != "cleaned" && normalizeComparablePath(stored.RepoPath) == normalizeComparablePath(input.RepoPath) && worktreesafety.IsSafe(worktreesafety.CheckInput{WorktreePath: stored.WorktreePath, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}) {
 			storedHealthy, err := g.isHealthyWorktree(ctx, stored.WorktreePath)
 			if err != nil {
@@ -534,8 +532,11 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 	// be pruned and recreated, while a healthy retired checkout may contain
 	// uncommitted work from the previous owner and must never be adopted. A
 	// healthy checkout with no provenance is instead an interrupted create and
-	// is safely recovered below.
-	if g.repos != nil && !hasStoredIdentity {
+	// is safely recovered below. The stored identity was already evaluated
+	// above; a match found via ListWorktrees is a different checkout and must
+	// still be checked for retirement regardless of whether a stored identity
+	// exists.
+	if g.repos != nil {
 		owner, err := g.repos.Worktrees.GetByPath(ctx, match.Path)
 		if err != nil {
 			return nil, fmt.Errorf("get worktree retirement provenance: %w", err)
