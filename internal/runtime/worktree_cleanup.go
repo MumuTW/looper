@@ -417,16 +417,6 @@ func (r *Runtime) cleanupWorktreeCandidate(ctx context.Context, repos *storage.R
 	return r.cleanWorktreeCandidate(ctx, repos, gitGateway, cfg, *project, candidate, worktreeRoot, "clean")
 }
 
-// recordWorktreeCleanupPlanSkip writes a durable skip event only while admission
-// still allows claims. Hold WithAllowLifecycleWork across the append so MarkDegraded
-// cannot close admission between a point-in-time AllowClaim and the event write.
-// Returns the admission error when closed so callers stop without counting a
-// skip that was never recorded.
-func (r *Runtime) recordWorktreeCleanupPlanSkip(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord, reason string) error {
-	return r.WithAllowLifecycleWork(func() {
-		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.skipped", &candidate, map[string]any{"reason": reason})
-	})
-}
 func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Repositories, gitGateway worktreeCleanupGit, cfg config.Config, project storage.ProjectRecord, candidate storage.WorktreeRecord, worktreeRoot, reason string) worktreeCleanupCandidateResult {
 	if cfg.Daemon.WorktreeCleanup.DryRun {
 		return r.recordWorktreeCleanupSkip(ctx, repos, candidate, "dry_run")

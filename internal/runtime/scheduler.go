@@ -3160,8 +3160,11 @@ func runEscalatorIfDue(ctx context.Context, input defaultSchedulerTickInput, run
 	if !input.EscalatorCadence.start(runAt, cadence) {
 		return nil
 	}
-	_, err := input.Escalator.Run(ctx)
-	input.EscalatorCadence.finish(runAt, err == nil)
+	result, err := input.Escalator.Run(ctx)
+	// A partial census is incomplete: omitted items are not evidence that work
+	// resolved, so it must not advance the cadence baseline. Treat it like a
+	// failed attempt so the next tick retries rather than waiting a full cadence.
+	input.EscalatorCadence.finish(runAt, err == nil && !result.Snapshot.Partial)
 	return err
 }
 
