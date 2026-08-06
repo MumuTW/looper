@@ -181,6 +181,10 @@ type Report struct {
 	// failure can leave a stale label uncertain. A pointer keeps legacy reports
 	// (which predate this field) distinguishable from an explicit false.
 	RouteEstablished *bool `json:"routeEstablished,omitempty"`
+	// PendingProjection marks a crash-boundary record written before the
+	// routing label projection. It is not a verdict and must not be treated as
+	// one by the advice-agreement resolver.
+	PendingProjection bool `json:"pendingProjection,omitempty"`
 }
 
 type EvaluationInput struct {
@@ -868,7 +872,6 @@ func (r *Runner) sourceFingerprintForProject(pullRequest githubinfra.PullRequest
 	reviewThreshold := r.requiredReviewChangedLinesFor(projectID)
 	reviewPolicyEnabled := trust == config.GatekeeperTrustAuto && reviewThreshold > 0
 	return sourceFingerprint(pullRequest, budgetEnabled, reviewPolicyEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions) + fmt.Sprintf("\x1fgatekeeper-trust=%s", string(trust)) + fmt.Sprintf("\x1fconfigured-target=%s", configuredTarget) + fmt.Sprintf("\x1fpolicy-permits-target=%t", permitsTarget) + fmt.Sprintf("\x1freview-threshold=%d", reviewThreshold)
-	return sourceFingerprint(pullRequest, budgetEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions) + fmt.Sprintf("\x1fgatekeeper-trust=%s", string(r.trustFor(projectID))) + fmt.Sprintf("\x1fconfigured-target=%s", configuredTarget) + fmt.Sprintf("\x1fpolicy-permits-target=%t", permitsTarget)
 }
 
 func (r *Runner) mergifyContractFingerprint(ctx context.Context, input DiscoveryInput) string {
@@ -1484,6 +1487,7 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	pending := report
 	pending.SourceFingerprint = ""
 	pending.EvaluatedAt = r.now().UTC().Format(time.RFC3339Nano)
+	pending.PendingProjection = true
 	if err := r.appendGateReportAt(ctx, pending, entityType, entityID, r.now()); err != nil {
 		return Report{}, fmt.Errorf("persist pending gate report: %w", err)
 	}
@@ -1526,9 +1530,37 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	// The final report is appended strictly after the pending projection so
 	// latestGateReports (which keeps the newest record for an entity) always
 	// resolves to the report with the real discovery fingerprint, never the
-	// empty-fingerprint pending record.
-	if err := r.appendGateReportAt(ctx, report, entityType, entityID, r.now().Add(time.Millisecond)); err != nil {
-		return Report{}, fmt.Errorf("persist gate report: %w", err)
+	// empty-fingerprint pending record. The gate report and terminal advice
+	// agreement are persisted atomically so a failure in either rolls back
+	// both.
+	reportEventID := eventlog.NewEventID("event")
+	projectID := report.ProjectID
+	if err := r.repos.WithTransaction(ctx, func(txRepos *storage.Repositories) error {
+		if err := eventlog.Append(ctx, txRepos, eventlog.AppendInput{
+			ID:        reportEventID,
+			EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+			Payload: report, CreatedAt: r.now().Add(time.Millisecond),
+		}); err != nil {
+			return fmt.Errorf("persist gate report: %w", err)
+		}
+		txRunner := &Runner{
+			repos:                    txRepos,
+			github:                   r.github,
+			now:                      r.now,
+			labelNamespaceForProject: r.labelNamespaceForProject,
+			policyPermitsTarget:      r.policyPermitsTarget,
+			trustForProject:          r.trustForProject,
+			diffBudgetForProject:     r.diffBudgetForProject,
+			configuredTargetBranch:   r.configuredTargetBranch,
+			repositoryIdentity:       r.repositoryIdentity,
+			logWarn:                  r.logWarn,
+		}
+		if err := txRunner.recordTerminalAdviceOutcomes(ctx, report, reportEventID); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return Report{}, err
 	}
 	// The owned comment is reconciled after the durable report: the report is the
 	// record, the comment is a convenience for whoever is deciding. A forge that
@@ -1587,14 +1619,20 @@ func withoutRequiredCheck(rules []githubinfra.RequiredCheckRule, name string) []
 		out = append(out, rule)
 	}
 	return out
+func (r *Runner) appendGateReport(ctx context.Context, report Report, entityType, entityID string) error {
+	return r.appendGateReportAt(ctx, report, entityType, entityID, r.now())
 }
 
-func (r *Runner) appendGateReportAt(ctx context.Context, report Report, entityType, entityID string, createdAt time.Time) error {
+func (r *Runner) appendGateReportAtWithID(ctx context.Context, report Report, entityType, entityID string, createdAt time.Time, eventID string) error {
 	projectID := report.ProjectID
-	return eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+	input := eventlog.AppendInput{
 		EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
 		Payload: report, CreatedAt: createdAt,
-	})
+	}
+	if eventID != "" {
+		input.ID = eventID
+	}
+	return eventlog.Append(ctx, r.repos, input)
 }
 
 func evaluateRequiredChecks(required []githubinfra.RequiredCheckRule, checks githubinfra.PullRequestCheckRuns) ([]Reason, []CheckEvidence) {

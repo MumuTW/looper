@@ -107,7 +107,7 @@ func TestApplyMergeWatchRecordsMergifyMergeEvidence(t *testing.T) {
 		detail:      githubinfra.IssueDetail{Number: 7, Labels: []string{"triaged"}},
 		rawTimeline: []map[string]any{{"source": map[string]any{"issue": map[string]any{"pull_request": map[string]any{"number": 42}}}}},
 	}}
-	if _, err := fixture.runner.applyMergeWatch(context.Background(), fixture.projectID, "acme/looper", t.TempDir(), loaded, fixture.cfg.Roles); err != nil {
+	if _, err := fixture.runner.applyMergeWatch(context.Background(), fixture.projectID, "acme/looper", t.TempDir(), loaded, fixture.cfg.Roles, labels.DefaultNamespace()); err != nil {
 		t.Fatalf("applyMergeWatch() error = %v", err)
 	}
 	events, err := fixture.runner.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
@@ -136,7 +136,7 @@ func TestApplyMergeWatchRejectsUnbackedMergifyLabel(t *testing.T) {
 		detail:      githubinfra.IssueDetail{Number: 7, Labels: []string{"triaged"}},
 		rawTimeline: []map[string]any{{"source": map[string]any{"issue": map[string]any{"pull_request": map[string]any{"number": 42}}}}},
 	}}
-	if _, err := fixture.runner.applyMergeWatch(context.Background(), fixture.projectID, "acme/looper", t.TempDir(), loaded, fixture.cfg.Roles); err != nil {
+	if _, err := fixture.runner.applyMergeWatch(context.Background(), fixture.projectID, "acme/looper", t.TempDir(), loaded, fixture.cfg.Roles, labels.DefaultNamespace()); err != nil {
 		t.Fatalf("applyMergeWatch() error = %v", err)
 	}
 	events, err := fixture.runner.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
@@ -161,7 +161,7 @@ func TestApplyMergeWatchShortCircuitsMergedSnapshotBeforeCheckRuns(t *testing.T)
 		Number: 42, State: "closed", HeadSHA: "head-42", BaseRefName: "main", MergedAt: "2026-05-14T11:58:07.000Z", MergedBy: "mergify[bot]",
 	}
 	fixture.github.failPRCheckRuns = map[string]error{"head-42": errors.New("HTTP 504 gateway timeout")}
-	snapshot, tempErr, err := fixture.runner.mergeWatchSnapshot(context.Background(), "acme/looper", cwd, 7, 42, "looper")
+	snapshot, tempErr, err := fixture.runner.mergeWatchSnapshot(context.Background(), "acme/looper", cwd, 7, 42, labels.DefaultNamespace(), "looper")
 	if err != nil {
 		t.Fatalf("mergeWatchSnapshot() error = %v", err)
 	}
@@ -192,7 +192,7 @@ func TestApplyMergeWatchRetiresHumanOwnedNativeAutoMergeWithoutEvidence(t *testi
 		detail:      githubinfra.IssueDetail{Number: 7, Labels: []string{"triaged"}},
 		rawTimeline: []map[string]any{{"source": map[string]any{"issue": map[string]any{"pull_request": map[string]any{"number": 42}}}}},
 	}}
-	if _, err := fixture.runner.applyMergeWatch(context.Background(), fixture.projectID, "acme/looper", t.TempDir(), loaded, fixture.cfg.Roles); err != nil {
+	if _, err := fixture.runner.applyMergeWatch(context.Background(), fixture.projectID, "acme/looper", t.TempDir(), loaded, fixture.cfg.Roles, labels.DefaultNamespace()); err != nil {
 		t.Fatalf("applyMergeWatch() error = %v", err)
 	}
 	events, err := fixture.runner.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
