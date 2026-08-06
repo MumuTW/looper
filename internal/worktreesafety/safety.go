@@ -40,6 +40,14 @@ func IsSafe(input CheckInput) bool {
 	return Validate(input) == nil
 }
 
+// NormalizePath returns the path identity used by the safety checks. It
+// resolves existing symlink components while preserving a safe lexical suffix
+// for paths that do not exist yet, so callers comparing filesystem and Git
+// authorities do not treat two spellings of one checkout as different paths.
+func NormalizePath(path string) string {
+	return normalizePath(path)
+}
+
 func samePath(a, b string) bool {
 	a = strings.TrimSpace(a)
 	b = strings.TrimSpace(b)

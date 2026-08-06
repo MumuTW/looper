@@ -306,33 +306,37 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 	if restored != nil {
 		return *restored, nil
 	}
-
+	var addArgs []string
 	if checkoutMode == CheckoutModeDetached {
 		startPoint, err := g.resolveDetachedStartPoint(ctx, input)
 		if err != nil {
 			return storage.WorktreeRecord{}, err
 		}
-		if err := g.runGit(ctx, input.RepoPath, nil, "worktree", "add", "--force", "--detach", worktreePath, startPoint); err != nil {
-			return storage.WorktreeRecord{}, err
-		}
+		addArgs = []string{"worktree", "add", "--force", "--detach", worktreePath, startPoint}
 	} else {
 		branchExists, err := g.branchExists(ctx, input.RepoPath, input.Branch)
 		if err != nil {
 			return storage.WorktreeRecord{}, err
 		}
-		args := []string{"worktree", "add", "--force"}
+		addArgs = []string{"worktree", "add", "--force"}
 		if branchExists {
-			args = append(args, worktreePath, input.Branch)
+			addArgs = append(addArgs, worktreePath, input.Branch)
 		} else {
 			startPoint, err := g.resolveAttachedStartPoint(ctx, input.RepoPath, input.Branch, input.BaseBranch)
 			if err != nil {
 				return storage.WorktreeRecord{}, err
 			}
-			args = append(args, "-b", input.Branch, worktreePath, startPoint)
+			addArgs = append(addArgs, "-b", input.Branch, worktreePath, startPoint)
 		}
-		if err := g.runGit(ctx, input.RepoPath, nil, args...); err != nil {
-			return storage.WorktreeRecord{}, err
-		}
+	}
+	// Hold the repository-container fence only from the physical worktree
+	// creation through AdoptPath. Remote ref resolution and branch discovery
+	// above may fetch or wait on a slow remote, and must not block sibling
+	// creates or disk-sweep mutations that are unrelated to filesystem changes.
+	releaseMutation := worktreesafety.AcquireManagedMutationLock(worktreesafety.WorktreeMutationScope(input.WorktreeRoot))
+	defer releaseMutation()
+	if err := g.runGit(ctx, input.RepoPath, nil, addArgs...); err != nil {
+		return storage.WorktreeRecord{}, err
 	}
 
 	// Protect agent-authored git commands (agents run their own `git add -A`
@@ -432,6 +436,12 @@ func (g *Gateway) DetectOriginRemote(ctx context.Context, repoPath string) (Orig
 
 func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInput) (*storage.WorktreeRecord, error) {
 	checkoutMode := normalizeCheckoutMode(input.CheckoutMode)
+	mutationRoot := input.WorktreeRoot
+	if strings.TrimSpace(mutationRoot) == "" {
+		mutationRoot = filepath.Dir(input.ExpectedWorktreePath)
+	}
+	releaseMutation := worktreesafety.AcquireManagedMutationLock(worktreesafety.WorktreeMutationScope(mutationRoot))
+	defer releaseMutation()
 
 	if g.repos != nil {
 		var stored *storage.WorktreeRecord
@@ -531,7 +541,10 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 	// be pruned and recreated, while a healthy retired checkout may contain
 	// uncommitted work from the previous owner and must never be adopted. A
 	// healthy checkout with no provenance is instead an interrupted create and
-	// is safely recovered below.
+	// is safely recovered below. The stored identity was already evaluated
+	// above; a match found via ListWorktrees is a different checkout and must
+	// still be checked for retirement regardless of whether a stored identity
+	// exists.
 	if g.repos != nil {
 		owner, err := g.repos.Worktrees.GetByPath(ctx, match.Path)
 		if err != nil {
@@ -613,6 +626,12 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: input.WorktreePath, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}); err != nil {
 		return err
 	}
+	mutationRoot := input.WorktreeRoot
+	if strings.TrimSpace(mutationRoot) == "" {
+		mutationRoot = filepath.Dir(input.WorktreePath)
+	}
+	releaseMutation := worktreesafety.AcquireManagedMutationLock(worktreesafety.WorktreeMutationScope(mutationRoot))
+	defer releaseMutation()
 
 	// Provenance check: refuse to remove a worktree that looper did not create.
 	// This prevents destructive cleanup of external (non-looper) worktrees that

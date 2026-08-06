@@ -208,8 +208,8 @@ func (r *Runner) recordConvergenceProgress(ctx context.Context, input stepInput,
 	return nil
 }
 
-func (r *Runner) recordPublishedReviewAndConvergence(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent, detail PullRequestDetail, markerVerified bool) error {
-	if err := r.recordPublishedReviewProgress(ctx, input, pending, reviewEvent, markerVerified); err != nil {
+func (r *Runner) recordPublishedReviewAndConvergence(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent, detail PullRequestDetail, marker ReviewMarkerResult, markerVerified bool) error {
+	if err := r.recordPublishedReviewProgress(ctx, input, pending, reviewEvent, marker, markerVerified); err != nil {
 		return err
 	}
 	return r.recordConvergenceProgress(ctx, input, detail)

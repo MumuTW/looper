@@ -4,6 +4,7 @@ package gatekeeper
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -128,6 +129,10 @@ type Evidence struct {
 	FinalObservedHeadSHA         string                       `json:"finalObservedHeadSha,omitempty"`
 	CodexReviewOutcome           string                       `json:"codexReviewOutcome,omitempty"`
 	ReviewProvenance             ReviewProvenance             `json:"reviewProvenance,omitempty"`
+	Additions                    int                          `json:"additions,omitempty"`
+	Deletions                    int                          `json:"deletions,omitempty"`
+	ChangedLines                 int                          `json:"changedLines,omitempty"`
+	ReviewRequiredByPolicy       bool                         `json:"reviewRequiredByPolicy"`
 }
 
 type Report struct {
@@ -187,10 +192,14 @@ type DiscoveryResult struct {
 	// the count that must sit at zero in steady state.
 	Reconciled int
 	Reports    []Report
+	// UnreviewedMerged counts new durable negative review-capacity records from
+	// the bounded recent merged-PR reconciliation.
+	UnreviewedMerged int
 }
 
 type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error)
+	ListMergedPullRequests(context.Context, githubinfra.ListMergedPullRequestsInput) ([]githubinfra.PullRequestSummary, error)
 	ViewPullRequestForGatekeeper(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
 	ViewPullRequestMergeWatch(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
 	GetBranchProtection(context.Context, githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error)
@@ -217,6 +226,11 @@ type GitHubGateway interface {
 // merge authority; this runner reports policy for one commit.
 const RequiredStatusContext = "Looper Gatekeeper"
 
+// DefaultRequiredReviewChangedLines is the deliberate capacity policy when an
+// operator has not set a project override. An explicit zero disables the
+// threshold after configuration normalization.
+const DefaultRequiredReviewChangedLines = 200
+
 type Options struct {
 	Repos  *storage.Repositories
 	GitHub GitHubGateway
@@ -235,6 +249,10 @@ type Options struct {
 	// DiffBudgetForProject returns the effective boolean change-size limits. Zero
 	// bounds are unlimited; nil means every project has no configured limit.
 	DiffBudgetForProject func(projectID string) config.GatekeeperDiffBudget
+	// RequiredReviewChangedLinesForProject returns the effective review-capacity
+	// threshold. Zero explicitly disables the threshold; a normalized config
+	// default supplies the ordinary 200-line policy when omitted.
+	RequiredReviewChangedLinesForProject func(projectID string) int
 	// ConfiguredTargetBranch reports the project policy's configured base branch.
 	// It is folded into the discovery fingerprint so a policy generation change
 	// invalidates reused success within the skip window.
@@ -249,18 +267,26 @@ type Options struct {
 // Stateful: agent-free but not database-free — it persists Gate reports in
 // the local SQLite event log.
 type Runner struct {
-	repos                    *storage.Repositories
-	github                   GitHubGateway
-	now                      func() time.Time
-	labelNamespaceForProject func(projectID string) (labels.Namespace, bool)
-	policyPermitsTarget      func(projectID, repo, baseRefName string) bool
-	trustForProject          func(projectID string) config.GatekeeperTrustLevel
-	diffBudgetForProject     func(projectID string) config.GatekeeperDiffBudget
-	configuredTargetBranch   func(projectID string) string
-	logWarn                  func(msg string, fields map[string]any)
-	lastPublishedStatusMu    sync.Mutex
-	lastPublishedStatus      map[string]string
+	repos                                *storage.Repositories
+	github                               GitHubGateway
+	now                                  func() time.Time
+	labelNamespaceForProject             func(projectID string) (labels.Namespace, bool)
+	policyPermitsTarget                  func(projectID, repo, baseRefName string) bool
+	trustForProject                      func(projectID string) config.GatekeeperTrustLevel
+	diffBudgetForProject                 func(projectID string) config.GatekeeperDiffBudget
+	requiredReviewChangedLinesForProject func(projectID string) int
+	reviewEvidenceLookup                 reviewEvidenceLookup
+	configuredTargetBranch               func(projectID string) string
+	logWarn                              func(msg string, fields map[string]any)
+	lastPublishedStatusMu                sync.Mutex
+	lastPublishedStatus                  map[string]string
 }
+
+// reviewEvidenceLookup is kept as a narrow seam around the local event-log
+// read. Production always uses reviewerReviewEvidenceAppearedSince; the seam
+// makes the transient-read failure path deterministic in lifecycle tests without
+// replacing the storage repository or sleeping around a scheduler tick.
+type reviewEvidenceLookup func(context.Context, *storage.Repositories, string, string, int64, string, string, string) (bool, error)
 
 func New(options Options) *Runner {
 	now := options.Now
@@ -272,12 +298,13 @@ func New(options Options) *Runner {
 		policy = func(string, string, string) bool { return true }
 	}
 	return &Runner{
-		repos: options.Repos, github: options.GitHub, now: now,
-		labelNamespaceForProject: options.LabelNamespaceForProject,
-		policyPermitsTarget:      policy,
-		trustForProject:          options.TrustForProject, diffBudgetForProject: options.DiffBudgetForProject,
-		configuredTargetBranch: options.ConfiguredTargetBranch,
-		logWarn:                options.LogWarn,
+		repos: options.Repos, github: options.GitHub, now: now, policyPermitsTarget: policy,
+		trustForProject: options.TrustForProject, diffBudgetForProject: options.DiffBudgetForProject,
+		requiredReviewChangedLinesForProject: options.RequiredReviewChangedLinesForProject,
+		reviewEvidenceLookup:                 reviewerReviewEvidenceAppearedSince,
+		labelNamespaceForProject:             options.LabelNamespaceForProject,
+		configuredTargetBranch:               options.ConfiguredTargetBranch,
+		logWarn:                              options.LogWarn,
 	}
 }
 
@@ -333,6 +360,8 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	diffBudget := r.diffBudget(input.ProjectID)
 	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0
 	configuredTarget := r.configuredTarget(input.ProjectID)
+	reviewThreshold := r.requiredReviewChangedLinesFor(input.ProjectID)
+	reviewPolicyEnabled := trust == config.GatekeeperTrustAuto && reviewThreshold > 0
 	stillOpen := make(map[string]struct{}, len(pullRequests))
 	for _, pullRequest := range pullRequests {
 		// A budget change is a gate-input change even when the PR list page is
@@ -340,7 +369,8 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		// not wait for the periodic maxSkipAge backstop. BaseSHA is folded into
 		// the fingerprint only while the budget is enabled, so a base advance on
 		// a repo with no configured limit does not invalidate every open report.
-		fingerprint := sourceFingerprint(pullRequest, budgetEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions) + fmt.Sprintf("\x1fgatekeeper-trust=%s", trust) + fmt.Sprintf("\x1fconfigured-target=%s", configuredTarget)
+		policyPermits := r.policyPermitsTarget(input.ProjectID, input.Repo, pullRequest.BaseRefName)
+		fingerprint := sourceFingerprint(pullRequest, budgetEnabled, reviewPolicyEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions) + fmt.Sprintf("\x1fgatekeeper-trust=%s", trust) + fmt.Sprintf("\x1fconfigured-target=%s", configuredTarget) + fmt.Sprintf("\x1fpolicy-permits=%t", policyPermits) + fmt.Sprintf("\x1freview-threshold=%d", reviewThreshold)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		stillOpen[entityID] = struct{}{}
 		previous, hasPrevious := previousReports[entityID]
@@ -350,18 +380,33 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			// after the project policy moves up the ladder.
 			hasPrevious = false
 		}
-		// When the previous report is waiting on a current-head review, check
-		// the local event log cheaply before deciding to skip. This avoids a
+		// Check the local event log cheaply before deciding to skip. This avoids a
 		// full forge evaluation every tick for PRs that may never receive a
-		// Reviewer review (unrequested, self-authored), while still observing
-		// a review the moment its durable event appears.
-		reviewEvidenceAppeared := false
-		if hasPrevious && previous.SourceFingerprint == fingerprint && reportAwaitsCurrentHeadReview(previous) {
-			if evidence, err := latestCodexReviewForHead(ctx, r.repos, input.ProjectID, input.Repo, pullRequest.Number, pullRequest.HeadSHA); err == nil && evidence.CurrentHeadValid {
-				reviewEvidenceAppeared = true
+		// Reviewer review (unrequested, self-authored), while also invalidating a
+		// below-threshold auto success if a later verified review arrives.
+		reviewEvidenceRefreshRequired := false
+		if hasPrevious && previous.SourceFingerprint == fingerprint && (reportAwaitsCurrentHeadReview(previous) || trust == config.GatekeeperTrustAuto) {
+			previousRecordedAt := ""
+			if previous.Evidence.CodexReview != nil {
+				previousRecordedAt = previous.Evidence.CodexReview.RecordedAt
+			}
+			lookup := r.reviewEvidenceLookup
+			if lookup == nil {
+				lookup = reviewerReviewEvidenceAppearedSince
+			}
+			if appeared, err := lookup(ctx, r.repos, input.ProjectID, input.Repo, pullRequest.Number, pullRequest.HeadSHA, previous.EvaluatedAt, previousRecordedAt); err == nil {
+				reviewEvidenceRefreshRequired = appeared
+			} else {
+				// An unavailable local event log cannot prove that no new blocking
+				// review arrived. Re-evaluate so a stale success is not reused while
+				// the evidence lookup is failing.
+				reviewEvidenceRefreshRequired = true
+				if r.logWarn != nil {
+					r.logWarn("gatekeeper review evidence lookup failed", map[string]any{"projectId": input.ProjectID, "repo": input.Repo, "prNumber": pullRequest.Number, "error": err.Error()})
+				}
 			}
 		}
-		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now(), convergenceRevisions[entityID], reviewEvidenceAppeared); ok {
+		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now(), convergenceRevisions[entityID], reviewEvidenceRefreshRequired); ok {
 			result.Skipped++
 			result.Reports = append(result.Reports, reused)
 			continue
@@ -389,9 +434,181 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		result.Reconciled++
 		result.Reports = append(result.Reports, report)
 	}
+	// Publish the current open-PR verdicts before the best-effort historical
+	// scan. Marker lookups for up to one page of merged PRs may be slow or
+	// rate-limited; branch protection must not keep an older success visible
+	// while the freshly evaluated report waits behind that audit work.
+	publishDeferredStatuses()
+	if trust == config.GatekeeperTrustAuto && reviewThreshold > 0 {
+		unreviewed, err := r.recordRecentMergedReviewBacklog(ctx, input)
+		if err != nil {
+			if r.logWarn != nil {
+				r.logWarn("gatekeeper merged review backlog scan failed", map[string]any{"projectId": input.ProjectID, "repo": input.Repo, "error": err.Error()})
+			}
+		} else {
+			result.UnreviewedMerged = unreviewed
+		}
+	}
 	publishDeferredStatuses()
 	return result, nil
 }
+
+// recordRecentMergedReviewBacklog makes the bounded recent merged-PR review
+// capacity observation durable. It is deliberately best-effort at the caller:
+// open-PR gate evaluation and status publication are merge-policy work, while
+// this scan is audit evidence about already merged changes.
+func (r *Runner) recordRecentMergedReviewBacklog(ctx context.Context, input DiscoveryInput) (int, error) {
+	threshold := r.requiredReviewChangedLinesFor(input.ProjectID)
+	if threshold <= 0 {
+		return 0, nil
+	}
+	merged, err := r.github.ListMergedPullRequests(ctx, githubinfra.ListMergedPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: DefaultDiscoveryPullRequestLimit})
+	if err != nil {
+		return 0, fmt.Errorf("list merged pull requests for review backlog: %w", err)
+	}
+	count := 0
+	reviewerLogin := ""
+	loginLoaded := false
+	for _, pullRequest := range merged {
+		changedLines := maxInt(pullRequest.Additions, 0) + maxInt(pullRequest.Deletions, 0)
+		if pullRequest.Number <= 0 || strings.TrimSpace(pullRequest.HeadSHA) == "" || threshold <= 0 || changedLines < threshold {
+			continue
+		}
+		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
+		events, err := r.repos.Events.ListByEntity(ctx, "pull_request", entityID)
+		if err != nil {
+			return count, fmt.Errorf("list review evidence for %s: %w", entityID, err)
+		}
+		completed, _, unreviewed := mergedReviewEvidenceForHead(events, pullRequest.HeadSHA)
+		if completed {
+			continue
+		}
+		// A negative backlog row is durable evidence that this merged PR was
+		// observed without a review. It must not trigger a forge lookup forever.
+		// A prior Reviewer refusal gets exactly one reconciliation opportunity;
+		// a later successful Reviewer run appends completed evidence and remains
+		// authoritative without requiring this historical scan to poll forever.
+		if unreviewed {
+			continue
+		}
+		if !loginLoaded {
+			login, loginErr := r.github.GetCurrentUserLoginForRepo(ctx, input.Repo, input.CWD)
+			if loginErr != nil || strings.TrimSpace(login) == "" {
+				if loginErr == nil {
+					loginErr = fmt.Errorf("empty reviewer login")
+				}
+				return count, fmt.Errorf("resolve reviewer identity for merged review backlog: %w", loginErr)
+			}
+			reviewerLogin = strings.TrimSpace(login)
+			loginLoaded = true
+		}
+		marker, markerErr := r.github.FindReviewMarker(ctx, githubinfra.VerifyReviewMarkerInput{
+			Repo: input.Repo, PRNumber: pullRequest.Number,
+			Marker:              "looper:review id_prefix=reviewer: head=" + strings.TrimSpace(pullRequest.HeadSHA),
+			AllowedReviewEvents: []string{"COMMENT", "APPROVE", "REQUEST_CHANGES"},
+			AuthorLogin:         reviewerLogin, AllowCleanComment: true, SkipInlineComments: true, CWD: input.CWD,
+		})
+		if markerErr != nil {
+			return count, fmt.Errorf("verify review evidence for %s: %w", entityID, markerErr)
+		}
+		if marker.Found {
+			if err := r.appendMergedReviewEvidence(ctx, input, pullRequest, "pr.review.completed", map[string]any{
+				"source": "gatekeeper-backlog-reconciliation", "outcome": marker.Outcome,
+				"event": marker.Event, "reviewerLogin": marker.AuthorLogin, "reviewId": marker.ReviewID,
+			}); err != nil {
+				return count, err
+			}
+			continue
+		}
+		if err := r.appendMergedReviewEvidence(ctx, input, pullRequest, "pr.review.unreviewed", map[string]any{"threshold": threshold}); err != nil {
+			return count, fmt.Errorf("record unreviewed merged pull request %s: %w", entityID, err)
+		}
+		count++
+	}
+	return count, nil
+}
+
+func (r *Runner) appendMergedReviewEvidence(ctx context.Context, input DiscoveryInput, pullRequest githubinfra.PullRequestSummary, eventType string, extra map[string]any) error {
+	projectID := input.ProjectID
+	entityType := "pull_request"
+	entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
+	payload := map[string]any{
+		"repo": input.Repo, "prNumber": pullRequest.Number, "headSha": pullRequest.HeadSHA,
+		"mergedAt": pullRequest.MergedAt, "additions": maxInt(pullRequest.Additions, 0),
+		"deletions": maxInt(pullRequest.Deletions, 0), "changedLines": maxInt(pullRequest.Additions, 0) + maxInt(pullRequest.Deletions, 0),
+	}
+	for key, value := range extra {
+		payload[key] = value
+	}
+	reviewID, _ := extra["reviewId"].(string)
+	eventID := eventlog.StableReviewEvidenceID(eventType, input.Repo, pullRequest.Number, pullRequest.HeadSHA, reviewID, "")
+	existing, err := r.repos.Events.ListByEntityAndEventTypes(ctx, "pull_request", entityID, []string{eventType})
+	if err != nil {
+		return err
+	}
+	for _, event := range existing {
+		if event.ID == eventID {
+			return nil
+		}
+	}
+	err = eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		ID: eventID, EventType: eventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+		ActorType: stringPtr("system"), ActorID: stringPtr("gatekeeper"), ActorDisplayName: stringPtr("gatekeeper"),
+		Payload: payload, CreatedAt: r.now(),
+	})
+	if err == nil {
+		return nil
+	}
+	// A concurrent discovery tick may have inserted the same deterministic row.
+	// Re-read before surfacing the error so retries remain idempotent.
+	if events, lookupErr := r.repos.Events.ListByEntityAndEventTypes(ctx, "pull_request", entityID, []string{eventType}); lookupErr == nil {
+		for _, event := range events {
+			if event.ID == eventID {
+				return nil
+			}
+		}
+	}
+	return err
+}
+
+func mergedReviewEvidenceForHead(events []storage.EventLogRecord, headSHA string) (completed bool, refused bool, unreviewed bool) {
+	for _, event := range events {
+		if event.EventType != "pr.review.completed" && event.EventType != "pr.review.refused" && event.EventType != "pr.review.unreviewed" {
+			continue
+		}
+		var payload struct {
+			HeadSHA string `json:"headSha"`
+		}
+		if json.Unmarshal([]byte(event.PayloadJSON), &payload) != nil || !strings.EqualFold(strings.TrimSpace(payload.HeadSHA), strings.TrimSpace(headSHA)) {
+			continue
+		}
+		switch event.EventType {
+		case "pr.review.completed":
+			completed = true
+		case "pr.review.refused":
+			refused = true
+		case "pr.review.unreviewed":
+			unreviewed = true
+		}
+	}
+	return completed, refused, unreviewed
+}
+
+func maxInt(value, floor int) int {
+	if value < floor {
+		return floor
+	}
+	return value
+}
+
+func reviewCapacityStatsKnown(additions, deletions int, additionsKnown, deletionsKnown bool) bool {
+	// Non-zero values preserve compatibility with hand-built gateway fakes and
+	// older adapters that predate the explicit presence bits. Zero is only
+	// trusted when the provider confirmed that the field was present.
+	return (additionsKnown || additions != 0) && (deletionsKnown || deletions != 0)
+}
+
+func stringPtr(value string) *string { return &value }
 
 // maxReconciledDepartures bounds how many departed pull requests one tick gives
 // a final report. A burst — a release day that merges sixty pull requests, a
@@ -504,6 +721,12 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	report.Evidence.Draft = detail.IsDraft
 	report.Evidence.BaseRefName = strings.TrimSpace(detail.BaseRefName)
 	report.Evidence.ReviewDecision = strings.ToUpper(strings.TrimSpace(detail.ReviewDecision))
+	reviewThreshold := r.requiredReviewChangedLinesFor(input.ProjectID)
+	reviewPolicyEnabled := r.trustFor(input.ProjectID) == config.GatekeeperTrustAuto && reviewThreshold > 0
+	report.Evidence.Additions = maxInt(detail.Additions, 0)
+	report.Evidence.Deletions = maxInt(detail.Deletions, 0)
+	report.Evidence.ChangedLines = report.Evidence.Additions + report.Evidence.Deletions
+	report.Evidence.ReviewRequiredByPolicy = reviewPolicyEnabled && report.Evidence.ChangedLines >= reviewThreshold
 	if input.ExpectedHeadSHA != "" && report.ObservedHeadSHA != input.ExpectedHeadSHA {
 		report.Reasons = []Reason{{Code: ReasonHeadStale}}
 		return r.persist(ctx, report)
@@ -526,6 +749,11 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	report.Evidence.CodexReview = &codexReview
 	if !codexReview.CurrentHeadValid {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewMissing, Subject: codexReviewReasonSubject(codexReview)})
+	}
+	if r.trustFor(input.ProjectID) == config.GatekeeperTrustAuto && !report.Evidence.ReviewRequiredByPolicy {
+		// Small changes and an explicit zero threshold waive only the clean-review
+		// requirement; an explicit blocking marker remains authoritative below.
+		report.Reasons = withoutReasonCodes(report.Reasons, ReasonCodexReviewMissing, ReasonCodexReviewRequired)
 	}
 
 	// Recorded here, before every gate branch and every early return below,
@@ -585,6 +813,50 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonMergeabilityNotClean, Subject: mergeabilityState.Raw()})
 	}
 
+	// Review-capacity counts are merge-base dependent just like the optional
+	// diff budget. Use the merge-watch observation when its base differs from
+	// the initial detail read, then revalidate that base before publishing.
+	reviewCapacityBaseSHA := ""
+	reviewCapacityBaseMissing := false
+	if reviewPolicyEnabled {
+		reviewCapacityBaseSHA = strings.TrimSpace(detail.BaseSHA)
+		additions, deletions := detail.Additions, detail.Deletions
+		statsKnown := reviewCapacityStatsKnown(detail.Additions, detail.Deletions, detail.AdditionsKnown, detail.DeletionsKnown)
+		if strings.TrimSpace(mergeability.BaseSHA) != strings.TrimSpace(detail.BaseSHA) {
+			reviewCapacityBaseSHA = strings.TrimSpace(mergeability.BaseSHA)
+			additions, deletions = mergeability.Additions, mergeability.Deletions
+			statsKnown = reviewCapacityStatsKnown(mergeability.Additions, mergeability.Deletions, mergeability.AdditionsKnown, mergeability.DeletionsKnown)
+		}
+		if reviewCapacityBaseSHA == "" {
+			reviewCapacityBaseMissing = true
+		} else if !statsKnown {
+			// A zero count is ambiguous when the provider omitted the field: it
+			// may describe a genuinely empty diff, or a large change whose
+			// additions/deletions were not decoded. Auto trust must not waive a
+			// current-head review on that uncertainty.
+			return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "review_capacity_stats")
+		}
+		if additions < 0 {
+			additions = 0
+		}
+		if deletions < 0 {
+			deletions = 0
+		}
+		report.Evidence.Additions = additions
+		report.Evidence.Deletions = deletions
+		report.Evidence.ChangedLines = additions + deletions
+		report.Evidence.ReviewRequiredByPolicy = report.Evidence.ChangedLines >= reviewThreshold
+		if !report.Evidence.ReviewRequiredByPolicy {
+			// The capacity policy waives the requirement for a review on small
+			// changes. Blocking provider-authored review markers are still checked
+			// below, so a waiver cannot turn an explicit veto into success.
+			report.Reasons = withoutReasonCodes(report.Reasons, ReasonCodexReviewMissing, ReasonCodexReviewRequired)
+		}
+		if report.Evidence.ReviewRequiredByPolicy && !codexReview.CurrentHeadValid && !hasReasonCode(report.Reasons, ReasonCodexReviewMissing) {
+			report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewMissing, Subject: codexReviewReasonSubject(codexReview)})
+		}
+	}
+
 	// The diff statistics were observed against detail.BaseSHA. If the base
 	// branch advanced between the detail read and the merge-watch read, GitHub
 	// recomputes changedFiles and deletions against a new merge base without
@@ -623,6 +895,9 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		if subject := diffBudgetExceededSubject(*stats, diffBudget); subject != "" {
 			report.Reasons = append(report.Reasons, Reason{Code: ReasonDiffBudgetExceeded, Subject: subject})
 		}
+	}
+	if reviewCapacityBaseMissing {
+		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "review_capacity_base")
 	}
 
 	protection, err := r.github.GetBranchProtection(ctx, githubinfra.BranchProtectionInput{Repo: input.Repo, Branch: report.Evidence.BaseRefName, CWD: input.CWD})
@@ -704,6 +979,11 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 
 	if r.trustFor(input.ProjectID) == config.GatekeeperTrustAuto {
+		if !reviewPolicyEnabled {
+			// An explicit zero disables the clean-review capacity requirement. A
+			// blocking marker remains authoritative and is still checked below.
+			report.Reasons = withoutReasonCodes(report.Reasons, ReasonCodexReviewMissing, ReasonCodexReviewRequired)
+		}
 		login, loginErr := r.github.GetCurrentUserLoginForRepo(ctx, input.Repo, input.CWD)
 		if loginErr != nil || strings.TrimSpace(login) == "" {
 			return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "codex_reviewer_identity")
@@ -720,14 +1000,14 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		if marker.Found {
 			report.Reasons = withoutReasonCodes(report.Reasons, ReasonCodexReviewMissing)
 			report.Evidence.CodexReviewOutcome = strings.ToLower(strings.TrimSpace(marker.Outcome))
-			if report.Evidence.CodexReviewOutcome == "blocking" || report.Evidence.CodexReviewOutcome == "actionable" {
+			if report.Evidence.CodexReviewOutcome == "blocking" {
 				report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewBlocked, Subject: report.Evidence.CodexReviewOutcome})
 			}
 		} else if report.Evidence.CodexReview != nil && report.Evidence.CodexReview.CurrentHeadValid && report.Evidence.CodexReview.Event == "COMMENT" {
 			// Markerless clean COMMENT policy records pr.review.posted with
 			// markerVerified=true but leaves no forge marker for FindReviewMarker.
 			report.Evidence.CodexReviewOutcome = "clean"
-		} else {
+		} else if report.Evidence.ReviewRequiredByPolicy {
 			report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewRequired, Subject: "current_head"})
 		}
 	}
@@ -755,6 +1035,9 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	// the provider omits it.
 	if budgetEnabled && strings.TrimSpace(finalBase) != diffBudgetBaseSHA {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "diff_budget_base")
+	}
+	if reviewPolicyEnabled && strings.TrimSpace(finalBase) != reviewCapacityBaseSHA {
+		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "review_capacity_base")
 	}
 	return r.persist(ctx, report)
 }
@@ -844,7 +1127,6 @@ func (r *Runner) projectLabelNamespace(ctx context.Context, projectID string) la
 	}
 	return labels.DefaultNamespace()
 }
-
 func (r *Runner) persistProviderBlock(ctx context.Context, report Report, code ReasonCode, subject string) (Report, error) {
 	report.Reasons = []Reason{{Code: code, Subject: subject}}
 	return r.persist(ctx, report)
@@ -870,6 +1152,17 @@ func (r *Runner) diffBudget(projectID string) config.GatekeeperDiffBudget {
 		return config.GatekeeperDiffBudget{}
 	}
 	return r.diffBudgetForProject(projectID)
+}
+
+func (r *Runner) requiredReviewChangedLinesFor(projectID string) int {
+	if r == nil || r.requiredReviewChangedLinesForProject == nil {
+		return DefaultRequiredReviewChangedLines
+	}
+	threshold := r.requiredReviewChangedLinesForProject(projectID)
+	if threshold < 0 {
+		return DefaultRequiredReviewChangedLines
+	}
+	return threshold
 }
 
 func (r *Runner) configuredTarget(projectID string) string {
@@ -1145,31 +1438,11 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	entityType := "pull_request"
 	entityID := fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
 	projectID := report.ProjectID
-	reportEventID := eventlog.NewEventID("event")
-	if err := r.repos.WithTransaction(ctx, func(txRepos *storage.Repositories) error {
-		if err := eventlog.Append(ctx, txRepos, eventlog.AppendInput{
-			ID:        reportEventID,
-			EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
-			Payload: report, CreatedAt: r.now(),
-		}); err != nil {
-			return fmt.Errorf("persist gate report: %w", err)
-		}
-		txRunner := &Runner{
-			repos:                  txRepos,
-			github:                 r.github,
-			now:                    r.now,
-			policyPermitsTarget:    r.policyPermitsTarget,
-			trustForProject:        r.trustForProject,
-			diffBudgetForProject:   r.diffBudgetForProject,
-			configuredTargetBranch: r.configuredTargetBranch,
-			logWarn:                r.logWarn,
-		}
-		if err := txRunner.recordTerminalAdviceOutcomes(ctx, report, reportEventID); err != nil {
-			return err
-		}
-		return nil
+	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+		Payload: report, CreatedAt: r.now(),
 	}); err != nil {
-		return Report{}, err
+		return Report{}, fmt.Errorf("persist gate report: %w", err)
 	}
 	// The owned comment is reconciled after the durable report: the report is the
 	// record, the comment is a convenience for whoever is deciding. A forge that
@@ -1197,6 +1470,9 @@ func gatekeeperCommitStatus(report Report) (string, string) {
 		}
 	}
 	if report.Eligible {
+		if report.Mode == string(config.GatekeeperTrustAuto) && !report.Evidence.ReviewRequiredByPolicy {
+			return "success", "Merge gates passed; review threshold not met"
+		}
 		return "success", "Current-head Codex review and merge gates passed"
 	}
 	for _, reason := range report.Reasons {

@@ -32,6 +32,7 @@ func TestIsHotEditablePathUsesExplicitAllowlist(t *testing.T) {
 		"daemon.worktreeCleanup.dryRun",
 		"daemon.worktreeCleanup.includeOrphans",
 		"daemon.worktreeCleanup.maxPerTick",
+		"daemon.worktreeCleanup.maxDiskSweepPerTick",
 		"daemon.worktreeCleanup.retentionDays",
 		"daemon.resourceGuard.enabled",
 		"daemon.resourceGuard.minDiskFreePercent",

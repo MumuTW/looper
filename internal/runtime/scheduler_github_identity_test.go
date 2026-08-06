@@ -87,6 +87,30 @@ func TestCodingRoleIdentityLookupsUseProjectProviderHostname(t *testing.T) {
 	}
 }
 
+func TestReviewerAdapterPreservesReviewID(t *testing.T) {
+	t.Parallel()
+	githubPath := t.TempDir()
+	gateway := githubinfra.New(githubinfra.Options{GHPath: "gh", CWD: githubPath, GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+		if got := strings.Join(options.Args, " "); got == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[{"id":202,"state":"APPROVED","body":"<!-- looper:review id=abc head=def outcome=clean -->"}]`}, nil
+		} else if got == "api --paginate --slurp repos/acme/looper/pulls/42/reviews/202/comments" {
+			return shell.Result{Stdout: `[]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}})
+	adapter := reviewerGitHubAdapter{gateway: gateway}
+	marker, err := adapter.FindReviewMarker(context.Background(), reviewer.VerifyReviewMarkerInput{
+		Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc head=def", AllowedReviewEvents: []reviewer.ReviewEvent{reviewer.ReviewEventApprove}, CWD: githubPath,
+	})
+	if err != nil {
+		t.Fatalf("FindReviewMarker() error = %v", err)
+	}
+	if !marker.Found || marker.ReviewID != "202" {
+		t.Fatalf("FindReviewMarker() = %#v, want ReviewID 202", marker)
+	}
+}
+
 func TestFixerReviewThreadCommandsUseConfiguredProviderHostname(t *testing.T) {
 	root := t.TempDir()
 	ghesPath := filepath.Join(root, "ghes")
