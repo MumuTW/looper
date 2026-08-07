@@ -168,7 +168,6 @@ func TestGatekeeperRejectsNegativeProjectReviewThreshold(t *testing.T) {
 	t.Fatalf("issues = %+v, want negative project threshold rejected", issues)
 }
 
-
 func TestGatekeeperTrustRejectsAutoWithReviewerNativeAutoMerge(t *testing.T) {
 	t.Parallel()
 	issues := gatekeeperIssues(Config{Roles: RoleConfigs{

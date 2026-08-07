@@ -1,6 +1,21 @@
 package gatekeeper
 
 // AdviceAgreementEventType records the forge-observed outcome of one advise
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/eventlog"
+	"github.com/MumuTW/looper/internal/storage"
+)
+
 // verdict in one terminal lifecycle epoch. The Gate report remains the
 // authority for what Gatekeeper said; the terminal pull-request state returned
 // by the forge is the authority for what happened afterwards.

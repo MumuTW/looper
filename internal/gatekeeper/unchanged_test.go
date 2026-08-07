@@ -307,7 +307,7 @@ func TestSkipUnchangedReevaluatesWhenReviewEvidenceLookupFails(t *testing.T) {
 		EvaluatedAt:       now.Add(-time.Minute).Format(time.RFC3339Nano),
 		Eligible:          true,
 	}
-	if _, reused := skipUnchanged(previous, true, "same", now, "", true); reused {
+	if _, reused := skipUnchanged(previous, true, "same", config.GatekeeperTrustAuto, now, "", true); reused {
 		t.Fatal("skipUnchanged() reused a cached success when review-evidence refresh was required")
 	}
 }

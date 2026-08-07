@@ -253,27 +253,15 @@ type GitHubGateway interface {
 	ValidateMergifyRouting(context.Context, githubinfra.ValidateMergifyRoutingInput) error
 }
 
-// RequiredStatusContext is the GitHub status context an operator adds to branch
-// protection when promoting Gatekeeper to auto. GitHub branch protection is the
-// merge authority; this runner reports policy for one commit.
-const RequiredStatusContext = "Looper Gatekeeper"
-
-// DefaultRequiredReviewChangedLines is the deliberate capacity policy when an
-// operator has not set a project override. An explicit zero disables the
-// threshold after configuration normalization.
 const DefaultRequiredReviewChangedLines = 200
-// RequiredStatusContext is the GitHub status context an operator adds to branch
-// protection when promoting Gatekeeper to auto. GitHub branch protection is the
-// merge authority; this runner reports policy for one commit.
-const RequiredStatusContext = "Looper Gatekeeper"
 
 type mergifyContractFingerprinter interface {
 	MergifyRoutingContractFingerprint(context.Context, githubinfra.ValidateMergifyRoutingInput) (string, error)
 }
 
 type Options struct {
-	Repos  *storage.Repositories
 	GitHub GitHubGateway
+	Repos  *storage.Repositories
 	Now    func() time.Time
 	// LabelNamespaceForProject resolves config-managed projects. API-managed
 	// projects fall back to their persisted catalog metadata in the runner.
@@ -298,9 +286,7 @@ type Options struct {
 	// invalidates reused success within the skip window.
 	ConfiguredTargetBranch func(projectID string) string
 	LogWarn                func(msg string, fields map[string]any)
-	LogWarn                 func(msg string, fields map[string]any)
-	LogWarn              func(msg string, fields map[string]any)
-	LogWarn                func(msg string, fields map[string]any)
+	RepositoryIdentity     func(projectID string) string
 }
 
 func boolPointer(value bool) *bool { return &value }
@@ -323,19 +309,9 @@ type Runner struct {
 	reviewEvidenceLookup                 reviewEvidenceLookup
 	configuredTargetBranch               func(projectID string) string
 	logWarn                              func(msg string, fields map[string]any)
-	lastPublishedStatusMu                sync.Mutex
-	lastPublishedStatus                  map[string]string
-	repos                    *storage.Repositories
-	github                   GitHubGateway
-	now                      func() time.Time
-	labelNamespaceForProject func(projectID string) (labels.Namespace, bool)
-	policyPermitsTarget      func(projectID, repo, baseRefName string) bool
-	trustForProject          func(projectID string) config.GatekeeperTrustLevel
-	diffBudgetForProject     func(projectID string) config.GatekeeperDiffBudget
-	configuredTargetBranch   func(projectID string) string
-	logWarn                  func(msg string, fields map[string]any)
-	outOfPageRouteMu         sync.Mutex
-	outOfPageRouteChecks     map[string]time.Time
+	outOfPageRouteMu                     sync.Mutex
+	outOfPageRouteChecks                 map[string]time.Time
+	repositoryIdentity                   func(projectID string) string
 }
 
 // reviewEvidenceLookup is kept as a narrow seam around the local event-log
@@ -361,14 +337,8 @@ func New(options Options) *Runner {
 		labelNamespaceForProject:             options.LabelNamespaceForProject,
 		configuredTargetBranch:               options.ConfiguredTargetBranch,
 		logWarn:                              options.LogWarn,
-		repos: options.Repos, github: options.GitHub, now: now,
-		labelNamespaceForProject: options.LabelNamespaceForProject,
-		policyPermitsTarget:      policy,
-		trustForProject:          options.TrustForProject,
-		diffBudgetForProject:     options.DiffBudgetForProject,
-		configuredTargetBranch:   options.ConfiguredTargetBranch,
-		logWarn:                  options.LogWarn,
-		outOfPageRouteChecks:     make(map[string]time.Time),
+		repositoryIdentity:                   options.RepositoryIdentity,
+		outOfPageRouteChecks:                 make(map[string]time.Time),
 	}
 }
 
@@ -412,23 +382,8 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	contractFingerprint := r.mergifyContractFingerprint(ctx, input)
 	result := DiscoveryResult{Reports: make([]Report, 0, len(pullRequests))}
-	// Deferred commit statuses must still publish on abort: a blocked report that
-	// was already evaluated this tick is durable in result.Reports, and leaving
-	// without publishing would keep a prior success visible to branch protection.
-	publishDeferredStatuses := func() {
-		if trust == config.GatekeeperTrustAuto {
-			r.publishDiscoveryCommitStatuses(ctx, input.ProjectID, input.Repo, input.CWD, result.Reports)
-		}
-	}
+	trust := r.trustFor(input.ProjectID)
 	reviewThreshold := r.requiredReviewChangedLinesFor(input.ProjectID)
-	// Deferred commit statuses must still publish on abort: a blocked report that
-	// was already evaluated this tick is durable in result.Reports, and leaving
-	// without publishing would keep a prior success visible to branch protection.
-	publishDeferredStatuses := func() {
-		if trust == config.GatekeeperTrustAuto {
-			r.publishDiscoveryCommitStatuses(ctx, input.ProjectID, input.Repo, input.CWD, result.Reports)
-		}
-	}
 	var evaluationErrs []error
 	stillOpen := make(map[string]struct{}, len(pullRequests))
 	for _, pullRequest := range pullRequests {
@@ -533,7 +488,6 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	// scan. Marker lookups for up to one page of merged PRs may be slow or
 	// rate-limited; branch protection must not keep an older success visible
 	// while the freshly evaluated report waits behind that audit work.
-	publishDeferredStatuses()
 	if trust == config.GatekeeperTrustAuto && reviewThreshold > 0 {
 		unreviewed, err := r.recordRecentMergedReviewBacklog(ctx, input)
 		if err != nil {
@@ -544,8 +498,6 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.UnreviewedMerged = unreviewed
 		}
 	}
-	publishDeferredStatuses()
-	publishDeferredStatuses()
 	if len(evaluationErrs) > 0 {
 		return result, errors.Join(evaluationErrs...)
 	}
@@ -771,77 +723,11 @@ func (r *Runner) departedFromOpenSet(
 	return departed
 }
 
-
-// maxReconciledDepartures bounds how many departed pull requests one tick gives
-// a final report. A burst — a release day that merges sixty pull requests, a
-// project whose discovery scope was just narrowed — must not turn one tick into
-// an unbounded run of forge reads. The remainder is picked up by later ticks,
-// because a pull request that is still recorded OPEN and still absent from the
-// open list stays a candidate until it is reconciled.
-const maxReconciledDepartures = 20
-
-// departedFromOpenSet names the pull requests whose latest report still says
-// OPEN but which are no longer in the open list — they merged or were closed
-// since the last tick.
-//
-// This is the lifecycle path that makes the merged state durable with webhooks
-// off, which is the default. Polling discovery lists only open pull requests, so
-// without this a pull request's last report is forever the one written while it
-// was still open, and `state=merged` answers empty on a default install.
-//
-// It is not a poller over merged history, and three things bound it:
-//
-//   - Only pull requests Looper itself last recorded as OPEN are candidates.
-//     Anything that merged before this ran, or that Looper never saw, is never
-//     revisited — there is no backfill.
-//   - The transition is one-way and self-clearing. Reconciling rewrites the
-//     state to MERGED or CLOSED, so the same pull request is never a candidate
-//     twice and the steady-state count is zero.
-//   - A truncated open list is not evidence of departure. When the list came
-//     back at the limit, a pull request may simply have fallen off the page, so
-//     nothing is reconciled at all rather than churning the overflow every tick.
-func (r *Runner) departedFromOpenSet(
-	repo string,
-	pullRequests []githubinfra.PullRequestSummary,
-	limit int,
-	previousReports map[string]Report,
-	stillOpen map[string]struct{},
-) []string {
-	if len(pullRequests) >= limit {
-		return nil
-	}
-	departed := make([]string, 0)
-	for entityID, previous := range previousReports {
-		if previous.Repo != repo || previous.PRNumber <= 0 {
-			continue
-		}
-		if !strings.EqualFold(strings.TrimSpace(previous.Evidence.PullRequestState), "OPEN") {
-			continue
-		}
-		if _, open := stillOpen[entityID]; open {
-			continue
-		}
-		departed = append(departed, entityID)
-	}
-	// Sorted so the cap takes a deterministic prefix rather than whichever
-	// entries Go's map iteration happened to yield first.
-	sort.Slice(departed, func(i, j int) bool {
-		return previousReports[departed[i]].PRNumber < previousReports[departed[j]].PRNumber
-	})
-	if len(departed) > maxReconciledDepartures {
-		departed = departed[:maxReconciledDepartures]
-	}
-	return departed
-}
-
-// sourceFingerprintForProject includes the local authority inputs that the
-// forge's pull-request list cannot expose. A trust, policy, or diff-budget
-// bound change must not leave a previously published auto-merge label in place
-// merely because the pull request itself is unchanged.
-// sourceFingerprintForProject includes the local authority inputs that the
-// forge's pull-request list cannot expose. A trust, policy, or diff-budget
-// bound change must not leave a previously published auto-merge label in place
-// merely because the pull request itself is unchanged.
+// sourceFingerprintForProjectWithContract includes the local authority inputs
+// that the forge's pull-request list cannot expose, plus the Mergify routing
+// contract fingerprint. A trust, policy, or diff-budget bound change must not
+// leave a previously published auto-merge label in place merely because the
+// pull request itself is unchanged.
 func (r *Runner) sourceFingerprintForProjectWithContract(pullRequest githubinfra.PullRequestSummary, projectID, repo, contractFingerprint string) string {
 	budget := r.diffBudget(projectID)
 	budgetEnabled := budget.MaxChangedFiles > 0 || budget.MaxDeletions > 0
@@ -859,21 +745,6 @@ func (r *Runner) sourceFingerprintForProjectWithContract(pullRequest githubinfra
 	}, "\x1f")
 }
 
-// sourceFingerprintForProject includes the local authority inputs that the
-// forge's pull-request list cannot expose. A trust, budget, or policy change
-// must not leave a previously published auto-merge label in place merely
-// because the pull request itself is unchanged.
-func (r *Runner) sourceFingerprintForProject(pullRequest githubinfra.PullRequestSummary, projectID, repo string) string {
-	diffBudget := r.diffBudget(projectID)
-	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0
-	configuredTarget := r.configuredTarget(projectID)
-	permitsTarget := r.policyPermitsTarget(projectID, repo, pullRequest.BaseRefName)
-	trust := r.trustFor(projectID)
-	reviewThreshold := r.requiredReviewChangedLinesFor(projectID)
-	reviewPolicyEnabled := trust == config.GatekeeperTrustAuto && reviewThreshold > 0
-	return sourceFingerprint(pullRequest, budgetEnabled, reviewPolicyEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions) + fmt.Sprintf("\x1fgatekeeper-trust=%s", string(trust)) + fmt.Sprintf("\x1fconfigured-target=%s", configuredTarget) + fmt.Sprintf("\x1fpolicy-permits-target=%t", permitsTarget) + fmt.Sprintf("\x1freview-threshold=%d", reviewThreshold)
-}
-
 func (r *Runner) mergifyContractFingerprint(ctx context.Context, input DiscoveryInput) string {
 	if r == nil || r.trustFor(input.ProjectID) != config.GatekeeperTrustAuto {
 		return ""
@@ -882,7 +753,7 @@ func (r *Runner) mergifyContractFingerprint(ctx context.Context, input Discovery
 	if !ok {
 		return "contract-fingerprint-unavailable"
 	}
-	fingerprint, err := fingerprinter.MergifyRoutingContractFingerprint(ctx, githubinfra.ValidateMergifyRoutingInput{Repo: input.Repo, CWD: input.CWD})
+	fingerprint, err := fingerprinter.MergifyRoutingContractFingerprint(ctx, githubinfra.ValidateMergifyRoutingInput{Repo: r.repositoryTarget(input.ProjectID), CWD: input.CWD})
 	if err != nil {
 		if r.logWarn != nil {
 			r.logWarn("gatekeeper: could not fingerprint Mergify routing contract", map[string]any{"repo": input.Repo, "error": err.Error()})
@@ -897,6 +768,14 @@ func (r *Runner) configuredTarget(projectID string) string {
 		return ""
 	}
 	return strings.TrimSpace(r.configuredTargetBranch(projectID))
+}
+
+func pageEntityIDs(repo string, pullRequests []githubinfra.PullRequestSummary) map[string]struct{} {
+	ids := make(map[string]struct{}, len(pullRequests))
+	for _, pr := range pullRequests {
+		ids[fmt.Sprintf("%s#%d", repo, pr.Number)] = struct{}{}
+	}
+	return ids
 }
 
 func (r *Runner) repositoryTarget(projectID string) string {
@@ -1233,7 +1112,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	// when the budget is disabled a base advance is not a gate input, so the
 	// lighter head-only read is sufficient.
 	var finalHead, finalBase string
-	if budgetEnabled {
+	if budgetEnabled || reviewPolicyEnabled {
 		finalHead, finalBase, err = r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
 	} else {
 		finalHead, err = r.github.GetPullRequestHeadSHA(ctx, viewInput)
@@ -1402,20 +1281,6 @@ func (r *Runner) requiredReviewChangedLinesFor(projectID string) int {
 	return threshold
 }
 
-func (r *Runner) configuredTarget(projectID string) string {
-	if r == nil || r.configuredTargetBranch == nil {
-		return ""
-	}
-	return strings.TrimSpace(r.configuredTargetBranch(projectID))
-}
-
-func (r *Runner) configuredTarget(projectID string) string {
-	if r == nil || r.configuredTargetBranch == nil {
-		return ""
-	}
-	return strings.TrimSpace(r.configuredTargetBranch(projectID))
-}
-
 func diffBudgetExceededSubject(stats githubinfra.PullRequestDiffStats, budget config.GatekeeperDiffBudget) string {
 	parts := make([]string, 0, 2)
 	if budget.MaxChangedFiles > 0 && stats.ChangedFiles > budget.MaxChangedFiles {
@@ -1526,6 +1391,7 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	}
 	if r.trustFor(report.ProjectID) == config.GatekeeperTrustAuto && report.Eligible {
 		report.RouteEstablished = boolPointer(true)
+	} else {
 	}
 	// The final report is appended strictly after the pending projection so
 	// latestGateReports (which keeps the newest record for an entity) always
@@ -1573,34 +1439,6 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	return report, nil
 }
 
-func gatekeeperCommitStatus(report Report) (string, string) {
-	for _, reason := range report.Reasons {
-		if reason.Code == ReasonGatekeeperCheckRequired {
-			return "error", "Looper Gatekeeper is not configured as a required status on the target branch"
-		}
-	}
-	for _, reason := range report.Reasons {
-		if reason.Code == ReasonCodexReviewRequired {
-			return "pending", "Waiting for Codex review of this commit"
-		}
-		if reason.Code == ReasonHeadStale {
-			return "pending", "Waiting for Gatekeeper evaluation of the current head"
-		}
-	}
-	if report.Eligible {
-		if report.Mode == string(config.GatekeeperTrustAuto) && !report.Evidence.ReviewRequiredByPolicy {
-			return "success", "Merge gates passed; review threshold not met"
-		}
-		return "success", "Current-head Codex review and merge gates passed"
-	}
-	for _, reason := range report.Reasons {
-		if reason.Code == ReasonProviderStateUnavailable || reason.Code == ReasonProviderStateAmbiguous {
-			return "error", "Gatekeeper could not verify current merge state"
-		}
-	}
-	return "failure", "Gatekeeper found blocking merge state"
-}
-
 func containsRequiredCheck(checks []string, want string) bool {
 	for _, check := range checks {
 		if strings.EqualFold(strings.TrimSpace(check), strings.TrimSpace(want)) {
@@ -1619,8 +1457,9 @@ func withoutRequiredCheck(rules []githubinfra.RequiredCheckRule, name string) []
 		out = append(out, rule)
 	}
 	return out
-func (r *Runner) appendGateReport(ctx context.Context, report Report, entityType, entityID string) error {
-	return r.appendGateReportAt(ctx, report, entityType, entityID, r.now())
+}
+func (r *Runner) appendGateReportAt(ctx context.Context, report Report, entityType, entityID string, createdAt time.Time) error {
+	return r.appendGateReportAtWithID(ctx, report, entityType, entityID, createdAt, "")
 }
 
 func (r *Runner) appendGateReportAtWithID(ctx context.Context, report Report, entityType, entityID string, createdAt time.Time, eventID string) error {
@@ -1771,26 +1610,6 @@ func withoutReasonCodes(reasons []Reason, codes ...ReasonCode) []Reason {
 			continue
 		}
 		out = append(out, reason)
-	}
-	return out
-}
-
-func containsRequiredCheck(checks []string, want string) bool {
-	for _, check := range checks {
-		if strings.EqualFold(strings.TrimSpace(check), strings.TrimSpace(want)) {
-			return true
-		}
-	}
-	return false
-}
-
-func withoutRequiredCheck(rules []githubinfra.RequiredCheckRule, name string) []githubinfra.RequiredCheckRule {
-	out := make([]githubinfra.RequiredCheckRule, 0, len(rules))
-	for _, rule := range rules {
-		if strings.EqualFold(strings.TrimSpace(rule.Context), strings.TrimSpace(name)) && rule.AppID == 0 {
-			continue
-		}
-		out = append(out, rule)
 	}
 	return out
 }
