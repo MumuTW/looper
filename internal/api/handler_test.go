@@ -2697,6 +2697,64 @@ func TestHandlerProjectsListRouteSuccess(t *testing.T) {
 	assertEqual(t, project["updatedAt"], nowISO)
 }
 
+func TestSerializeProjectProjectsGatekeeperTrustFromMetadataAndConfig(t *testing.T) {
+	auto := config.GatekeeperTrustAuto
+	cfg := config.Config{
+		Roles: config.RoleConfigs{Gatekeeper: config.GatekeeperRoleConfig{Trust: config.GatekeeperTrustAdvise}},
+		Projects: []config.ProjectRefConfig{{
+			ID:    "configured-project",
+			Roles: &config.PartialRoleConfigs{Gatekeeper: &config.PartialGatekeeperRoleConfig{Trust: &auto}},
+		}},
+	}
+
+	metadataTrust := `{"roles":{"gatekeeper":{"trust":"auto"}}}`
+	if got := serializeProject(storage.ProjectRecord{ID: "api-project", MetadataJSON: &metadataTrust}, cfg, "main").GatekeeperTrust; got != "auto" {
+		t.Fatalf("metadata gatekeeper trust = %q, want auto", got)
+	}
+	if got := serializeProject(storage.ProjectRecord{ID: "configured-project"}, cfg, "main").GatekeeperTrust; got != "auto" {
+		t.Fatalf("configured gatekeeper trust = %q, want auto", got)
+	}
+	if got := serializeProject(storage.ProjectRecord{ID: "default-project"}, config.Config{}, "main").GatekeeperTrust; got != "" {
+		t.Fatalf("default gatekeeper trust = %q, want omitted observe", got)
+	}
+}
+
+func TestValidateManualHoldBypassUsesProjectLabelNamespaceForInjectedAndGitHubRefresh(t *testing.T) {
+	fixture := newTestFixture(t)
+	projectID := "custom-label-project"
+	repoPath := t.TempDir()
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	metadata := `{"repo":"acme/looper","labelNamespace":"team.looper:","source":"api"}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Custom labels", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	target := domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, Repo: "acme/looper", IssueNumber: 8}
+
+	injected := NewHandler(Context{
+		Config:  fixture.config,
+		Runtime: fixture.runtime,
+		RefreshTargetLabels: func(context.Context, domain.LoopTarget, string) ([]string, error) {
+			return []string{"team.looper:hold"}, nil
+		},
+	})
+	if err := injected.validateManualHoldBypassForLoopTarget(context.Background(), projectID, domain.LoopTypeWorker, target, false); err == nil || !strings.Contains(err.Error(), "currently held") {
+		t.Fatalf("injected refresh error = %v, want custom namespace hold refusal", err)
+	}
+
+	ghPath := filepath.Join(t.TempDir(), "gh")
+	if err := os.WriteFile(ghPath, []byte("#!/bin/sh\nprintf '%s\\n' '{\"labels\":[{\"name\":\"team.looper:hold\"}]}'\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh = %v", err)
+	}
+	cfg := fixture.config
+	cfg.Tools.GHPath = &ghPath
+	githubRefresh := NewHandler(Context{Config: cfg, Runtime: fixture.runtime})
+	if err := githubRefresh.validateManualHoldBypassForLoopTarget(context.Background(), projectID, domain.LoopTypeWorker, target, false); err == nil || !strings.Contains(err.Error(), "currently held") {
+		t.Fatalf("GitHub refresh error = %v, want custom namespace hold refusal", err)
+	}
+}
+
 func TestResolveProjectProviderKind(t *testing.T) {
 	t.Parallel()
 
