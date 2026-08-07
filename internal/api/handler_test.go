@@ -514,6 +514,60 @@ func TestHandlerLoopRetryRejectsConflictingActiveLoop(t *testing.T) {
 	}
 }
 
+func TestHandlerLoopRetryMapsIssueClaimConflictToLoopConflict(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_issue_claim"
+	repo := "acme/looper"
+	prNumber := int64(77)
+	prTarget := "pr:acme/looper:77"
+	issueTarget := "issue:acme/looper:19"
+	sourceWorkerMeta := `{"worker":{"repo":"acme/looper","issueNumber":19}}`
+	reviewerMeta := `{"sourceWorkerId":"source_worker_pr"}`
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	// Completed source worker whose PR retargets from issue 19.
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "source_worker_pr", Seq: 60, ProjectID: projectID, Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &sourceWorkerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(source_worker_pr) error = %v", err)
+	}
+	// Active reviewer claiming issue 19 through the source worker.
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "active_reviewer_pr", Seq: 61, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &reviewerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(active_reviewer_pr) error = %v", err)
+	}
+	// Dormant issue worker to retry — same-type preconditions pass (no other
+	// active worker on issue 19), but Loops.Upsert detects the cross-type claim.
+	dormantID := "dormant_issue_worker"
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: dormantID, Seq: 62, ProjectID: projectID, Type: "worker", TargetType: "issue", TargetID: &issueTarget, Repo: &repo, Status: "failed", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(dormant_issue_worker) error = %v", err)
+	}
+	lastErrorKind := "non_retryable"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_dormant_issue_worker", ProjectID: &projectID, LoopID: &dormantID, Type: "worker", TargetType: "issue", TargetID: issueTarget, Repo: &repo, DedupeKey: "worker:project_retry_issue_claim:acme/looper:19", Priority: storage.QueuePriorityWorker, Status: "failed", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, LastErrorKind: &lastErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/62/retry", strings.NewReader(`{"mode":"auto","resetAttempts":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	apiErr := body["error"].(map[string]any)
+	assertEqual(t, apiErr["code"], string(pkgapi.ErrorCodeLoopConflict))
+	// The dormant loop must remain failed, not partially queued.
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), dormantID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	if loop.Status != "failed" {
+		t.Fatalf("loop.Status = %q, want failed after conflict rejection", loop.Status)
+	}
+}
+
 func TestHandlerActiveRunsSurfacesManualInterventionStatus(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})
@@ -1839,6 +1893,32 @@ func TestHandlerWebhookForwardAcceptsLoopbackWithoutDoubleScheduling(t *testing.
 	assertEqual(t, recorded, 1)
 }
 
+func TestHandlerWebhookForwardRejectsOversizePayload(t *testing.T) {
+	fixture := newTestFixture(t)
+	fixture.config.Webhook.Enabled = true
+	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
+	runtime := webhookForwardRuntime{Runtime: fixture.runtime, config: &fixture.config, status: func() looperdruntime.WebhookStatus {
+		return looperdruntime.WebhookStatus{Enabled: true}
+	}}
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtime, WebhookForwarder: forwarder})
+
+	payload := bytes.Repeat([]byte("x"), (1<<20)+1)
+	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader(payload))
+	req.RemoteAddr = "127.0.0.1:1234"
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["code"], "REQUEST_TOO_LARGE")
+	if forwarder.calls != 0 {
+		t.Fatalf("forwarder calls = %d, want 0 for oversize payload", forwarder.calls)
+	}
+}
+
 func TestHandlerWebhookForwardProcessesDeliveryWhenRuntimeIsDegraded(t *testing.T) {
 	fixture := newTestFixture(t)
 	fixture.config.Webhook.Enabled = true
@@ -2630,6 +2710,64 @@ func TestHandlerProjectsListRouteSuccess(t *testing.T) {
 	}
 	assertEqual(t, project["createdAt"], nowISO)
 	assertEqual(t, project["updatedAt"], nowISO)
+}
+
+func TestSerializeProjectProjectsGatekeeperTrustFromMetadataAndConfig(t *testing.T) {
+	auto := config.GatekeeperTrustAuto
+	cfg := config.Config{
+		Roles: config.RoleConfigs{Gatekeeper: config.GatekeeperRoleConfig{Trust: config.GatekeeperTrustAdvise}},
+		Projects: []config.ProjectRefConfig{{
+			ID:    "configured-project",
+			Roles: &config.PartialRoleConfigs{Gatekeeper: &config.PartialGatekeeperRoleConfig{Trust: &auto}},
+		}},
+	}
+
+	metadataTrust := `{"roles":{"gatekeeper":{"trust":"auto"}}}`
+	if got := serializeProject(storage.ProjectRecord{ID: "api-project", MetadataJSON: &metadataTrust}, cfg, "main").GatekeeperTrust; got != "auto" {
+		t.Fatalf("metadata gatekeeper trust = %q, want auto", got)
+	}
+	if got := serializeProject(storage.ProjectRecord{ID: "configured-project"}, cfg, "main").GatekeeperTrust; got != "auto" {
+		t.Fatalf("configured gatekeeper trust = %q, want auto", got)
+	}
+	if got := serializeProject(storage.ProjectRecord{ID: "default-project"}, config.Config{}, "main").GatekeeperTrust; got != "" {
+		t.Fatalf("default gatekeeper trust = %q, want omitted observe", got)
+	}
+}
+
+func TestValidateManualHoldBypassUsesProjectLabelNamespaceForInjectedAndGitHubRefresh(t *testing.T) {
+	fixture := newTestFixture(t)
+	projectID := "custom-label-project"
+	repoPath := t.TempDir()
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	metadata := `{"repo":"acme/looper","labelNamespace":"team.looper:","source":"api"}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Custom labels", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	target := domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, Repo: "acme/looper", IssueNumber: 8}
+
+	injected := NewHandler(Context{
+		Config:  fixture.config,
+		Runtime: fixture.runtime,
+		RefreshTargetLabels: func(context.Context, domain.LoopTarget, string) ([]string, error) {
+			return []string{"team.looper:hold"}, nil
+		},
+	})
+	if err := injected.validateManualHoldBypassForLoopTarget(context.Background(), projectID, domain.LoopTypeWorker, target, false); err == nil || !strings.Contains(err.Error(), "currently held") {
+		t.Fatalf("injected refresh error = %v, want custom namespace hold refusal", err)
+	}
+
+	ghPath := filepath.Join(t.TempDir(), "gh")
+	if err := os.WriteFile(ghPath, []byte("#!/bin/sh\nprintf '%s\\n' '{\"labels\":[{\"name\":\"team.looper:hold\"}]}'\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh = %v", err)
+	}
+	cfg := fixture.config
+	cfg.Tools.GHPath = &ghPath
+	githubRefresh := NewHandler(Context{Config: cfg, Runtime: fixture.runtime})
+	if err := githubRefresh.validateManualHoldBypassForLoopTarget(context.Background(), projectID, domain.LoopTypeWorker, target, false); err == nil || !strings.Contains(err.Error(), "currently held") {
+		t.Fatalf("GitHub refresh error = %v, want custom namespace hold refusal", err)
+	}
 }
 
 func TestResolveProjectProviderKind(t *testing.T) {
@@ -6340,6 +6478,9 @@ func TestHandlerWorkersCreateForceClearsAutoDiscoveredPayloadWhenReusingIssueWor
 	if payload["autoDiscovered"] == true {
 		t.Fatalf("payload = %#v, want forced reused worker to bypass auto-discovered hold checks", payload)
 	}
+	if payload["issueClaimOverride"] != true {
+		t.Fatalf("payload = %#v, want forced reused worker payload to carry durable issueClaimOverride", payload)
+	}
 	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
@@ -6349,6 +6490,12 @@ func TestHandlerWorkersCreateForceClearsAutoDiscoveredPayloadWhenReusingIssueWor
 	if workerMeta["autoDiscovered"] == true {
 		t.Fatalf("metadata = %#v, want forced reused worker metadata to bypass auto-discovered hold checks", metadata)
 	}
+	if workerMeta["issueClaimOverride"] != true {
+		t.Fatalf("metadata = %#v, want forced reused worker metadata to carry durable issueClaimOverride", metadata)
+	}
+	if !storage.LoopForcesIssueClaimAdmission(*loop) {
+		t.Fatalf("LoopForcesIssueClaimAdmission = false, want forced reused worker to retain operator override authority")
+	}
 	run, err := fixture.runtime.Services().Repositories.Runs.GetByID(context.Background(), "run_existing_held_issue_worker")
 	if err != nil {
 		t.Fatalf("Runs.GetByID() error = %v", err)
@@ -6357,6 +6504,42 @@ func TestHandlerWorkersCreateForceClearsAutoDiscoveredPayloadWhenReusingIssueWor
 	work, _ := checkpoint["work"].(map[string]any)
 	if work["autoDiscovered"] == true {
 		t.Fatalf("checkpoint = %#v, want forced reused worker checkpoint to bypass auto-discovered hold checks", checkpoint)
+	}
+	if work["issueClaimOverride"] != true {
+		t.Fatalf("checkpoint = %#v, want forced reused worker checkpoint to carry durable issueClaimOverride", checkpoint)
+	}
+}
+
+func TestHandlerWorkersCreateForceRejectsMalformedReusableMetadata(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	projectID := "project_1"
+	loopID := "loop_malformed_reusable_worker"
+	targetID := "issue:acme/looper:77"
+	repo := "acme/looper"
+	malformedMetadata := `{"worker":`
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "issue", TargetID: &targetID,
+		Repo: &repo, Status: "idle", MetadataJSON: &malformedMetadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main","force":true}`)))
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", recorder.Code, recorder.Body.String())
+	}
+	stored, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if stored == nil || stored.MetadataJSON == nil || *stored.MetadataJSON != malformedMetadata {
+		t.Fatalf("stored metadata = %#v, want malformed value preserved for diagnosis", stored)
 	}
 }
 

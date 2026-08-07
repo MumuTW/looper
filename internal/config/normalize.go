@@ -2244,6 +2244,10 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			threshold := *configs.Gatekeeper.RequiredReviewChangedLines
 			gatekeeper.RequiredReviewChangedLines = &threshold
 		}
+		if configs.Gatekeeper.RequiredReviewChangedLines != nil {
+			threshold := *configs.Gatekeeper.RequiredReviewChangedLines
+			gatekeeper.RequiredReviewChangedLines = &threshold
+		}
 		cloned.Gatekeeper = &gatekeeper
 	}
 	if configs.Auditor != nil {
