@@ -96,6 +96,37 @@ func TestStageReusesIdenticalExistingRelease(t *testing.T) {
 	}
 }
 
+func TestStageRetriesDurabilitySyncWhenReusingPublishedRelease(t *testing.T) {
+	root := t.TempDir()
+	sources := t.TempDir()
+	cli := writeExecutable(t, sources, "looper-source", "cli-v1")
+	daemon := writeExecutable(t, sources, "looperd-source", "daemon-v1")
+	input := StageInput{RootDir: root, ReleaseID: "1.2.3-stable-aaaaaaa", CLIBinaryPath: cli, DaemonBinaryPath: daemon, Build: testBuild("1.2.3", "aaaaaaa"), Now: fixedNow}
+	originalSync := stageSyncDirectory
+	t.Cleanup(func() { stageSyncDirectory = originalSync })
+	calls := 0
+	stageSyncDirectory = func(path string) error {
+		calls++
+		if calls == 1 {
+			return errors.New("injected releases directory sync failure")
+		}
+		return originalSync(path)
+	}
+	if _, err := Stage(input); err == nil || !strings.Contains(err.Error(), "injected releases directory sync failure") {
+		t.Fatalf("first Stage() error = %v, want publish sync failure", err)
+	}
+	result, err := Stage(input)
+	if err != nil {
+		t.Fatalf("retry Stage() error = %v", err)
+	}
+	if result.ReleaseID != input.ReleaseID {
+		t.Fatalf("retry release ID = %q, want %q", result.ReleaseID, input.ReleaseID)
+	}
+	if calls != 2 {
+		t.Fatalf("stage sync calls = %d, want initial failure plus retry", calls)
+	}
+}
+
 func TestActivateRestoresPreviousPointerAtomicallyWhenSyncFails(t *testing.T) {
 	root := t.TempDir()
 	sources := t.TempDir()
@@ -160,6 +191,36 @@ func TestStageRejectsSymlinkedExistingReleaseDirectory(t *testing.T) {
 	}
 	if _, err := Stage(input); err == nil || !strings.Contains(err.Error(), "real directory") {
 		t.Fatalf("Stage() error = %v, want symlink destination rejection", err)
+	}
+}
+
+func TestVerifyAndActivateRejectSymlinkedReleaseDirectory(t *testing.T) {
+	root := t.TempDir()
+	sources := t.TempDir()
+	input := StageInput{
+		RootDir:          root,
+		ReleaseID:        "1.2.3-stable-aaaaaaa",
+		CLIBinaryPath:    writeExecutable(t, sources, "looper", "cli"),
+		DaemonBinaryPath: writeExecutable(t, sources, "looperd", "daemon"),
+		Build:            testBuild("1.2.3", "aaaaaaa"),
+		Now:              fixedNow,
+	}
+	staged, err := Stage(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	external := filepath.Join(t.TempDir(), "release")
+	if err := os.Rename(staged.Directory, external); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, staged.Directory); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Verify(root, input.ReleaseID); err == nil || !strings.Contains(err.Error(), "real directory") {
+		t.Fatalf("Verify() error = %v, want real-directory refusal", err)
+	}
+	if _, err := Activate(root, input.ReleaseID); err == nil || !strings.Contains(err.Error(), "real directory") {
+		t.Fatalf("Activate() error = %v, want real-directory refusal", err)
 	}
 }
 

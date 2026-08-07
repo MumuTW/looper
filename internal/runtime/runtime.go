@@ -458,6 +458,11 @@ func (r *Runtime) Stop(reason string) {
 		// fail and roll back its latch; an already-published join is waited.
 		r.BeginShutdown(reason)
 		r.waitForDrainProducerJoin()
+		// HTTP Server.Shutdown normally waits for handlers, but it can return
+		// its deadline error while an already-admitted mutation is still using
+		// the coordinator. Join that lease before deciding whether SQLite can
+		// close; a timeout is retained as a drain failure below.
+		r.waitForAdmittedHTTPMutations()
 
 		r.stopConfigReloadLoop()
 		r.stopDeferredReviewerRecovery()
@@ -730,6 +735,11 @@ func (r *Runtime) joinWorkProducersForDrain() {
 	// reconcile work so drained:true cannot race a late Reconcile that mutates
 	// forwarder/tunnel state after the final backup.
 	r.joinWebhookReconcileForDrain()
+	// Forwarder monitors can delete and respawn durable forwarder records after
+	// their child exits. Stop and join them before publishing drained:true; the
+	// delivery queue itself remains owned by webhookForwarder and is still
+	// counted until its accepted work completes.
+	r.stopWebhookRuntime()
 	// Drain join must not record discovery wait timeouts on shutdownDrainErr;
 	// that flag retains SQLite on later Stop even after discovery eventually exits.
 	r.waitProjectDiscoveryForDrain()
@@ -814,6 +824,31 @@ func (r *Runtime) waitForDrainProducerJoin() {
 		r.shutdownDrainErr = errors.Join(r.shutdownDrainErr, fmt.Errorf("upgrade drain residual work producers still running after shutdown wait (%d)", len(r.drainResidualDones)))
 	}
 	r.mu.Unlock()
+}
+
+// waitForAdmittedHTTPMutations waits for handlers that passed the admission
+// gate before shutdown. net/http may return a Shutdown deadline while such a
+// handler is still executing; closing SQLite in that window would race its
+// coordinator access. A timeout is a containment failure, so Stop retains the
+// storage instead of reporting a graceful close.
+func (r *Runtime) waitForAdmittedHTTPMutations() {
+	if r == nil || r.admittedHTTPMutations.Load() <= 0 {
+		return
+	}
+	timeout := r.shutdownTimeout
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for r.admittedHTTPMutations.Load() > 0 {
+		if !time.Now().Before(deadline) {
+			r.mu.Lock()
+			r.shutdownDrainErr = errors.Join(r.shutdownDrainErr, fmt.Errorf("admitted HTTP mutations still running after shutdown wait (%d)", r.admittedHTTPMutations.Load()))
+			r.mu.Unlock()
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // DrainSnapshot reports Supervisor-owned work still in flight after BeginDrain.
@@ -1365,11 +1400,21 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	loopService := &loops.Service{DB: coordinator.DB(), Repos: repositories, Now: r.now}
 	startedAt := r.now().UTC()
-	if err := r.syncConfiguredProjects(ctx, projectService, r.config, startedAt); err != nil {
-		return err
+	upgradeHold := upgradeVerifyHoldEnabled()
+	if !upgradeHold {
+		if err := r.syncConfiguredProjects(ctx, projectService, r.config, startedAt); err != nil {
+			return err
+		}
+	} else if r.logger != nil {
+		r.logger.Info("looperd upgrade verify hold defers configured project sync", map[string]any{
+			"env": "LOOPER_UPGRADE_VERIFY_HOLD=1",
+		})
 	}
 	// Project import is already committed. Materialize that durable state even
 	// when the startup request is canceled; CompleteStartup still observes ctx.
+	// This is a read-only catalog projection. Under verify hold the mutating
+	// configured-project sync above is intentionally deferred until the unheld
+	// restart so the candidate cannot change rollback state before verification.
 	if err := r.reloadProjectCatalog(context.Background(), repositories); err != nil {
 		return err
 	}

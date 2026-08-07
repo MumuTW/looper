@@ -23,6 +23,7 @@ const ManifestVersion = 1
 
 var releaseIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
+var stageSyncDirectory = syncDirectory
 var activateSyncDirectory = syncDirectory
 
 type File struct {
@@ -97,7 +98,14 @@ func Stage(input StageInput) (StageResult, error) {
 		}
 		// Idempotent restage: later cutovers re-stage the live pair that is
 		// already this release id from a prior candidate stage.
-		return reuseExistingRelease(root, input)
+		result, err := reuseExistingRelease(root, input)
+		if err != nil {
+			return StageResult{}, err
+		}
+		if err := stageSyncDirectory(filepath.Join(root, "releases")); err != nil {
+			return StageResult{}, fmt.Errorf("sync reused releases directory: %w", err)
+		}
+		return result, nil
 	} else if !os.IsNotExist(err) {
 		return StageResult{}, fmt.Errorf("inspect release destination: %w", err)
 	}
@@ -134,7 +142,7 @@ func Stage(input StageInput) (StageResult, error) {
 	if err := os.Rename(temporary, destination); err != nil {
 		return fail(fmt.Errorf("publish release directory: %w", err))
 	}
-	if err := syncDirectory(releasesDir); err != nil {
+	if err := stageSyncDirectory(releasesDir); err != nil {
 		return StageResult{}, err
 	}
 	return StageResult{RootDir: root, ReleaseID: input.ReleaseID, Directory: destination, Manifest: manifest}, nil
@@ -201,6 +209,13 @@ func Verify(rootDir, releaseID string) (StageResult, error) {
 		return StageResult{}, err
 	}
 	directory := filepath.Join(root, "releases", releaseID)
+	directoryInfo, err := os.Lstat(directory)
+	if err != nil {
+		return StageResult{}, fmt.Errorf("inspect release directory: %w", err)
+	}
+	if directoryInfo.Mode()&os.ModeSymlink != 0 || !directoryInfo.IsDir() {
+		return StageResult{}, fmt.Errorf("release directory %s must be a real directory, not a symlink or other file", directory)
+	}
 	manifestPath := filepath.Join(directory, "manifest.json")
 	if err := requireRegularFile(manifestPath, "release manifest"); err != nil {
 		return StageResult{}, err

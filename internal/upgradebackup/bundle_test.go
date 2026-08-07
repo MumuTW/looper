@@ -50,6 +50,33 @@ func TestCreateBundlesOneSnapshotWithManifestedInputs(t *testing.T) {
 	}
 }
 
+func TestCreateSyncsNewBackupRootParent(t *testing.T) {
+	root := t.TempDir()
+	backupRoot := filepath.Join(root, "new-parent", "backups")
+	config := writeBundleFile(t, root, "config.toml", "[server]\n")
+	cli := writeBundleFile(t, root, "looper-bin", "cli")
+	daemon := writeBundleFile(t, root, "looperd-bin", "daemon")
+	originalSyncDirectory := syncDirectory
+	t.Cleanup(func() { syncDirectory = originalSyncDirectory })
+	calls := map[string]int{}
+	syncDirectory = func(path string) error {
+		calls[path]++
+		return originalSyncDirectory(path)
+	}
+	if _, err := Create(context.Background(), Input{
+		RootDir: backupRoot, ConfigPath: config, DatabasePath: filepath.Join(root, "looper.sqlite"),
+		CLIBinaryPath: cli, DaemonBinaryPath: daemon,
+		Snapshot: func(context.Context) (string, error) {
+			return writeBundleFile(t, root, "snapshot.sqlite", "sqlite"), nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if calls[filepath.Dir(backupRoot)] == 0 {
+		t.Fatalf("syncDirectory calls = %#v, want newly-created backup root parent %q", calls, filepath.Dir(backupRoot))
+	}
+}
+
 func TestCreatePinsConfigContentsAcrossSnapshotWindow(t *testing.T) {
 	// Regression for the backup race: validated bytes must be what lands in the
 	// bundle even if ConfigPath is rewritten while Snapshot runs.

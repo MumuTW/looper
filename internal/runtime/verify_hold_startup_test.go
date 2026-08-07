@@ -2,11 +2,13 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -69,5 +71,38 @@ func TestCompleteStartupVerifyHoldDefersRecoveryMutations(t *testing.T) {
 	}
 	if containsEventType(events, "looperd.recovery.lock_released") || containsEventType(events, "looperd.started") {
 		t.Fatalf("events = %#v, want no startup recovery or started event while held", events)
+	}
+}
+
+func TestStartVerifyHoldDefersConfiguredProjectSync(t *testing.T) {
+	t.Setenv("LOOPER_UPGRADE_VERIFY_HOLD", "1")
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	called := false
+	rt := New(Options{
+		Config:        cfg,
+		Logger:        &testLogger{},
+		DeferRecovery: true,
+		SyncConfiguredProjects: func(context.Context, *projects.Service, config.Config, time.Time) error {
+			called = true
+			return errors.New("configured project sync must be deferred under verify hold")
+		},
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v, want held startup to skip project sync", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+	if called {
+		t.Fatal("configured project sync ran before verify hold admission was selected")
+	}
+	if err := rt.CompleteStartup(context.Background()); err != nil {
+		t.Fatalf("CompleteStartup() error = %v", err)
+	}
+	if got := rt.AdmissionState(); got != AdmissionDraining {
+		t.Fatalf("AdmissionState() = %q, want draining", got)
 	}
 }

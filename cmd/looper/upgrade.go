@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/upgradebackup"
 	"github.com/MumuTW/looper/internal/upgraderelease"
@@ -59,6 +60,10 @@ type upgradeStatus struct {
 				QuarantinedRunningRuns      int `json:"quarantinedRunningRuns"`
 			} `json:"outstanding"`
 		} `json:"recovery"`
+		Binary struct {
+			Path          string `json:"path"`
+			CurrentTarget string `json:"currentTarget"`
+		} `json:"binary"`
 	} `json:"service"`
 	Storage struct {
 		SchemaVersion     string   `json:"schemaVersion"`
@@ -69,6 +74,20 @@ type upgradeStatus struct {
 		ActiveRuns   int `json:"activeRuns"`
 		RunningItems int `json:"runningItems"`
 	} `json:"scheduler"`
+	Tools struct {
+		LooperPath string `json:"looperPath"`
+	} `json:"tools"`
+}
+
+type upgradeConfigResponse struct {
+	Storage struct {
+		DBPath string `json:"dbPath"`
+	} `json:"storage"`
+	Metadata struct {
+		ConfigPath  string `json:"configPath"`
+		FilePresent bool   `json:"filePresent"`
+		Revision    string `json:"revision"`
+	} `json:"metadata"`
 }
 
 type upgradeDaemonVersion struct {
@@ -115,11 +134,21 @@ type upgradeRestoreResult struct {
 	Restored bool                 `json:"restored"`
 }
 
+type upgradeRecoverResult struct {
+	JournalPath string `json:"journalPath"`
+	Recovered   bool   `json:"recovered"`
+}
+
 var upgradeRestoreOpenPIDs = findUpgradeRestoreOpenPIDs
+
+// A rollback bundle copies a complete SQLite snapshot and three executable or
+// config artifacts. It needs a larger client deadline than ordinary control
+// requests, while remaining finite so a wedged daemon is still reported.
+var upgradeBackupRequestTimeout = 15 * time.Minute
 
 func runUpgrade(ctx context.Context, global, operands []string, stdout interface{ Write([]byte) (int, error) }) error {
 	if len(operands) == 0 {
-		return badUsage("upgrade requires activate-release, backup, drain, preflight, restore, restore-preflight, stage-release, verify, or verify-start")
+		return badUsage("upgrade requires activate-release, backup, drain, preflight, recover, restore, restore-preflight, stage-release, verify, or verify-start")
 	}
 	if operands[0] == "backup" {
 		if len(operands) != 1 {
@@ -129,7 +158,7 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 		if err != nil {
 			return err
 		}
-		result, err := requestJSON[upgradeBackupResult](ctx, cfg, "POST", "/api/v1/upgrade/backup", nil)
+		result, err := requestJSONWithin[upgradeBackupResult](ctx, upgradeBackupRequestTimeout, cfg, "POST", "/api/v1/upgrade/backup", nil)
 		if err != nil {
 			return err
 		}
@@ -152,6 +181,16 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 			return err
 		}
 		return writeVersionJSON(stdout, result)
+	}
+	if operands[0] == "recover" {
+		journalPath, err := parseUpgradeRecoverArgs(operands[1:])
+		if err != nil {
+			return err
+		}
+		if err := upgraderestore.Recover(journalPath); err != nil {
+			return err
+		}
+		return writeVersionJSON(stdout, upgradeRecoverResult{JournalPath: journalPath, Recovered: true})
 	}
 	if operands[0] == "stage-release" {
 		targetLooper, targetLooperd, root, err := parseUpgradeStageReleaseArgs(operands[1:])
@@ -189,7 +228,7 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 		return runUpgradeRestore(ctx, bundle, stdout)
 	}
 	if operands[0] != "preflight" {
-		return badUsage("upgrade requires activate-release, backup, drain, preflight, restore, restore-preflight, stage-release, verify, or verify-start")
+		return badUsage("upgrade requires activate-release, backup, drain, preflight, recover, restore, restore-preflight, stage-release, verify, or verify-start")
 	}
 	targetLooper, targetLooperd, jsonOutput, err := parseUpgradePreflightArgs(operands[1:])
 	if err != nil {
@@ -392,6 +431,11 @@ func upgradeStartDrainBlocks(report upgradePreflight) []string {
 	if !report.TargetConfigCompatible {
 		blocks = append(blocks, "target daemon rejects the selected configuration")
 	}
+	if report.TargetIdentityValid && report.TargetPairMatches {
+		if err := releaseCandidateAllowed(report.Target.Daemon); err != nil {
+			blocks = append(blocks, "target release is not stageable: "+err.Error())
+		}
+	}
 	if !report.Current.Status.Service.Healthy {
 		blocks = append(blocks, "current daemon service is unhealthy")
 	}
@@ -529,6 +573,13 @@ func parseUpgradeVerifyArgs(args []string) (string, error) {
 	return args[1], nil
 }
 
+func parseUpgradeRecoverArgs(args []string) (string, error) {
+	if len(args) != 2 || args[0] != "--journal" || strings.TrimSpace(args[1]) == "" {
+		return "", badUsage("upgrade recover requires --journal <path>")
+	}
+	return args[1], nil
+}
+
 func parseUpgradeRestoreArgs(args []string) (string, error) {
 	var bundle string
 	confirmed := false
@@ -600,8 +651,13 @@ func runUpgradeActivateRelease(ctx context.Context, root, releaseID string, stdo
 }
 
 func runUpgradeVerifyStart(ctx context.Context, global []string, root, releaseID, bundleDirectory string, stdout interface{ Write([]byte) (int, error) }) error {
-	if _, err := upgradebackup.Verify(bundleDirectory); err != nil {
+	verified, err := upgradebackup.Verify(bundleDirectory)
+	if err != nil {
 		return fmt.Errorf("verify rollback bundle: %w", err)
+	}
+	source, err := upgradebackup.RestoreSource(verified.Manifest)
+	if err != nil {
+		return fmt.Errorf("read rollback bundle restore targets: %w", err)
 	}
 	staged, err := upgraderelease.Verify(root, releaseID)
 	if err != nil {
@@ -629,6 +685,13 @@ func runUpgradeVerifyStart(ctx context.Context, global []string, root, releaseID
 	if err != nil {
 		return err
 	}
+	liveConfig, err := requestJSON[upgradeConfigResponse](ctx, cfg, "GET", "/api/v1/config", nil)
+	if err != nil {
+		return err
+	}
+	if err := verifyUpgradeStartBindings(verified.Directory, verified.Manifest, source, liveConfig, status, root); err != nil {
+		return err
+	}
 	projects, err := requestJSON[upgradeProjects](ctx, cfg, "GET", "/api/v1/projects", nil)
 	if err != nil {
 		return err
@@ -648,6 +711,114 @@ func runUpgradeVerifyStart(ctx context.Context, global []string, root, releaseID
 		return fmt.Errorf("post-start verification failed: %s", strings.Join(report.Blocks, "; "))
 	}
 	return nil
+}
+
+func verifyUpgradeStartBindings(bundleDirectory string, manifest upgradebackup.Manifest, source upgradebackup.Source, liveConfig upgradeConfigResponse, status upgradeStatus, releaseRoot string) error {
+	if !liveConfig.Metadata.FilePresent {
+		return fmt.Errorf("verify-start refused: live config file is not present")
+	}
+	liveConfigPath, err := normalizeUpgradeFilesystemPath(liveConfig.Metadata.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("verify-start refused: resolve live config path: %w", err)
+	}
+	bundleConfigPath, err := normalizeUpgradeFilesystemPath(source.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("verify-start refused: resolve rollback config path: %w", err)
+	}
+	if liveConfigPath != bundleConfigPath {
+		return fmt.Errorf("verify-start refused: live config path %q does not match rollback bundle target %q", liveConfigPath, bundleConfigPath)
+	}
+	liveDatabasePath, filesystem, err := storage.SQLiteFilesystemPath(liveConfig.Storage.DBPath)
+	if err != nil {
+		return fmt.Errorf("verify-start refused: resolve live database path: %w", err)
+	}
+	if !filesystem {
+		return fmt.Errorf("verify-start refused: live database is not an on-disk SQLite target")
+	}
+	liveDatabasePath, err = normalizeUpgradeFilesystemPath(liveDatabasePath)
+	if err != nil {
+		return fmt.Errorf("verify-start refused: resolve live database path: %w", err)
+	}
+	bundleDatabasePath, err := normalizeUpgradeFilesystemPath(source.DatabasePath)
+	if err != nil {
+		return fmt.Errorf("verify-start refused: resolve rollback database path: %w", err)
+	}
+	if liveDatabasePath != bundleDatabasePath {
+		return fmt.Errorf("verify-start refused: live database path %q does not match rollback bundle target %q", liveDatabasePath, bundleDatabasePath)
+	}
+	configRevision, err := upgradeBundleConfigRevision(bundleDirectory, manifest)
+	if err != nil {
+		return fmt.Errorf("verify-start refused: read rollback config generation: %w", err)
+	}
+	if strings.TrimSpace(liveConfig.Metadata.Revision) == "" || liveConfig.Metadata.Revision != configRevision {
+		return fmt.Errorf("verify-start refused: live config revision %q does not match rollback bundle revision %q", liveConfig.Metadata.Revision, configRevision)
+	}
+
+	releaseRootPath, err := normalizeUpgradeLexicalPath(releaseRoot)
+	if err != nil {
+		return fmt.Errorf("verify-start refused: resolve release root: %w", err)
+	}
+	expectedDaemonPath := filepath.Clean(upgraderelease.CurrentDaemonExecutable(releaseRootPath))
+	actualDaemonPath, err := normalizeUpgradeLexicalPath(status.Service.Binary.Path)
+	if err != nil || actualDaemonPath != expectedDaemonPath {
+		return fmt.Errorf("verify-start refused: running daemon path %q does not follow current release path %q", status.Service.Binary.Path, expectedDaemonPath)
+	}
+	expectedCLIPath := filepath.Join(releaseRootPath, "current", "looper")
+	actualCLIPath, err := normalizeUpgradeLexicalPath(status.Tools.LooperPath)
+	if err != nil || actualCLIPath != expectedCLIPath {
+		return fmt.Errorf("verify-start refused: configured CLI path %q does not follow current release path %q", status.Tools.LooperPath, expectedCLIPath)
+	}
+	return nil
+}
+
+func upgradeBundleConfigRevision(bundleDirectory string, manifest upgradebackup.Manifest) (string, error) {
+	configName := ""
+	for name := range manifest.Files {
+		if name == "config" || strings.HasPrefix(name, "config.") {
+			if configName != "" {
+				return "", fmt.Errorf("rollback bundle names multiple config artifacts")
+			}
+			configName = name
+		}
+	}
+	if configName == "" {
+		return "", fmt.Errorf("rollback bundle does not name a config artifact")
+	}
+	raw, err := os.ReadFile(filepath.Join(bundleDirectory, configName))
+	if err != nil {
+		return "", err
+	}
+	return config.ConfigFileRevision(raw, true), nil
+}
+
+func normalizeUpgradeFilesystemPath(path string) (string, error) {
+	abs, err := normalizeUpgradeLexicalPath(path)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved), nil
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	if err == nil {
+		return filepath.Join(parent, filepath.Base(abs)), nil
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	return abs, nil
+}
+
+func normalizeUpgradeLexicalPath(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("path is empty")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(abs), nil
 }
 
 func containsUpgradeEvent(events upgradeEvents, eventType string) bool {

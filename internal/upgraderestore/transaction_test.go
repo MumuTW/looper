@@ -239,6 +239,53 @@ func TestRecoverRollsBackUncommittedRestore(t *testing.T) {
 	}
 }
 
+func TestRecoverCleansPreparationJournalAfterStageInterruption(t *testing.T) {
+	fixture := newRestoreFixture(t, true)
+	originalStage := stageSourceAtForRestore
+	t.Cleanup(func() { stageSourceAtForRestore = originalStage })
+	stageSourceAtForRestore = func(sourcePath, temporaryPath string, mode os.FileMode, description string) error {
+		if description == "configuration" {
+			panic("simulated interruption before preparation journal phase transition")
+		}
+		return originalStage(sourcePath, temporaryPath, mode, description)
+	}
+	crashed := false
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				crashed = true
+			}
+		}()
+		_ = restore(fixture.bundleDirectory, fixture.source, defaultFileOperations)
+	}()
+	if !crashed {
+		t.Fatal("restore did not reach the pre-journal-stage interruption")
+	}
+	if _, err := os.Lstat(JournalPath(fixture.databasePath)); err != nil {
+		t.Fatalf("preparation journal after interruption: %v", err)
+	}
+	if entries, err := os.ReadDir(filepath.Dir(fixture.databasePath)); err != nil {
+		t.Fatal(err)
+	} else {
+		foundStage := false
+		for _, entry := range entries {
+			if strings.Contains(entry.Name(), ".looper-restore-stage-") {
+				foundStage = true
+			}
+		}
+		if !foundStage {
+			t.Fatal("interrupted preparation did not leave a named staged artifact")
+		}
+	}
+	if err := Recover(JournalPath(fixture.databasePath)); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	fixture.assertOriginalTargets(t)
+	assertPathMissing(t, JournalPath(fixture.databasePath))
+	assertNoRestoreArtifacts(t, filepath.Dir(fixture.configPath))
+	assertNoRestoreArtifacts(t, filepath.Dir(fixture.databasePath))
+}
+
 func TestRecoverCleansUndoAlreadyInstalledBeforeSourceRemoval(t *testing.T) {
 	fixture := newRestoreFixture(t, true)
 	type targetSpec struct {
@@ -439,6 +486,44 @@ func TestPublishNoReplaceSyncsDestinationBeforeRemovingSource(t *testing.T) {
 			assertPathMissing(t, source)
 			assertFileContents(t, destination, "restored bytes")
 		})
+	}
+}
+
+func TestCreateJournalPublishesFullySyncedContentBeforeCrashBoundary(t *testing.T) {
+	directory := t.TempDir()
+	journalPath := filepath.Join(directory, "looper.sqlite"+journalSuffix)
+	want := restoreJournal{
+		Version: journalVersion,
+		Phase:   phasePrepared,
+		Entries: []journalEntry{{Name: entryDatabase, TargetPath: filepath.Join(directory, "looper.sqlite")}},
+	}
+	interrupted := false
+	operations := fileOperations{
+		syncDirectory: func(path string) error {
+			if err := syncDirectories(path); err != nil {
+				return err
+			}
+			interrupted = true
+			panic("simulated interruption after journal publication")
+		},
+	}
+	func() {
+		defer func() { _ = recover() }()
+		_ = createJournalWithOperations(journalPath, want, operations)
+	}()
+	if !interrupted {
+		t.Fatal("createJournal did not reach the post-publication crash boundary")
+	}
+	encoded, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatalf("read published journal: %v", err)
+	}
+	var got restoreJournal
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatalf("published journal is not complete JSON: %v", err)
+	}
+	if got.Version != want.Version || got.Phase != want.Phase || len(got.Entries) != 1 || got.Entries[0].Name != entryDatabase {
+		t.Fatalf("published journal = %#v, want %#v", got, want)
 	}
 }
 

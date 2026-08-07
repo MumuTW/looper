@@ -95,6 +95,7 @@ type fileOperations struct {
 }
 
 var defaultFileOperations = fileOperations{rename: os.Rename, link: os.Link}
+var stageSourceAtForRestore = stageSourceAt
 
 // JournalPath returns the deterministic recovery-journal path for databasePath.
 // The journal sits beside the database so a caller can find it after a crash.
@@ -243,66 +244,26 @@ func restore(bundleDirectory string, source upgradebackup.Source, operations fil
 
 	databaseMode := targetMode(states[0])
 	configMode := targetMode(states[3])
-	databaseStage, err := stageSource(databaseSource, source.DatabasePath, databaseMode, "database")
+	databaseStage, err := reserveRestoreArtifactPath(source.DatabasePath, "stage")
 	if err != nil {
-		return err
+		return fmt.Errorf("reserve staged database beside target: %w", err)
 	}
-	staged := []string{databaseStage}
-	cleanupBeforeJournal := func() {
-		for _, path := range staged {
-			_ = os.Remove(path)
-		}
-	}
-	configStage, err := stageSource(configSource, source.ConfigPath, configMode, "configuration")
+	configStage, err := reserveRestoreArtifactPath(source.ConfigPath, "stage")
 	if err != nil {
-		cleanupBeforeJournal()
-		return err
-	}
-	staged = append(staged, configStage)
-
-	dbHash, dbSize, err := fileContentIdentity(databaseStage)
-	if err != nil {
-		cleanupBeforeJournal()
-		return fmt.Errorf("hash staged database: %w", err)
-	}
-	cfgHash, cfgSize, err := fileContentIdentity(configStage)
-	if err != nil {
-		cleanupBeforeJournal()
-		return fmt.Errorf("hash staged configuration: %w", err)
-	}
-	// Fail closed if the bundle was mutated after Verify (including during PID
-	// probes / lock acquisition): staged bytes must still match the manifest.
-	if verified != nil {
-		if err := requireStagedMatchesManifest(dbHash, dbSize, verified.Manifest.Files["database.sqlite"], "database.sqlite"); err != nil {
-			cleanupBeforeJournal()
-			return err
-		}
-		if err := requireStagedMatchesManifest(cfgHash, cfgSize, verified.Manifest.Files[configName], configName); err != nil {
-			cleanupBeforeJournal()
-			return err
-		}
-	} else {
-		// No manifest: still require staged bytes equal the source files now.
-		if same, err := sameRegularFileContent(databaseStage, databaseSource); err != nil || !same {
-			cleanupBeforeJournal()
-			if err != nil {
-				return err
-			}
-			return fmt.Errorf("staged database does not match bundle source after copy")
-		}
-		if same, err := sameRegularFileContent(configStage, configSource); err != nil || !same {
-			cleanupBeforeJournal()
-			if err != nil {
-				return err
-			}
-			return fmt.Errorf("staged configuration does not match bundle source after copy")
-		}
+		_ = os.Remove(databaseStage)
+		return fmt.Errorf("reserve staged configuration beside target: %w", err)
 	}
 	entries := []journalEntry{
-		{Name: entryDatabase, TargetPath: states[0].path, StagedPath: databaseStage, HadOriginal: states[0].present, StagedSHA256: dbHash, StagedSize: dbSize},
+		{Name: entryDatabase, TargetPath: states[0].path, StagedPath: databaseStage, HadOriginal: states[0].present},
 		{Name: entryWAL, TargetPath: states[1].path, HadOriginal: states[1].present},
 		{Name: entrySHM, TargetPath: states[2].path, HadOriginal: states[2].present},
-		{Name: entryConfig, TargetPath: states[3].path, StagedPath: configStage, HadOriginal: states[3].present, StagedSHA256: cfgHash, StagedSize: cfgSize},
+		{Name: entryConfig, TargetPath: states[3].path, StagedPath: configStage, HadOriginal: states[3].present},
+	}
+	reservedArtifacts := []string{databaseStage, configStage}
+	cleanupBeforeJournal := func() {
+		for _, path := range reservedArtifacts {
+			_ = os.Remove(path)
+		}
 	}
 	for index := range entries {
 		undoPath, err := reserveUndoPath(entries[index].TargetPath)
@@ -311,6 +272,7 @@ func restore(bundleDirectory string, source upgradebackup.Source, operations fil
 			return err
 		}
 		entries[index].UndoPath = undoPath
+		reservedArtifacts = append(reservedArtifacts, undoPath)
 	}
 	for index, state := range states {
 		if err := confirmTargetUnchanged(state, targetDescription(index)); err != nil {
@@ -330,6 +292,59 @@ func restore(bundleDirectory string, source upgradebackup.Source, operations fil
 			return errors.Join(operationErr, fmt.Errorf("rollback restore transaction: %w", rollbackErr))
 		}
 		return operationErr
+	}
+	if err := stageSourceAtForRestore(databaseSource, databaseStage, databaseMode, "database"); err != nil {
+		return fail(err)
+	}
+	if err := stageSourceAtForRestore(configSource, configStage, configMode, "configuration"); err != nil {
+		return fail(err)
+	}
+	dbHash, dbSize, err := fileContentIdentity(databaseStage)
+	if err != nil {
+		return fail(fmt.Errorf("hash staged database: %w", err))
+	}
+	cfgHash, cfgSize, err := fileContentIdentity(configStage)
+	if err != nil {
+		return fail(fmt.Errorf("hash staged configuration: %w", err))
+	}
+	// Fail closed if the bundle was mutated after Verify (including during PID
+	// probes / lock acquisition): staged bytes must still match the manifest.
+	if verified != nil {
+		if err := requireStagedMatchesManifest(dbHash, dbSize, verified.Manifest.Files["database.sqlite"], "database.sqlite"); err != nil {
+			return fail(err)
+		}
+		if err := requireStagedMatchesManifest(cfgHash, cfgSize, verified.Manifest.Files[configName], configName); err != nil {
+			return fail(err)
+		}
+	} else {
+		// No manifest: still require staged bytes equal the source files now.
+		if same, err := sameRegularFileContent(databaseStage, databaseSource); err != nil || !same {
+			if err != nil {
+				return fail(err)
+			}
+			return fail(fmt.Errorf("staged database does not match bundle source after copy"))
+		}
+		if same, err := sameRegularFileContent(configStage, configSource); err != nil || !same {
+			if err != nil {
+				return fail(err)
+			}
+			return fail(fmt.Errorf("staged configuration does not match bundle source after copy"))
+		}
+	}
+	journal.Entries[0].StagedSHA256 = dbHash
+	journal.Entries[0].StagedSize = dbSize
+	journal.Entries[3].StagedSHA256 = cfgHash
+	journal.Entries[3].StagedSize = cfgSize
+	for index, state := range states {
+		if err := confirmTargetUnchanged(state, targetDescription(index)); err != nil {
+			return fail(err)
+		}
+	}
+	// Persist the staged identities before moving any original target aside.
+	// If the process stops during preparation, the phase-prepared journal still
+	// names both stage paths and Recover can remove them without guessing.
+	if err := persistPhase(journalPath, &journal, phasePrepared, operations); err != nil {
+		return fail(err)
 	}
 
 	for index, entry := range journal.Entries {
@@ -585,35 +600,45 @@ func requireJournalAbsent(path string) error {
 }
 
 func stageSource(sourcePath, targetPath string, mode os.FileMode, description string) (string, error) {
+	temporaryPath, err := reserveRestoreArtifactPath(targetPath, "stage")
+	if err != nil {
+		return "", fmt.Errorf("reserve staged %s beside target: %w", description, err)
+	}
+	if err := stageSourceAt(sourcePath, temporaryPath, mode, description); err != nil {
+		return "", err
+	}
+	return temporaryPath, nil
+}
+
+func stageSourceAt(sourcePath, temporaryPath string, mode os.FileMode, description string) error {
 	sourceInfo, err := os.Lstat(sourcePath)
 	if err != nil {
-		return "", fmt.Errorf("inspect bundle %s: %w", description, err)
+		return fmt.Errorf("inspect bundle %s: %w", description, err)
 	}
 	if !sourceInfo.Mode().IsRegular() {
-		return "", fmt.Errorf("bundle %s must be a regular file and not a symlink", description)
+		return fmt.Errorf("bundle %s must be a regular file and not a symlink", description)
 	}
 	source, err := os.Open(sourcePath)
 	if err != nil {
-		return "", fmt.Errorf("open bundle %s: %w", description, err)
+		return fmt.Errorf("open bundle %s: %w", description, err)
 	}
 	defer source.Close()
 	openedInfo, err := source.Stat()
 	if err != nil {
-		return "", fmt.Errorf("inspect opened bundle %s: %w", description, err)
+		return fmt.Errorf("inspect opened bundle %s: %w", description, err)
 	}
 	if !openedInfo.Mode().IsRegular() || !os.SameFile(sourceInfo, openedInfo) {
-		return "", fmt.Errorf("bundle %s changed while it was opened", description)
+		return fmt.Errorf("bundle %s changed while it was opened", description)
 	}
 
-	temporary, err := os.CreateTemp(filepath.Dir(targetPath), temporaryPattern(targetPath, "stage"))
+	temporary, err := os.OpenFile(temporaryPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode.Perm())
 	if err != nil {
-		return "", fmt.Errorf("create staged %s beside target: %w", description, err)
+		return fmt.Errorf("create staged %s beside target: %w", description, err)
 	}
-	temporaryPath := temporary.Name()
-	fail := func(operationErr error) (string, error) {
+	fail := func(operationErr error) error {
 		_ = temporary.Close()
 		_ = os.Remove(temporaryPath)
-		return "", operationErr
+		return operationErr
 	}
 	if err := temporary.Chmod(mode.Perm()); err != nil {
 		return fail(fmt.Errorf("set staged %s permissions: %w", description, err))
@@ -626,23 +651,27 @@ func stageSource(sourcePath, targetPath string, mode os.FileMode, description st
 	}
 	if err := temporary.Close(); err != nil {
 		_ = os.Remove(temporaryPath)
-		return "", fmt.Errorf("close staged %s: %w", description, err)
+		return fmt.Errorf("close staged %s: %w", description, err)
 	}
-	return temporaryPath, nil
+	return nil
 }
 
 func reserveUndoPath(targetPath string) (string, error) {
-	reservation, err := os.CreateTemp(filepath.Dir(targetPath), temporaryPattern(targetPath, "undo"))
+	return reserveRestoreArtifactPath(targetPath, "undo")
+}
+
+func reserveRestoreArtifactPath(targetPath, kind string) (string, error) {
+	reservation, err := os.CreateTemp(filepath.Dir(targetPath), temporaryPattern(targetPath, kind))
 	if err != nil {
-		return "", fmt.Errorf("reserve undo path for %s: %w", targetPath, err)
+		return "", fmt.Errorf("reserve %s path for %s: %w", kind, targetPath, err)
 	}
 	path := reservation.Name()
 	if err := reservation.Close(); err != nil {
 		_ = os.Remove(path)
-		return "", fmt.Errorf("close undo reservation for %s: %w", targetPath, err)
+		return "", fmt.Errorf("close %s reservation for %s: %w", kind, targetPath, err)
 	}
 	if err := os.Remove(path); err != nil {
-		return "", fmt.Errorf("release undo reservation for %s: %w", targetPath, err)
+		return "", fmt.Errorf("release %s reservation for %s: %w", kind, targetPath, err)
 	}
 	return path, nil
 }
@@ -652,31 +681,50 @@ func temporaryPattern(targetPath, kind string) string {
 }
 
 func createJournal(path string, journal restoreJournal) error {
+	return createJournalWithOperations(path, journal, defaultFileOperations)
+}
+
+func createJournalWithOperations(path string, journal restoreJournal, operations fileOperations) error {
 	encoded, err := encodeJournal(journal)
 	if err != nil {
 		return err
 	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if operations.link == nil {
+		operations.link = os.Link
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".looper-restore-journal-create-*")
 	if err != nil {
 		return fmt.Errorf("create restore journal: %w", err)
 	}
+	temporaryPath := temporary.Name()
 	fail := func(operationErr error) error {
-		_ = file.Close()
-		_ = os.Remove(path)
+		_ = temporary.Close()
+		_ = os.Remove(temporaryPath)
 		return operationErr
 	}
-	if _, err := file.Write(encoded); err != nil {
+	if err := temporary.Chmod(0o600); err != nil {
+		return fail(fmt.Errorf("set restore journal permissions: %w", err))
+	}
+	if _, err := temporary.Write(encoded); err != nil {
 		return fail(fmt.Errorf("write restore journal: %w", err))
 	}
-	if err := file.Sync(); err != nil {
+	if err := temporary.Sync(); err != nil {
 		return fail(fmt.Errorf("sync restore journal: %w", err))
 	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(path)
+	if err := temporary.Close(); err != nil {
+		_ = os.Remove(temporaryPath)
 		return fmt.Errorf("close restore journal: %w", err)
 	}
-	if err := syncDirectories(filepath.Dir(path)); err != nil {
-		return fmt.Errorf("sync restore journal directory: %w", err)
+	// Publish only after the complete temporary file is durable. The hard-link
+	// path in publishNoReplace is atomic and refuses to replace a journal that
+	// appeared concurrently; its directory sync makes the new authoritative
+	// name durable before the temporary name is removed.
+	if err := publishNoReplace(operations, temporaryPath, path, "restore journal"); err != nil {
+		// publishNoReplace may have already created a durable destination before
+		// failing to remove the temporary name. Never remove the authoritative
+		// journal here; Recover must be able to inspect it after the error.
+		_ = os.Remove(temporaryPath)
+		return fmt.Errorf("publish restore journal: %w", err)
 	}
 	return nil
 }
@@ -1036,8 +1084,8 @@ func installNoReplace(source, dest, description string) error {
 }
 
 // publishNoReplace publishes source to dest without replacing an existing dest.
-// Prefer hard-link (fails if dest exists). Any non-success falls back only to
-// exclusive O_EXCL copy — never plain rename (which can replace a concurrent create).
+// Prefer hard-link (fails if dest exists). The copy fallback publishes through
+// a complete temporary file and never exposes a partially copied destination.
 func publishNoReplace(operations fileOperations, source, dest, description string) error {
 	if _, err := os.Lstat(dest); err == nil {
 		return fmt.Errorf("refusing to install %s: target %s already exists", description, dest)
@@ -1079,14 +1127,86 @@ func publishNoReplace(operations fileOperations, source, dest, description strin
 		_ = os.Remove(source)
 		return nil
 	}
-	if err := copyFileExclusive(source, dest); err != nil {
+	if err := copyFileAtomicNoReplace(source, dest, description, syncDirectory); err != nil {
 		return fmt.Errorf("install %s: %w", description, err)
-	}
-	if err := syncDirectory(filepath.Dir(dest)); err != nil {
-		return fmt.Errorf("sync destination directory after installing %s: %w", description, err)
 	}
 	if err := os.Remove(source); err != nil {
 		return fmt.Errorf("remove source after installing %s: %w", description, err)
+	}
+	return nil
+}
+
+// copyFileAtomicNoReplace keeps an exclusive-copy fallback from exposing a
+// partially written destination. It first makes and syncs a complete private
+// copy, then publishes that copy with a hard link (or, on filesystems without
+// hard-link support, an atomic rename after a no-replace check). A crash before
+// publication therefore leaves the source and/or publish temporary intact,
+// never a destination that looks like a candidate but contains a prefix.
+func copyFileAtomicNoReplace(source, dest, description string, syncDirectory func(string) error) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(dest), ".looper-restore-publish-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	cleanup := func() { _ = temporary.Close(); _ = os.Remove(temporaryPath) }
+	if err := temporary.Chmod(info.Mode().Perm()); err != nil {
+		cleanup()
+		return err
+	}
+	if err := temporary.Truncate(0); err != nil {
+		cleanup()
+		return err
+	}
+	if _, err := io.Copy(temporary, in); err != nil {
+		cleanup()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		_ = os.Remove(temporaryPath)
+		return err
+	}
+	if _, err := os.Lstat(dest); err == nil {
+		_ = os.Remove(temporaryPath)
+		return fmt.Errorf("refusing to install %s: target %s already exists", description, dest)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		_ = os.Remove(temporaryPath)
+		return fmt.Errorf("inspect %s destination: %w", description, err)
+	}
+	if err := os.Link(temporaryPath, dest); err == nil {
+		if err := syncDirectory(filepath.Dir(dest)); err != nil {
+			return fmt.Errorf("sync destination directory after installing %s: %w", description, err)
+		}
+		if err := os.Remove(temporaryPath); err != nil {
+			return fmt.Errorf("remove publish temporary after installing %s: %w", description, err)
+		}
+		return nil
+	}
+	if _, err := os.Lstat(dest); err == nil {
+		_ = os.Remove(temporaryPath)
+		return fmt.Errorf("refusing to install %s: target %s already exists", description, dest)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		_ = os.Remove(temporaryPath)
+		return fmt.Errorf("inspect %s destination: %w", description, err)
+	}
+	if err := os.Rename(temporaryPath, dest); err != nil {
+		_ = os.Remove(temporaryPath)
+		return fmt.Errorf("publish complete %s: %w", description, err)
+	}
+	if err := syncDirectory(filepath.Dir(dest)); err != nil {
+		return fmt.Errorf("sync destination directory after installing %s: %w", description, err)
 	}
 	return nil
 }

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MumuTW/looper/internal/upgradebackup"
 	"github.com/MumuTW/looper/internal/version"
@@ -78,6 +79,22 @@ func TestUpgradePreflightIncompleteIdentityNeverMatches(t *testing.T) {
 	}
 }
 
+func TestUpgradeStartDrainBlocksRejectsUnsupportedReleaseChannel(t *testing.T) {
+	target := completeUpgradeIdentity("candidate")
+	target.Metadata.Channel = "dev"
+	report := upgradePreflight{CurrentPairMatches: true, TargetConfigCompatible: true, Target: struct {
+		CLI    version.Info `json:"cli"`
+		Daemon version.Info `json:"daemon"`
+	}{CLI: target, Daemon: target}, TargetPairMatches: true, TargetIdentityValid: true}
+	report.Current.Status.Service.Healthy = true
+	report.Current.Status.Service.AdmissionState = "ready"
+	report.Current.Status.Storage.Healthy = true
+	blocks := upgradeStartDrainBlocks(report)
+	if len(blocks) != 1 || !strings.Contains(blocks[0], "target release is not stageable") {
+		t.Fatalf("upgradeStartDrainBlocks() = %v, want unsupported-channel blocker", blocks)
+	}
+}
+
 func TestUpgradePreflightReportsTargetConfigFailure(t *testing.T) {
 	current := completeUpgradeIdentity("release-a")
 	server := upgradeTestDaemon(t, current)
@@ -126,6 +143,10 @@ func TestUpgradePostStartRequiresVerifyHoldAdmission(t *testing.T) {
 						QuarantinedRunningRuns      int `json:"quarantinedRunningRuns"`
 					} `json:"outstanding"`
 				} `json:"recovery"`
+				Binary struct {
+					Path          string `json:"path"`
+					CurrentTarget string `json:"currentTarget"`
+				} `json:"binary"`
 			}{Healthy: true, Version: identity.Version, AdmissionState: "draining", StartedAt: &startedAt, Build: identity.Metadata},
 			Storage: struct {
 				SchemaVersion     string   `json:"schemaVersion"`
@@ -173,6 +194,98 @@ func TestParseUpgradeVerifyStartArgsRequiresBundle(t *testing.T) {
 	}
 	if _, _, _, err := parseUpgradeVerifyStartArgs([]string{"--release-root", "/srv/looper", "--release", "candidate-release"}); err == nil {
 		t.Fatal("parseUpgradeVerifyStartArgs() without bundle error = nil")
+	}
+}
+
+func TestUpgradeRecoverIsReachableThroughDispatcher(t *testing.T) {
+	journalPath := filepath.Join(t.TempDir(), "looper.sqlite.restore-journal")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	if code := run([]string{"upgrade", "recover", "--journal", journalPath}, strings.NewReader(""), stdout, stderr); code != 0 {
+		t.Fatalf("run(upgrade recover) exit = %d, stderr = %q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), journalPath) {
+		t.Fatalf("recover output = %q, want journal path", stdout.String())
+	}
+}
+
+func TestVerifyUpgradeStartBindsBundleAndCurrentPaths(t *testing.T) {
+	bundle, databasePath, configPath := createUpgradeRestoreBundleWithSource(t)
+	verified, err := upgradebackup.Verify(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := upgradebackup.RestoreSource(verified.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseRoot := filepath.Join(t.TempDir(), "release-root")
+	liveConfig := upgradeConfigResponse{}
+	liveConfig.Storage.DBPath = databasePath
+	liveConfig.Metadata.ConfigPath = configPath
+	liveConfig.Metadata.FilePresent = true
+	liveConfig.Metadata.Revision, err = upgradeBundleConfigRevision(bundle, verified.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := upgradeStatus{}
+	status.Service.Binary.Path = filepath.Join(releaseRoot, "current", "looperd")
+	status.Tools.LooperPath = filepath.Join(releaseRoot, "current", "looper")
+	if err := verifyUpgradeStartBindings(bundle, verified.Manifest, source, liveConfig, status, releaseRoot); err != nil {
+		t.Fatalf("verifyUpgradeStartBindings() baseline error = %v", err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*upgradeConfigResponse, *upgradeStatus)
+		want   string
+	}{
+		{name: "database target", mutate: func(config *upgradeConfigResponse, _ *upgradeStatus) {
+			config.Storage.DBPath = filepath.Join(t.TempDir(), "other.sqlite")
+		}, want: "database path"},
+		{name: "config target", mutate: func(config *upgradeConfigResponse, _ *upgradeStatus) {
+			config.Metadata.ConfigPath = filepath.Join(t.TempDir(), "other.toml")
+		}, want: "config path"},
+		{name: "config generation", mutate: func(config *upgradeConfigResponse, _ *upgradeStatus) { config.Metadata.Revision = "sha256:drifted" }, want: "config revision"},
+		{name: "daemon executable", mutate: func(_ *upgradeConfigResponse, status *upgradeStatus) {
+			status.Service.Binary.Path = filepath.Join(releaseRoot, "releases", "candidate", "looperd")
+		}, want: "daemon path"},
+		{name: "CLI executable", mutate: func(_ *upgradeConfigResponse, status *upgradeStatus) {
+			status.Tools.LooperPath = filepath.Join(releaseRoot, "releases", "candidate", "looper")
+		}, want: "CLI path"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config := liveConfig
+			candidate := status
+			test.mutate(&config, &candidate)
+			if err := verifyUpgradeStartBindings(bundle, verified.Manifest, source, config, candidate, releaseRoot); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("verifyUpgradeStartBindings() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestUpgradeBackupUsesDedicatedTimeout(t *testing.T) {
+	originalRequestTimeout := requestTimeout
+	originalBackupTimeout := upgradeBackupRequestTimeout
+	t.Cleanup(func() {
+		requestTimeout = originalRequestTimeout
+		upgradeBackupRequestTimeout = originalBackupTimeout
+	})
+	requestTimeout = 10 * time.Millisecond
+	upgradeBackupRequestTimeout = 150 * time.Millisecond
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/upgrade/backup" {
+			t.Fatalf("request path = %q, want backup", r.URL.Path)
+		}
+		time.Sleep(50 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"directory":"/tmp/rollback"}}`))
+	}))
+	t.Cleanup(server.Close)
+	configForDaemon(t, server.URL)
+	if err := runUpgrade(context.Background(), nil, []string{"backup"}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("runUpgrade(backup) error = %v; dedicated timeout was not used", err)
 	}
 }
 

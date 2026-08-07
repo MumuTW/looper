@@ -13,6 +13,7 @@ For the default supported install path:
 For source development:
 
 - Go `1.22`
+- Node.js `22+` and pnpm `10` for the production dashboard build
 - `git`
 - `gh` for GitHub projects
 - `osascript` if macOS notifications stay enabled
@@ -97,7 +98,7 @@ looperd service install
 
 Installing refuses rather than guessing:
 
-- **`daemon.environment` is refused.** The unit carries no environment, so anything the daemon needs belongs in the configuration file.
+- **`daemon.environment` is refused.** The unit carries no user-configurable environment; it supplies only a fixed service `PATH` so sandbox preflight matches the supervisor. Anything else the daemon needs belongs in the configuration file.
 - **`daemon.plistPath` is refused.** The unit always goes to the canonical per-user location, so activation, status, and uninstall address the same thing.
 - **Auto-detected tool paths are refused.** A supervisor starts the daemon with a minimal `PATH`, so a `git` or `gh` found through your shell would be searched for again and may resolve differently.
 - **An existing unit is refused.** Replacing one is `uninstall` then `install`, so no active service is silently left on an old definition.
@@ -195,10 +196,20 @@ cd looper
 Then build or run the Go binaries:
 
 ```bash
+cd web/dashboard
+pnpm install --frozen-lockfile
+pnpm test
+pnpm run build
+cd ../..
 go build -o looper ./cmd/looper
 go build -o looperd ./cmd/looperd
 go run ./cmd/looperd
 ```
+
+The dashboard assets are generated into `internal/dashboard/assets` and
+embedded into `looperd`; without the dashboard build, the daemon serves the
+development fallback page instead of the production SPA. `scripts/verify.sh`
+runs the same install, test, and build sequence before the Go checks.
 
 In another shell, run the CLI from source:
 
@@ -252,9 +263,20 @@ holds SQLite open). Then restore the matching pre-cutover config and SQLite
 snapshot from a v2 backup bundle (fail-closed if targets are still open):
 
 ```bash
-# stop supervised looperd (launchctl unload / systemctl --user stop looperd)
+# macOS: stop and forget the installed LaunchAgent
+launchctl bootout gui/$(id -u)/io.looper.looperd
+# Linux: stop the installed systemd user unit
+systemctl --user stop looperd.service
 looper upgrade restore-preflight --bundle <directory>
 looper upgrade restore --bundle <directory> --confirm
+```
+
+If the bundle is unavailable but a durable restore journal remains, recover the
+database/config pair directly from the journal; this command does not inspect
+or require the bundle:
+
+```bash
+looper upgrade recover --journal /absolute/path/to/looper.sqlite.restore-journal
 ```
 
 Both restore commands require `lsof` on `PATH` so Looper can prove that the
@@ -272,9 +294,14 @@ Supported sequence:
 6. **`backup` again while drained (mandatory)** — this is the rollback bundle for cutover. Work may still commit between step 3 and drain completion; only the post-drain bundle is guaranteed to include that work. Record this bundle directory as `ROLLBACK_BUNDLE`.
 7. `activate-release` the candidate (switches `current` only — does not restart)
 8. Point `tools.looperPath` at `release-root/current/looper` if not already
-9. **Restart the supervised daemon with `LOOPER_UPGRADE_VERIFY_HOLD=1`** so it loads `current/looperd` but **keeps admission drained** (no claim/mutation) until verification finishes. Without this hold, the replacement scheduler can complete work before `verify-start`; a later failed verify + restore of `$ROLLBACK_BUNDLE` would discard those writes.
+9. **Restart the supervised daemon with a manager-level `LOOPER_UPGRADE_VERIFY_HOLD=1` environment** so it loads `current/looperd` but **keeps admission drained** (no claim/mutation) until verification finishes. A shell prefix such as `LOOPER_UPGRADE_VERIFY_HOLD=1 launchctl ...` does not update an already-installed service's environment. Use the manager commands below:
+   - macOS: `launchctl setenv LOOPER_UPGRADE_VERIFY_HOLD 1`, then `launchctl kickstart -k gui/$(id -u)/io.looper.looperd`
+   - Linux: `systemctl --user set-environment LOOPER_UPGRADE_VERIFY_HOLD=1`, then `systemctl --user restart looperd.service`
+   Without this hold, the replacement scheduler can complete work before `verify-start`; a later failed verify + restore of `$ROLLBACK_BUNDLE` would discard those writes.
 10. `verify-start --bundle $ROLLBACK_BUNDLE` (requires `admissionState: draining`, daemon/`tools.looperPath` governed by `current`, and the candidate's `storage.dbPath` matching the rollback bundle source)
-11. On success: **restart again without `LOOPER_UPGRADE_VERIFY_HOLD`** so admission opens and normal work resumes
+11. On success: **remove the manager-level hold and restart again** so admission opens and normal work resumes:
+    - macOS: `launchctl unsetenv LOOPER_UPGRADE_VERIFY_HOLD`, then `launchctl kickstart -k gui/$(id -u)/io.looper.looperd`
+    - Linux: `systemctl --user unset-environment LOOPER_UPGRADE_VERIFY_HOLD`, then `systemctl --user restart looperd.service`
 
 On failure after restart (while still held/drained):
 
@@ -282,6 +309,8 @@ On failure after restart (while still held/drained):
 2. `restore-preflight --bundle $ROLLBACK_BUNDLE` → `restore --bundle $ROLLBACK_BUNDLE --confirm` (use the **post-drain** bundle, not the pre-drain one)
 3. `activate-release` the **prior** release id
 4. Restore prior `tools.looperPath` if you changed it
-5. Restart the supervised daemon **without** `LOOPER_UPGRADE_VERIFY_HOLD`
+5. Remove the manager-level hold and restart the supervised daemon:
+   - macOS: `launchctl unsetenv LOOPER_UPGRADE_VERIFY_HOLD`, then `launchctl kickstart -k gui/$(id -u)/io.looper.looperd`
+   - Linux: `systemctl --user unset-environment LOOPER_UPGRADE_VERIFY_HOLD`, then `systemctl --user restart looperd.service`
 
 Backup-copied binaries are evidence, not an executable release; binary rollback is always via a previously staged release under the same `release-root`.

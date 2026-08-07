@@ -101,8 +101,13 @@ func Create(ctx context.Context, input Input) (Result, error) {
 	if input.ConfigContents == nil && strings.TrimSpace(input.ConfigPath) == "" {
 		return Result{}, fmt.Errorf("config path or materialized config contents are required")
 	}
+	backupRoot, err := filepath.Abs(input.RootDir)
+	if err != nil {
+		return Result{}, fmt.Errorf("resolve backup root: %w", err)
+	}
+	backupRoot = filepath.Clean(backupRoot)
+	var backupRootParentSyncs []string
 	var configPath string
-	var err error
 	if input.ConfigContents == nil {
 		configPath, err = absolutePath(input.ConfigPath, "config")
 		if err != nil {
@@ -134,20 +139,21 @@ func Create(ctx context.Context, input Input) (Result, error) {
 	if input.Now != nil {
 		now = input.Now
 	}
-	if err := os.MkdirAll(input.RootDir, 0o755); err != nil {
-		return Result{}, fmt.Errorf("create backup root: %w", err)
+	backupRootParentSyncs, err = ensureBackupRoot(backupRoot)
+	if err != nil {
+		return Result{}, err
 	}
 	snapshot, err := input.Snapshot(ctx)
 	if err != nil {
 		return Result{}, fmt.Errorf("create sqlite snapshot: %w", err)
 	}
 	bundlePrefix := "upgrade-" + strings.ReplaceAll(now().UTC().Format("20060102T150405.000Z"), ":", "-")
-	bundle := filepath.Join(input.RootDir, bundlePrefix)
+	bundle := filepath.Join(backupRoot, bundlePrefix)
 	if err := os.Mkdir(bundle, 0o700); err != nil {
 		if !os.IsExist(err) {
 			return Result{}, fmt.Errorf("create backup bundle: %w", err)
 		}
-		bundle, err = os.MkdirTemp(input.RootDir, bundlePrefix+"-")
+		bundle, err = os.MkdirTemp(backupRoot, bundlePrefix+"-")
 		if err != nil {
 			return Result{}, fmt.Errorf("create unique backup bundle: %w", err)
 		}
@@ -215,7 +221,53 @@ func Create(ctx context.Context, input Input) (Result, error) {
 	if err := syncDirectory(filepath.Dir(bundle)); err != nil {
 		return fail(fmt.Errorf("sync backup root: %w", err))
 	}
+	for _, parent := range backupRootParentSyncs {
+		if err := syncDirectory(parent); err != nil {
+			return fail(fmt.Errorf("sync backup root parent %s: %w", parent, err))
+		}
+	}
 	return Result{Directory: bundle, Manifest: manifest}, nil
+}
+
+// ensureBackupRoot creates the backup root and returns every newly-created
+// ancestor that must be synced after the bundle is published. Syncing the
+// backup root persists the bundle entry; syncing its newly-created parents
+// persists the root entry itself and closes the power-loss window for a first
+// backup in a fresh directory tree.
+func ensureBackupRoot(root string) ([]string, error) {
+	missing := []string{}
+	probe := root
+	for {
+		info, err := os.Stat(probe)
+		if err == nil {
+			if !info.IsDir() {
+				return nil, fmt.Errorf("backup root %s is not a directory", root)
+			}
+			break
+		}
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("inspect backup root %s: %w", root, err)
+		}
+		missing = append(missing, probe)
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			break
+		}
+		probe = parent
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return nil, fmt.Errorf("create backup root: %w", err)
+	}
+	if len(missing) == 0 {
+		return nil, nil
+	}
+	parents := make([]string, 0, len(missing))
+	// missing is ordered from root toward the first existing ancestor. The
+	// closest new parent is synced first, then its parents, and finally the
+	// existing ancestor that receives the first new directory entry.
+	parents = append(parents, missing[1:]...)
+	parents = append(parents, probe)
+	return parents, nil
 }
 
 func syncFile(path string) error {
@@ -227,7 +279,9 @@ func syncFile(path string) error {
 	return f.Sync()
 }
 
-func syncDirectory(path string) error {
+var syncDirectory = syncDirectoryImpl
+
+func syncDirectoryImpl(path string) error {
 	dir, err := os.Open(path)
 	if err != nil {
 		return err
