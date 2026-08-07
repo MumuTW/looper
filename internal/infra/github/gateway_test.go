@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -752,7 +753,7 @@ func TestListAttributionPathsUsesPaginatedGitHubEvidence(t *testing.T) {
 			if want := "api --paginate --slurp repos/acme/looper/check-runs/99/annotations?per_page=100 -H Accept: application/vnd.github+json --hostname ghes.example"; got != want {
 				t.Fatalf("annotation args = %q, want %q", got, want)
 			}
-			return shell.Result{Stdout: `[[{"path":"internal/runtime/a.go"},{"path":"internal/runtime/a.go"}]]`}, nil
+			return shell.Result{Stdout: `[[{"path":"internal/runtime/a.go","annotation_level":"failure"},{"path":"internal/runtime/a.go","annotation_level":"warning"}]]`}, nil
 		case 2:
 			if want := "api --paginate --slurp repos/acme/looper/pulls/42/files?per_page=100 -H Accept: application/vnd.github+json --hostname ghes.example"; got != want {
 				t.Fatalf("files args = %q, want %q", got, want)
@@ -768,6 +769,9 @@ func TestListAttributionPathsUsesPaginatedGitHubEvidence(t *testing.T) {
 	annotations, err := gateway.ListCheckRunAnnotations(context.Background(), CheckRunAnnotationsInput{Repo: "ghes.example/acme/looper", CheckRunID: 99})
 	if err != nil || len(annotations) != 2 || annotations[0].Path != "internal/runtime/a.go" {
 		t.Fatalf("ListCheckRunAnnotations() = %#v, %v", annotations, err)
+	}
+	if annotations[0].Level != "failure" || annotations[1].Level != "warning" {
+		t.Fatalf("annotation levels = %#v, want REST annotation_level values", annotations)
 	}
 	files, err := gateway.ListPullRequestFiles(context.Background(), ViewPullRequestInput{Repo: "ghes.example/acme/looper", PRNumber: 42})
 	if err != nil || len(files) != 2 || files[0] != "a.go" || files[1] != "z.go" {
@@ -2440,10 +2444,11 @@ func TestGatewayListIssueTimelineScopesAPIToHostname(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "api --paginate --slurp repos/acme/looper/issues/8/timeline -H Accept: application/vnd.github+json --hostname github.example.com" {
+		want := "api --paginate repos/acme/looper/issues/8/timeline -H Accept: application/vnd.github+json --jq " + issueTimelineProjection + " --hostname github.example.com"
+		if args != want {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
-		return shell.Result{Stdout: `[[{"id":1,"event":"closed"}]]`}, nil
+		return shell.Result{Stdout: `{"id":1,"event":"closed","created_at":"2026-05-14T12:00:00Z","label":null}`}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
 	rows, err := gateway.ListIssueTimeline(context.Background(), IssueTimelineInput{Repo: "github.example.com/acme/looper", IssueNumber: 8})
@@ -2452,6 +2457,140 @@ func TestGatewayListIssueTimelineScopesAPIToHostname(t *testing.T) {
 	}
 	if len(rows) != 1 || asInt64(rows[0]["id"]) != 1 || asString(rows[0]["event"]) != "closed" {
 		t.Fatalf("ListIssueTimeline() = %#v, want parsed enterprise timeline", rows)
+	}
+}
+
+// TestGatewayListIssueTimelineDecodesProjectedPages covers the decode side of
+// the capture-cap contract: gh emits the projected events as a stream of
+// objects across pages, and the gateway must hand the coordinator and triager
+// exactly the consumed fields — event kind, timestamp, id, label name, and the
+// minimal linked-PR identity retained on cross-referenced events so
+// linkedPullRequestNumbers can still discover the PR a cross-reference points at.
+func TestGatewayListIssueTimelineDecodesProjectedPages(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		return shell.Result{Stdout: `{"id":1,"event":"labeled","created_at":"2026-05-14T12:00:00Z","label":{"name":"looper:triaged"},"source":null,"pull_request":null,"issue":null}
+{"id":2,"event":"reopened","created_at":"2026-05-15T09:30:00Z","label":null,"source":null,"pull_request":null,"issue":null}
+{"id":3,"event":"cross-referenced","created_at":"2026-05-16T10:00:00Z","label":null,"source":{"issue":{"number":42,"html_url":"https://github.com/acme/looper/pull/42","url":"https://api.github.com/repos/acme/looper/pulls/42","pull_request":{"number":42,"html_url":"https://github.com/acme/looper/pull/42","url":"https://api.github.com/repos/acme/looper/pulls/42"}}},"pull_request":null,"issue":null}`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	rows, err := gateway.ListIssueTimeline(context.Background(), IssueTimelineInput{Repo: "acme/looper", IssueNumber: 8})
+	if err != nil {
+		t.Fatalf("ListIssueTimeline() error = %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("ListIssueTimeline() len = %d, want every projected event", len(rows))
+	}
+	label, _ := rows[0]["label"].(map[string]any)
+	if label == nil || asString(label["name"]) != "looper:triaged" {
+		t.Fatalf("ListIssueTimeline()[0].label = %#v, want the label event's name", rows[0]["label"])
+	}
+	if rows[1]["label"] != nil {
+		t.Fatalf("ListIssueTimeline()[1].label = %#v, want null for events without a label", rows[1]["label"])
+	}
+	if asInt64(rows[2]["id"]) != 3 || asString(rows[2]["event"]) != "cross-referenced" || asString(rows[2]["created_at"]) != "2026-05-16T10:00:00Z" {
+		t.Fatalf("ListIssueTimeline()[2] = %#v, want the projected cross-reference event", rows[2])
+	}
+	// The cross-referenced event must retain enough of its source for
+	// linkedPullRequestNumbers to discover the linked PR: the nested issue's
+	// number, URL, and pull_request marker. The full source body is dropped by
+	// the projection, which is what keeps the wire shape under the capture cap.
+	source, _ := rows[2]["source"].(map[string]any)
+	if source == nil {
+		t.Fatalf("ListIssueTimeline()[2].source = %#v, want the retained cross-reference source", rows[2]["source"])
+	}
+	sourceIssue, _ := source["issue"].(map[string]any)
+	if sourceIssue == nil || asInt64(sourceIssue["number"]) != 42 {
+		t.Fatalf("ListIssueTimeline()[2].source.issue = %#v, want the linked PR number 42", source["issue"])
+	}
+	if asString(sourceIssue["html_url"]) != "https://github.com/acme/looper/pull/42" {
+		t.Fatalf("ListIssueTimeline()[2].source.issue.html_url = %#v, want the linked PR URL", sourceIssue["html_url"])
+	}
+	prMarker, _ := sourceIssue["pull_request"].(map[string]any)
+	if prMarker == nil || asInt64(prMarker["number"]) != 42 {
+		t.Fatalf("ListIssueTimeline()[2].source.issue.pull_request = %#v, want the PR marker that distinguishes a PR from a plain issue", sourceIssue["pull_request"])
+	}
+}
+
+// TestIssueTimelineProjectionFiltersRawCrossReferencePage pins the jq filter
+// itself rather than a hand-written projection: it runs the real jq binary on
+// a raw GitHub-shaped timeline page — full cross-reference bodies included —
+// and asserts the projected output keeps the linked-PR identity while dropping
+// the bodies. The fake-runner decode tests feed the gateway the projected
+// shape directly, so they cannot catch a future edit that deletes `source`
+// from issueTimelineProjection; exercising the filter end to end is what
+// catches it.
+func TestIssueTimelineProjectionFiltersRawCrossReferencePage(t *testing.T) {
+	t.Parallel()
+	jqPath, err := exec.LookPath("jq")
+	if err != nil {
+		t.Skipf("jq is not available: %v", err)
+	}
+	const bodyMarker = "LOOPER-PROJECTION-BODY-MARKER"
+	rawPage := `[
+		{
+			"id": 11,
+			"event": "labeled",
+			"created_at": "2026-05-14T12:00:00Z",
+			"actor": {"login": "octo", "id": 1},
+			"label": {"name": "triaged", "color": "ededed"}
+		},
+		{
+			"id": 12,
+			"event": "cross-referenced",
+			"created_at": "2026-05-16T10:00:00Z",
+			"actor": {"login": "octo", "id": 1},
+			"source": {
+				"type": "issue",
+				"issue": {
+					"number": 42,
+					"title": "Linked PR",
+					"body": "` + bodyMarker + ` a very large discussion body that must not cross the capture boundary",
+					"html_url": "https://github.com/acme/looper/pull/42",
+					"url": "https://api.github.com/repos/acme/looper/issues/42",
+					"user": {"login": "octo"},
+					"pull_request": {
+						"number": 42,
+						"html_url": "https://github.com/acme/looper/pull/42",
+						"url": "https://api.github.com/repos/acme/looper/pulls/42",
+						"diff_url": "https://github.com/acme/looper/pull/42.diff"
+					}
+				}
+			}
+		}
+	]`
+	cmd := exec.Command(jqPath, "-c", issueTimelineProjection)
+	cmd.Stdin = strings.NewReader(rawPage)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("jq %q failed: %v; output=%s", issueTimelineProjection, err, out)
+	}
+	projected := string(out)
+	if strings.Contains(projected, bodyMarker) {
+		t.Fatalf("projected output = %q, want the cross-reference body dropped", projected)
+	}
+	rows, err := decodeJSONObjects(projected)
+	if err != nil {
+		t.Fatalf("decodeJSONObjects(projected) error = %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("projected rows = %d, want both events; output=%s", len(rows), projected)
+	}
+	label, _ := rows[0]["label"].(map[string]any)
+	if label == nil || asString(label["name"]) != "triaged" {
+		t.Fatalf("projected labeled event = %#v, want the label name retained", rows[0])
+	}
+	source, _ := rows[1]["source"].(map[string]any)
+	if source == nil {
+		t.Fatalf("projected cross-reference event = %#v, want the source retained", rows[1])
+	}
+	sourceIssue, _ := source["issue"].(map[string]any)
+	if sourceIssue == nil || asInt64(sourceIssue["number"]) != 42 || asString(sourceIssue["html_url"]) != "https://github.com/acme/looper/pull/42" {
+		t.Fatalf("projected source.issue = %#v, want the linked PR identity retained", source["issue"])
+	}
+	if _, hasPullRequestMarker := sourceIssue["pull_request"].(map[string]any); !hasPullRequestMarker {
+		t.Fatalf("projected source.issue.pull_request = %#v, want the PR marker retained so linked-PR discovery can tell PRs from issues", sourceIssue["pull_request"])
 	}
 }
 
@@ -3042,6 +3181,26 @@ func TestGatewaySetCommitStatusRejectsInvalidInput(t *testing.T) {
 		t.Fatal("SetCommitStatus() error = nil, want invalid state error")
 	}
 }
+
+func TestGatewayListMergedPullRequests(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if args := strings.Join(options.Args, " "); args != "pr list --repo acme/looper --state merged --limit 100 --json number,url,state,mergedAt,headRefOid,additions,deletions" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `[{"number":42,"url":"https://example.test/pull/42","state":"MERGED","mergedAt":"2026-07-30T12:00:00Z","headRefOid":"abc123","additions":120,"deletions":30}]`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	prs, err := gateway.ListMergedPullRequests(context.Background(), ListMergedPullRequestsInput{Repo: "acme/looper", Limit: 100})
+	if err != nil {
+		t.Fatalf("ListMergedPullRequests() error = %v", err)
+	}
+	if len(prs) != 1 || prs[0].Number != 42 || prs[0].MergedAt != "2026-07-30T12:00:00Z" || prs[0].HeadSHA != "abc123" || prs[0].Additions != 120 || prs[0].Deletions != 30 || !prs[0].AdditionsKnown || !prs[0].DeletionsKnown {
+		t.Fatalf("ListMergedPullRequests() = %#v", prs)
+	}
+}
+
 func TestGatewayCloseIssueRejectsUnknownStateReason(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

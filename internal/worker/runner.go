@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"database/sql"
@@ -50,12 +51,16 @@ const (
 	stepValidate        = workflow.StepValidate
 	stepOpenPR          = workflow.StepOpenPR
 
-	defaultAgentTimeout     = time.Hour
-	defaultClaimTTL         = 10 * time.Minute
-	defaultRetryDelay       = 5 * time.Second
-	defaultRetryMax         = 3
-	defaultIssueLimit       = 30
-	personalIssueQueryLimit = 100
+	defaultAgentTimeout = time.Hour
+	defaultClaimTTL     = 10 * time.Minute
+	defaultRetryDelay   = 5 * time.Second
+	defaultRetryMax     = 3
+	defaultIssueLimit   = 30
+	// Keep in lockstep with internal/infra/git.WorktreeFingerprintVersion; this
+	// package owns the persisted checkpoint comparison without importing the
+	// concrete gateway implementation.
+	worktreeFingerprintVersion = "v4"
+	personalIssueQueryLimit    = 100
 
 	workerBranchSlugMaxLength        = 30
 	workerBranchSlugMaxWords         = 5
@@ -245,6 +250,7 @@ type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	ListOpenIssues(context.Context, ListOpenIssuesInput) ([]IssueSummary, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
+	ViewPullRequestForDiscovery(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error)
 	GetCurrentUserLogin(context.Context, string, string) (string, error)
 	AddIssueAssignees(context.Context, IssueAssigneesInput) error
@@ -304,10 +310,12 @@ type PushInput struct {
 }
 
 type InspectHeadInput struct {
-	RepoPath     string
-	WorktreeRoot string
-	WorktreePath string
-	BaseRef      string
+	RepoPath       string
+	WorktreeRoot   string
+	WorktreePath   string
+	BaseRef        string
+	ContentPaths   []string
+	CompareHeadSHA string
 }
 
 type InspectHeadResult struct {
@@ -318,7 +326,18 @@ type InspectHeadResult struct {
 	ChangedFiles          []string
 	StagedFiles           []string
 	UntrackedFiles        []string
+	UnstagedFileCount     int
+	RenameSourceFiles     []string
 	DiffFingerprint       string
+	ContentFingerprint    string
+	// Compared* fingerprints are scoped to InspectHeadInput.ContentPaths. They
+	// prove that predecessor paths survived while a replacement adds new paths.
+	ComparedContentFingerprint string
+	ComparedIndexFingerprint   string
+	ContentFingerprintVersion  string
+	IndexFingerprint           string
+	WorktreeMatchesHead        bool
+	HeadDescendsFromCompare    bool
 }
 
 type VerifyWorktreeIdentityInput struct {
@@ -351,25 +370,27 @@ type GitGateway interface {
 }
 
 type AgentRunInput struct {
-	ExecutionID         string
-	ProjectID           string
-	LoopID              string
-	RunID               string
-	Prompt              string
-	NativeResumePrompt  string
-	NativeSessionID     string
-	WorkingDirectory    string
-	Timeout             time.Duration
-	HeartbeatTimeout    time.Duration
-	Metadata            map[string]any
-	IdempotencyKey      string
-	RestrictToolNetwork bool
-	OnBeforeTimeout     func(context.Context, agent.TimeoutObservation) error
+	ExecutionID              string
+	ProjectID                string
+	LoopID                   string
+	RunID                    string
+	Prompt                   string
+	NativeResumePrompt       string
+	NativeSessionID          string
+	WorkingDirectory         string
+	Timeout                  time.Duration
+	HeartbeatTimeout         time.Duration
+	TimeoutObservationBudget time.Duration
+	Metadata                 map[string]any
+	IdempotencyKey           string
+	RestrictToolNetwork      bool
+	OnBeforeTimeout          func(context.Context, agent.TimeoutObservation) error
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
-	UseSnapshot    bool
-	SnapshotVendor string
-	SnapshotModel  *string
+	UseSnapshot             bool
+	SnapshotVendor          string
+	SnapshotModel           *string
+	SnapshotReasoningEffort *config.ReasoningEffort
 }
 
 type AgentResult struct {
@@ -387,6 +408,8 @@ type AgentResult struct {
 	ElapsedRuntimeSeconds        int64
 	LastProgressAt               string
 	PreTimeoutError              string
+	NativeResumeMode             string
+	NativeResumeStatus           string
 }
 
 const validationGatedLocalOnlyPrompt = `
@@ -465,10 +488,13 @@ type Options struct {
 	Now                             func() time.Time
 	AgentTimeout                    time.Duration
 	AgentIdleTimeout                time.Duration
-	ClaimTTL                        time.Duration
-	ValidationCommands              []string
-	ValidationCommandsByProject     map[string][]string
-	ValidationRunner                ValidationRunner
+	// TimeoutObservationBudget bounds the Git evidence callback after an agent
+	// timeout. Zero uses the executor's conservative default.
+	TimeoutObservationBudget    time.Duration
+	ClaimTTL                    time.Duration
+	ValidationCommands          []string
+	ValidationCommandsByProject map[string][]string
+	ValidationRunner            ValidationRunner
 	// ContainmentTracker registers validation shell handles with the Execution
 	// Supervisor for shutdown drain / retain-storage (#577). Nil in tests or
 	// when the runner is not daemon-owned.
@@ -479,6 +505,7 @@ type Options struct {
 	Disclosure              *config.DisclosureConfig
 	AgentRuntime            string
 	AgentProfileID          string
+	AgentReasoningEffort    *config.ReasoningEffort
 	CustomInstructions      *config.Config
 	AgentModel              *string
 	RetryBaseDelay          time.Duration
@@ -557,6 +584,7 @@ type Runner struct {
 	now                         func() time.Time
 	agentTimeout                time.Duration
 	agentIdleTimeout            time.Duration
+	timeoutObservationBudget    time.Duration
 	claimTTL                    time.Duration
 	validationCommands          []string
 	validationCommandsByProject map[string][]string
@@ -570,6 +598,7 @@ type Runner struct {
 	disclosure                  config.DisclosureConfig
 	agentRuntime                string
 	agentProfileID              string
+	agentReasoningEffort        *config.ReasoningEffort
 	customInstructions          config.Config
 	projectRoleConfig           *config.Config
 	agentModel                  *string
@@ -630,14 +659,15 @@ type workerInput struct {
 }
 
 type workerCheckpoint struct {
-	ResumePolicy   string                `json:"resumePolicy,omitempty"`
-	Work           *workerInput          `json:"work,omitempty"`
-	ClaimedLockKey string                `json:"claimedLockKey,omitempty"`
-	IssueClaim     *checkpointIssueClaim `json:"issueClaim,omitempty"`
-	Worktree       *checkpointWorktree   `json:"worktree,omitempty"`
-	Plan           *checkpointPlan       `json:"plan,omitempty"`
-	Execution      *checkpointExecution  `json:"execution,omitempty"`
-	Lifecycle      *lifecycle.State      `json:"gitPrLifecycle,omitempty"`
+	ResumePolicy   string                  `json:"resumePolicy,omitempty"`
+	Work           *workerInput            `json:"work,omitempty"`
+	ClaimedLockKey string                  `json:"claimedLockKey,omitempty"`
+	IssueClaim     *checkpointIssueClaim   `json:"issueClaim,omitempty"`
+	Worktree       *checkpointWorktree     `json:"worktree,omitempty"`
+	Plan           *checkpointPlan         `json:"plan,omitempty"`
+	Execution      *checkpointExecution    `json:"execution,omitempty"`
+	Continuation   *checkpointContinuation `json:"continuation,omitempty"`
+	Lifecycle      *lifecycle.State        `json:"gitPrLifecycle,omitempty"`
 	// ReproductionAbsent is set when capture first observes no applicable
 	// manifest. A later manifest is only adopted after a completed agent
 	// execution (intentional worker-authored reproduction); pre-execution
@@ -676,6 +706,8 @@ type checkpointPlan struct {
 }
 
 type checkpointExecution struct {
+	RunID                        string            `json:"runId,omitempty"`
+	ExecutionID                  string            `json:"executionId,omitempty"`
 	Status                       string            `json:"status,omitempty"`
 	Summary                      string            `json:"summary,omitempty"`
 	ParseStatus                  string            `json:"parseStatus,omitempty"`
@@ -689,8 +721,23 @@ type checkpointExecution struct {
 	ConfiguredMaxRuntimeSeconds  int64             `json:"configuredMaxRuntimeSeconds,omitempty"`
 	ElapsedRuntimeSeconds        int64             `json:"elapsedRuntimeSeconds,omitempty"`
 	LastProgressAt               string            `json:"lastProgressAt,omitempty"`
+	NativeResumeMode             string            `json:"nativeResumeMode,omitempty"`
+	NativeResumeStatus           string            `json:"nativeResumeStatus,omitempty"`
 	ProgressBeforeTimeout        *worktreeProgress `json:"progressBeforeTimeout,omitempty"`
 	ProgressSnapshotError        string            `json:"progressSnapshotError,omitempty"`
+}
+
+// checkpointContinuation is the durable handoff record for a timeout retry.
+// Execution carries the latest attempt's timeout observation; this separate
+// record keeps the predecessor's before/after comparison when that retry later
+// completes and replaces Execution with its terminal result.
+type checkpointContinuation struct {
+	PredecessorRunID       string            `json:"predecessorRunId,omitempty"`
+	PredecessorExecutionID string            `json:"predecessorExecutionId,omitempty"`
+	Mode                   string            `json:"mode,omitempty"`
+	Outcome                string            `json:"outcome,omitempty"`
+	BeforeTimeout          *worktreeProgress `json:"beforeTimeout,omitempty"`
+	AfterRestart           *worktreeProgress `json:"afterRestart,omitempty"`
 }
 
 // worktreeProgress records only status metadata; it never persists diff
@@ -706,10 +753,26 @@ type worktreeProgress struct {
 	StagedFileCount    int      `json:"stagedFileCount"`
 	UntrackedFiles     []string `json:"untrackedFiles,omitempty"`
 	UntrackedFileCount int      `json:"untrackedFileCount"`
-	DiffFingerprint    string   `json:"diffFingerprint,omitempty"`
-	TimeoutType        string   `json:"timeoutType,omitempty"`
-	LastProgressAt     string   `json:"lastProgressAt,omitempty"`
-	CapturedAt         string   `json:"capturedAt,omitempty"`
+	UnstagedFileCount  int      `json:"unstagedFileCount"`
+	RenameSourceFiles  []string `json:"renameSourceFiles,omitempty"`
+	// The string path fields are kept for human-facing diagnostics. The byte
+	// fields are the lossless comparison authority: encoding/json base64-encodes
+	// []byte so Git paths that are not valid UTF-8 survive checkpoint round trips.
+	ChangedFileBytes            [][]byte `json:"changedFileBytes,omitempty"`
+	StagedFileBytes             [][]byte `json:"stagedFileBytes,omitempty"`
+	UntrackedFileBytes          [][]byte `json:"untrackedFileBytes,omitempty"`
+	RenameSourceFileBytes       [][]byte `json:"renameSourceFileBytes,omitempty"`
+	DiffFingerprint             string   `json:"diffFingerprint,omitempty"`
+	ContentFingerprint          string   `json:"contentFingerprint,omitempty"`
+	PreservedContentFingerprint string   `json:"preservedContentFingerprint,omitempty"`
+	PreservedIndexFingerprint   string   `json:"preservedIndexFingerprint,omitempty"`
+	ContentFingerprintVersion   string   `json:"contentFingerprintVersion,omitempty"`
+	IndexFingerprint            string   `json:"indexFingerprint,omitempty"`
+	WorktreeMatchesHead         bool     `json:"worktreeMatchesHead"`
+	HeadDescendsFromCompare     bool     `json:"-"`
+	TimeoutType                 string   `json:"timeoutType,omitempty"`
+	LastProgressAt              string   `json:"lastProgressAt,omitempty"`
+	CapturedAt                  string   `json:"capturedAt,omitempty"`
 }
 
 type checkpointPullPR struct {
@@ -1074,14 +1137,40 @@ func sanitizePublicPausedIssueClaimSummary(summary string) string {
 	return cleaned
 }
 
-func checkpointExecutionFromAgentResult(result AgentResult) *checkpointExecution {
+func checkpointExecutionFromAgentResult(result AgentResult, runID, executionID string) *checkpointExecution {
 	return &checkpointExecution{
+		RunID: runID, ExecutionID: executionID,
 		Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus,
 		ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle, Stdout: result.Stdout,
 		TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds,
 		ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt,
+		NativeResumeMode: result.NativeResumeMode, NativeResumeStatus: result.NativeResumeStatus,
 		ProgressSnapshotError: result.PreTimeoutError,
 	}
+}
+
+func (c *workerCheckpoint) recordContinuationResumeMode(result AgentResult) {
+	if c == nil || c.Continuation == nil || strings.TrimSpace(result.NativeResumeMode) == "" {
+		return
+	}
+	c.Continuation.Mode = result.NativeResumeMode
+}
+
+func workerContinuationPrompt(continuation *checkpointContinuation) string {
+	if continuation == nil || continuation.BeforeTimeout == nil || continuation.AfterRestart == nil {
+		return ""
+	}
+	return fmt.Sprintf(`CONTINUATION CONTEXT:
+This is a retry in the same recorded worktree, not a fresh task. The predecessor run was %s and its agent execution was %s. The daemon classified the handoff as %s. Before timeout: HEAD %s with changed/staged/untracked counts %d/%d/%d. Immediately before this replacement: HEAD %s with counts %d/%d/%d.
+Inspect the existing worktree and continue its changes. Do not reset, clean, checkout over, recreate, or discard the existing worktree.`,
+		firstNonEmpty(continuation.PredecessorRunID, "unknown"),
+		firstNonEmpty(continuation.PredecessorExecutionID, "unknown"),
+		firstNonEmpty(continuation.Outcome, "unknown"),
+		firstNonEmpty(continuation.BeforeTimeout.HeadSHA, "unknown"),
+		continuation.BeforeTimeout.ChangedFileCount, continuation.BeforeTimeout.StagedFileCount, continuation.BeforeTimeout.UntrackedFileCount,
+		firstNonEmpty(continuation.AfterRestart.HeadSHA, "unknown"),
+		continuation.AfterRestart.ChangedFileCount, continuation.AfterRestart.StagedFileCount, continuation.AfterRestart.UntrackedFileCount,
+	)
 }
 
 func New(options Options) *Runner {
@@ -1097,6 +1186,7 @@ func New(options Options) *Runner {
 	if agentIdleTimeout <= 0 {
 		agentIdleTimeout = 15 * time.Minute
 	}
+	timeoutObservationBudget := options.TimeoutObservationBudget
 	claimTTL := options.ClaimTTL
 	if claimTTL <= 0 {
 		claimTTL = defaultClaimTTL
@@ -1135,6 +1225,7 @@ func New(options Options) *Runner {
 		now:                         now,
 		agentTimeout:                agentTimeout,
 		agentIdleTimeout:            agentIdleTimeout,
+		timeoutObservationBudget:    timeoutObservationBudget,
 		claimTTL:                    claimTTL,
 		validationCommands:          append([]string(nil), options.ValidationCommands...),
 		validationCommandsByProject: cloneValidationCommandsByProject(options.ValidationCommandsByProject),
@@ -1148,6 +1239,7 @@ func New(options Options) *Runner {
 		disclosure:                  disclosureCfg,
 		agentRuntime:                strings.TrimSpace(options.AgentRuntime),
 		agentProfileID:              strings.TrimSpace(options.AgentProfileID),
+		agentReasoningEffort:        cloneReasoningEffortPtr(options.AgentReasoningEffort),
 		customInstructions:          customInstructionConfig(options.CustomInstructions),
 		projectRoleConfig:           options.CustomInstructions,
 		agentModel:                  cloneStringPtr(options.AgentModel),
@@ -1269,9 +1361,10 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
+	namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)
 	eligible := 0
 	for _, issue := range issues {
-		if domain.IsAutoLaneHeld(domain.LoopTypeWorker, issue.Labels) {
+		if domain.IsAutoLaneHeldForNamespace(domain.LoopTypeWorker, issue.Labels, namespace) {
 			result.Skipped++
 			continue
 		}
@@ -1353,7 +1446,8 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	if !ok {
 		return r.discoveryPolicy
 	}
-	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
+	namespace := config.ProjectLabelNamespace(r.projectRoleConfig, projectID)
+	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: namespace.RemapAll(role.Discovery.Labels), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
 }
 
 func (r *Runner) isPersonalProject(projectID string) bool {
@@ -1943,7 +2037,8 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 		}
 	}
 	if input.Loop.TargetType == "pull_request" && work.Repo != "" && work.PRNumber > 0 && r.github != nil {
-		_ = r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: work.Repo, PRNumber: work.PRNumber, Labels: []string{labels.SpecReady}, CWD: input.Project.RepoPath})
+		namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)
+		_ = r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: work.Repo, PRNumber: work.PRNumber, Labels: []string{namespace.SpecReady()}, CWD: input.Project.RepoPath})
 	}
 	checkpoint.Work = &work
 	checkpoint.ClaimedLockKey = lockKey
@@ -1989,6 +2084,14 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 			return checkpoint, err
 		}
 	}
+	if checkpoint.Worktree != nil && checkpoint.ResumePolicy == loops.ResumePolicyReplayStep && checkpoint.Execution == nil {
+		if _, statErr := os.Stat(checkpoint.Worktree.Path); errors.Is(statErr, os.ErrNotExist) {
+			if safetyErr := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); safetyErr != nil {
+				return checkpoint, staleWorkerWorktreeError(*checkpoint.Worktree, work, safetyErr.Error())
+			}
+			checkpoint.Worktree = nil
+		}
+	}
 	if checkpoint.Worktree != nil {
 		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err == nil {
 			// Reusing an existing path skips CreateWorktree/RestoreWorktree, so
@@ -2008,6 +2111,11 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 			}
 			return checkpoint, nil
 		} else {
+			// A fresh replay with no timeout evidence may safely recover a
+			// checkpoint whose old checkout was cleaned after a successful turn
+			// (for example, a later HITL follow-up). Timeout/continuation
+			// checkpoints never take this path: their recorded worktree remains
+			// the preservation authority and must be restored manually.
 			// A checkpointed path may hold uncommitted progress even when the
 			// predecessor crashed before it could persist an execution result.
 			// Recreating its deterministic branch path here would silently turn a
@@ -2262,7 +2370,10 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				return checkpoint, awaiting
 			}
 		}
-		agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+		if err := r.verifyTimeoutProgressBeforeReplacement(ctx, input.Project, input.Run.ID, work, worktree, &checkpoint); err != nil {
+			return checkpoint, err
+		}
+		agentVendor, agentModel, _, agentReasoningEffort, useSnapshot, err := r.identityFromRun(input.Run)
 		if err != nil {
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 		}
@@ -2273,6 +2384,10 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		}
 		if len(validationCommands) > 0 {
 			prompt += validationGatedLocalOnlyPrompt
+		}
+		continuationPrompt := workerContinuationPrompt(checkpoint.Continuation)
+		if continuationPrompt != "" {
+			prompt += "\n\n" + continuationPrompt
 		}
 		if work.Reproduction != nil {
 			prompt += "\n\n" + work.Reproduction.PromptInstruction()
@@ -2323,6 +2438,9 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				}
 			}
 		}
+		if continuationPrompt != "" && nativeResumePrompt != "" {
+			nativeResumePrompt += "\n\n" + continuationPrompt
+		}
 		executionID := eventlog.NewEventID("agent")
 		metadata := map[string]any{"loopType": "worker", "title": work.Title, "repo": work.Repo, "baseBranch": work.BaseBranch}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
@@ -2334,17 +2452,37 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		} else if held {
 			return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 		}
-		useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
+		useSnap, snapVendor, snapModel, snapReasoningEffort := agentRunSnapshotFields(agentVendor, agentModel, agentReasoningEffort, useSnapshot)
 		var (
 			preTimeoutProgress *worktreeProgress
 			progressMu         sync.Mutex
 		)
 		onBeforeTimeout := func(timeoutCtx context.Context, observation agent.TimeoutObservation) error {
-			progress, progressErr := r.captureWorktreeProgress(timeoutCtx, input.Project, work, worktree, observation)
+			// Persist the intent before touching Git. A daemon crash during status,
+			// content, or index capture must leave a durable fail-closed marker;
+			// otherwise recovery cannot distinguish an untouched timeout from an
+			// observation that was interrupted halfway through.
+			progressMu.Lock()
+			checkpoint.Execution = &checkpointExecution{RunID: input.Run.ID, ExecutionID: executionID, Status: "timeout_observing", ProgressSnapshotError: "worker timeout observation in progress"}
+			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+			if err := r.persistCheckpoint(timeoutCtx, input.Run.ID, checkpoint); err != nil {
+				progressMu.Unlock()
+				return fmt.Errorf("persist worker timeout observation intent: %w", err)
+			}
+			progressMu.Unlock()
+
+			progress, progressErr := r.captureWorktreeProgress(timeoutCtx, input.Project, work, worktree, observation, nil)
 			progressMu.Lock()
 			defer progressMu.Unlock()
 			if progressErr != nil {
-				checkpoint.Execution = &checkpointExecution{Status: "timeout_observing", ProgressSnapshotError: progressErr.Error()}
+				if timeoutCtx.Err() != nil {
+					return timeoutCtx.Err()
+				}
+				checkpoint.Execution = &checkpointExecution{RunID: input.Run.ID, ExecutionID: executionID, Status: "timeout_observing", ProgressSnapshotError: progressErr.Error()}
+				checkpoint.Continuation = &checkpointContinuation{
+					PredecessorRunID: input.Run.ID, PredecessorExecutionID: executionID,
+					Mode: "timeout_observed", Outcome: "observation failed",
+				}
 				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 				if persistErr := r.persistCheckpoint(timeoutCtx, input.Run.ID, checkpoint); persistErr != nil {
 					return errors.Join(progressErr, fmt.Errorf("persist pre-timeout worker progress failure: %w", persistErr))
@@ -2352,7 +2490,11 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				return progressErr
 			}
 			preTimeoutProgress = &progress
-			checkpoint.Execution = &checkpointExecution{Status: "timeout_observing", ProgressBeforeTimeout: &progress}
+			checkpoint.Execution = &checkpointExecution{RunID: input.Run.ID, ExecutionID: executionID, Status: "timeout_observing", ProgressBeforeTimeout: &progress}
+			checkpoint.Continuation = &checkpointContinuation{
+				PredecessorRunID: input.Run.ID, PredecessorExecutionID: executionID,
+				Mode: "timeout_observed", BeforeTimeout: &progress,
+			}
 			checkpoint.ResumePolicy = "retry_from_timeout_context"
 			if err := r.persistCheckpoint(timeoutCtx, input.Run.ID, checkpoint); err != nil {
 				return fmt.Errorf("persist pre-timeout worker progress: %w", err)
@@ -2362,11 +2504,11 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
 			ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 			Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID,
-			WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
+			WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, TimeoutObservationBudget: r.timeoutObservationBudget,
 			Metadata: metadata, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID),
 			RestrictToolNetwork: len(validationCommands) > 0,
 			OnBeforeTimeout:     onBeforeTimeout,
-			UseSnapshot:         useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+			UseSnapshot:         useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
 		})
 		if err != nil {
 			return checkpoint, err
@@ -2380,6 +2522,16 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if err != nil {
 			return checkpoint, err
 		}
+		// The executor owns the native-resume decision. Persist the continuation
+		// projection before any completed-result gate can suspend or reject this
+		// run. A HITL suspension deliberately cannot set Execution: doing so
+		// would make the resumed run skip the agent turn that consumes the answer.
+		checkpoint.recordContinuationResumeMode(result)
+		if checkpoint.Continuation != nil {
+			if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+			}
+		}
 		// HITL (gated): after the agent turn, if it wrote an ask sentinel, suspend
 		// the run so a human can answer. Returned as a typed error the step loop
 		// converts into an awaiting_human suspension (not a failure).
@@ -2391,7 +2543,8 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			}
 		}
 		if result.Status != "completed" {
-			checkpoint.Execution = checkpointExecutionFromAgentResult(result)
+			checkpoint.recordContinuationResumeMode(result)
+			checkpoint.Execution = checkpointExecutionFromAgentResult(result, input.Run.ID, executionID)
 			checkpoint.Execution.ProgressBeforeTimeout = preTimeoutProgress
 			if result.PreTimeoutError != "" {
 				checkpoint.Execution.ProgressSnapshotError = result.PreTimeoutError
@@ -2400,6 +2553,20 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 					return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 				}
 				return checkpoint, &runpipe.LoopError{Message: "Worker timeout progress snapshot failed: " + result.PreTimeoutError, Kind: runpipe.FailureManualIntervention}
+			}
+			if result.Status == "timeout" && preTimeoutProgress != nil {
+				if err := r.verifyTimeoutProgressAfterTermination(ctx, input.Project, work, worktree, *preTimeoutProgress); err != nil {
+					checkpoint.Execution.ProgressSnapshotError = err.Error()
+					checkpoint.Continuation = &checkpointContinuation{
+						PredecessorRunID: input.Run.ID, PredecessorExecutionID: executionID,
+						Mode: "timeout_observed", Outcome: "observation failed", BeforeTimeout: preTimeoutProgress,
+					}
+					checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+					if persistErr := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); persistErr != nil {
+						return checkpoint, &runpipe.LoopError{Message: persistErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
+					}
+					return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureManualIntervention}
+				}
 			}
 			checkpoint.ResumePolicy = "retry_from_timeout_context"
 			if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
@@ -2417,15 +2584,19 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		} else if held {
 			return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 		}
-		// HITL (gated): the resumed turn completed without asking again, so the human
-		// answer that seeded it has been acted on. Flip it to "consumed" now — after
-		// the turn, never before — so a failed/timed-out turn re-reads the answer on
-		// retry, while a successful one never re-injects it on a later run.
-		r.acknowledgePostTurnMetadata(ctx, &input.Loop, includedHumanInbox)
-		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
+		checkpoint.recordContinuationResumeMode(result)
+		checkpoint.Execution = checkpointExecutionFromAgentResult(result, input.Run.ID, executionID)
+		checkpoint.Execution.ProgressBeforeTimeout = preTimeoutProgress
+		if err := validateCompletedExecutionCheckpoint(checkpoint.Execution); err != nil {
+			if persistErr := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); persistErr != nil {
+				return checkpoint, &runpipe.LoopError{Message: persistErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
+			}
 			return checkpoint, err
 		}
-		checkpoint.Execution = checkpointExecutionFromAgentResult(result)
+		// HITL (gated): only consume the human context after the completed result
+		// passes validation. Invalid structured output is replayed in a fresh
+		// execute turn and must still receive the answer/message that authorized it.
+		r.acknowledgePostTurnMetadata(ctx, &input.Loop, includedHumanInbox)
 		checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
 		if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {
 			return checkpoint, err
@@ -2452,7 +2623,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	return checkpoint, nil
 }
 
-func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree, observation agent.TimeoutObservation) (worktreeProgress, error) {
+func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree, observation agent.TimeoutObservation, compare *worktreeProgress) (worktreeProgress, error) {
 	if r.git == nil {
 		return worktreeProgress{}, fmt.Errorf("worker git gateway is not configured")
 	}
@@ -2460,24 +2631,53 @@ func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.Pr
 	if err != nil {
 		return worktreeProgress{}, err
 	}
-	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path})
+	contentPaths := []string(nil)
+	compareHeadSHA := ""
+	if compare != nil {
+		// Keep an explicit empty slice for a clean predecessor. Nil means that
+		// no scoped comparison was requested; an empty scope still has a
+		// deterministic content/index digest.
+		contentPaths = make([]string, 0, len(compare.ChangedFiles)+len(compare.RenameSourceFiles))
+		contentPaths = append(contentPaths, compare.ChangedFiles...)
+		contentPaths = append(contentPaths, compare.RenameSourceFiles...)
+		compareHeadSHA = compare.HeadSHA
+	}
+	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: firstNonEmpty(worktree.HeadSHA, worktree.BaseBranch, work.BaseBranch), ContentPaths: contentPaths, CompareHeadSHA: compareHeadSHA})
 	if err != nil {
 		return worktreeProgress{}, err
 	}
+	preservedContentFingerprint := inspect.ComparedContentFingerprint
+	preservedIndexFingerprint := inspect.ComparedIndexFingerprint
+	if compare == nil {
+		// The first timeout observation has no predecessor scope; its complete
+		// aggregate becomes the scope for a later additive replacement.
+		preservedContentFingerprint = inspect.ContentFingerprint
+		preservedIndexFingerprint = inspect.IndexFingerprint
+	}
 	return worktreeProgress{
-		HeadSHA:            inspect.HeadSHA,
-		WorktreeID:         worktree.ID,
-		Branch:             inspect.Branch,
-		ChangedFiles:       boundPathList(inspect.ChangedFiles, worktreeProgressPathCap),
-		ChangedFileCount:   len(inspect.ChangedFiles),
-		StagedFiles:        boundPathList(inspect.StagedFiles, worktreeProgressPathCap),
-		StagedFileCount:    len(inspect.StagedFiles),
-		UntrackedFiles:     boundPathList(inspect.UntrackedFiles, worktreeProgressPathCap),
-		UntrackedFileCount: len(inspect.UntrackedFiles),
-		DiffFingerprint:    inspect.DiffFingerprint,
-		TimeoutType:        observation.TimeoutType,
-		LastProgressAt:     observation.LastProgressAt,
-		CapturedAt:         eventlog.FormatJavaScriptISOString(r.now().UTC()),
+		HeadSHA:               inspect.HeadSHA,
+		WorktreeID:            worktree.ID,
+		Branch:                inspect.Branch,
+		ChangedFiles:          boundPathList(inspect.ChangedFiles, worktreeProgressPathCap),
+		ChangedFileCount:      len(inspect.ChangedFiles),
+		StagedFiles:           boundPathList(inspect.StagedFiles, worktreeProgressPathCap),
+		StagedFileCount:       len(inspect.StagedFiles),
+		UntrackedFiles:        boundPathList(inspect.UntrackedFiles, worktreeProgressPathCap),
+		UntrackedFileCount:    len(inspect.UntrackedFiles),
+		UnstagedFileCount:     inspect.UnstagedFileCount,
+		RenameSourceFiles:     boundPathList(inspect.RenameSourceFiles, worktreeProgressPathCap),
+		ChangedFileBytes:      pathByteList(boundPathList(inspect.ChangedFiles, worktreeProgressPathCap)),
+		StagedFileBytes:       pathByteList(boundPathList(inspect.StagedFiles, worktreeProgressPathCap)),
+		UntrackedFileBytes:    pathByteList(boundPathList(inspect.UntrackedFiles, worktreeProgressPathCap)),
+		RenameSourceFileBytes: pathByteList(boundPathList(inspect.RenameSourceFiles, worktreeProgressPathCap)),
+		DiffFingerprint:       inspect.DiffFingerprint, ContentFingerprint: inspect.ContentFingerprint,
+		PreservedContentFingerprint: preservedContentFingerprint, PreservedIndexFingerprint: preservedIndexFingerprint,
+		ContentFingerprintVersion: firstNonEmpty(inspect.ContentFingerprintVersion, worktreeFingerprintVersion),
+		IndexFingerprint:          inspect.IndexFingerprint, HeadDescendsFromCompare: inspect.HeadDescendsFromCompare,
+		WorktreeMatchesHead: inspect.WorktreeMatchesHead,
+		TimeoutType:         observation.TimeoutType,
+		LastProgressAt:      observation.LastProgressAt,
+		CapturedAt:          eventlog.FormatJavaScriptISOString(r.now().UTC()),
 	}, nil
 }
 
@@ -2490,6 +2690,235 @@ func boundPathList(paths []string, capN int) []string {
 		return append([]string(nil), paths...)
 	}
 	return append([]string(nil), paths[:capN]...)
+}
+
+func pathByteList(paths []string) [][]byte {
+	if len(paths) == 0 {
+		return nil
+	}
+	result := make([][]byte, len(paths))
+	for i, path := range paths {
+		result[i] = append([]byte(nil), []byte(path)...)
+	}
+	return result
+}
+
+func (r *Runner) verifyTimeoutProgressAfterTermination(ctx context.Context, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree, before worktreeProgress) error {
+	after, err := r.captureWorktreeProgress(ctx, project, work, worktree, agent.TimeoutObservation{}, &before)
+	if err != nil {
+		return fmt.Errorf("worker timeout progress verification after termination failed: %w", err)
+	}
+	if !preservesWorktreeProgress(before, after) {
+		return fmt.Errorf("worker timeout progress changed after termination; operator action is required before retry")
+	}
+	return nil
+}
+
+func (r *Runner) verifyTimeoutProgressBeforeReplacement(ctx context.Context, project storage.ProjectRecord, runID string, work workerInput, worktree checkpointWorktree, checkpoint *workerCheckpoint) error {
+	if checkpoint.Execution == nil {
+		if checkpoint.Continuation != nil && checkpoint.Continuation.AfterRestart != nil {
+			return r.reobserveContinuationBeforeReplacement(ctx, project, runID, work, worktree, checkpoint)
+		}
+		return nil
+	}
+	if checkpoint.Execution.Status == "timeout_observing" {
+		checkpoint.Execution.ProgressSnapshotError = "worker timeout observation did not reach terminal timeout; operator must confirm containment before replacement"
+		checkpoint.Continuation = &checkpointContinuation{
+			PredecessorRunID: checkpoint.Execution.RunID, PredecessorExecutionID: checkpoint.Execution.ExecutionID,
+			Mode: "timeout_observed", Outcome: "observation failed", BeforeTimeout: checkpoint.Execution.ProgressBeforeTimeout,
+		}
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		if err := r.persistCheckpoint(ctx, runID, *checkpoint); err != nil {
+			return &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		}
+		return &runpipe.LoopError{Message: checkpoint.Execution.ProgressSnapshotError, Kind: runpipe.FailureManualIntervention}
+	}
+	if checkpoint.Execution.Status != "timeout" {
+		if checkpoint.Continuation != nil && checkpoint.Continuation.AfterRestart != nil {
+			return r.reobserveContinuationBeforeReplacement(ctx, project, runID, work, worktree, checkpoint)
+		}
+		return nil
+	}
+	if checkpoint.Execution.ProgressBeforeTimeout == nil {
+		if strings.TrimSpace(checkpoint.Execution.ProgressSnapshotError) == "" {
+			return nil
+		}
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		message := "worker timeout has no preserved progress snapshot; operator must discard or restore the worktree before retry"
+		if err := r.persistCheckpoint(ctx, runID, *checkpoint); err != nil {
+			return &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		}
+		return &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
+	}
+	before := checkpoint.Execution.ProgressBeforeTimeout
+	current, err := r.captureWorktreeProgress(ctx, project, work, worktree, agent.TimeoutObservation{}, before)
+	if err != nil {
+		message := fmt.Sprintf("worker timeout progress verification before retry failed: %v", err)
+		checkpoint.Execution.ProgressSnapshotError = message
+		checkpoint.Continuation = &checkpointContinuation{
+			PredecessorRunID: checkpoint.Execution.RunID, PredecessorExecutionID: checkpoint.Execution.ExecutionID,
+			Mode: "checkpoint_same_worktree", Outcome: "observation failed", BeforeTimeout: before,
+		}
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		if persistErr := r.persistCheckpoint(ctx, runID, *checkpoint); persistErr != nil {
+			return &runpipe.LoopError{Message: persistErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		}
+		return &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
+	}
+	preserved := preservesWorktreeProgress(*before, current)
+	outcome := "changed"
+	if preserved {
+		outcome = "preserved"
+	}
+	checkpoint.Continuation = &checkpointContinuation{
+		PredecessorRunID: checkpoint.Execution.RunID, PredecessorExecutionID: checkpoint.Execution.ExecutionID,
+		Mode: "checkpoint_same_worktree", Outcome: outcome, BeforeTimeout: before, AfterRestart: &current,
+	}
+	if !preserved {
+		checkpoint.Execution.ProgressSnapshotError = "worker timeout progress changed before replacement; operator action is required before retry"
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+	}
+	if err := r.persistCheckpoint(ctx, runID, *checkpoint); err != nil {
+		return &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+	}
+	if preserved {
+		return nil
+	}
+	return &runpipe.LoopError{Message: checkpoint.Execution.ProgressSnapshotError, Kind: runpipe.FailureManualIntervention}
+}
+
+func (r *Runner) reobserveContinuationBeforeReplacement(ctx context.Context, project storage.ProjectRecord, runID string, work workerInput, worktree checkpointWorktree, checkpoint *workerCheckpoint) error {
+	continuation := checkpoint.Continuation
+	if continuation == nil || continuation.AfterRestart == nil {
+		return nil
+	}
+	baseline := continuation.AfterRestart
+	current, err := r.captureWorktreeProgress(ctx, project, work, worktree, agent.TimeoutObservation{}, baseline)
+	if err != nil {
+		message := fmt.Sprintf("worker continuation progress verification before retry failed: %v", err)
+		if checkpoint.Execution == nil {
+			checkpoint.Execution = &checkpointExecution{RunID: runID, Status: "failed"}
+		}
+		checkpoint.Execution.ProgressSnapshotError = message
+		continuation.Outcome = "observation failed"
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		if persistErr := r.persistCheckpoint(ctx, runID, *checkpoint); persistErr != nil {
+			return &runpipe.LoopError{Message: persistErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		}
+		return &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
+	}
+	preserved := preservesWorktreeProgress(*baseline, current)
+	if !preserved && continuation.Outcome == "preserved" {
+		// A replacement may add work only after the previous observation proved
+		// this baseline. Compare scoped digests for the baseline paths instead of
+		// requiring the aggregate fingerprint to remain unchanged. The scoped
+		// proof composes across repeated failed replacement attempts and rejects
+		// same-path destructive rewrites.
+		preserved = preservesAdditiveWorktreeProgress(*baseline, current)
+	}
+	continuation.AfterRestart = &current
+	if !preserved {
+		if checkpoint.Execution == nil {
+			checkpoint.Execution = &checkpointExecution{RunID: runID, Status: "failed"}
+		}
+		checkpoint.Execution.ProgressSnapshotError = "worker continuation progress changed before replacement; operator action is required before retry"
+		continuation.Outcome = "changed"
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+	} else {
+		// A previous drift outcome is historical once a fresh observation proves
+		// the checkout safe again; leave the next retry eligible instead of
+		// returning the same manual-intervention error forever.
+		continuation.Outcome = "preserved"
+		if checkpoint.Execution != nil {
+			checkpoint.Execution.ProgressSnapshotError = ""
+		}
+		checkpoint.ResumePolicy = "retry_from_timeout_context"
+	}
+	if err := r.persistCheckpoint(ctx, runID, *checkpoint); err != nil {
+		return &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+	}
+	if !preserved {
+		return &runpipe.LoopError{Message: checkpoint.Execution.ProgressSnapshotError, Kind: runpipe.FailureManualIntervention}
+	}
+	return nil
+}
+
+// preservesAdditiveWorktreeProgress proves that a failed replacement changed
+// only by adding work to the already-proven checkout. The current observation
+// carries fingerprints scoped to the previous baseline paths; comparing them
+// with the baseline's full fingerprints is content/index authority, while the
+// same-head check prevents a replacement from smuggling an unrelated commit.
+func preservesAdditiveWorktreeProgress(before, after worktreeProgress) bool {
+	if before.HeadSHA == "" || after.HeadSHA == "" || before.HeadSHA != after.HeadSHA || before.Branch != after.Branch {
+		return false
+	}
+	if before.ContentFingerprintVersion != worktreeFingerprintVersion || after.ContentFingerprintVersion != worktreeFingerprintVersion || before.ContentFingerprint == "" || before.IndexFingerprint == "" || after.ContentFingerprint == "" || after.PreservedContentFingerprint == "" || after.PreservedIndexFingerprint == "" {
+		return false
+	}
+	// Path evidence is capped in checkpoints. If the baseline was truncated,
+	// the scoped digest cannot cover every predecessor path, so fail closed.
+	if before.ChangedFileCount != len(before.ChangedFileBytes) || before.StagedFileCount != len(before.StagedFileBytes) || before.UntrackedFileCount != len(before.UntrackedFileBytes) || before.ChangedFileCount != len(before.ChangedFiles) || before.StagedFileCount != len(before.StagedFiles) || before.UntrackedFileCount != len(before.UntrackedFiles) {
+		return false
+	}
+	if before.RenameSourceFiles != nil && len(before.RenameSourceFileBytes) != len(before.RenameSourceFiles) {
+		return false
+	}
+	return after.PreservedContentFingerprint == before.ContentFingerprint && after.PreservedIndexFingerprint == before.IndexFingerprint
+}
+
+func sameWorktreeProgress(before, after worktreeProgress) bool {
+	return before.HeadSHA == after.HeadSHA && before.Branch == after.Branch && before.DiffFingerprint == after.DiffFingerprint && before.ContentFingerprintVersion == after.ContentFingerprintVersion && before.ContentFingerprint != "" && before.ContentFingerprint == after.ContentFingerprint && before.IndexFingerprint == after.IndexFingerprint && equalPathEvidence(before.ChangedFiles, before.ChangedFileBytes, after.ChangedFiles, after.ChangedFileBytes) && equalPathEvidence(before.StagedFiles, before.StagedFileBytes, after.StagedFiles, after.StagedFileBytes) && equalPathEvidence(before.UntrackedFiles, before.UntrackedFileBytes, after.UntrackedFiles, after.UntrackedFileBytes) && equalPathEvidence(before.RenameSourceFiles, before.RenameSourceFileBytes, after.RenameSourceFiles, after.RenameSourceFileBytes)
+}
+
+func equalPathEvidence(left []string, leftBytes [][]byte, right []string, rightBytes [][]byte) bool {
+	if len(leftBytes) != len(left) || len(rightBytes) != len(right) || len(leftBytes) != len(rightBytes) {
+		return false
+	}
+	for i := range leftBytes {
+		if !bytes.Equal(leftBytes[i], rightBytes[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func preservesWorktreeProgress(before, after worktreeProgress) bool {
+	if before.ChangedFileCount == 0 {
+		if before.Branch != after.Branch || before.HeadSHA == "" || after.HeadSHA == "" {
+			return false
+		}
+		if before.HeadSHA == after.HeadSHA {
+			// A clean snapshot still needs a same-head proof. A stale clean
+			// checkout must not be treated as preserved merely because it has no
+			// changed paths to hash.
+			return before.ContentFingerprintVersion == worktreeFingerprintVersion && after.ContentFingerprintVersion == worktreeFingerprintVersion && before.ContentFingerprint != "" && before.ContentFingerprint == after.ContentFingerprint && before.IndexFingerprint != "" && before.IndexFingerprint == after.IndexFingerprint
+		}
+		// A clean timeout snapshot may have been committed before retry. Accept
+		// only a descendant of the recorded head on the same branch.
+		return before.ContentFingerprintVersion == worktreeFingerprintVersion && after.ContentFingerprintVersion == worktreeFingerprintVersion && before.ContentFingerprint != "" && after.ContentFingerprint != "" && before.Branch == after.Branch && after.HeadDescendsFromCompare
+	}
+	// Checkpoints written before the versioned content/index evidence existed
+	// cannot prove that predecessor edits survived. Stop for operator review
+	// rather than authorizing a replacement from status-only equality.
+	if before.ContentFingerprintVersion != worktreeFingerprintVersion || before.ContentFingerprint == "" {
+		return false
+	}
+	if sameWorktreeProgress(before, after) {
+		return true
+	}
+	if before.HeadSHA == "" || after.HeadSHA == "" || before.HeadSHA == after.HeadSHA || before.Branch != after.Branch || after.ChangedFileCount != 0 || !after.HeadDescendsFromCompare || after.ContentFingerprintVersion != worktreeFingerprintVersion {
+		return false
+	}
+	if before.ContentFingerprint == after.ContentFingerprint && (before.StagedFileCount == 0 || before.UnstagedFileCount == 0) {
+		return true
+	}
+	// A staged-index-only snapshot can have old HEAD bytes in the worktree and
+	// newer staged bytes in the index. A descendant commit legitimately turns
+	// that into a clean checkout, so compare the recorded index evidence rather
+	// than rejecting the valid transition as a content mismatch. Mixed
+	// staged/unstaged edits remain fail-closed because WorktreeMatchesHead is
+	// false for them.
+	return before.WorktreeMatchesHead && before.IndexFingerprint != "" && before.IndexFingerprint == after.IndexFingerprint
 }
 
 func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *workerCheckpoint, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree, run storage.RunRecord) (bool, error) {
@@ -3041,11 +3470,12 @@ func (r *Runner) workerHoldSummaryForWork(ctx context.Context, project storage.P
 		return false, "", nil
 	}
 	if work.PRNumber > 0 {
-		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: work.Repo, PRNumber: work.PRNumber, CWD: project.RepoPath})
+		detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: work.Repo, PRNumber: work.PRNumber, CWD: project.RepoPath})
 		if err != nil {
 			return false, "", err
 		}
-		if domain.IsAutoLaneHeld(domain.LoopTypeWorker, detail.Labels) {
+		namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)
+		if domain.IsAutoLaneHeldForNamespace(domain.LoopTypeWorker, detail.Labels, namespace) {
 			return true, fmt.Sprintf("Worker stopped because %s#%d is currently held", work.Repo, work.PRNumber), nil
 		}
 		if len(retargetedToPullRequest) > 0 && retargetedToPullRequest[0] {
@@ -3060,7 +3490,8 @@ func (r *Runner) workerHoldSummaryForWork(ctx context.Context, project storage.P
 		if err != nil {
 			return false, "", err
 		}
-		if domain.IsAutoLaneHeld(domain.LoopTypeWorker, detail.Labels) {
+		namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)
+		if domain.IsAutoLaneHeldForNamespace(domain.LoopTypeWorker, detail.Labels, namespace) {
 			return true, fmt.Sprintf("Worker stopped because %s is currently held", formatIssueReference(issueLookupRepo(work), work.IssueNumber)), nil
 		}
 	}
@@ -3172,7 +3603,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 		if repo == "" || prNumber == 0 {
 			return workerInput{}, &runpipe.LoopError{Message: "pull_request worker loop requires repo and prNumber", Kind: runpipe.FailureNonRetryable}
 		}
-		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
+		detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
 		if err != nil {
 			return workerInput{}, err
 		}
@@ -3246,6 +3677,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	// completed execution so the next queued claim actually starts the agent.
 	if latestRun != nil && latestRun.Status == "success" && r.hitlEnabled && len(loops.ReadHumanInbox(loop.MetadataJSON)) > 0 {
 		resumedCheckpoint.Execution = nil
+		resumedCheckpoint.Continuation = nil
 		resumedCheckpoint.Validation = nil
 	}
 	switch decision.Mode {
@@ -3255,7 +3687,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		resumedCheckpoint = rewindCheckpointForExecuteRetry(checkpoint)
 	}
 	nowISO := r.nowISO()
-	encoded := runpipe.MustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Lifecycle: resumedCheckpoint.Lifecycle, ReproductionBaseline: resumedCheckpoint.ReproductionBaseline, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
+	encoded := runpipe.MustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Continuation: resumedCheckpoint.Continuation, Lifecycle: resumedCheckpoint.Lifecycle, ReproductionBaseline: resumedCheckpoint.ReproductionBaseline, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	// replaysAgentStep must reflect whether an agent process will actually
 	// run under the gate, not just whether the workflow reaches execute. A
@@ -3492,6 +3924,9 @@ func (r *Runner) getLatestCheckpoint(ctx context.Context, run storage.RunRecord,
 	}
 	if fallback.Execution != nil {
 		checkpoint.Execution = fallback.Execution
+	}
+	if fallback.Continuation != nil {
+		checkpoint.Continuation = fallback.Continuation
 	}
 	if fallback.Lifecycle != nil {
 		checkpoint.Lifecycle = fallback.Lifecycle
@@ -4253,7 +4688,7 @@ func shouldReplayExecuteOnResume(status string, failedStep WorkerStep, checkpoin
 		return false
 	}
 	switch failedStep {
-	case stepValidate, stepOpenPR:
+	case stepExecute, stepValidate, stepOpenPR:
 	default:
 		return false
 	}
@@ -4275,7 +4710,16 @@ func executeStepAlreadyCompleted(checkpoint workerCheckpoint) bool {
 }
 
 func rewindCheckpointForExecuteRetry(checkpoint workerCheckpoint) workerCheckpoint {
-	checkpoint.Execution = nil
+	// Keep timeout_observing durable through the execute replay decision. A
+	// daemon can crash after the observation intent is persisted but before the
+	// executor returns; clearing that marker would let the replacement bypass
+	// verifyTimeoutProgressBeforeReplacement's fail-closed containment gate.
+	execution := checkpoint.Execution
+	preserveTimeoutObservation := execution != nil && execution.Status == "timeout_observing"
+	preserveTimeout := execution != nil && execution.Status == "timeout" && execution.ProgressBeforeTimeout != nil
+	if !preserveTimeoutObservation && !preserveTimeout {
+		checkpoint.Execution = nil
+	}
 	checkpoint.Validation = nil
 	checkpoint.PullRequest = nil
 	checkpoint.SkipReason = ""
@@ -4362,7 +4806,7 @@ func (r *Runner) renamePlannerSpecPullRequestAfterTakeover(ctx context.Context, 
 	if r.github == nil || work.ExecutionMode != "push-existing" || work.PRNumber <= 0 {
 		return nil
 	}
-	current, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: work.Repo, PRNumber: work.PRNumber, CWD: cwd})
+	current, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: work.Repo, PRNumber: work.PRNumber, CWD: cwd})
 	if err != nil {
 		return err
 	}
@@ -4406,7 +4850,7 @@ func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, run storage
 	if r.github == nil || prNumber <= 0 || !r.disclosure.Enabled || !r.disclosure.Channels.PullRequest {
 		return nil
 	}
-	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		return err
 	}
@@ -4427,7 +4871,7 @@ func (r *Runner) lifecycleAgentCreatedPullRequest(ctx context.Context, currentLo
 	}
 	expectedBranch = strings.TrimSpace(expectedBranch)
 	expectedBaseBranch = strings.TrimSpace(expectedBaseBranch)
-	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: state.PRNumber, CWD: cwd})
+	detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: repo, PRNumber: state.PRNumber, CWD: cwd})
 	if err != nil {
 		return checkpointPullPR{}, "", false, err
 	}
@@ -4512,7 +4956,7 @@ func (r *Runner) stampPullRequestDisclosure(run storage.RunRecord, body string) 
 // snapshot when present; falls back to runner identity on empty snapshot or
 // parse errors (stamp-only paths must not fail the run).
 func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string) {
-	vendor, modelPtr, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+	vendor, modelPtr, _, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID, r.agentReasoningEffort)
 	if err != nil {
 		// Present but invalid snapshot must not fall back to live runner identity.
 		return "", ""
@@ -5213,7 +5657,7 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky,
 	if previous != nil {
 		previousSnapshot = previous.AgentSnapshotJSON
 	}
-	snapshotJSON, refreshed, legacyResume, err := config.ResolveRunAgentSnapshotJSONForValidationGate(previousSnapshot, sticky, requireToolNetworkDenial, replaysAgentStep, r.agentRuntime, r.agentModel, r.agentProfileID)
+	snapshotJSON, refreshed, legacyResume, err := config.ResolveRunAgentSnapshotJSONForValidationGate(previousSnapshot, sticky, requireToolNetworkDenial, replaysAgentStep, r.agentRuntime, r.agentModel, r.agentProfileID, r.agentReasoningEffort)
 	if err != nil {
 		return nil, err
 	}
@@ -5240,17 +5684,17 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky,
 // identityFromRun returns the vendor/model/profile that must drive this run.
 // When the run has AgentSnapshotJSON, that identity is execution authority.
 // model is a pointer so nil (unset) and non-nil empty (suppress) stay distinct.
-func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, useSnapshot bool, err error) {
-	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, reasoningEffort *config.ReasoningEffort, useSnapshot bool, err error) {
+	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID, r.agentReasoningEffort)
 }
 
-func agentRunSnapshotFields(vendor string, model *string, useSnapshot bool) (bool, string, *string) {
+func agentRunSnapshotFields(vendor string, model *string, reasoningEffort *config.ReasoningEffort, useSnapshot bool) (bool, string, *string, *config.ReasoningEffort) {
 	if !useSnapshot {
-		return false, "", nil
+		return false, "", nil, nil
 	}
 	// Pass through including non-nil empty suppress so SnapshotModel stays
 	// distinct from unset and ParamsForRoleVendor can strip params --model/-m.
-	return true, vendor, model
+	return true, vendor, model, reasoningEffort
 }
 
 func cloneStringPtr(value *string) *string {
@@ -5259,6 +5703,14 @@ func cloneStringPtr(value *string) *string {
 	}
 	trimmed := strings.TrimSpace(*value)
 	return &trimmed
+}
+
+func cloneReasoningEffortPtr(value *config.ReasoningEffort) *config.ReasoningEffort {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func int64Ptr(value int64) *int64 { return &value }

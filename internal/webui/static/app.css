@@ -1,0 +1,602 @@
+/* looper operator UI — warm paper.
+ *
+ * Light is the primary theme: cream page, white cards, warm-gray hairlines.
+ * Dark is the same paper seen at night — warm charcoal, never cold gray.
+ * One accent per triage group; chips are outlined, not filled, so a dense
+ * board still reads as one quiet surface. */
+
+:root {
+  color-scheme: light dark;
+
+  --paper: #fcfbf7;
+  --card: #ffffff;
+  --ink: #1d1f23;
+  --ink-2: #62666f;
+  --ink-3: #9ba0a8;
+  --line: #e7e3d9;
+  --hairline: #ede9df;
+  --hover: #fbf9f3;
+  --shadow: 0 1px 2px rgba(90, 80, 60, 0.05), 0 6px 18px rgba(90, 80, 60, 0.07);
+  --shadow-soft: 0 1px 2px rgba(90, 80, 60, 0.04);
+
+  --actionable: #5e9430;
+  --machine: #574ce3;
+  --stuck: #a87b3e;
+  --danger: #b0432f;
+
+  /* The accents above are graphic marks — tile borders, dots, chip outlines —
+   * where their exact value carries the identity. Chip labels are 11px text,
+   * so green and amber get a darkened twin that clears 4.5:1 on white; violet
+   * and red already do and are reused unchanged. */
+  --actionable-text: #4d7a27;
+  --machine-text: #574ce3;
+  --stuck-text: #8a6430;
+  --danger-text: #a33d2b;
+
+  /* Chip fills stay near-white; the tint lives in the border and the label. */
+  --chip-bg: #ffffff;
+
+  --sans: helvetica, arial, ui-sans-serif, system-ui, "Segoe UI", roboto, sans-serif;
+  --mono: ui-monospace, "SF Mono", sfmono-regular, menlo, consolas, "Liberation Mono", monospace;
+
+  --radius: 14px;
+  --radius-sm: 9px;
+  --page: 1100px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #131418;
+    --card: #17181c;
+    --ink: #ece8de;
+    --ink-2: #a5a49d;
+    --ink-3: #82817a;
+    --line: #2b2c31;
+    --hairline: #24252a;
+    --hover: #1c1d22;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 18px rgba(0, 0, 0, 0.28);
+    --shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.35);
+
+    --actionable: #86c254;
+    --machine: #9d94ff;
+    --stuck: #d5a45f;
+    --danger: #e2775f;
+
+    /* On a dark surface the accents already clear AA as text. */
+    --actionable-text: #86c254;
+    --machine-text: #9d94ff;
+    --stuck-text: #d5a45f;
+    --danger-text: #e2775f;
+
+    --chip-bg: #1b1c21;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums lining-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* ---- top bar ------------------------------------------------------------ */
+
+.topbar {
+  border-bottom: 1px solid var(--hairline);
+  background: var(--paper);
+}
+
+.topbar-inner {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  max-width: var(--page);
+  margin: 0 auto;
+  padding: 13px 24px;
+}
+
+.wordmark {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.nav {
+  display: flex;
+  gap: 4px;
+  flex: 1;
+}
+
+.nav-link {
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  color: var(--ink-2);
+  border: 1px solid transparent;
+  transition: color 120ms ease, background-color 120ms ease;
+}
+
+.nav-link:hover {
+  color: var(--ink);
+  background: var(--hover);
+}
+
+.nav-link.is-active {
+  color: var(--ink);
+  background: var(--card);
+  border-color: var(--line);
+  box-shadow: var(--shadow-soft);
+}
+
+.nav-link-secondary {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-2);
+}
+
+/* ---- page --------------------------------------------------------------- */
+
+.page {
+  max-width: var(--page);
+  margin: 0 auto;
+  padding: 34px 24px 88px;
+}
+
+.page-head {
+  margin-bottom: 22px;
+}
+
+.page-title {
+  margin: 0;
+  font-size: 27px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.page-sub {
+  margin: 5px 0 0;
+  font-size: 13.5px;
+  color: var(--ink-2);
+  max-width: 62ch;
+}
+
+/* The refreshing region dims a touch instead of showing a spinner. */
+.board {
+  transition: opacity 220ms ease;
+}
+
+.board.htmx-request {
+  opacity: 0.62;
+}
+
+/* ---- status band -------------------------------------------------------- */
+
+.band {
+  margin-bottom: 30px;
+}
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 14px 16px 15px;
+  background: var(--card);
+  border: 1.5px solid var(--line);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.tile-actionable { border-left-color: var(--actionable); }
+.tile-machine    { border-left-color: var(--machine); }
+.tile-stuck      { border-left-color: var(--stuck); }
+
+.tile-count {
+  font-family: var(--mono);
+  font-size: 26px;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+}
+
+.tile-label {
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+
+.band-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 18px;
+  margin-top: 12px;
+  padding: 0 3px;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+
+.updated {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  color: var(--ink-2);
+}
+
+.refresh-control {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  color: var(--ink-2);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.refresh-control:hover {
+  color: var(--ink);
+}
+
+.notices {
+  margin: 12px 0 0;
+  padding: 9px 13px;
+  list-style: none;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--stuck);
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+
+.notices li + li {
+  margin-top: 3px;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--ink-3);
+}
+
+.dot-actionable { background: var(--actionable); }
+.dot-machine    { background: var(--machine); }
+.dot-stuck      { background: var(--stuck); }
+
+/* ---- groups ------------------------------------------------------------- */
+
+.group + .group {
+  margin-top: 26px;
+}
+
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 9px;
+  padding: 0 3px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+
+.group-count {
+  color: var(--ink-3);
+}
+
+.empty {
+  margin: 0;
+  padding: 16px 18px;
+  background: var(--card);
+  border: 1.5px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-soft);
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+/* ---- rows --------------------------------------------------------------- */
+
+/* One card per section, hairline-separated inside: three stacked cards read
+ * calmer than thirty floating ones. */
+.rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  background: var(--card);
+  border: 1.5px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+/* Each row is its own grid, so the chip column is pinned to a width rather
+ * than sized to content: otherwise the chips stagger from row to row and the
+ * board loses the column an operator scans down. */
+.row {
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr) 158px auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 44px;
+  padding: 0 16px;
+  font-size: 13.5px;
+}
+
+.row + .row {
+  border-top: 1px solid var(--hairline);
+}
+
+.row:hover {
+  background: var(--hover);
+}
+
+.row-main {
+  min-width: 0;
+}
+
+.row-link {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  min-width: 0;
+}
+
+a.row-link:hover .row-title {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: var(--ink-3);
+}
+
+.row-ref {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.row-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A summary row stands in for a run of rows the board folded away. It is the
+ * same row, quieted: the accent dot drops to the muted ink, and the chip and
+ * meta columns are gone because they described one entry rather than the run. */
+.row-summary {
+  grid-template-columns: 7px minmax(0, 1fr);
+}
+
+.row-summary:hover {
+  background: transparent;
+}
+
+.row-summary-text {
+  display: block;
+  overflow: hidden;
+  font-size: 13px;
+  font-style: italic;
+  color: var(--ink-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- chips -------------------------------------------------------------- */
+
+.chip {
+  justify-self: start;
+  max-width: 100%;
+  padding: 2px 9px 3px;
+  border: 1px solid;
+  border-radius: 999px;
+  background: var(--chip-bg);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.35;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chip-actionable { color: var(--actionable-text); border-color: color-mix(in srgb, var(--actionable) 42%, var(--line)); }
+.chip-machine    { color: var(--machine-text);    border-color: color-mix(in srgb, var(--machine) 42%, var(--line)); }
+.chip-stuck      { color: var(--stuck-text);      border-color: color-mix(in srgb, var(--stuck) 42%, var(--line)); }
+.chip-danger     { color: var(--danger-text);     border-color: color-mix(in srgb, var(--danger) 42%, var(--line)); }
+
+/* ---- meta --------------------------------------------------------------- */
+
+.row-meta {
+  display: grid;
+  grid-template-columns: 72px 60px 34px;
+  gap: 10px;
+  align-items: baseline;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  text-align: right;
+}
+
+.meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The values carry information and take the readable ink; only the unit word
+ * "threads" stays in the muted tone it inherits from .row-meta. */
+.meta-num,
+.meta-diff,
+.meta-age {
+  color: var(--ink-2);
+}
+
+/* ---- swap motion -------------------------------------------------------- */
+
+/* A row whose state moved inside the refresh window warms up and settles.
+ * Paper, not a strobe: no border change, no movement. */
+@keyframes row-settle {
+  from { background-color: color-mix(in srgb, var(--stuck) 11%, var(--card)); }
+  to   { background-color: transparent; }
+}
+
+.row.is-changed {
+  animation: row-settle 1500ms ease-out both;
+}
+
+.group-actionable .row.is-changed {
+  animation-name: row-settle-actionable;
+}
+
+.group-machine .row.is-changed {
+  animation-name: row-settle-machine;
+}
+
+@keyframes row-settle-actionable {
+  from { background-color: color-mix(in srgb, var(--actionable) 11%, var(--card)); }
+  to   { background-color: transparent; }
+}
+
+@keyframes row-settle-machine {
+  from { background-color: color-mix(in srgb, var(--machine) 11%, var(--card)); }
+  to   { background-color: transparent; }
+}
+
+/* htmx's own indicator styles are disabled via the htmx-config meta so the
+ * page needs no inline <style>; this is the replacement. */
+.htmx-indicator {
+  opacity: 0;
+}
+
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator {
+  opacity: 1;
+}
+
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 180ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .row.is-changed {
+    animation: none;
+  }
+
+  .board {
+    transition: none;
+  }
+
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none;
+  }
+}
+
+/* ---- narrow ------------------------------------------------------------- */
+
+@media (max-width: 760px) {
+  .page {
+    padding: 26px 16px 64px;
+  }
+
+  .topbar-inner {
+    padding: 12px 16px;
+    gap: 14px;
+  }
+
+  .tiles {
+    grid-template-columns: 1fr;
+    gap: 9px;
+  }
+
+  .tile {
+    flex-direction: row;
+    align-items: baseline;
+    gap: 10px;
+    padding: 11px 14px;
+  }
+
+  .tile-count {
+    font-size: 20px;
+  }
+
+  .row {
+    grid-template-columns: 7px minmax(0, 1fr) auto;
+    grid-template-areas:
+      "dot main main"
+      ".   chip meta";
+    align-items: center;
+    gap: 4px 12px;
+    padding: 9px 14px;
+  }
+
+  .row-summary {
+    grid-template-columns: 7px minmax(0, 1fr);
+    grid-template-areas: "dot main";
+  }
+
+  .row .dot   { grid-area: dot; }
+  .row-main   { grid-area: main; }
+  .row .chip  { grid-area: chip; }
+  .row-meta   { grid-area: meta; justify-self: end; }
+
+  .row-meta {
+    grid-template-columns: auto auto auto;
+    gap: 12px;
+  }
+
+  .meta-empty {
+    display: none;
+  }
+}

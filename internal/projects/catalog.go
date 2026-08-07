@@ -142,6 +142,7 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 			ID:              record.ID,
 			Name:            record.Name,
 			RepoPath:        record.RepoPath,
+			LabelNamespace:  metadataString(metadata, "labelNamespace"),
 			BaseBranch:      cloneStringPointer(record.BaseBranch),
 			Provider:        provider,
 			Repo:            metadataString(metadata, "repo"),
@@ -170,8 +171,11 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 			project.WorktreeRoot = &worktreeRoot
 		}
 		project.Path = metadataString(metadata, "path")
-		if err := decodeMetadataValue(metadata, "network", &project.Network); err != nil {
-			return nil, fmt.Errorf("decode project %q network policy: %w", project.ID, err)
+		// Legacy routed metadata is intentionally ignored. GitHub work intent
+		// remains usable locally, while a durable record cannot silently revive
+		// Routed behavior after the unsupported config surface was removed.
+		if err := decodeMetadataValue(metadata, "classificationLabels", &project.ClassificationLabels); err != nil {
+			return nil, fmt.Errorf("decode project %q classification-label policy: %w", project.ID, err)
 		}
 		if err := decodeMetadataValue(metadata, "webhook", &project.Webhook); err != nil {
 			return nil, fmt.Errorf("decode project %q webhook policy: %w", project.ID, err)

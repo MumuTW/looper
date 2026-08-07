@@ -62,12 +62,22 @@ func TestHermesSuggestionNeverOverridesExplicitAgentAuthority(t *testing.T) {
 	}{
 		{name: "global vendor", configure: func(cfg *config.Config) { cfg.Agent.Vendor = &vendor }},
 		{name: "global model", configure: func(cfg *config.Config) { cfg.Agent.Model = &model }},
+		{name: "global reasoning effort", configure: func(cfg *config.Config) {
+			effort := config.ReasoningEffortHigh
+			cfg.Agent.ReasoningEffort = &effort
+		}},
 		{name: "global params", configure: func(cfg *config.Config) { cfg.Agent.Params = map[string]any{"args": []any{"--provider", "openrouter"}} }},
 		{name: "global env", configure: func(cfg *config.Config) { cfg.Agent.Env = map[string]string{"OPENAI_API_KEY": "secret"} }},
 		{name: "profile", configure: func(cfg *config.Config) {
 			cfg.Agent.Profiles = map[string]config.AgentBindingConfig{"fast": {Vendor: &profileVendor}}
 		}},
 		{name: "role", configure: func(cfg *config.Config) { cfg.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &roleVendor} }},
+		{name: "canonical role reasoning effort", configure: func(cfg *config.Config) {
+			effort := config.ReasoningEffortHigh
+			cfg.Roles.Coding = map[string]config.CodingRoleConfig{
+				config.CodingRoleWorker: {Agent: &config.RoleAgentConfig{ReasoningEffort: &effort}},
+			}
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := config.CloneConfig(base)

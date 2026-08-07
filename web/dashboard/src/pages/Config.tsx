@@ -19,6 +19,7 @@ import {
   type PatchConfigBody,
 } from "@/lib/api";
 import {
+  AGENT_REASONING_EFFORT_OPTIONS,
   AGENT_VENDOR_OPTIONS,
   agentVendorOptionLabel,
   agentProfilePath,
@@ -93,7 +94,7 @@ function resolveFieldMeta(
 /**
  * Profile add/remove is gated on entry/leaf editability, not the map container.
  * Real daemon metadata exposes agent.profiles as non-editable/restart-bound
- * while agent.profiles.<id>.vendor|model remain hot-editable.
+ * while agent.profiles.<id> identity leaves remain hot-editable.
  */
 function agentProfilesEditableByAuthority(data: ConfigData): boolean {
   const fields = data.metadata.fields ?? {};
@@ -354,6 +355,7 @@ function AgentProfiles({
   const [newId, setNewId] = useState("");
   const [newVendor, setNewVendor] = useState("");
   const [newModel, setNewModel] = useState("");
+  const [newReasoningEffort, setNewReasoningEffort] = useState("");
   const [localError, setLocalError] = useState<string | null>(null);
 
   // Section badge may still show map-container source; edit authority uses leaves.
@@ -365,7 +367,7 @@ function AgentProfiles({
   const publishedIds = Object.keys(data.agent?.profiles ?? {}).sort();
   const stagedIds = new Set<string>();
   for (const path of Object.keys(drafts)) {
-    const match = /^agent\.profiles\.([A-Za-z0-9_-]+)\.(vendor|model)$/.exec(
+    const match = /^agent\.profiles\.([A-Za-z0-9_-]+)\.(vendor|model|reasoningEffort)$/.exec(
       path,
     );
     if (match) stagedIds.add(match[1]);
@@ -390,8 +392,9 @@ function AgentProfiles({
     }
     const vendor = newVendor.trim();
     const model = newModel.trim();
-    if (!vendor && !model) {
-      setLocalError("Set at least vendor or model for the profile.");
+    const reasoningEffort = newReasoningEffort.trim();
+    if (!vendor && !model && !reasoningEffort) {
+      setLocalError("Set at least vendor, model, or reasoning effort for the profile.");
       return;
     }
     // Clear whole-profile unset if re-adding after remove. Then stage only the
@@ -403,8 +406,10 @@ function AgentProfiles({
     }
     const vendorPath = agentProfilePath(id, "vendor");
     const modelPath = agentProfilePath(id, "model");
+    const effortPath = agentProfilePath(id, "reasoningEffort");
     if (vendor) onDraft(vendorPath, vendor);
     if (model) onDraft(modelPath, model);
+    if (reasoningEffort) onDraft(effortPath, reasoningEffort);
     if (reAddingAfterRemove) {
       const published = data.agent?.profiles?.[id];
       if (!vendor && published?.vendor != null && String(published.vendor) !== "") {
@@ -415,10 +420,14 @@ function AgentProfiles({
       if (!model && published?.model != null) {
         onToggleUnset(modelPath);
       }
+      if (!reasoningEffort && published?.reasoningEffort != null) {
+        onToggleUnset(effortPath);
+      }
     }
     setNewId("");
     setNewVendor("");
     setNewModel("");
+    setNewReasoningEffort("");
     setLocalError(null);
   };
 
@@ -431,7 +440,7 @@ function AgentProfiles({
         <div>
           <h3 className="m-0 text-[12px] font-medium">Agent profiles</h3>
           <p className="m-0 text-[10px] text-[var(--text-muted)]">
-            Named vendor/model presets referenced by coding-role agent bindings.
+            Named vendor/model/reasoning-effort presets referenced by coding-role agent bindings.
             Params are not editable here.
           </p>
         </div>
@@ -448,15 +457,19 @@ function AgentProfiles({
           const wholePath = `agent.profiles.${id}`;
           const vendorPath = agentProfilePath(id, "vendor");
           const modelPath = agentProfilePath(id, "model");
+          const effortPath = agentProfilePath(id, "reasoningEffort");
           const pendingRemoval = unsetPaths.has(wholePath);
           const exists = publishedIds.includes(id);
           const vendorMeta = resolveFieldMeta(data, vendorPath);
           const modelMeta = resolveFieldMeta(data, modelPath);
+          const effortMeta = resolveFieldMeta(data, effortPath);
           const vendorEditable = metaIsEditable(vendorMeta) && canEdit;
           const modelEditable = metaIsEditable(modelMeta) && canEdit;
+          const effortEditable = metaIsEditable(effortMeta) && canEdit;
           const published = data.agent?.profiles?.[id];
           const vendorUnset = unsetPaths.has(vendorPath);
           const modelUnset = unsetPaths.has(modelPath);
+          const effortUnset = unsetPaths.has(effortPath);
           const vendorValue =
             vendorUnset || pendingRemoval
               ? ""
@@ -473,6 +486,14 @@ function AgentProfiles({
                 : published?.model == null
                   ? ""
                   : String(published.model);
+          const effortValue =
+            effortUnset || pendingRemoval
+              ? ""
+              : Object.hasOwn(drafts, effortPath)
+                ? String(drafts[effortPath] ?? "")
+                : published?.reasoningEffort == null
+                  ? ""
+                  : String(published.reasoningEffort);
           const canUnsetVendor =
             vendorEditable &&
             !pendingRemoval &&
@@ -485,10 +506,19 @@ function AgentProfiles({
             (sourceIsConfigFile(modelMeta?.source) ||
               modelUnset ||
               published?.model != null);
+          const canUnsetEffort =
+            effortEditable &&
+            !pendingRemoval &&
+            (sourceIsConfigFile(effortMeta?.source) ||
+              effortUnset ||
+              Object.hasOwn(drafts, effortPath) ||
+              published?.reasoningEffort != null);
 
           // Last remaining identity leaf (or both) must remove the profile —
           // leaf-only unsets leave agent.profiles.<id>={} which the daemon rejects.
-          const toggleProfileLeafUnset = (field: "vendor" | "model") => {
+          const toggleProfileLeafUnset = (
+            field: "vendor" | "model" | "reasoningEffort",
+          ) => {
             const path = agentProfilePath(id, field);
             if (unsetPaths.has(path)) {
               onToggleUnset(path);
@@ -662,10 +692,72 @@ function AgentProfiles({
                     </p>
                   ) : null}
                 </div>
+                <div className="min-w-0">
+                  <div className="flex items-start gap-1.5">
+                    <label className="min-w-0 flex-1 text-[11px]">
+                      <span className="text-[var(--text-muted)]">Reasoning effort</span>
+                      <select
+                        aria-label={effortPath}
+                        className={`${controlClass} mt-0.5 ${effortUnset ? "opacity-50" : ""}`}
+                        value={effortValue}
+                        disabled={!effortEditable || pendingRemoval || effortUnset}
+                        onChange={(event) =>
+                          onDraft(effortPath, event.currentTarget.value)
+                        }
+                      >
+                        {effortValue === "" ? (
+                          <option value="" disabled>
+                            Inherit
+                          </option>
+                        ) : null}
+                        {AGENT_REASONING_EFFORT_OPTIONS.map((option) => (
+                          <option key={option} value={option}>
+                            {option}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    {canUnsetEffort ? (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="mt-4 shrink-0"
+                        disabled={disabled}
+                        aria-label={
+                          effortUnset
+                            ? `Undo unset ${effortPath}`
+                            : `Unset ${effortPath}`
+                        }
+                        title={
+                          effortUnset
+                            ? "Keep the current file value"
+                            : exists &&
+                                profileLeafUnsetWouldEmpty(
+                                  data,
+                                  drafts,
+                                  unsetPaths,
+                                  id,
+                                  "reasoningEffort",
+                                )
+                              ? "Remove profile (last identity leaf)"
+                              : "Remove this value from the config file (inherit)"
+                        }
+                        onClick={() => toggleProfileLeafUnset("reasoningEffort")}
+                      >
+                        {effortUnset ? "Undo" : "Unset"}
+                      </Button>
+                    ) : null}
+                  </div>
+                  {effortUnset ? (
+                    <p className="m-0 mt-1 text-[10px] text-[var(--warn)]">
+                      Pending: remove profile reasoning effort (inherit).
+                    </p>
+                  ) : null}
+                </div>
               </div>
-              {(errors[vendorPath] || errors[modelPath] || errors[wholePath]) && (
+              {(errors[vendorPath] || errors[modelPath] || errors[effortPath] || errors[wholePath]) && (
                 <p className="m-0 mt-1 text-[11px] text-[var(--danger)]" role="alert">
-                  {errors[wholePath] || errors[vendorPath] || errors[modelPath]}
+                  {errors[wholePath] || errors[vendorPath] || errors[modelPath] || errors[effortPath]}
                 </p>
               )}
             </div>
@@ -673,7 +765,7 @@ function AgentProfiles({
         })}
       </div>
 
-      <div className="mt-2 grid gap-1.5 sm:grid-cols-[minmax(120px,0.6fr)_minmax(140px,0.7fr)_minmax(140px,1fr)_auto]">
+      <div className="mt-2 grid gap-1.5 sm:grid-cols-2 lg:grid-cols-5">
         <input
           aria-label="New profile id"
           className={`${controlClass} mono`}
@@ -705,6 +797,20 @@ function AgentProfiles({
           placeholder="Model (optional)"
           onChange={(event) => setNewModel(event.currentTarget.value)}
         />
+        <select
+          aria-label="New profile reasoning effort"
+          className={controlClass}
+          value={newReasoningEffort}
+          disabled={!canEdit}
+          onChange={(event) => setNewReasoningEffort(event.currentTarget.value)}
+        >
+          <option value="">Reasoning effort (optional)</option>
+          {AGENT_REASONING_EFFORT_OPTIONS.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
+        </select>
         <Button variant="ghost" size="sm" disabled={!canEdit} onClick={stageNew}>
           Add profile
         </Button>
@@ -1323,13 +1429,18 @@ export function ConfigPage() {
       });
       setUnsetPaths((current) => {
         const next = new Set(current);
-        if (next.has(path)) next.delete(path);
+        // A newly staged leaf with no published value is undone by clearing
+        // the draft; sending an unset for an absent field would turn a local
+        // discard into a durable no-op patch (and can confuse OCC/rebase).
+        const published = data ? getConfigValue(data, path) : undefined;
+        const hasPublishedValue = published !== undefined && published !== null;
+        if (next.has(path) || !hasPublishedValue) next.delete(path);
         else next.add(path);
         return next;
       });
       clearPathError(path);
     },
-    [clearPathError, retireLoad],
+    [clearPathError, data, retireLoad],
   );
 
   const onSecretSet = useCallback(
@@ -1386,22 +1497,26 @@ export function ConfigPage() {
       const wholePath = `agent.profiles.${id}`;
       const vendorPath = agentProfilePath(id, "vendor");
       const modelPath = agentProfilePath(id, "model");
+      const effortPath = agentProfilePath(id, "reasoningEffort");
       setDrafts((current) => {
         if (
           !Object.hasOwn(current, vendorPath) &&
-          !Object.hasOwn(current, modelPath)
+          !Object.hasOwn(current, modelPath) &&
+          !Object.hasOwn(current, effortPath)
         ) {
           return current;
         }
         const next = { ...current };
         delete next[vendorPath];
         delete next[modelPath];
+        delete next[effortPath];
         return next;
       });
       setUnsetPaths((current) => {
         const next = new Set(current);
         next.delete(vendorPath);
         next.delete(modelPath);
+        next.delete(effortPath);
         if (existed) next.add(wholePath);
         else next.delete(wholePath);
         return next;
@@ -1756,7 +1871,7 @@ export function ConfigPage() {
           <div>
             <h3 className="m-0 text-[12px] font-medium">Role agent bindings</h3>
             <p className="m-0 text-[10px] text-[var(--text-muted)]">
-              Optional profile / vendor / model override per coding role. Leave
+              Optional profile / vendor / model / reasoning-effort override per coding role. Leave
               blank to inherit the global agent.
             </p>
           </div>

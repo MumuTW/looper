@@ -46,6 +46,128 @@ func TestGatekeeperTrustAcceptsAuto(t *testing.T) {
 	}
 }
 
+func TestGatekeeperReviewThresholdAcceptsDefaultAndRejectsNegative(t *testing.T) {
+	t.Parallel()
+	if issues := gatekeeperIssues(Config{Roles: RoleConfigs{Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto}}}); len(issues) != 0 {
+		t.Fatalf("default threshold issues = %+v", issues)
+	}
+	issues := gatekeeperIssues(Config{Roles: RoleConfigs{Gatekeeper: GatekeeperRoleConfig{RequiredReviewChangedLines: -1}}})
+	if len(issues) != 1 || issues[0].Path != "roles.gatekeeper.requiredReviewChangedLines" {
+		t.Fatalf("issues = %+v, want negative threshold rejected", issues)
+	}
+}
+
+func TestGatekeeperReviewThresholdDefaultAndExplicitZeroScopes(t *testing.T) {
+	t.Parallel()
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	if got := cfg.Roles.Gatekeeper.RequiredReviewChangedLines; got != 200 {
+		t.Fatalf("global threshold = %d, want normalized default 200", got)
+	}
+	zero := 0
+	mergeConfig(&cfg, PartialConfig{Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{RequiredReviewChangedLines: &zero}}})
+	if got := cfg.Roles.Gatekeeper.RequiredReviewChangedLines; got != 0 {
+		t.Fatalf("explicit global zero = %d, want threshold disabled", got)
+	}
+	cfg.Roles.Gatekeeper.RequiredReviewChangedLines = 200
+	cfg.Projects = []ProjectRefConfig{{ID: "demo", Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{RequiredReviewChangedLines: &zero}}}}
+	if got := ProjectRoleConfigs(cfg, "demo").Gatekeeper.RequiredReviewChangedLines; got != 0 {
+		t.Fatalf("explicit project zero = %d, want project threshold disabled", got)
+	}
+}
+
+func TestGatekeeperAutoRejectsMarkerlessCommentCleanPolicy(t *testing.T) {
+	t.Parallel()
+	clean := ReviewerReviewEventComment
+	cfg := Config{Roles: RoleConfigs{
+		Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto, RequiredReviewChangedLines: 200},
+		Reviewer:   ReviewerRoleConfig{Behavior: ReviewerConfig{ReviewEvents: ReviewerReviewEventsConfig{Clean: clean}}},
+	}}
+	var issues []ValidationIssue
+	validateGatekeeperReviewEventCompatibility(cfg, &issues)
+	if len(issues) != 1 || issues[0].Path != "roles.reviewer.behavior.reviewEvents.clean" {
+		t.Fatalf("issues = %+v, want one global clean-event conflict", issues)
+	}
+}
+
+func TestGatekeeperProjectAutoRejectsInheritedMarkerlessCommentCleanPolicy(t *testing.T) {
+	t.Parallel()
+	clean := ReviewerReviewEventComment
+	auto := GatekeeperTrustAuto
+	cfg := Config{
+		Roles:    RoleConfigs{Gatekeeper: GatekeeperRoleConfig{RequiredReviewChangedLines: 200}, Reviewer: ReviewerRoleConfig{Behavior: ReviewerConfig{ReviewEvents: ReviewerReviewEventsConfig{Clean: clean}}}},
+		Projects: []ProjectRefConfig{{ID: "demo", Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto}}}},
+	}
+	var issues []ValidationIssue
+	validateGatekeeperReviewEventCompatibility(cfg, &issues)
+	if len(issues) != 1 || issues[0].Path != "projects[0].roles.gatekeeper.trust" {
+		t.Fatalf("issues = %+v, want one project trust conflict", issues)
+	}
+}
+
+func TestGatekeeperAutoAllowsMarkerlessCommentWhenReviewThresholdDisabled(t *testing.T) {
+	t.Parallel()
+	clean := ReviewerReviewEventComment
+	cfg := Config{Roles: RoleConfigs{
+		Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto, RequiredReviewChangedLines: 0},
+		Reviewer:   ReviewerRoleConfig{Behavior: ReviewerConfig{ReviewEvents: ReviewerReviewEventsConfig{Clean: clean}}},
+	}}
+	var issues []ValidationIssue
+	validateGatekeeperReviewEventCompatibility(cfg, &issues)
+	if len(issues) != 0 {
+		t.Fatalf("issues = %+v, want markerless COMMENT allowed when threshold is disabled", issues)
+	}
+}
+
+func TestGatekeeperProjectThresholdOverrideControlsCommentCompatibility(t *testing.T) {
+	t.Parallel()
+	clean := ReviewerReviewEventComment
+	auto := GatekeeperTrustAuto
+	zero := 0
+	positive := 200
+	base := Config{
+		Roles:    RoleConfigs{Gatekeeper: GatekeeperRoleConfig{RequiredReviewChangedLines: 0}, Reviewer: ReviewerRoleConfig{Behavior: ReviewerConfig{ReviewEvents: ReviewerReviewEventsConfig{Clean: clean}}}},
+		Projects: []ProjectRefConfig{{ID: "disabled", Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto, RequiredReviewChangedLines: &zero}}}, {ID: "enabled", Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto, RequiredReviewChangedLines: &positive}}}},
+	}
+	var issues []ValidationIssue
+	validateGatekeeperReviewEventCompatibility(base, &issues)
+	if len(issues) != 1 || issues[0].Path != "projects[1].roles.gatekeeper.trust" {
+		t.Fatalf("issues = %+v, want only positive project threshold conflict", issues)
+	}
+}
+
+func TestGatekeeperProjectThresholdOnlyOverrideControlsCommentCompatibility(t *testing.T) {
+	t.Parallel()
+	clean := ReviewerReviewEventComment
+	auto := GatekeeperTrustAuto
+	positive := 200
+	base := Config{
+		Roles:    RoleConfigs{Gatekeeper: GatekeeperRoleConfig{Trust: auto, RequiredReviewChangedLines: 0}, Reviewer: ReviewerRoleConfig{Behavior: ReviewerConfig{ReviewEvents: ReviewerReviewEventsConfig{Clean: clean}}}},
+		Projects: []ProjectRefConfig{{ID: "enabled", Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{RequiredReviewChangedLines: &positive}}}},
+	}
+	var issues []ValidationIssue
+	validateGatekeeperReviewEventCompatibility(base, &issues)
+	if len(issues) != 1 || issues[0].Path != "projects[0].roles.gatekeeper.requiredReviewChangedLines" {
+		t.Fatalf("issues = %+v, want threshold-only project override conflict", issues)
+	}
+}
+
+func TestGatekeeperRejectsNegativeProjectReviewThreshold(t *testing.T) {
+	t.Parallel()
+	negative := -1
+	cfg := Config{Projects: []ProjectRefConfig{{ID: "demo", Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{RequiredReviewChangedLines: &negative}}}}}
+	var issues []ValidationIssue
+	validateCoreConfig(cfg, &issues)
+	for _, issue := range issues {
+		if issue.Path == "projects[0].roles.gatekeeper.requiredReviewChangedLines" {
+			return
+		}
+	}
+	t.Fatalf("issues = %+v, want negative project threshold rejected", issues)
+}
+
 func TestGatekeeperTrustRejectsUnknownLevel(t *testing.T) {
 	t.Parallel()
 
@@ -85,12 +207,16 @@ func TestMergePartialGatekeeperTrust(t *testing.T) {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
 	advise := GatekeeperTrustAdvise
+	threshold := 350
 	mergeConfig(&cfg, PartialConfig{Roles: &PartialRoleConfigs{
-		Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &advise},
+		Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &advise, RequiredReviewChangedLines: &threshold},
 	}})
 
 	if cfg.Roles.Gatekeeper.Trust != GatekeeperTrustAdvise {
 		t.Fatalf("merged trust = %q, want advise", cfg.Roles.Gatekeeper.Trust)
+	}
+	if cfg.Roles.Gatekeeper.RequiredReviewChangedLines != threshold {
+		t.Fatalf("merged threshold = %d, want %d", cfg.Roles.Gatekeeper.RequiredReviewChangedLines, threshold)
 	}
 }
 
@@ -100,7 +226,8 @@ func TestMergePartialGatekeeperTrust(t *testing.T) {
 func TestClonePartialRoleConfigsPreservesGatekeeperTrust(t *testing.T) {
 	t.Parallel()
 	advise := GatekeeperTrustAdvise
-	original := &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &advise}}
+	threshold := 350
+	original := &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &advise, RequiredReviewChangedLines: &threshold}}
 
 	cloned := clonePartialRoleConfigs(original)
 
@@ -110,12 +237,19 @@ func TestClonePartialRoleConfigsPreservesGatekeeperTrust(t *testing.T) {
 	if *cloned.Gatekeeper.Trust != GatekeeperTrustAdvise {
 		t.Fatalf("cloned trust = %q, want advise", *cloned.Gatekeeper.Trust)
 	}
+	if cloned.Gatekeeper.RequiredReviewChangedLines == nil || *cloned.Gatekeeper.RequiredReviewChangedLines != threshold {
+		t.Fatalf("cloned threshold = %#v, want %d", cloned.Gatekeeper.RequiredReviewChangedLines, threshold)
+	}
 	// A shallow copy of the pointer would let a later edit of one layer rewrite
 	// another.
 	observe := GatekeeperTrustObserve
 	*original.Gatekeeper.Trust = observe
 	if *cloned.Gatekeeper.Trust != GatekeeperTrustAdvise {
 		t.Fatal("clone aliases the original trust pointer")
+	}
+	threshold = 500
+	if *cloned.Gatekeeper.RequiredReviewChangedLines != 350 {
+		t.Fatal("clone aliases the original threshold pointer")
 	}
 }
 

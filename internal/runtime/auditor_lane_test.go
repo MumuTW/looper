@@ -41,7 +41,9 @@ func (f fakeAuditorGateway) ListCheckRunAnnotations(_ context.Context, input git
 	}
 	return f.annotations[input.CheckRunID], nil
 }
-
+func (fakeAuditorGateway) ListPullRequestFiles(context.Context, githubinfra.ViewPullRequestInput) ([]string, error) {
+	return nil, errors.New("files unavailable in fake")
+}
 func TestObservePostMergeFailureRecordsOneOptInDefaultBranchObservation(t *testing.T) {
 	ctx := context.Background()
 	workdir := t.TempDir()
@@ -185,6 +187,54 @@ func TestFailedAuditorCheckPathsRejectsTruncatedCheckRunEvidence(t *testing.T) {
 	})
 	if !equalStringSlices(paths, []string{"failure.go"}) || complete {
 		t.Fatalf("failedAuditorCheckPathEvidence() = (%#v, %v), want paths with incomplete evidence", paths, complete)
+	}
+}
+
+func TestCleanAuditorCheckEvidenceRequiresCompleteTerminalSuccess(t *testing.T) {
+	tests := []struct {
+		name   string
+		checks githubinfra.PullRequestCheckRuns
+		want   bool
+	}{
+		{name: "empty", checks: githubinfra.PullRequestCheckRuns{}, want: false},
+		{name: "pending", checks: githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{Status: "in_progress"}}}, want: false},
+		{name: "successful check", checks: githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{Status: "completed", Conclusion: "success"}}}, want: true},
+		{name: "truncated", checks: githubinfra.PullRequestCheckRuns{TotalCount: 2, CheckRuns: []githubinfra.PullRequestCheckRun{{Status: "completed", Conclusion: "success"}}}, want: false},
+		{name: "pending status", checks: githubinfra.PullRequestCheckRuns{Statuses: []githubinfra.PullRequestStatus{{State: "pending"}}}, want: false},
+		{name: "successful status", checks: githubinfra.PullRequestCheckRuns{Statuses: []githubinfra.PullRequestStatus{{State: "success"}}}, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := cleanAuditorCheckEvidence(test.checks); got != test.want {
+				t.Fatalf("cleanAuditorCheckEvidence() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRecordAuditorBaselineScopesDeduplicationToProject(t *testing.T) {
+	ctx := context.Background()
+	coordinator := openMigratedCoordinator(t, filepath.Join(t.TempDir(), "auditor.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 31, 12, 0, 0, 0, time.UTC)
+	nowISO := eventlog.FormatJavaScriptISOString(now)
+	projectA := storage.ProjectRecord{ID: "project_a", Name: "A", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}
+	projectB := storage.ProjectRecord{ID: "project_b", Name: "B", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Projects.Upsert(ctx, projectA); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Projects.Upsert(ctx, projectB); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordAuditorBaseline(ctx, repos, projectA, "acme/looper", "head", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordAuditorBaseline(ctx, repos, projectB, "acme/looper", "head", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	events, err := repos.Events.ListByEntity(ctx, "branch_head", "acme/looper@head")
+	if err != nil || countAuditorEvents(events, auditor.BaselineEventType) != 2 {
+		t.Fatalf("baseline events = %#v, %v; want one per project", events, err)
 	}
 }
 

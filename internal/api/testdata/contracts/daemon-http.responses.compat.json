@@ -151,7 +151,21 @@
             "candidates": 0,
             "cleaned": 0,
             "skipped": 0,
-            "failed": 0
+            "failed": 0,
+            "diskSweep": {
+              "scanned": 0,
+              "unregistered": 0,
+              "wouldRemove": 0,
+              "removed": 0,
+              "skipped": 0,
+              "failed": 0,
+              "containersScanned": 0,
+              "containersUnreachable": 0,
+              "containersWouldRemove": 0,
+              "containersRemoved": 0,
+              "containersSkipped": 0,
+              "containersFailed": 0
+            }
           },
           "resourceGuard": {
             "enabled": true,
@@ -203,23 +217,6 @@
               "terminated": 0,
               "stopped": 0
             }
-          },
-          "network": {
-            "configured": false,
-            "github": {
-              "numericId": 0
-            },
-            "currentGithub": {
-              "numericId": 0
-            },
-            "cloudReachable": false,
-            "lease": {
-              "name": "",
-              "fencingToken": 0
-            },
-            "routedProjects": 0,
-            "localProjects": 0,
-            "identityDrift": false
           },
           "safety": {
             "allowAutoCommit": true,
@@ -279,12 +276,6 @@
             "listenPort": 0,
             "publicBaseUrl": "",
             "fallbackPollIntervalSeconds": 300
-          },
-          "network": {
-            "enrolled": false,
-            "loopernetBaseUrl": "",
-            "nodeName": "",
-            "githubLogin": ""
           },
           "agent": {
             "vendor": "opencode",
@@ -362,7 +353,8 @@
               "retentionDays": 7,
               "maxPerTick": 10,
               "includeOrphans": true,
-              "dryRun": false
+              "dryRun": false,
+              "maxDiskSweepPerTick": 2000
             },
             "resourceGuard": {
               "enabled": true,
@@ -643,12 +635,6 @@
             "publicBaseUrl": "",
             "fallbackPollIntervalSeconds": 300
           },
-          "network": {
-            "enrolled": false,
-            "loopernetBaseUrl": "",
-            "nodeName": "",
-            "githubLogin": ""
-          },
           "agent": {
             "vendor": "opencode",
             "params": {},
@@ -725,7 +711,8 @@
               "retentionDays": 7,
               "maxPerTick": 10,
               "includeOrphans": true,
-              "dryRun": false
+              "dryRun": false,
+              "maxDiskSweepPerTick": 2000
             },
             "resourceGuard": {
               "enabled": true,
@@ -1039,21 +1026,40 @@
       }
     },
     {
-      "id": "postMergeDigest.get",
+      "id": "gatekeeper.agreements",
       "status": 200,
       "body": {
         "ok": true,
         "data": {
-          "enabled": false,
-          "digest": {
-            "date": "2026-04-11",
-            "generatedAt": "2026-04-11T12:00:00Z",
-            "empty": true,
-            "merged": [],
-            "closedAndRegenerated": [],
-            "awaitingHuman": [],
-            "anomalies": []
-          }
+          "items": [
+            {
+              "id": "agreement_1",
+              "projectId": "project_1",
+              "repo": "acme/looper",
+              "prNumber": 42,
+              "verdictEventId": "event_gate_1",
+              "verdictEligible": true,
+              "verdictHeadSha": "abc123",
+              "outcome": "merged_as_is",
+              "agreement": true,
+              "terminalState": "MERGED",
+              "terminalHeadSha": "abc123",
+              "terminalAt": "2026-04-11T12:00:00.000Z",
+              "recordedAt": "2026-04-11T11:59:00.000Z",
+              "createdAt": "2026-04-11T11:59:00.000Z"
+            }
+          ]
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "gatekeeper.verdicts",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "items": []
         },
         "requestId": "fixture-request-id"
       }

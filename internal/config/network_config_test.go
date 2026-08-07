@@ -1,18 +1,13 @@
 package config
 
-import (
-	"strings"
-	"testing"
-)
+import "testing"
 
-func TestValidateRejectsInvalidRoutedProjectPrerequisites(t *testing.T) {
+func TestValidateRejectsProgrammaticRoutedProject(t *testing.T) {
 	t.Parallel()
 	cfg, err := DefaultConfig(t.TempDir())
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
-	cfg.Roles.Planner.AutoDiscovery = true
-	cfg.Roles.Fixer.AutoDiscovery = true
 	cfg.Projects = []ProjectRefConfig{{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), Network: ProjectNetworkConfig{Mode: NetworkModeRouted}}}
 
 	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
@@ -23,25 +18,18 @@ func TestValidateRejectsInvalidRoutedProjectPrerequisites(t *testing.T) {
 	if !ok {
 		t.Fatalf("err = %T, want *ConfigValidationError", err)
 	}
-	joined := validationErr.Error()
-	if !strings.Contains(joined, "config validation failed") {
-		t.Fatalf("error = %q, want validation prefix", joined)
-	}
-	if len(validationErr.Issues) < 4 {
-		t.Fatalf("issues = %#v, want multiple routed prerequisite failures", validationErr.Issues)
+	if len(validationErr.Issues) != 1 || validationErr.Issues[0].Path != "projects[0].network.mode" {
+		t.Fatalf("issues = %#v, want one withdrawn routed-mode failure", validationErr.Issues)
 	}
 }
 
-func TestValidateAcceptsRoutedProjectWithExplicitNetworkAndDisabledPlannerFixer(t *testing.T) {
+func TestValidateAcceptsLocalOnlyProject(t *testing.T) {
 	t.Parallel()
 	cfg, err := DefaultConfig(t.TempDir())
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
-	cfg.Roles.Planner.AutoDiscovery = false
-	cfg.Roles.Fixer.AutoDiscovery = false
-	cfg.Network = NetworkConfig{Enrolled: true, LoopernetBaseURL: "https://loopernet.example.com", NodeName: "red", GitHubLogin: "worker", GitHubUserID: 42}
-	cfg.Projects = []ProjectRefConfig{{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), Network: ProjectNetworkConfig{Mode: NetworkModeRouted}}}
+	cfg.Projects = []ProjectRefConfig{{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), Network: ProjectNetworkConfig{Mode: NetworkModeOff}}}
 
 	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err != nil {
 		t.Fatalf("ValidateWithOptions() error = %v", err)
@@ -72,21 +60,5 @@ func TestValidateReportsInvalidProjectNetworkModeOnce(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("network.mode issue count = %d, want 1; issues=%#v", count, validationErr.Issues)
-	}
-}
-
-func TestValidateRejectsOverlongNetworkNodeName(t *testing.T) {
-	t.Parallel()
-	cfg, err := DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	cfg.Roles.Planner.AutoDiscovery = false
-	cfg.Roles.Fixer.AutoDiscovery = false
-	cfg.Network = NetworkConfig{Enrolled: true, LoopernetBaseURL: "https://loopernet.example.com", NodeName: strings.Repeat("a", 33), GitHubLogin: "worker", GitHubUserID: 42}
-	cfg.Projects = []ProjectRefConfig{{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), Network: ProjectNetworkConfig{Mode: NetworkModeRouted}}}
-	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
-	if err == nil || !strings.Contains(err.Error(), "32 characters or fewer") {
-		t.Fatalf("ValidateWithOptions() error = %v, want node-name length validation", err)
 	}
 }

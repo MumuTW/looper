@@ -15,6 +15,14 @@ import (
 	"github.com/MumuTW/looper/internal/storage"
 )
 
+func TestCanonicalReasoningEffortNormalizesGlobalCoordinatorValue(t *testing.T) {
+	raw := config.ReasoningEffort(" High ")
+	got := canonicalReasoningEffort(&raw)
+	if got == nil || *got != config.ReasoningEffortHigh {
+		t.Fatalf("canonicalReasoningEffort() = %v, want high", got)
+	}
+}
+
 func TestClaimPhaseRefreshesConfigAfterPublicationBoundary(t *testing.T) {
 	t.Parallel()
 

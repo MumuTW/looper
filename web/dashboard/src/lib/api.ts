@@ -246,6 +246,29 @@ export type ActiveRunWorktree = {
   branch?: string | null;
 };
 
+/** Redacted daemon-owned evidence for a Worker timeout continuation. */
+export type ActiveRunProgress = {
+  headSha?: string | null;
+  worktreeId?: string | null;
+  branch?: string | null;
+  changedFileCount: number;
+  stagedFileCount: number;
+  untrackedFileCount: number;
+  diffFingerprint?: string | null;
+  timeoutType?: string | null;
+  lastProgressAt?: string | null;
+  capturedAt?: string | null;
+};
+
+export type ActiveRunContinuation = {
+  predecessorRunId?: string | null;
+  predecessorExecutionId?: string | null;
+  mode?: string | null;
+  outcome?: "preserved" | "changed" | "committed" | "lost" | string | null;
+  beforeTimeout?: ActiveRunProgress | null;
+  afterRestart?: ActiveRunProgress | null;
+};
+
 export type ActiveRun = {
   seq: number;
   runId?: string | null;
@@ -268,6 +291,7 @@ export type ActiveRun = {
   target: ActiveRunTarget;
   agent?: ActiveRunAgent | null;
   worktree?: ActiveRunWorktree | null;
+  continuation?: ActiveRunContinuation | null;
 };
 
 export type ActiveRunsList = {
@@ -371,6 +395,8 @@ export type Loop = {
   convergence?: ReviewerConvergence | null;
   /** Latest run's derived outcome, when that run was a fixer run. */
   outcome?: FixerRunOutcome | null;
+  /** Redacted timeout-continuation evidence from the latest run, including closed loops. */
+  continuation?: ActiveRunContinuation | null;
 };
 
 export type LoopsList = {
@@ -389,12 +415,87 @@ export type Project = {
   provider: string;
   repo?: string | null;
   worktreeRoot?: string | null;
+  /** Omitted by the daemon when the effective level is the default observe. */
+  gatekeeperTrust?: "advise" | "auto" | null;
   createdAt: string;
   updatedAt: string;
 };
 
 export type ProjectsList = {
   items: Project[];
+};
+
+export type GatekeeperAgreement = {
+  id: string;
+  projectId: string;
+  repo: string;
+  prNumber: number;
+  verdictEventId: string;
+  verdictEligible: boolean;
+  verdictHeadSha?: string | null;
+  outcome: string;
+  agreement: boolean;
+  terminalState: string;
+  terminalHeadSha?: string | null;
+  terminalAt: string;
+  recordedAt: string;
+  createdAt: string;
+};
+
+export type GatekeeperAgreementsList = {
+  items: GatekeeperAgreement[];
+};
+
+export type GatekeeperVerdictReason = {
+  code: string;
+  subject?: string | null;
+};
+
+export type GatekeeperCheckEvidence = {
+  name: string;
+  appId?: number;
+  status?: string;
+  conclusion?: string;
+};
+
+export type GatekeeperVerdictEvidence = {
+  pullRequestState?: string;
+  closedAt?: string;
+  mergedAt?: string;
+  draft: boolean;
+  baseRefName?: string;
+  mergeable?: boolean | null;
+  mergeableState?: string;
+  requiredChecks: string[];
+  checks: GatekeeperCheckEvidence[];
+  requiredApprovingReviewCount: number;
+  reviewDecision?: string;
+  unresolvedReviewThreadIds: string[];
+  holdLabels: string[];
+  projectPolicyPermitsTarget: boolean;
+  finalObservedHeadSha?: string;
+};
+
+export type GatekeeperVerdict = {
+  id: string;
+  projectId: string;
+  repo: string;
+  prNumber: number;
+  version: number;
+  mode: string;
+  status: string;
+  eligible: boolean;
+  expectedHeadSha?: string | null;
+  observedHeadSha?: string | null;
+  requiresFreshRevalidation: boolean;
+  reasons: GatekeeperVerdictReason[];
+  evidence: GatekeeperVerdictEvidence;
+  evaluatedAt: string;
+  createdAt: string;
+};
+
+export type GatekeeperVerdictsList = {
+  items: GatekeeperVerdict[];
 };
 
 export type ConfigScalar = string | number | boolean | null;
@@ -424,12 +525,13 @@ export type ConfigMetadata = {
 export type ConfigAgentProfileView = {
   vendor?: string | null;
   model?: string | null;
+  reasoningEffort?: string | null;
 };
 
 export type ConfigAgentView = {
   vendor?: string | null;
   model?: string | null;
-  /** Named vendor/model profiles (no params). */
+  /** Named vendor/model/reasoning-effort profiles (no params). */
   profiles?: Record<string, ConfigAgentProfileView>;
   nativeResume?: { enabled?: boolean };
   timeouts?: Record<string, number>;
@@ -588,6 +690,36 @@ export function fetchLoop(
 
 export function fetchProjects(signal?: AbortSignal): Promise<ProjectsList> {
   return apiFetch<ProjectsList>("/api/v1/projects", { signal });
+}
+
+export function fetchGatekeeperAgreements(opts?: {
+  projectId?: string;
+  limit?: number;
+  signal?: AbortSignal;
+}): Promise<GatekeeperAgreementsList> {
+  const params = new URLSearchParams();
+  if (opts?.projectId) params.set("projectId", opts.projectId);
+  if (opts?.limit != null) params.set("limit", String(opts.limit));
+  const query = params.toString();
+  return apiFetch<GatekeeperAgreementsList>(
+    `/api/v1/gatekeeper/agreements${query ? `?${query}` : ""}`,
+    { signal: opts?.signal },
+  );
+}
+
+export function fetchGatekeeperVerdicts(opts?: {
+  projectId?: string;
+  limit?: number;
+  signal?: AbortSignal;
+}): Promise<GatekeeperVerdictsList> {
+  const params = new URLSearchParams();
+  if (opts?.projectId) params.set("projectId", opts.projectId);
+  if (opts?.limit != null) params.set("limit", String(opts.limit));
+  const query = params.toString();
+  return apiFetch<GatekeeperVerdictsList>(
+    `/api/v1/gatekeeper/verdicts${query ? `?${query}` : ""}`,
+    { signal: opts?.signal },
+  );
 }
 
 export function fetchConfig(signal?: AbortSignal): Promise<ConfigData> {

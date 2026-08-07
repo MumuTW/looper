@@ -13,8 +13,8 @@ const (
 	ModeHumanGated = "human-gated"
 	ModeAutonomous = "autonomous"
 
-	DispatchPlan      = "dispatch/plan"
-	DispatchImplement = "dispatch/implement"
+	DispatchPlan      = labels.DispatchPlan
+	DispatchImplement = labels.DispatchImplement
 
 	ReactionSuccess = "+1"
 	ReactionFailure = "confused"
@@ -46,6 +46,7 @@ type Config struct {
 	AssignTo             string
 	PlannerTriggerLabels []string
 	WorkerTriggerLabels  []string
+	Namespace            labels.Namespace
 }
 
 type Action struct {
@@ -76,8 +77,8 @@ func humanNeedsDependencyGate(issue Issue, cfg Config) bool {
 	if !ok || !hasLabel(issue.Labels, cfg.TriagedLabel) {
 		return false
 	}
-	dispatchLabel, ok := singleDispatchLabel(issue.Labels)
-	if !ok || dispatchLabel != commandDispatchLabel(command) {
+	dispatchLabel, ok := singleDispatchLabelForNamespace(issue.Labels, cfg.Namespace)
+	if !ok || !labels.Has([]string{dispatchLabel}, commandDispatchLabelForNamespace(command, cfg.Namespace)) {
 		return false
 	}
 	triggerLabels := triggerLabelsForDispatch(dispatchLabel, cfg)
@@ -91,12 +92,12 @@ func autonomousNeedsDependencyGate(issue Issue, cfg Config, now time.Time) bool 
 	if !hasLabel(issue.Labels, cfg.TriagedLabel) {
 		return false
 	}
-	dispatchLabel, ok := singleDispatchLabel(issue.Labels)
+	dispatchLabel, ok := singleDispatchLabelForNamespace(issue.Labels, cfg.Namespace)
 	if !ok {
 		return false
 	}
 	triggerLabels := triggerLabelsForDispatch(dispatchLabel, cfg)
-	if len(triggerLabels) == 0 || autonomousDispatchHeld(issue.Labels, cfg.HoldLabel) || len(missingLabels(issue.Labels, triggerLabels)) == 0 {
+	if len(triggerLabels) == 0 || autonomousDispatchHeldForNamespace(issue.Labels, cfg.HoldLabel, cfg.Namespace) || len(missingLabels(issue.Labels, triggerLabels)) == 0 {
 		return false
 	}
 	if issue.TriagedAt.IsZero() || now.UTC().Before(issue.TriagedAt.UTC().Add(cfg.AutonomousDelay)) {
@@ -116,11 +117,11 @@ func decideHumanGated(issue Issue, cfg Config, graph *depgraph.DependencyGraph) 
 		return fail(action, "Coordinator can't dispatch until triage finishes.")
 	}
 
-	dispatchLabel, ok := singleDispatchLabel(issue.Labels)
+	dispatchLabel, ok := singleDispatchLabelForNamespace(issue.Labels, cfg.Namespace)
 	if !ok {
 		return fail(action, "Coordinator can't dispatch because triage did not set a dispatch label.")
 	}
-	if dispatchLabel != commandDispatchLabel(command) {
+	if !labels.Has([]string{dispatchLabel}, commandDispatchLabelForNamespace(command, cfg.Namespace)) {
 		return fail(action, "Coordinator can't dispatch because the slash command does not match triage.")
 	}
 
@@ -148,7 +149,7 @@ func decideAutonomous(issue Issue, cfg Config, now time.Time, graph *depgraph.De
 	if !hasLabel(issue.Labels, cfg.TriagedLabel) {
 		return Action{NoOp: true}
 	}
-	dispatchLabel, ok := singleDispatchLabel(issue.Labels)
+	dispatchLabel, ok := singleDispatchLabelForNamespace(issue.Labels, cfg.Namespace)
 	if !ok {
 		return Action{NoOp: true}
 	}
@@ -156,7 +157,7 @@ func decideAutonomous(issue Issue, cfg Config, now time.Time, graph *depgraph.De
 	if len(triggerLabels) == 0 {
 		return Action{NoOp: true}
 	}
-	if autonomousDispatchHeld(issue.Labels, cfg.HoldLabel) || len(missingLabels(issue.Labels, triggerLabels)) == 0 {
+	if autonomousDispatchHeldForNamespace(issue.Labels, cfg.HoldLabel, cfg.Namespace) || len(missingLabels(issue.Labels, triggerLabels)) == 0 {
 		return Action{NoOp: true}
 	}
 	if issue.TriagedAt.IsZero() || now.UTC().Before(issue.TriagedAt.UTC().Add(cfg.AutonomousDelay)) {
@@ -243,25 +244,33 @@ func isAllowedUser(comment Comment, allowedUsers []string) bool {
 	return comment.HasWriteAccess
 }
 
-func singleDispatchLabel(labels []string) (string, bool) {
-	match := ""
-	for _, label := range labels {
-		if !strings.HasPrefix(label, "dispatch/") {
+func singleDispatchLabelForNamespace(issueLabels []string, namespace labels.Namespace) (string, bool) {
+	configured := ""
+	for _, label := range issueLabels {
+		if !namespace.IsConfiguredDispatch(label) {
 			continue
 		}
-		if match != "" {
+		if configured != "" {
 			return "", false
 		}
-		match = label
+		if namespace.IsConfiguredDispatchPlan(label) {
+			configured = namespace.DispatchPlan()
+		} else {
+			configured = namespace.DispatchImplement()
+		}
 	}
-	return match, match != ""
+	return configured, configured != ""
 }
 
 func triggerLabelsForDispatch(dispatchLabel string, cfg Config) []string {
-	switch dispatchLabel {
-	case DispatchPlan:
+	namespace := cfg.Namespace
+	if strings.TrimSpace(namespace.Prefix) == "" {
+		namespace = labels.DefaultNamespace()
+	}
+	switch {
+	case namespace.IsConfiguredDispatchPlan(dispatchLabel):
 		return compactLabels(cfg.PlannerTriggerLabels)
-	case DispatchImplement:
+	case namespace.IsConfiguredDispatchImplement(dispatchLabel):
 		return compactLabels(cfg.WorkerTriggerLabels)
 	default:
 		return nil
@@ -289,12 +298,12 @@ func missingLabels(existing []string, want []string) []string {
 	return missing
 }
 
-func commandDispatchLabel(command string) string {
+func commandDispatchLabelForNamespace(command string, namespace labels.Namespace) string {
 	switch command {
 	case "/plan":
-		return DispatchPlan
+		return namespace.DispatchPlan()
 	case "/implement":
-		return DispatchImplement
+		return namespace.DispatchImplement()
 	default:
 		return ""
 	}
@@ -312,10 +321,10 @@ func hasLabel(itemLabels []string, want string) bool {
 	return labels.Has(itemLabels, want)
 }
 
-func autonomousDispatchHeld(issueLabels []string, legacyHoldLabel string) bool {
+func autonomousDispatchHeldForNamespace(issueLabels []string, legacyHoldLabel string, namespace labels.Namespace) bool {
 	// Coordinator autonomous dispatch is only blocked by the official global hold.
 	// Lane-specific official holds apply later in each lane's own discovery gate.
-	if hasLabel(issueLabels, labels.HoldGlobal) {
+	if hasLabel(issueLabels, namespace.HoldGlobal()) {
 		return true
 	}
 	return hasLabel(issueLabels, strings.TrimSpace(legacyHoldLabel))

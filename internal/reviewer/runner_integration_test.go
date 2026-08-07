@@ -77,7 +77,7 @@ func TestReviewerAutoMergeHappyPathWithFakeGH(t *testing.T) {
 	fakeGH.WriteState(t, harness.GHState{
 		Commands: map[string]any{"pr diff": map[string]any{"stdout": json.RawMessage(`"diff --git a/app.go b/app.go\n@@ -1,1 +1,2 @@\n-old\n+new\n+more\n"`)}},
 		Routes: map[string]any{
-			"repos/acme/looper/issues/358":               json.RawMessage(`{"number":358,"title":"Auto merge","body":"## Acceptance criteria\n- ship app change\n- add more\n","html_url":"https://example.test/issues/358","state":"open","created_at":"2026-05-14T12:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
+			"repos/acme/looper/issues/358":               json.RawMessage(`{"number":358,"title":"Auto merge","body":"## Acceptance criteria\n- ship app change\n- add more\n","html_url":"https://example.test/issues/358","state":"open","created_at":"2026-05-14T12:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}`),
 			"repos/acme/looper":                          json.RawMessage(`{"allow_squash_merge":true,"allow_merge_commit":true,"allow_rebase_merge":true,"allow_auto_merge":true}`),
 			"repos/acme/looper/branches/main/protection": json.RawMessage(`{"required_status_checks":{"contexts":["ci"]}}`),
 		},
@@ -144,7 +144,7 @@ func TestReviewerAutoMergeCriteriaFailWithFakeGH(t *testing.T) {
 	fakeGH.WriteState(t, harness.GHState{
 		Commands: map[string]any{"pr diff": map[string]any{"stdout": json.RawMessage(`"diff --git a/app.go b/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n"`)}},
 		Routes: map[string]any{
-			"repos/acme/looper/issues/358": json.RawMessage(`{"number":358,"title":"Auto merge","body":"## Acceptance criteria\n- ship app change\n- add tests\n","html_url":"https://example.test/issues/358","state":"open","created_at":"2026-05-14T12:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
+			"repos/acme/looper/issues/358": json.RawMessage(`{"number":358,"title":"Auto merge","body":"## Acceptance criteria\n- ship app change\n- add tests\n","html_url":"https://example.test/issues/358","state":"open","created_at":"2026-05-14T12:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}`),
 		},
 		CurrentUserLogin: "reviewer",
 		PullRequests: map[string]harness.GHPullRequest{
@@ -194,7 +194,7 @@ func TestReviewerAutoMergeCriteriaFailWithFakeGH(t *testing.T) {
 	assertOrderedText(t, string(logBytes),
 		`"argv":["api","repos/acme/looper/pulls/42/reviews","--method","POST","--input","-","--include"]`,
 		`"argv":["api","repos/acme/looper/issues/358/labels/triaged","--method","DELETE"]`,
-		`"argv":["api","repos/acme/looper/issues/358/labels/dispatch%2Fplan","--method","DELETE"]`,
+		`"argv":["api","repos/acme/looper/issues/358/labels/looper%3Adispatch%3Aplan","--method","DELETE"]`,
 	)
 	if strings.Contains(string(logBytes), `"argv":["pr","merge","42"`) {
 		t.Fatalf("criteria-fail path unexpectedly enabled auto-merge:\n%s", string(logBytes))
@@ -259,6 +259,14 @@ func (a reviewerIntegrationGatewayAdapter) ViewPullRequest(ctx context.Context, 
 	return PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: append([]string(nil), detail.Labels...), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: append([]string(nil), detail.ReviewRequests...), HasConflicts: detail.HasConflicts, Diff: diff, Comments: detail.Comments, IssueComments: issueComments, Reviews: detail.Reviews}, nil
 }
 
+func (a reviewerIntegrationGatewayAdapter) ViewPullRequestForDiscovery(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	detail, err := a.Gateway.ViewPullRequestForDiscovery(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return PullRequestDetail{}, err
+	}
+	return PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: append([]string(nil), detail.Labels...), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: append([]string(nil), detail.ReviewRequests...), HasConflicts: detail.HasConflicts}, nil
+}
+
 func (a reviewerIntegrationGatewayAdapter) GetPullRequestHeadSHA(ctx context.Context, input ViewPullRequestInput) (string, error) {
 	return a.Gateway.GetPullRequestHeadSHA(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 }
@@ -284,7 +292,7 @@ func (a reviewerIntegrationGatewayAdapter) FindReviewMarker(ctx context.Context,
 	if err != nil {
 		return ReviewMarkerResult{}, err
 	}
-	return ReviewMarkerResult{Found: found.Found, Outcome: found.Outcome, Event: ReviewEvent(found.Event), AuthorLogin: found.AuthorLogin, Body: found.Body, InlineCommentBodies: append([]string(nil), found.InlineCommentBodies...)}, nil
+	return ReviewMarkerResult{Found: found.Found, Outcome: found.Outcome, Event: ReviewEvent(found.Event), AuthorLogin: found.AuthorLogin, ReviewID: found.ReviewID, Body: found.Body, InlineCommentBodies: append([]string(nil), found.InlineCommentBodies...)}, nil
 }
 
 func (a reviewerIntegrationGatewayAdapter) CreateIssueComment(ctx context.Context, input IssueCommentInput) (IssueCommentResult, error) {

@@ -12,21 +12,7 @@ import (
 	"time"
 
 	"github.com/MumuTW/looper/internal/config"
-	networkclient "github.com/MumuTW/looper/internal/network/client"
 )
-
-type recordingNetworkManager struct {
-	configs []config.Config
-}
-
-func (m *recordingNetworkManager) Start(context.Context) error { return nil }
-func (m *recordingNetworkManager) Stop()                       {}
-func (m *recordingNetworkManager) Status() networkclient.Status {
-	return networkclient.Status{}
-}
-func (m *recordingNetworkManager) UpdateConfig(cfg config.Config) {
-	m.configs = append(m.configs, config.CloneConfig(cfg))
-}
 
 func TestReloadConfigPublishesHotSnapshotAndKeepsMaterializedProjects(t *testing.T) {
 	t.Parallel()
@@ -64,8 +50,6 @@ func TestReloadConfigPublishesHotSnapshotAndKeepsMaterializedProjects(t *testing
 			return next, nil
 		},
 	})
-	networkManager := &recordingNetworkManager{}
-	rt.networkManager = networkManager
 	rt.projectCatalog.Publish([]config.ProjectRefConfig{{ID: "database-project", Name: "Database project", RepoPath: t.TempDir(), Validation: &config.ProjectValidationConfig{OptOut: true}}})
 	operationSnapshot := rt.Config()
 
@@ -84,13 +68,6 @@ func TestReloadConfigPublishesHotSnapshotAndKeepsMaterializedProjects(t *testing
 	}
 	if len(got.Projects) != 1 || got.Projects[0].ID != "database-project" {
 		t.Fatalf("Config().Projects = %#v, want materialized database project", got.Projects)
-	}
-	if len(networkManager.configs) != 1 {
-		t.Fatalf("network UpdateConfig calls = %d, want 1", len(networkManager.configs))
-	}
-	networkSnapshot := networkManager.configs[0]
-	if networkSnapshot.Roles.Worker.AutoDiscovery != next.Config.Roles.Worker.AutoDiscovery || len(networkSnapshot.Projects) != 1 || networkSnapshot.Projects[0].ID != "database-project" {
-		t.Fatalf("network config snapshot = %#v, want hot globals plus materialized project", networkSnapshot)
 	}
 	if operationSnapshot.Scheduler.MaxConcurrentRuns != cfg.Scheduler.MaxConcurrentRuns {
 		t.Fatalf("captured operation snapshot changed = %d, want %d", operationSnapshot.Scheduler.MaxConcurrentRuns, cfg.Scheduler.MaxConcurrentRuns)

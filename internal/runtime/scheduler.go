@@ -29,6 +29,7 @@ import (
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/notify"
+	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops/runpipe"
 	networkclient "github.com/MumuTW/looper/internal/network/client"
 	"github.com/MumuTW/looper/internal/network/protocol"
@@ -262,6 +263,20 @@ func (f catalogWebhookFixer) DiscoverPullRequestsForBaseBranchUpdate(ctx context
 
 type schedulerTaskTracker struct{ wg sync.WaitGroup }
 
+func canonicalReasoningEffort(effort *config.ReasoningEffort) *config.ReasoningEffort {
+	if effort == nil {
+		return nil
+	}
+	normalized, ok := config.ParseReasoningEffort(string(*effort))
+	if !ok {
+		// Startup validation is the authority for rejecting unsupported values.
+		// Preserve an invalid direct Config value here so the validation error is
+		// not hidden by scheduler construction in tests or embedders.
+		return effort
+	}
+	return &normalized
+}
+
 func (t *schedulerTaskTracker) Go(fn func()) {
 	t.wg.Add(1)
 	go func() {
@@ -433,6 +448,7 @@ func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string
 
 func runTrustedReviewSubmission(ctx context.Context, input forge.TrustedReviewSubmission, stdout, stderr io.Writer) error {
 	return reviewsubmit.RunTrusted(ctx, reviewsubmit.Options{
+		ProjectID:           input.ProjectID,
 		PRRef:               input.PRRef,
 		Event:               input.Event,
 		CommitID:            input.CommitID,
@@ -521,6 +537,17 @@ func (a plannerGitHubAdapter) ViewPullRequest(ctx context.Context, input planner
 	return planner.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.URL, State: pr.State, Labels: append([]string(nil), pr.Labels...), HeadRefName: pr.HeadRefName, BaseRefName: pr.BaseRefName}, nil
 }
 
+func (a plannerGitHubAdapter) ViewPullRequestForDiscovery(ctx context.Context, input planner.ViewPullRequestInput) (planner.PullRequestDetail, error) {
+	if a.gateway == nil {
+		return planner.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
+	}
+	pr, err := a.gateway.ViewPullRequestForDiscovery(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return planner.PullRequestDetail{}, err
+	}
+	return planner.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.URL, State: pr.State, Labels: append([]string(nil), pr.Labels...), HeadRefName: pr.HeadRefName, BaseRefName: pr.BaseRefName}, nil
+}
+
 func (a plannerGitHubAdapter) CreatePullRequest(ctx context.Context, input planner.CreatePullRequestInput) (planner.CreatePullRequestResult, error) {
 	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "planner", disclosure.ChannelPullRequest)
 	if a.gateway == nil {
@@ -597,7 +624,7 @@ func (a plannerAgentExecutorAdapter) Start(ctx context.Context, input planner.Ag
 		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
 		Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
 		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
-		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
+		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel, SnapshotReasoningEffort: input.SnapshotReasoningEffort,
 	})
 	if err != nil {
 		return nil, err
@@ -668,6 +695,26 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(detail.ReviewRequestUsers), HasConflicts: detail.HasConflicts, ChecksSummary: summarizeCheckStates(detail.Checks), Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Reviews: detail.Reviews}, nil
 }
 
+// ViewPullRequestForDiscovery is the lightweight metadata tier: no
+// statusCheckRollup, no reviews, no review threads, no issue comments.
+// It serves discovery/pending/assignment paths that only inspect
+// IsDraft/Author/ReviewRequests/Labels/State, and never consumes
+// detail.Checks or detail.Reviews.
+func (a reviewerGitHubAdapter) ViewPullRequestForDiscovery(ctx context.Context, input reviewer.ViewPullRequestInput) (reviewer.PullRequestDetail, error) {
+	if a.gateway == nil {
+		return reviewer.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
+	}
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return reviewer.PullRequestDetail{}, err
+	}
+	detail, err := a.gateway.ViewPullRequestForDiscovery(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return reviewer.PullRequestDetail{}, err
+	}
+	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(detail.ReviewRequestUsers), HasConflicts: detail.HasConflicts}, nil
+}
+
 func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
 	if a.gateway == nil {
 		return githubinfra.IssueDetail{}, fmt.Errorf("github gateway is not configured")
@@ -713,7 +760,7 @@ func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input revie
 	if err != nil {
 		return reviewer.ReviewMarkerResult{}, err
 	}
-	return reviewer.ReviewMarkerResult{Found: marker.Found, Outcome: marker.Outcome, Event: reviewer.ReviewEvent(marker.Event), AuthorLogin: marker.AuthorLogin, Body: marker.Body, InlineCommentBodies: append([]string(nil), marker.InlineCommentBodies...)}, nil
+	return reviewer.ReviewMarkerResult{Found: marker.Found, Outcome: marker.Outcome, Event: reviewer.ReviewEvent(marker.Event), AuthorLogin: marker.AuthorLogin, ReviewID: marker.ReviewID, Body: marker.Body, InlineCommentBodies: append([]string(nil), marker.InlineCommentBodies...)}, nil
 }
 
 func (a reviewerGitHubAdapter) CreateIssueComment(ctx context.Context, input reviewer.IssueCommentInput) (reviewer.IssueCommentResult, error) {
@@ -971,7 +1018,7 @@ func reviewerAllowedPRRef(metadata map[string]any) string {
 // reviewerAllowedReviewPolicy extracts daemon-selected review policy, head,
 // and run identity from reviewer metadata. The runner authors these fields from
 // its immutable loop/run checkpoint; agent argv is never authoritative.
-func reviewerAllowedReviewPolicy(metadata map[string]any) forge.TrustedReviewProxyPolicy {
+func reviewerAllowedReviewPolicy(projectID string, metadata map[string]any) forge.TrustedReviewProxyPolicy {
 	if metadata == nil {
 		return forge.TrustedReviewProxyPolicy{}
 	}
@@ -981,6 +1028,7 @@ func reviewerAllowedReviewPolicy(metadata map[string]any) forge.TrustedReviewPro
 	reviewerManual, _ := metadata["reviewerManual"].(bool)
 	reviewerRunID, _ := metadata["reviewerRunID"].(string)
 	return forge.TrustedReviewProxyPolicy{
+		ProjectID:        strings.TrimSpace(projectID),
 		Clean:            strings.TrimSpace(clean),
 		Blocking:         strings.TrimSpace(blocking),
 		ExpectedCommitID: strings.TrimSpace(expectedCommitID),
@@ -1061,7 +1109,7 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 	if reviewerAllowsTrustedReviewProxy(a.config, input.ProjectID, input.Metadata) {
 		allowedPR := reviewerAllowedPRRef(input.Metadata)
 		allowedCwd := strings.TrimSpace(input.WorkingDirectory)
-		policy := reviewerAllowedReviewPolicy(input.Metadata)
+		policy := reviewerAllowedReviewPolicy(input.ProjectID, input.Metadata)
 		if policy.ReviewerManual && policy.ReviewerRunID != strings.TrimSpace(input.RunID) {
 			return nil, fmt.Errorf("install run-bound trusted review proxy: reviewer run id does not match agent run")
 		}
@@ -1089,21 +1137,22 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		}
 	}
 	execution, err := a.executor.Start(ctx, agent.RunInput{
-		ExecutionID:        input.ExecutionID,
-		ProjectID:          input.ProjectID,
-		LoopID:             input.LoopID,
-		RunID:              input.RunID,
-		Prompt:             input.Prompt,
-		NativeResumePrompt: input.NativeResumePrompt,
-		WorkingDirectory:   input.WorkingDirectory,
-		Timeout:            input.Timeout,
-		HeartbeatTimeout:   input.HeartbeatTimeout,
-		Metadata:           input.Metadata,
-		IdempotencyKey:     input.IdempotencyKey,
-		Env:                reviewerTrustedReviewEnv(sock),
-		UseSnapshot:        input.UseSnapshot,
-		SnapshotVendor:     input.SnapshotVendor,
-		SnapshotModel:      input.SnapshotModel,
+		ExecutionID:             input.ExecutionID,
+		ProjectID:               input.ProjectID,
+		LoopID:                  input.LoopID,
+		RunID:                   input.RunID,
+		Prompt:                  input.Prompt,
+		NativeResumePrompt:      input.NativeResumePrompt,
+		WorkingDirectory:        input.WorkingDirectory,
+		Timeout:                 input.Timeout,
+		HeartbeatTimeout:        input.HeartbeatTimeout,
+		Metadata:                input.Metadata,
+		IdempotencyKey:          input.IdempotencyKey,
+		Env:                     reviewerTrustedReviewEnv(sock),
+		UseSnapshot:             input.UseSnapshot,
+		SnapshotVendor:          input.SnapshotVendor,
+		SnapshotModel:           input.SnapshotModel,
+		SnapshotReasoningEffort: input.SnapshotReasoningEffort,
 	})
 	if err != nil {
 		proxyCleanup()
@@ -1162,6 +1211,24 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 		return fixer.PullRequestDetail{}, err
 	}
 	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+}
+
+// ViewPullRequestForDiscovery is the lightweight metadata tier: no
+// statusCheckRollup, no reviews, no review threads, no issue comments.
+// Fixer discovery paths that need failing-check evidence must keep using
+// ViewPullRequest (full tier); this method is only for callers that
+// inspect State/IsDraft/Labels/HeadSHA/HeadRefName/BaseRefName/BaseSHA/
+// ReviewDecision/HasConflicts/Author.
+func (a fixerGitHubAdapter) ViewPullRequestForDiscovery(ctx context.Context, input fixer.ViewPullRequestInput) (fixer.PullRequestDetail, error) {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return fixer.PullRequestDetail{}, err
+	}
+	detail, err := a.gateway.ViewPullRequestForDiscovery(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return fixer.PullRequestDetail{}, err
+	}
+	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
 }
 
 func (a fixerGitHubAdapter) ViewIssue(ctx context.Context, input fixer.ViewIssueInput) (fixer.IssueDetail, error) {
@@ -1504,7 +1571,7 @@ func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentR
 		Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
 		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
 		RestrictToolNetwork: input.RestrictToolNetwork,
-		UseSnapshot:         input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
+		UseSnapshot:         input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel, SnapshotReasoningEffort: input.SnapshotReasoningEffort,
 	})
 	if err != nil {
 		return nil, err
@@ -1605,6 +1672,22 @@ func (a workerGitHubAdapter) ViewPullRequest(ctx context.Context, input worker.V
 		return worker.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
 	}
 	detail, err := a.gateway.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return worker.PullRequestDetail{}, err
+	}
+	return worker.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, URL: detail.URL, State: detail.State, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, HeadSHA: detail.HeadSHA, Labels: append([]string(nil), detail.Labels...), ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(detail.ReviewRequestUsers)}, nil
+}
+
+// ViewPullRequestForDiscovery is the lightweight metadata tier, identical
+// to ViewPullRequest for the worker adapter (which never consumes
+// detail.Checks or detail.Reviews). It exists so discovery-path callers
+// can express the metadata intent explicitly and share the per-tick
+// snapshot's thin cache.
+func (a workerGitHubAdapter) ViewPullRequestForDiscovery(ctx context.Context, input worker.ViewPullRequestInput) (worker.PullRequestDetail, error) {
+	if a.gateway == nil {
+		return worker.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
+	}
+	detail, err := a.gateway.ViewPullRequestForDiscovery(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return worker.PullRequestDetail{}, err
 	}
@@ -1734,11 +1817,11 @@ func (a workerGitAdapter) PrepareWorktree(ctx context.Context, input worker.Prep
 }
 
 func (a workerGitAdapter) InspectHead(ctx context.Context, input worker.InspectHeadInput) (worker.InspectHeadResult, error) {
-	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, BaseRef: input.BaseRef})
+	result, err := a.gateway.InspectHead(ctx, gitinfra.InspectHeadInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, BaseRef: input.BaseRef, ContentPaths: input.ContentPaths, CompareHeadSHA: input.CompareHeadSHA})
 	if err != nil {
 		return worker.InspectHeadResult{}, err
 	}
-	return worker.InspectHeadResult{HeadSHA: result.HeadSHA, Branch: result.Branch, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles, StagedFiles: result.StagedFiles, UntrackedFiles: result.UntrackedFiles, DiffFingerprint: result.DiffFingerprint}, nil
+	return worker.InspectHeadResult{HeadSHA: result.HeadSHA, Branch: result.Branch, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles, StagedFiles: result.StagedFiles, UntrackedFiles: result.UntrackedFiles, UnstagedFileCount: result.UnstagedFileCount, RenameSourceFiles: result.RenameSourceFiles, DiffFingerprint: result.DiffFingerprint, ContentFingerprint: result.ContentFingerprint, ComparedContentFingerprint: result.ComparedContentFingerprint, ComparedIndexFingerprint: result.ComparedIndexFingerprint, ContentFingerprintVersion: result.ContentFingerprintVersion, IndexFingerprint: result.IndexFingerprint, WorktreeMatchesHead: result.WorktreeMatchesHead, HeadDescendsFromCompare: result.HeadDescendsFromCompare}, nil
 }
 
 func (a workerGitAdapter) VerifyWorktreeIdentity(ctx context.Context, input worker.VerifyWorktreeIdentityInput) error {
@@ -1779,10 +1862,11 @@ func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.Agen
 		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
 		Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID,
 		WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
-		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
+		TimeoutObservationBudget: input.TimeoutObservationBudget,
+		Metadata:                 input.Metadata, IdempotencyKey: input.IdempotencyKey,
 		RestrictToolNetwork: input.RestrictToolNetwork,
 		OnBeforeTimeout:     input.OnBeforeTimeout,
-		UseSnapshot:         input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
+		UseSnapshot:         input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel, SnapshotReasoningEffort: input.SnapshotReasoningEffort,
 	})
 	if err != nil {
 		return nil, err
@@ -1795,7 +1879,7 @@ func (a workerAgentExecutionAdapter) Wait(ctx context.Context) (worker.AgentResu
 	if err != nil {
 		return worker.AgentResult{}, err
 	}
-	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt, PreTimeoutError: result.PreTimeoutError}, nil
+	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt, PreTimeoutError: result.PreTimeoutError, NativeResumeMode: result.NativeResumeMode, NativeResumeStatus: result.NativeResumeStatus}, nil
 }
 
 func (a workerAgentExecutionAdapter) Kill(reason string) error {
@@ -1960,12 +2044,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	var escalatorRunner escalatorScheduler
 	if cfg.Roles.Escalator.Enabled {
 		escalatorRunner = escalator.NewRunner(
-			escalator.NewCollector(repos, newRuntimeEscalatorLinker(cfg), escalator.CollectorOptions{
-				Now:                   now,
-				RetryAttemptThreshold: cfg.Roles.Escalator.RetryAttemptThreshold,
-				UnroutedAfter:         time.Duration(cfg.Roles.Escalator.UnroutedAfterSeconds) * time.Second,
-				StaleHeadAfter:        time.Duration(cfg.Roles.Escalator.StaleHeadAfterSeconds) * time.Second,
-			}),
+			NewEscalatorCollector(cfg, repos, now),
 			notificationGateway,
 			repos,
 			escalator.RunnerOptions{Now: now, MaxItems: cfg.Roles.Escalator.MaxItems},
@@ -1984,11 +2063,20 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Repos:  repos,
 			GitHub: gatekeeperGitHubAdapter{Gateway: githubGateway, config: &cfg},
 			Now:    now,
+			LabelNamespaceForProject: func(projectID string) (labels.Namespace, bool) {
+				if _, ok := runtimeProjectBinding(cfg, projectID); !ok {
+					return labels.Namespace{}, false
+				}
+				return config.ProjectLabelNamespace(&cfg, projectID), true
+			},
 			TrustForProject: func(projectID string) config.GatekeeperTrustLevel {
 				return gatekeeperTrustForProject(cfg, projectID)
 			},
 			DiffBudgetForProject: func(projectID string) config.GatekeeperDiffBudget {
 				return gatekeeperDiffBudgetForProject(cfg, projectID)
+			},
+			RequiredReviewChangedLinesForProject: func(projectID string) int {
+				return gatekeeperRequiredReviewChangedLinesForProject(cfg, projectID)
 			},
 			LogWarn: func(msg string, fields map[string]any) {
 				if logger != nil {
@@ -2156,6 +2244,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Config: agent.ExecutorConfig{
 				Vendor:              resolved.Vendor,
 				Model:               resolved.Model,
+				ReasoningEffort:     resolved.ReasoningEffort,
 				Params:              cfg.Agent.Params,
 				Env:                 cfg.Agent.Env,
 				NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
@@ -2208,21 +2297,22 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			plannerAutoDiscovery = false
 		}
 		plannerRoleRunner = planner.New(planner.Options{
-			DB:                 coordinator.DB(),
-			Repos:              repos,
-			GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: plannerStamper, config: &cfg},
-			Git:                plannerGitAdapter{gateway: gitGateway, stamper: plannerStamper},
-			AgentExecutor:      plannerAgentExecutorAdapter{executor: plannerExecutor},
-			Logger:             logger,
-			Now:                now,
-			AllowAutoPush:      boolPtr(cfg.Defaults.AllowAutoPush),
-			Disclosure:         &cfg.Disclosure,
-			AgentRuntime:       string(resolved.Vendor),
-			AgentProfileID:     resolved.ProfileID,
-			CustomInstructions: &cfg,
-			AgentModel:         agentModel,
-			AgentTimeout:       time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds) * time.Second,
-			AgentIdleTimeout:   time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds) * time.Second,
+			DB:                   coordinator.DB(),
+			Repos:                repos,
+			GitHub:               plannerGitHubAdapter{gateway: githubGateway, stamper: plannerStamper, config: &cfg},
+			Git:                  plannerGitAdapter{gateway: gitGateway, stamper: plannerStamper},
+			AgentExecutor:        plannerAgentExecutorAdapter{executor: plannerExecutor},
+			Logger:               logger,
+			Now:                  now,
+			AllowAutoPush:        boolPtr(cfg.Defaults.AllowAutoPush),
+			Disclosure:           &cfg.Disclosure,
+			AgentRuntime:         string(resolved.Vendor),
+			AgentProfileID:       resolved.ProfileID,
+			AgentReasoningEffort: resolved.ReasoningEffort,
+			CustomInstructions:   &cfg,
+			AgentModel:           agentModel,
+			AgentTimeout:         time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds) * time.Second,
+			AgentIdleTimeout:     time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds) * time.Second,
 			DiscoveryPolicy: planner.DiscoveryPolicy{
 				AutoDiscovery:              plannerAutoDiscovery,
 				Labels:                     append([]string(nil), plannerRole.Discovery.Labels...),
@@ -2276,6 +2366,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Config: agent.ExecutorConfig{
 				Vendor:              *cfg.Agent.Vendor,
 				Model:               cfg.Agent.Model,
+				ReasoningEffort:     canonicalReasoningEffort(cfg.Agent.ReasoningEffort),
 				Params:              cfg.Agent.Params,
 				Env:                 cfg.Agent.Env,
 				NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
@@ -2348,6 +2439,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Disclosure:              &cfg.Disclosure,
 			AgentRuntime:            string(resolved.Vendor),
 			AgentProfileID:          resolved.ProfileID,
+			AgentReasoningEffort:    resolved.ReasoningEffort,
 			CustomInstructions:      &cfg,
 			LooperCLIPath:           looperCLIPath,
 			AgentModel:              agentModel,
@@ -2404,6 +2496,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Disclosure:                  &cfg.Disclosure,
 			AgentRuntime:                string(resolved.Vendor),
 			AgentProfileID:              resolved.ProfileID,
+			AgentReasoningEffort:        resolved.ReasoningEffort,
 			CustomInstructions:          &cfg,
 			AgentModel:                  agentModel,
 			AgentTimeout:                time.Duration(cfg.Agent.Timeouts.FixerMaxRuntimeSeconds) * time.Second,
@@ -2502,17 +2595,18 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				LabelMode:                  workerRole.Discovery.LabelMode,
 				RequireAssigneeCurrentUser: workerRole.Discovery.RequireAssigneeCurrentUser,
 			},
-			Disclosure:          &cfg.Disclosure,
-			AgentRuntime:        string(resolved.Vendor),
-			AgentProfileID:      resolved.ProfileID,
-			CustomInstructions:  &cfg,
-			Network:             coordinatorNetworkGateway{statePath: networkclient.DefaultStatePath(runtimeHomeDirOrEmpty()), client: &http.Client{Timeout: 10 * time.Second}},
-			AgentModel:          agentModel,
-			AgentTimeout:        time.Duration(cfg.Agent.Timeouts.WorkerMaxRuntimeSeconds) * time.Second,
-			AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.WorkerIdleTimeoutSeconds) * time.Second,
-			RetryBaseDelay:      retryBaseDelay,
-			RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
-			OnQueueItemEnqueued: requestWake,
+			Disclosure:           &cfg.Disclosure,
+			AgentRuntime:         string(resolved.Vendor),
+			AgentProfileID:       resolved.ProfileID,
+			AgentReasoningEffort: resolved.ReasoningEffort,
+			CustomInstructions:   &cfg,
+			Network:              coordinatorNetworkGateway{statePath: networkclient.DefaultStatePath(runtimeHomeDirOrEmpty()), client: &http.Client{Timeout: 10 * time.Second}},
+			AgentModel:           agentModel,
+			AgentTimeout:         time.Duration(cfg.Agent.Timeouts.WorkerMaxRuntimeSeconds) * time.Second,
+			AgentIdleTimeout:     time.Duration(cfg.Agent.Timeouts.WorkerIdleTimeoutSeconds) * time.Second,
+			RetryBaseDelay:       retryBaseDelay,
+			RetryMaxAttempts:     int64(cfg.Scheduler.RetryMaxAttempts),
+			OnQueueItemEnqueued:  requestWake,
 			OnRunCompleted: func(ctx context.Context, input worker.RunCompletedInput) error {
 				return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
 			},
@@ -2947,8 +3041,10 @@ func runEscalatorIfDue(ctx context.Context, input defaultSchedulerTickInput, run
 	if !input.EscalatorCadence.start(runAt, cadence) {
 		return nil
 	}
-	_, err := input.Escalator.Run(ctx)
-	input.EscalatorCadence.finish(runAt, err == nil)
+	result, err := input.Escalator.Run(ctx)
+	// A rotating census is intentionally not a successful cadence tick: its
+	// snapshot omits source rows and must be retried on the next scheduler tick.
+	input.EscalatorCadence.finish(runAt, err == nil && !result.Snapshot.Partial)
 	return err
 }
 

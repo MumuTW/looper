@@ -152,25 +152,33 @@ func AssertKnownLoopType(loopType LoopType) error {
 // repository — so the only behavior it can change is a miss becoming a hit,
 // which is the safe direction for a veto.
 func IsAutoLaneHeld(loopType LoopType, itemLabels []string) bool {
-	if labels.Has(itemLabels, labels.HoldGlobal) {
+	return IsAutoLaneHeldForNamespace(loopType, itemLabels, labels.DefaultNamespace())
+}
+
+func IsAutoLaneHeldForNamespace(loopType LoopType, itemLabels []string, namespace labels.Namespace) bool {
+	if labels.Has(itemLabels, namespace.HoldGlobal()) {
 		return true
 	}
 	switch loopType {
 	case LoopTypePlanner:
 		return false
 	case LoopTypeWorker:
-		return labels.Has(itemLabels, labels.HoldWorker)
+		return labels.Has(itemLabels, namespace.HoldWorker())
 	case LoopTypeFixer:
-		return labels.Has(itemLabels, labels.HoldFixer)
+		return labels.Has(itemLabels, namespace.HoldFixer())
 	case LoopTypeReviewer:
-		return labels.Has(itemLabels, labels.HoldReviewer)
+		return labels.Has(itemLabels, namespace.HoldReviewer())
 	default:
 		return false
 	}
 }
 
 func IsAutomaticLoopHeld(loopType LoopType, manual bool, itemLabels []string) bool {
-	return !manual && IsAutoLaneHeld(loopType, itemLabels)
+	return IsAutomaticLoopHeldForNamespace(loopType, manual, itemLabels, labels.DefaultNamespace())
+}
+
+func IsAutomaticLoopHeldForNamespace(loopType LoopType, manual bool, itemLabels []string, namespace labels.Namespace) bool {
+	return !manual && IsAutoLaneHeldForNamespace(loopType, itemLabels, namespace)
 }
 
 func AssertKnownLoopStatus(status LoopStatus) error {

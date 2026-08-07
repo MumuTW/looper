@@ -80,6 +80,59 @@ func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	}
 }
 
+// TestReviewerDiscoveryLaneUsesMetadataTier is the contract/invariant
+// regression test for the GraphQL quota incident (#549): the reviewer
+// discovery lane must route author-resolution through the lightweight
+// metadata tier (ViewPullRequestForDiscovery), never the full
+// statusCheckRollup-laden view. The runner fakes delegate
+// ViewPullRequestForDiscovery to ViewPullRequest, so this test asserts
+// the discovery path actually selects the metadata method when a
+// snapshot is present and the author is missing from the list row
+// (the resolveAuthor path that previously used the heavy view).
+func TestReviewerDiscoveryLaneUsesMetadataTier(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		currentLogin: "octocat",
+		listOpenByLabel: map[string][]PullRequestSummary{
+			"": {
+				// No Author on the list row: resolveAuthor must fetch the
+				// metadata tier to fill it in.
+				{Number: 42, Title: "Needs author", State: "OPEN", HeadSHA: "head-42", ReviewRequests: []string{"octocat"}},
+			},
+		},
+	}
+	snapshot := githubinfra.NewDiscoverySnapshot(nil, githubinfra.NewDiscoveryTickState(), githubinfra.DiscoverySnapshotOptions{PullRequestLimit: 100})
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github,
+		Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{},
+		Logger: fixture.logger, Now: fixture.now,
+		DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, EnableSelfReview: false},
+	})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper", Snapshot: snapshot})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if github.viewDiscoveryCalls != 1 {
+		t.Fatalf("ViewPullRequestForDiscovery calls = %d, want 1 (resolveAuthor must use the metadata tier)", github.viewDiscoveryCalls)
+	}
+	// The follow-up loop re-check (discoverExistingReviewerLoop) legitimately
+	// uses the full tier because it consumes Reviews/Checks — that is a
+	// deliberate exception, not the discovery path. The invariant under
+	// test is that the resolveAuthor discovery step used the metadata
+	// tier; if the lane had regressed to the heavy view for discovery,
+	// viewDiscoveryCalls would be 0.
+	if github.viewCalls > 1 {
+		t.Fatalf("full ViewPullRequest calls = %d, want at most 1 (only the follow-up loop re-check)", github.viewCalls)
+	}
+	// The lane still produced a queue item: metadata tier carries enough
+	// data for discovery to proceed.
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("len(QueueItems) = %d, want 1 (metadata tier must not block discovery)", len(result.QueueItems))
+	}
+}
+
 func TestDiscoverPullRequestsSkipsOccupiedCandidateAndContinuesBatch(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1081,6 +1134,26 @@ func TestReviewerFailedLoopRecoveryEligibilityHonorsStopOnConfig(t *testing.T) {
 				t.Fatalf("eligible = false, want true")
 			}
 		})
+	}
+}
+
+// TestReviewerFailedLoopRecoveryEligibilityHonorsCustomNamespaceReadyLabel
+// pins the spec-ready stop gate for a custom namespace: with StopOnReadyLabel
+// enabled, a failed reviewer loop must not auto-recover once the PR carries the
+// project's namespaced spec-ready label rather than the default looper:spec-ready.
+func TestReviewerFailedLoopRecoveryEligibilityHonorsCustomNamespaceReadyLabel(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish: expected old, got new"})
+	cfg := &config.Config{Projects: []config.ProjectRefConfig{{ID: "project_1", RepoPath: t.TempDir(), LabelNamespace: "team.looper:"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true}, CustomInstructions: cfg})
+	loop, _ := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	eligible, _, reason, err := runner.failedReviewerLoopRecoveryEligibility(context.Background(), *loop, PullRequestSummary{Number: 42, State: "OPEN", Labels: []string{"team.looper:spec-ready"}})
+	if err != nil {
+		t.Fatalf("failedReviewerLoopRecoveryEligibility() error = %v", err)
+	}
+	if eligible || reason != "ready_label" {
+		t.Fatalf("eligible = %t, reason = %q, want false / ready_label", eligible, reason)
 	}
 }
 
@@ -3450,6 +3523,30 @@ func TestFilterSkipMetadataRecordsReviewerForNotRequested(t *testing.T) {
 	}
 }
 
+// TestFilterSkipMetadataRecordsNamespacedRequiredLabel pins the persisted
+// ready_label skip metadata to the project's effective spec-ready label, so a
+// custom-namespaced spec PR is not rediscovered while its namespaced
+// promotion label is still present.
+func TestFilterSkipMetadataRecordsNamespacedRequiredLabel(t *testing.T) {
+	t.Parallel()
+	namespace := labels.NewNamespace("team.looper:")
+	metadata := filterSkipMetadata(reviewerCheckpoint{
+		SkipKind:   "ready_label",
+		SkipReason: "Skipped because spec-ready label is present",
+		Detail:     &checkpointDetail{HeadSHA: "abc123", Labels: []string{namespace.SpecReady()}},
+	}, "2026-05-01T00:00:00Z", namespace.SpecReady())
+	if metadata == nil {
+		t.Fatalf("filterSkipMetadata() = nil, want metadata")
+	}
+	got, _ := stringFromAny(metadata["requiredLabel"])
+	if got != namespace.SpecReady() {
+		t.Fatalf("metadata.requiredLabel = %q, want %q", got, namespace.SpecReady())
+	}
+	if got, _ := stringFromAny(metadata["headSha"]); got != "abc123" {
+		t.Fatalf("metadata.headSha = %q, want abc123", got)
+	}
+}
+
 func TestDiscoverPullRequestsRequeuesConflictedSkipWhenConflictClears(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -4788,7 +4885,7 @@ func TestProcessClaimedItemAutoMergeApprovesAndEnablesAutoMergeWhenCriteriaPass(
 		reviewRequests:      []string{"reviewer"},
 		viewBody:            "Implements feature.\n\nCloses #358",
 		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,2 @@\n-old\n+new\n+more\n",
-		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n- add more\n", Labels: []string{"triaged", "dispatch/plan"}},
+		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n- add more\n", Labels: []string{"triaged", "looper:dispatch:plan"}},
 	}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig(), CustomInstructions: reviewerAutoMergeTestConfig(t), CriteriaVerifier: stubCriteriaVerifier{responses: map[criteria.AcceptanceCriterion]criteria.CriterionAssessment{
@@ -4851,7 +4948,7 @@ func TestProcessClaimedItemAutoMergeApprovesAndCommentsWhenAutoMergeRefused(t *t
 		reviewRequests:      []string{"reviewer"},
 		viewBody:            "Implements feature.\n\nCloses #358",
 		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n",
-		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n", Labels: []string{"triaged", "dispatch/plan"}},
+		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n", Labels: []string{"triaged", "looper:dispatch:plan"}},
 		repositorySettings:  githubinfra.RepositorySettings{AllowSquashMerge: true, AllowMergeCommit: true, AllowRebaseMerge: true, AllowAutoMerge: false},
 	}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
@@ -4890,7 +4987,7 @@ func TestProcessClaimedItemAutoMergeApprovesWithoutRemoteProbeWhenOutOfScope(t *
 		reviewRequests:      []string{"reviewer"},
 		viewBody:            "Implements feature.\n\nCloses #358",
 		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n",
-		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n", Labels: []string{"triaged", "dispatch/plan"}},
+		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n", Labels: []string{"triaged", "looper:dispatch:plan"}},
 	}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig(), CustomInstructions: reviewerAutoMergeTestConfig(t), CriteriaVerifier: stubCriteriaVerifier{responses: map[criteria.AcceptanceCriterion]criteria.CriterionAssessment{
@@ -4937,7 +5034,7 @@ func TestProcessClaimedItemAutoMergeCommentsAndRetriagesWhenCriteriaFail(t *test
 		reviewRequests:      []string{"reviewer"},
 		viewBody:            "Implements feature.\n\nCloses #358",
 		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n",
-		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n- add tests\n", Labels: []string{"triaged", "dispatch/plan", "other"}},
+		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n- add tests\n", Labels: []string{"triaged", "looper:dispatch:plan", "other"}},
 	}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig(), CustomInstructions: reviewerAutoMergeTestConfig(t), CriteriaVerifier: stubCriteriaVerifier{responses: map[criteria.AcceptanceCriterion]criteria.CriterionAssessment{
@@ -4963,8 +5060,8 @@ func TestProcessClaimedItemAutoMergeCommentsAndRetriagesWhenCriteriaFail(t *test
 	if len(github.removeIssueLabelCalls) != 1 {
 		t.Fatalf("removeIssueLabelCalls = %#v, want one issue label removal", github.removeIssueLabelCalls)
 	}
-	if got := github.removeIssueLabelCalls[0].Labels; len(got) != 2 || got[0] != "triaged" || got[1] != "dispatch/plan" {
-		t.Fatalf("removed labels = %#v, want triaged + dispatch/plan", got)
+	if got := github.removeIssueLabelCalls[0].Labels; len(got) != 2 || got[0] != "triaged" || got[1] != "looper:dispatch:plan" {
+		t.Fatalf("removed labels = %#v, want triaged + looper:dispatch:plan", got)
 	}
 	if len(github.enableAutoMergeCalls) != 0 {
 		t.Fatalf("enableAutoMergeCalls = %#v, want none", github.enableAutoMergeCalls)
@@ -9476,6 +9573,33 @@ func testReviewerLoopConfig() config.ReviewerLoopConfig {
 	return config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 60, MinPublishIntervalSeconds: 300, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: false, StopOnReadyLabel: true, StopOnIdenticalOutput: true}
 }
 
+func TestReviewCapacityRefusalRequiresStructuredRateLimitResult(t *testing.T) {
+	t.Parallel()
+	refusal, ok := reviewCapacityRefusal(AgentResult{Stdout: `__LOOPER_RESULT__={"type":"rate_limit","message":"review quota exhausted"}`})
+	if !ok || refusal.reason != "rate_limit" || refusal.message != "review quota exhausted" {
+		t.Fatalf("reviewCapacityRefusal() = %#v, %t", refusal, ok)
+	}
+	if _, ok := reviewCapacityRefusal(AgentResult{Summary: "rate limit exceeded"}); ok {
+		t.Fatal("prose rate-limit message must not become durable refusal evidence")
+	}
+}
+
+func TestAppendReviewEvidencePersistsPullRequestEntity(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	runner := New(Options{Repos: fixture.repos, Now: fixture.now})
+	input := stepInput{Project: storage.ProjectRecord{ID: "project_1"}, Repo: "acme/looper", PRNumber: 42}
+	if err := runner.appendReviewEvidence(context.Background(), input, "pr.review.refused", map[string]any{"headSha": "abc123", "reason": "rate_limit"}); err != nil {
+		t.Fatalf("appendReviewEvidence() error = %v", err)
+	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if len(events) != 1 || events[0].EventType != "pr.review.refused" || !strings.Contains(events[0].PayloadJSON, `"reason":"rate_limit"`) {
+		t.Fatalf("events = %#v, want durable rate-limit refusal", events)
+	}
+}
+
 func (f *runnerFixture) advance(delta time.Duration) { f.current = f.current.Add(delta) }
 
 func (f *runnerFixture) nowISO() string {
@@ -9572,6 +9696,7 @@ type fakeGitHubGateway struct {
 	listHeadSHA                     string
 	removeReviewRequestOnSecondView bool
 	viewCalls                       int
+	viewDiscoveryCalls              int
 	author                          string
 	labels                          []string
 	reviewDecision                  string
@@ -9697,7 +9822,7 @@ func (g *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string, string)
 	return "octocat", nil
 }
 
-func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error) {
+func (g *fakeGitHubGateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
 	g.viewCalls++
 	if len(g.viewErrs) > 0 {
 		err := g.viewErrs[0]
@@ -9748,6 +9873,11 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 	return PullRequestDetail{Number: 42, Title: "Review me", Body: body, State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: g.effectiveAuthor(), ReviewRequests: reviewRequests, ReviewRequestUsers: users, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Diff: diff, Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: cloneCommentMaps(g.reviews)}, nil
 }
 
+func (g *fakeGitHubGateway) ViewPullRequestForDiscovery(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	g.viewDiscoveryCalls++
+	return g.ViewPullRequest(ctx, input)
+}
+
 func (g *fakeGitHubGateway) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
 	if g.issueDetailErr != nil {
 		return githubinfra.IssueDetail{}, g.issueDetailErr
@@ -9755,7 +9885,7 @@ func (g *fakeGitHubGateway) ViewIssue(_ context.Context, input githubinfra.ViewI
 	if g.issueDetail.Number != 0 {
 		return g.issueDetail, nil
 	}
-	return githubinfra.IssueDetail{Number: input.IssueNumber, Title: "Issue", Body: "", State: "open", Labels: []string{"triaged", "dispatch/plan"}}, nil
+	return githubinfra.IssueDetail{Number: input.IssueNumber, Title: "Issue", Body: "", State: "open", Labels: []string{"triaged", "looper:dispatch:plan"}}, nil
 }
 
 func (g *fakeGitHubGateway) GetRepositorySettings(context.Context, githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {

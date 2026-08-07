@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/MumuTW/looper/internal/forge"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/outboundguard"
 	"github.com/MumuTW/looper/internal/reviewitem"
 	"github.com/MumuTW/looper/internal/storage"
@@ -107,6 +109,7 @@ type Options struct {
 	ConfigArgs []string
 
 	PRRef               string
+	ProjectID           string
 	Event               string
 	CommitID            string
 	CleanReviewEvent    string
@@ -198,7 +201,11 @@ func RunTrusted(ctx context.Context, opts Options, cfg config.Config, credential
 	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
 		return err
 	}
-	if err := validateReviewerReviewSubmitHold(ctx, cfg, repo, prNumber, opts.ReviewerManual, opts.ReviewerRunID, detail.Labels); err != nil {
+	namespace, err := reviewSubmitLabelNamespaceForProject(cfg, opts.ProjectID, repo, cwd)
+	if err != nil {
+		return err
+	}
+	if err := validateReviewerReviewSubmitHoldForNamespace(ctx, cfg, namespace, repo, prNumber, opts.ReviewerManual, opts.ReviewerRunID, detail.Labels); err != nil {
 		return err
 	}
 	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy, detail.Author); err != nil {
@@ -223,7 +230,7 @@ func RunTrusted(ctx context.Context, opts Options, cfg config.Config, credential
 		if canSubmitWithoutAnchorValidation(err, payload.Comments) {
 			// Body-only oversized/truncated fallback still must fail closed on base/head
 			// drift: hold-only refresh is not enough when commit_id was captured earlier.
-			if _, err := validateLatestReviewerReviewSubmitPublication(ctx, gateway, cfg, repo, prNumber, commitID, detail.BaseSHA, opts.ReviewerManual, opts.ReviewerRunID, cwd); err != nil {
+			if _, err := validateLatestReviewerReviewSubmitPublication(ctx, gateway, cfg, repo, prNumber, commitID, detail.BaseSHA, opts.ReviewerManual, opts.ReviewerRunID, cwd, opts.ProjectID); err != nil {
 				return err
 			}
 			return submitReviewWithoutAnchorValidation(ctx, stdout, stderr, gateway, repo, prNumber, submissionEvent, payload, commitID, cwd, cfg.Disclosure)
@@ -244,7 +251,7 @@ func RunTrusted(ctx context.Context, opts Options, cfg config.Config, credential
 		return err
 	}
 	// Fail closed on base/head drift between anchor resolution and mutation.
-	if _, err := validateLatestReviewerReviewSubmitPublication(ctx, gateway, cfg, repo, prNumber, commitID, detail.BaseSHA, opts.ReviewerManual, opts.ReviewerRunID, cwd); err != nil {
+	if _, err := validateLatestReviewerReviewSubmitPublication(ctx, gateway, cfg, repo, prNumber, commitID, detail.BaseSHA, opts.ReviewerManual, opts.ReviewerRunID, cwd, opts.ProjectID); err != nil {
 		return err
 	}
 	if err := gateway.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: submissionEvent, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: cfg.Disclosure, CWD: cwd}); err != nil {
@@ -536,8 +543,8 @@ func validateExpectedHeadCommit(expected string, actual string) error {
 	return nil
 }
 
-func validateReviewerReviewSubmitHold(ctx context.Context, cfg config.Config, repo string, prNumber int64, manual bool, runID string, labels []string) error {
-	if !domain.IsAutoLaneHeld(domain.LoopTypeReviewer, labels) {
+func validateReviewerReviewSubmitHoldForNamespace(ctx context.Context, cfg config.Config, namespace labels.Namespace, repo string, prNumber int64, manual bool, runID string, itemLabels []string) error {
+	if !domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, itemLabels, namespace) {
 		return nil
 	}
 	if manual {
@@ -573,10 +580,61 @@ func validateReviewerReviewSubmitHold(ctx context.Context, cfg config.Config, re
 	return fmt.Errorf("reviewer review submit blocked because %s#%d is currently held", repo, prNumber)
 }
 
+// reviewSubmitLabelNamespace resolves the project-scoped label authority for
+// the trusted review-submit child. The proxy binds the child to the daemon's
+// working directory and PR, so matching the same configured project by repo or
+// path keeps the final hold check on the same namespace the reviewer used.
+// Refuse to fall back to the default namespace when a configured custom
+// namespace cannot be identified: missing a human veto is less safe than
+// declining publication.
+func reviewSubmitLabelNamespace(cfg config.Config, repo, cwd string) (labels.Namespace, error) {
+	return reviewSubmitLabelNamespaceForProject(cfg, "", repo, cwd)
+}
+
+func reviewSubmitLabelNamespaceForProject(cfg config.Config, projectID, repo, cwd string) (labels.Namespace, error) {
+	repo = strings.TrimSpace(repo)
+	cwd = strings.TrimSpace(cwd)
+	projectID = strings.TrimSpace(projectID)
+	if projectID != "" {
+		for _, project := range cfg.Projects {
+			if project.ID == projectID {
+				return labels.NewNamespace(project.LabelNamespace), nil
+			}
+		}
+		return labels.Namespace{}, fmt.Errorf("resolve project label namespace for review submit %s: bound project %q is not configured", repo, projectID)
+	}
+	for _, project := range cfg.Projects {
+		matchesRepo := strings.TrimSpace(project.Repo) != "" && strings.EqualFold(strings.TrimSpace(project.Repo), repo)
+		matchesPath := reviewSubmitPathsEqual(project.RepoPath, cwd)
+		if matchesRepo || matchesPath {
+			return labels.NewNamespace(project.LabelNamespace), nil
+		}
+	}
+	for _, project := range cfg.Projects {
+		if strings.TrimSpace(project.LabelNamespace) != "" {
+			return labels.Namespace{}, fmt.Errorf("resolve project label namespace for review submit %s: no configured project matches working directory %q or repository %q", repo, cwd, repo)
+		}
+	}
+	return labels.DefaultNamespace(), nil
+}
+
+func reviewSubmitPathsEqual(left, right string) bool {
+	left, right = strings.TrimSpace(left), strings.TrimSpace(right)
+	if left == "" || right == "" {
+		return false
+	}
+	if filepath.Clean(left) == filepath.Clean(right) {
+		return true
+	}
+	leftAbs, leftErr := filepath.Abs(left)
+	rightAbs, rightErr := filepath.Abs(right)
+	return leftErr == nil && rightErr == nil && filepath.Clean(leftAbs) == filepath.Clean(rightAbs)
+}
+
 // validateLatestReviewerReviewSubmitPublication re-reads the PR before mutation
 // and fails closed on head/base drift plus hold labels. Refreshed labels are
 // returned so publish authority uses the latest snapshot.
-func validateLatestReviewerReviewSubmitPublication(ctx context.Context, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, manual bool, runID string, cwd string) ([]string, error) {
+func validateLatestReviewerReviewSubmitPublication(ctx context.Context, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, manual bool, runID string, cwd string, projectIDs ...string) ([]string, error) {
 	detail, err := gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		return nil, fmt.Errorf("refresh pull request before review publish: %w", err)
@@ -587,7 +645,20 @@ func validateLatestReviewerReviewSubmitPublication(ctx context.Context, gh revie
 	if err := validateExpectedBaseCommit(expectedBaseSHA, detail.BaseSHA); err != nil {
 		return nil, err
 	}
-	if err := validateReviewerReviewSubmitHold(ctx, cfg, repo, prNumber, manual, runID, detail.Labels); err != nil {
+	projectID := ""
+	if len(projectIDs) > 0 {
+		projectID = projectIDs[0]
+	}
+	var namespace labels.Namespace
+	if projectID == "" {
+		namespace, err = reviewSubmitLabelNamespace(cfg, repo, cwd)
+	} else {
+		namespace, err = reviewSubmitLabelNamespaceForProject(cfg, projectID, repo, cwd)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := validateReviewerReviewSubmitHoldForNamespace(ctx, cfg, namespace, repo, prNumber, manual, runID, detail.Labels); err != nil {
 		return nil, err
 	}
 	return detail.Labels, nil

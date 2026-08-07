@@ -1,5 +1,7 @@
 # Coordinator admission and assignment authority is committed to GitHub
 
+> Status: withdrawn from the supported product by #84. This ADR is retained as historical design context; Routed configuration and runtime maintenance are unavailable.
+
 ## Context
 
 Network mode extends Coordinator from Issue triage/dispatch into a control plane for both Issue admission and PR review assignment. Per `AGENTS.md`'s "Name the authority before enforcing it" rule, every side-effecting action must answer: *what is the Authority for this action, and why is it not the agent's own structured output?*

@@ -36,7 +36,7 @@ func TestCoordinatorHappyPathWithFakeGH(t *testing.T) {
 		Routes: map[string]any{
 			"repos/acme/looper/issues/1":          json.RawMessage(`{"number":1,"title":"Coordinator bug","body":"triage me","html_url":"https://example.test/issues/1","state":"open","created_at":"2026-05-14T12:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[]}`),
 			"repos/acme/looper/issues/1/comments": json.RawMessage(`[[]]`),
-			"repos/acme/looper/issues/1/timeline": json.RawMessage(`[[]]`),
+			"repos/acme/looper/issues/1/timeline": json.RawMessage(`[]`),
 		},
 	})
 
@@ -76,7 +76,7 @@ func TestCoordinatorHappyPathWithFakeGH(t *testing.T) {
 	assertOrderedText(t, logText,
 		`"argv":["issue","list"`,
 		`"argv":["label","create","kind/bug"`,
-		`"argv":["api","repos/acme/looper/issues/1/labels","--method","POST","-f","labels[]=kind/bug","-f","labels[]=area/coordinator","-f","labels[]=complexity/m","-f","labels[]=dispatch/plan"`,
+		`"argv":["api","repos/acme/looper/issues/1/labels","--method","POST","-f","labels[]=kind/bug","-f","labels[]=area/coordinator","-f","labels[]=complexity/m","-f","labels[]=looper:dispatch:plan"`,
 		`"argv":["api","repos/acme/looper/issues/1/comments","--method","POST"`,
 		`"argv":["api","repos/acme/looper/issues/1/labels","--method","POST","-f","labels[]=triaged"`,
 	)
@@ -91,10 +91,10 @@ func TestCoordinatorHumanDispatchWithFakeGH(t *testing.T) {
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
-	fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":2,"title":"Coordinator bug","body":"dispatch me","url":"https://example.test/issues/2","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
-		"repos/acme/looper/issues/2":                      json.RawMessage(`{"number":2,"title":"Coordinator bug","body":"dispatch me","html_url":"https://example.test/issues/2","state":"open","created_at":"2026-05-14T11:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
+	fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":2,"title":"Coordinator bug","body":"dispatch me","url":"https://example.test/issues/2","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
+		"repos/acme/looper/issues/2":                      json.RawMessage(`{"number":2,"title":"Coordinator bug","body":"dispatch me","html_url":"https://example.test/issues/2","state":"open","created_at":"2026-05-14T11:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}`),
 		"repos/acme/looper/issues/2/comments":             json.RawMessage(`[[{"id":17,"body":"/plan","created_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"author_association":"MEMBER"}]]`),
-		"repos/acme/looper/issues/2/timeline":             json.RawMessage(`[[{"event":"labeled","created_at":"2026-05-14T11:30:00Z","label":{"name":"triaged"}}]]`),
+		"repos/acme/looper/issues/2/timeline":             json.RawMessage(`[{"event":"labeled","created_at":"2026-05-14T11:30:00Z","label":{"name":"triaged"}}]`),
 		"repos/acme/looper/collaborators/octo/permission": json.RawMessage(`{"permission":"write"}`),
 	}})
 
@@ -130,10 +130,10 @@ func TestCoordinatorHumanDispatchBlockedByDependencyWithFakeGH(t *testing.T) {
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
-	fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":2,"title":"Coordinator bug","body":"dispatch me","url":"https://example.test/issues/2","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
-		"repos/acme/looper/issues/2":                         json.RawMessage(`{"number":2,"title":"Coordinator bug","body":"dispatch me","html_url":"https://example.test/issues/2","state":"open","created_at":"2026-05-14T11:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
+	fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":2,"title":"Coordinator bug","body":"dispatch me","url":"https://example.test/issues/2","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
+		"repos/acme/looper/issues/2":                         json.RawMessage(`{"number":2,"title":"Coordinator bug","body":"dispatch me","html_url":"https://example.test/issues/2","state":"open","created_at":"2026-05-14T11:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}`),
 		"repos/acme/looper/issues/2/comments":                json.RawMessage(`[[{"id":17,"body":"/plan","created_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"author_association":"MEMBER"}]]`),
-		"repos/acme/looper/issues/2/timeline":                json.RawMessage(`[[{"event":"labeled","created_at":"2026-05-14T11:30:00Z","label":{"name":"triaged"}}]]`),
+		"repos/acme/looper/issues/2/timeline":                json.RawMessage(`[{"event":"labeled","created_at":"2026-05-14T11:30:00Z","label":{"name":"triaged"}}]`),
 		"repos/acme/looper/issues/2/dependencies/blocked_by": json.RawMessage(`[{"number":1,"state":"open","state_reason":"","repository":{"full_name":"acme/looper"}}]`),
 		"repos/acme/looper/collaborators/octo/permission":    json.RawMessage(`{"permission":"write"}`),
 	}})
@@ -171,10 +171,10 @@ func TestCoordinatorAutonomousDispatchWithFakeGH(t *testing.T) {
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
-	fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":3,"title":"Coordinator bug","body":"dispatch me","url":"https://example.test/issues/3","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
-		"repos/acme/looper/issues/3":                      json.RawMessage(`{"number":3,"title":"Coordinator bug","body":"dispatch me","html_url":"https://example.test/issues/3","state":"open","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
+	fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":3,"title":"Coordinator bug","body":"dispatch me","url":"https://example.test/issues/3","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
+		"repos/acme/looper/issues/3":                      json.RawMessage(`{"number":3,"title":"Coordinator bug","body":"dispatch me","html_url":"https://example.test/issues/3","state":"open","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}`),
 		"repos/acme/looper/issues/3/comments":             json.RawMessage(`[[]]`),
-		"repos/acme/looper/issues/3/timeline":             json.RawMessage(`[[{"event":"labeled","created_at":"2026-05-14T10:00:00Z","label":{"name":"triaged"}}]]`),
+		"repos/acme/looper/issues/3/timeline":             json.RawMessage(`[{"event":"labeled","created_at":"2026-05-14T10:00:00Z","label":{"name":"triaged"}}]`),
 		"repos/acme/looper/collaborators/octo/permission": json.RawMessage(`{"permission":"write"}`),
 	}})
 
@@ -216,14 +216,14 @@ func TestCoordinatorAutonomousDispatchWaitsForBlockedByCompletionWithFakeGH(t *t
 		if blockerStateReason != "" {
 			stateReasonField = `"state_reason":"` + blockerStateReason + `"`
 		}
-		fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":1,"title":"A","body":"done first","url":"https://example.test/issues/1","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]},{"number":2,"title":"B","body":"blocked","url":"https://example.test/issues/2","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
-			"repos/acme/looper/issues/1":                         json.RawMessage(`{"number":1,"title":"A","body":"done first","html_url":"https://example.test/issues/1","state":"` + blockerState + `",` + stateReasonField + `,"created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
+		fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":1,"title":"A","body":"done first","url":"https://example.test/issues/1","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]},{"number":2,"title":"B","body":"blocked","url":"https://example.test/issues/2","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
+			"repos/acme/looper/issues/1":                         json.RawMessage(`{"number":1,"title":"A","body":"done first","html_url":"https://example.test/issues/1","state":"` + blockerState + `",` + stateReasonField + `,"created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}`),
 			"repos/acme/looper/issues/1/comments":                json.RawMessage(`[[]]`),
-			"repos/acme/looper/issues/1/timeline":                json.RawMessage(`[[{"event":"labeled","created_at":"2026-05-14T10:00:00Z","label":{"name":"triaged"}}]]`),
+			"repos/acme/looper/issues/1/timeline":                json.RawMessage(`[{"event":"labeled","created_at":"2026-05-14T10:00:00Z","label":{"name":"triaged"}}]`),
 			"repos/acme/looper/issues/1/dependencies/blocked_by": json.RawMessage(`[[]]`),
-			"repos/acme/looper/issues/2":                         json.RawMessage(`{"number":2,"title":"B","body":"blocked","html_url":"https://example.test/issues/2","state":"open","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
+			"repos/acme/looper/issues/2":                         json.RawMessage(`{"number":2,"title":"B","body":"blocked","html_url":"https://example.test/issues/2","state":"open","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}`),
 			"repos/acme/looper/issues/2/comments":                json.RawMessage(`[[]]`),
-			"repos/acme/looper/issues/2/timeline":                json.RawMessage(`[[{"event":"labeled","created_at":"2026-05-14T10:00:00Z","label":{"name":"triaged"}}]]`),
+			"repos/acme/looper/issues/2/timeline":                json.RawMessage(`[{"event":"labeled","created_at":"2026-05-14T10:00:00Z","label":{"name":"triaged"}}]`),
 			"repos/acme/looper/issues/2/dependencies/blocked_by": json.RawMessage(`[[{"number":1,"repository":{"full_name":"acme/looper"}}]]`),
 		}})
 	}
@@ -271,13 +271,13 @@ func TestCoordinatorCycleHandlingWithFakeGH(t *testing.T) {
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
-	fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":1,"title":"A","body":"a","url":"https://example.test/issues/1","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]},{"number":2,"title":"B","body":"b","url":"https://example.test/issues/2","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
-		"repos/acme/looper/issues/1":                         json.RawMessage(`{"number":1,"title":"A","body":"a","html_url":"https://example.test/issues/1","state":"open","state_reason":"","created_at":"2026-05-14T10:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
-		"repos/acme/looper/issues/2":                         json.RawMessage(`{"number":2,"title":"B","body":"b","html_url":"https://example.test/issues/2","state":"open","state_reason":"","created_at":"2026-05-14T10:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
+	fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":1,"title":"A","body":"a","url":"https://example.test/issues/1","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]},{"number":2,"title":"B","body":"b","url":"https://example.test/issues/2","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
+		"repos/acme/looper/issues/1":                         json.RawMessage(`{"number":1,"title":"A","body":"a","html_url":"https://example.test/issues/1","state":"open","state_reason":"","created_at":"2026-05-14T10:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}`),
+		"repos/acme/looper/issues/2":                         json.RawMessage(`{"number":2,"title":"B","body":"b","html_url":"https://example.test/issues/2","state":"open","state_reason":"","created_at":"2026-05-14T10:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}`),
 		"repos/acme/looper/issues/1/comments":                json.RawMessage(`[[]]`),
 		"repos/acme/looper/issues/2/comments":                json.RawMessage(`[[]]`),
-		"repos/acme/looper/issues/1/timeline":                json.RawMessage(`[[{"event":"labeled","created_at":"2026-05-14T11:00:00Z","label":{"name":"triaged"}}]]`),
-		"repos/acme/looper/issues/2/timeline":                json.RawMessage(`[[{"event":"labeled","created_at":"2026-05-14T11:00:00Z","label":{"name":"triaged"}}]]`),
+		"repos/acme/looper/issues/1/timeline":                json.RawMessage(`[{"event":"labeled","created_at":"2026-05-14T11:00:00Z","label":{"name":"triaged"}}]`),
+		"repos/acme/looper/issues/2/timeline":                json.RawMessage(`[{"event":"labeled","created_at":"2026-05-14T11:00:00Z","label":{"name":"triaged"}}]`),
 		"repos/acme/looper/issues/1/dependencies/blocked_by": json.RawMessage(`[{"number":2,"state":"open","state_reason":"","repository":{"full_name":"acme/looper"}}]`),
 		"repos/acme/looper/issues/2/dependencies/blocked_by": json.RawMessage(`[{"number":1,"state":"open","state_reason":"","repository":{"full_name":"acme/looper"}}]`),
 	}})
@@ -299,10 +299,10 @@ func TestCoordinatorCycleHandlingWithFakeGH(t *testing.T) {
 	assertOrderedText(t, string(logBytes),
 		`"argv":["api","--paginate","--slurp","repos/acme/looper/issues/1/dependencies/blocked_by"`,
 		`"argv":["api","repos/acme/looper/issues/1/labels/triaged","--method","DELETE"]`,
-		`"argv":["api","repos/acme/looper/issues/1/labels/dispatch%2Fplan","--method","DELETE"]`,
+		`"argv":["api","repos/acme/looper/issues/1/labels/looper%3Adispatch%3Aplan","--method","DELETE"]`,
 		`"argv":["api","repos/acme/looper/issues/1/comments","--method","POST"`,
 		`"argv":["api","repos/acme/looper/issues/2/labels/triaged","--method","DELETE"]`,
-		`"argv":["api","repos/acme/looper/issues/2/labels/dispatch%2Fplan","--method","DELETE"]`,
+		`"argv":["api","repos/acme/looper/issues/2/labels/looper%3Adispatch%3Aplan","--method","DELETE"]`,
 	)
 	if !strings.Contains(string(logBytes), cycleCommentMarker) && !strings.Contains(string(logBytes), `\u003c!-- looper:coordinator:cycle --\u003e`) {
 		t.Fatal("cycle marker missing from fake-gh invocation log")
@@ -315,11 +315,11 @@ func TestCoordinatorNotPlannedRetriageWithFakeGH(t *testing.T) {
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
-	fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":2,"title":"B","body":"b","url":"https://example.test/issues/2","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
+	fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":2,"title":"B","body":"b","url":"https://example.test/issues/2","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
 		"repos/acme/looper/issues/1":                         json.RawMessage(`{"number":1,"title":"A","body":"a","html_url":"https://example.test/issues/1","state":"closed","state_reason":"not_planned","created_at":"2026-05-14T10:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[]}`),
-		"repos/acme/looper/issues/2":                         json.RawMessage(`{"number":2,"title":"B","body":"b","html_url":"https://example.test/issues/2","state":"open","state_reason":"","created_at":"2026-05-14T10:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
+		"repos/acme/looper/issues/2":                         json.RawMessage(`{"number":2,"title":"B","body":"b","html_url":"https://example.test/issues/2","state":"open","state_reason":"","created_at":"2026-05-14T10:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}`),
 		"repos/acme/looper/issues/2/comments":                json.RawMessage(`[[]]`),
-		"repos/acme/looper/issues/2/timeline":                json.RawMessage(`[[{"event":"labeled","created_at":"2026-05-14T11:00:00Z","label":{"name":"triaged"}}]]`),
+		"repos/acme/looper/issues/2/timeline":                json.RawMessage(`[{"event":"labeled","created_at":"2026-05-14T11:00:00Z","label":{"name":"triaged"}}]`),
 		"repos/acme/looper/issues/2/dependencies/blocked_by": json.RawMessage(`[{"number":1,"state":"closed","state_reason":"not_planned","repository":{"full_name":"acme/looper"}}]`),
 	}})
 
@@ -337,7 +337,7 @@ func TestCoordinatorNotPlannedRetriageWithFakeGH(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile(invocation log) error = %v", err)
 	}
-	if !strings.Contains(string(logBytes), `"argv":["api","repos/acme/looper/issues/2/labels/triaged","--method","DELETE"]`) || !strings.Contains(string(logBytes), `"argv":["api","repos/acme/looper/issues/2/labels/dispatch%2Fplan","--method","DELETE"]`) {
+	if !strings.Contains(string(logBytes), `"argv":["api","repos/acme/looper/issues/2/labels/triaged","--method","DELETE"]`) || !strings.Contains(string(logBytes), `"argv":["api","repos/acme/looper/issues/2/labels/looper%3Adispatch%3Aplan","--method","DELETE"]`) {
 		t.Fatalf("expected label removal in log\n%s", string(logBytes))
 	}
 	if strings.Contains(string(logBytes), cycleCommentMarker) {
@@ -351,19 +351,19 @@ func TestCoordinatorTieBreakWithFakeGH(t *testing.T) {
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
-	fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":10,"title":"Parent","body":"p","url":"https://example.test/issues/10","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[]},{"number":11,"title":"A","body":"a","url":"https://example.test/issues/11","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/implement"}]},{"number":12,"title":"B","body":"b","url":"https://example.test/issues/12","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/implement"}]},{"number":13,"title":"C","body":"c","url":"https://example.test/issues/13","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/implement"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
+	fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":10,"title":"Parent","body":"p","url":"https://example.test/issues/10","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[]},{"number":11,"title":"A","body":"a","url":"https://example.test/issues/11","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"looper:dispatch:implement"}]},{"number":12,"title":"B","body":"b","url":"https://example.test/issues/12","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"looper:dispatch:implement"}]},{"number":13,"title":"C","body":"c","url":"https://example.test/issues/13","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"looper:dispatch:implement"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
 		"repos/acme/looper/issues/10":                         json.RawMessage(`{"number":10,"title":"Parent","body":"p","html_url":"https://example.test/issues/10","state":"open","state_reason":"","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[]}`),
-		"repos/acme/looper/issues/11":                         json.RawMessage(`{"number":11,"title":"A","body":"a","html_url":"https://example.test/issues/11","state":"open","state_reason":"","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/implement"}]}`),
-		"repos/acme/looper/issues/12":                         json.RawMessage(`{"number":12,"title":"B","body":"b","html_url":"https://example.test/issues/12","state":"open","state_reason":"","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/implement"}]}`),
-		"repos/acme/looper/issues/13":                         json.RawMessage(`{"number":13,"title":"C","body":"c","html_url":"https://example.test/issues/13","state":"open","state_reason":"","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/implement"}]}`),
+		"repos/acme/looper/issues/11":                         json.RawMessage(`{"number":11,"title":"A","body":"a","html_url":"https://example.test/issues/11","state":"open","state_reason":"","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"looper:dispatch:implement"}]}`),
+		"repos/acme/looper/issues/12":                         json.RawMessage(`{"number":12,"title":"B","body":"b","html_url":"https://example.test/issues/12","state":"open","state_reason":"","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"looper:dispatch:implement"}]}`),
+		"repos/acme/looper/issues/13":                         json.RawMessage(`{"number":13,"title":"C","body":"c","html_url":"https://example.test/issues/13","state":"open","state_reason":"","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"looper:dispatch:implement"}]}`),
 		"repos/acme/looper/issues/10/comments":                json.RawMessage(`[[]]`),
 		"repos/acme/looper/issues/11/comments":                json.RawMessage(`[[]]`),
 		"repos/acme/looper/issues/12/comments":                json.RawMessage(`[[]]`),
 		"repos/acme/looper/issues/13/comments":                json.RawMessage(`[[]]`),
-		"repos/acme/looper/issues/10/timeline":                json.RawMessage(`[[]]`),
-		"repos/acme/looper/issues/11/timeline":                json.RawMessage(`[[{"event":"labeled","created_at":"2026-05-14T10:00:00Z","label":{"name":"triaged"}}]]`),
-		"repos/acme/looper/issues/12/timeline":                json.RawMessage(`[[{"event":"labeled","created_at":"2026-05-14T10:00:00Z","label":{"name":"triaged"}}]]`),
-		"repos/acme/looper/issues/13/timeline":                json.RawMessage(`[[{"event":"labeled","created_at":"2026-05-14T10:00:00Z","label":{"name":"triaged"}}]]`),
+		"repos/acme/looper/issues/10/timeline":                json.RawMessage(`[]`),
+		"repos/acme/looper/issues/11/timeline":                json.RawMessage(`[{"event":"labeled","created_at":"2026-05-14T10:00:00Z","label":{"name":"triaged"}}]`),
+		"repos/acme/looper/issues/12/timeline":                json.RawMessage(`[{"event":"labeled","created_at":"2026-05-14T10:00:00Z","label":{"name":"triaged"}}]`),
+		"repos/acme/looper/issues/13/timeline":                json.RawMessage(`[{"event":"labeled","created_at":"2026-05-14T10:00:00Z","label":{"name":"triaged"}}]`),
 		"repos/acme/looper/issues/11/dependencies/blocked_by": json.RawMessage(`[]`),
 		"repos/acme/looper/issues/12/dependencies/blocked_by": json.RawMessage(`[]`),
 		"repos/acme/looper/issues/13/dependencies/blocked_by": json.RawMessage(`[]`),

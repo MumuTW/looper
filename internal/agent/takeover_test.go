@@ -51,6 +51,13 @@ func TestInteractiveResumeCommandLine(t *testing.T) {
 	if _, ok := InteractiveResumeCommandLine(codexCfg(), wt, "  "); ok {
 		t.Fatalf("empty session id must not render a command")
 	}
+
+	effort := config.ReasoningEffortHigh
+	got, ok = InteractiveResumeCommandLine(ExecutorConfig{Vendor: config.AgentVendorCodex, ReasoningEffort: &effort}, wt, sid)
+	want := "cd " + wt + " && codex -c model_reasoning_effort=high resume " + sid
+	if !ok || got != want {
+		t.Fatalf("codex resume effort line = %q (ok=%v), want %q", got, ok, want)
+	}
 }
 
 // Cross-vendor role takeover must not reuse global agent.params.command owned by

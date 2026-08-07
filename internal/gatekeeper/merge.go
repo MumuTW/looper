@@ -21,14 +21,14 @@ type MergeOutcome struct {
 	HeadSHA string `json:"headSha"`
 	// MergeStrategy records the configured forge strategy so Auditor can reject
 	// a rebase tip as incomplete revert provenance.
-	MergeStrategy string `json:"mergeStrategy,omitempty"`
-	MergeCommitSHA string `json:"mergeCommitSha,omitempty"`
-	SourceIssue *githubinfra.IssueReference `json:"sourceIssue,omitempty"`
+	MergeStrategy  string                      `json:"mergeStrategy,omitempty"`
+	MergeCommitSHA string                      `json:"mergeCommitSha,omitempty"`
+	SourceIssue    *githubinfra.IssueReference `json:"sourceIssue,omitempty"`
 	// TouchedFiles is GitHub's authoritative pull-request file list captured
 	// after a successful merge. Auditor may use it as attribution evidence.
-	TouchedFiles []string `json:"touchedFiles,omitempty"`
-	TouchedFilesAvailable bool `json:"touchedFilesAvailable,omitempty"`
-	Merged  bool   `json:"merged"`
+	TouchedFiles          []string `json:"touchedFiles,omitempty"`
+	TouchedFilesAvailable bool     `json:"touchedFilesAvailable,omitempty"`
+	Merged                bool     `json:"merged"`
 	// Reason explains a refusal. Empty on success.
 	Reason string `json:"reason,omitempty"`
 	// ConfirmingReasons are the gates that blocked the confirming evaluation, when

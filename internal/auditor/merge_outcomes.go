@@ -33,7 +33,12 @@ func CandidatesFromMergeOutcomes(events []storage.EventLogRecord) ([]MergeCandid
 		if err != nil {
 			return nil, fmt.Errorf("parse merge outcome event %s timestamp: %w", event.ID, err)
 		}
-		candidates = append(candidates, MergeCandidate{ProjectID: outcome.ProjectID, Repo: outcome.Repo, PRNumber: outcome.PRNumber, HeadSHA: outcome.HeadSHA, MergeCommitSHA: outcome.MergeCommitSHA, MergeStrategy: outcome.MergeStrategy, SourceIssue: outcome.SourceIssue, MergedAt: mergedAt.UTC(), TouchedFiles: append([]string(nil), outcome.TouchedFiles...), TouchedFilesAvailable: outcome.TouchedFilesAvailable})
+		// Version 1 did not persist the availability bit. A legacy event that
+		// already carries a non-empty file list can be safely enriched from its
+		// own authoritative snapshot; an empty or absent list remains blocked
+		// until the confirmation lane re-reads the PR files from GitHub.
+		filesAvailable := outcome.TouchedFilesAvailable || (outcome.Version < 2 && len(outcome.TouchedFiles) > 0)
+		candidates = append(candidates, MergeCandidate{ProjectID: outcome.ProjectID, Repo: outcome.Repo, PRNumber: outcome.PRNumber, HeadSHA: outcome.HeadSHA, MergeCommitSHA: outcome.MergeCommitSHA, MergeStrategy: outcome.MergeStrategy, SourceIssue: outcome.SourceIssue, MergedAt: mergedAt.UTC(), TouchedFiles: append([]string(nil), outcome.TouchedFiles...), TouchedFilesAvailable: filesAvailable})
 	}
 	return candidates, nil
 }

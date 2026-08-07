@@ -128,6 +128,29 @@ type PlannerWorkGraphNodeRecord struct {
 	UpdatedAt              string
 }
 
+// WithTransaction runs a repository operation against one SQLite transaction.
+// Event-log projections that must be observed together (for example a Gate
+// report and its terminal agreement) use this boundary so a partial append
+// cannot become the durable source of truth.
+func (r *Repositories) WithTransaction(ctx context.Context, fn func(*Repositories) error) error {
+	if r == nil || r.q == nil {
+		return fmt.Errorf("repository transaction storage is not configured")
+	}
+	if fn == nil {
+		return fmt.Errorf("repository transaction callback is nil")
+	}
+	if _, ok := r.q.(*sql.Tx); ok {
+		return fn(r)
+	}
+	db, ok := r.q.(txBeginner)
+	if !ok {
+		return fmt.Errorf("repository transaction storage is not transactional")
+	}
+	return WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
+		return fn(NewRepositories(tx))
+	})
+}
+
 // RetireQueuedLoop pauses a queued loop and cancels its selected queued item
 // in one transaction. It returns false when either record stopped being queued
 // before the transaction established its status guard.
@@ -627,6 +650,80 @@ func (r *EventsRepository) ListByEntityAndEventTypes(ctx context.Context, entity
 	return scanEventLogs(rows)
 }
 
+// ListByEventType returns the newest durable events of one type. The optional
+// project filter is applied in SQLite so a read-only projection cannot load an
+// unrelated project's full event history into the daemon before applying its
+// limit.
+func (r *EventsRepository) ListByEventType(ctx context.Context, eventType, projectID string, limit int64) ([]EventLogRecord, error) {
+	if strings.TrimSpace(eventType) == "" {
+		return []EventLogRecord{}, nil
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+
+	query := "SELECT " + eventLogColumns + " FROM event_logs WHERE event_type = ?"
+	args := []any{eventType}
+	if strings.TrimSpace(projectID) != "" {
+		query += " AND project_id = ?"
+		args = append(args, projectID)
+	}
+	query += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := r.q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list event logs by type: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
+// ListLatestByEventType returns the newest event for each durable entity in an
+// event family. The optional project filter is applied before the window so a
+// read-only projection can bound its scan without loading another project's
+// history. Entity identity includes project_id because the same pull request
+// can be observed by more than one registered project. A positive limit caps
+// the newest entities; zero or negative means all entities for callers that
+// need a complete state projection.
+func (r *EventsRepository) ListLatestByEventType(ctx context.Context, eventType, projectID string, limit int64) ([]EventLogRecord, error) {
+	if strings.TrimSpace(eventType) == "" {
+		return []EventLogRecord{}, nil
+	}
+
+	query := `SELECT ` + eventLogColumns + `
+		FROM (
+			SELECT ` + eventLogColumns + `, rowid AS event_rowid,
+				ROW_NUMBER() OVER (
+					PARTITION BY COALESCE(project_id, ''), COALESCE(entity_id, '')
+					ORDER BY created_at DESC, rowid DESC
+				) AS event_rank
+			FROM event_logs
+			WHERE event_type = ?`
+	args := []any{eventType}
+	if strings.TrimSpace(projectID) != "" {
+		query += " AND project_id = ?"
+		args = append(args, projectID)
+	}
+	query += `
+		) AS ranked
+		WHERE event_rank = 1
+		ORDER BY created_at DESC, event_rowid DESC`
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+
+	rows, err := r.q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list latest event logs by type: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
 // ListByEntityTypeAndEventTypes reads the complete lifecycle for one entity
 // family without imposing an arbitrary status-page limit. Callers derive live
 // projections from the returned durable events; this query does not record a
@@ -792,6 +889,37 @@ func (r *EventsRepository) ListTriageSourceStates(ctx context.Context, projectID
 		records = append(records, chunkRecords...)
 	}
 	return records, nil
+}
+
+// ListAwaitingTriageSourceStates returns one current lifecycle row per source
+// that has not reached confirmation, routing, or retirement. The event log is
+// append-only, so status readers must aggregate by source key in SQLite rather
+// than reread every historical event on each poll. The returned projection is
+// still authoritative only for the report and terminal-event evidence it
+// contains; it does not create a second lifecycle record.
+func (r *EventsRepository) ListAwaitingTriageSourceStates(ctx context.Context, projectID string) ([]TriageSourceStateRecord, error) {
+	args := []any{}
+	projectFilter := ""
+	if strings.TrimSpace(projectID) != "" {
+		projectFilter = " AND project_id = ?"
+		args = append(args, projectID)
+	}
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT `+triageSourceKeySQL+` AS source_key,
+			MIN(CASE WHEN event_type = 'triage.enrolled' THEN payload_json END),
+			MIN(CASE WHEN event_type = 'triage.report' THEN payload_json END),
+			MAX(event_type = 'triage.routed'),
+			MAX(event_type = 'triage.retired')
+		FROM event_logs INDEXED BY idx_event_logs_triage_source_key
+		WHERE `+triageLifecyclePredicateSQL+projectFilter+`
+		GROUP BY source_key
+		HAVING MAX(CASE WHEN event_type IN ('triage.confirmed', 'triage.routed', 'triage.retired') THEN 1 ELSE 0 END) = 0
+		ORDER BY source_key
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list awaiting triage source states: %w", err)
+	}
+	return scanTriageSourceStates(rows)
 }
 
 // ListTriageSourceStateWindow returns at most limit source lifecycles, rotating
@@ -1814,6 +1942,39 @@ func (r *RunsRepository) AppendCheckpointSecondaryIssue(ctx context.Context, id,
 	return nil
 }
 
+// ClearTimeoutProgress removes the timeout-preservation evidence only after an
+// operator has explicitly authorized discarding the associated worktree. The
+// checkpoint otherwise remains intact so the next worker run keeps its work,
+// plan, and worktree identity while no longer trying to preserve discarded
+// progress.
+func (r *RunsRepository) ClearTimeoutProgress(ctx context.Context, id, updatedAt string) error {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE runs
+		SET checkpoint_json = CASE
+				WHEN json_valid(checkpoint_json) AND json_type(checkpoint_json) = 'object'
+					THEN CASE
+						WHEN json_extract(checkpoint_json, '$.execution.status') = 'timeout_observing'
+						THEN json_set(json_remove(checkpoint_json, '$.execution.progressBeforeTimeout', '$.execution.progressSnapshotError', '$.continuation'), '$.execution.status', 'timeout')
+						ELSE json_remove(checkpoint_json, '$.execution.progressBeforeTimeout', '$.execution.progressSnapshotError', '$.continuation')
+					END
+				ELSE checkpoint_json
+			END,
+			updated_at = ?
+		WHERE id = ?
+	`, updatedAt, id)
+	if err != nil {
+		return fmt.Errorf("clear run timeout progress: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read cleared run timeout progress rows: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("clear run timeout progress: run not found: %s", id)
+	}
+	return nil
+}
+
 // MergeRunResumePolicy rewrites only the checkpoint's resume policy.
 //
 // The retry-policy writers read a run, change this one field, and would otherwise
@@ -2329,12 +2490,41 @@ func (r *PullRequestSnapshotsRepository) List(ctx context.Context) ([]PullReques
 	return scanPullRequestSnapshots(rows)
 }
 
+// ListLatest returns one snapshot per project/repository/pull request. Snapshot
+// captures are append-only, and callers that render current state should not
+// materialize historical payloads (which may include a full diff) just to
+// discard them in memory.
+func (r *PullRequestSnapshotsRepository) ListLatest(ctx context.Context) ([]PullRequestSnapshotRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `
+		WITH ranked AS (
+			SELECT id, ROW_NUMBER() OVER (
+				PARTITION BY project_id, lower(repo), pr_number
+				-- IDs are random; rowid preserves insertion order when both
+				-- millisecond timestamps tie.
+				ORDER BY captured_at DESC, created_at DESC, rowid DESC
+			) AS row_number
+			FROM pull_request_snapshots
+		)
+		SELECT `+qualifiedColumns("snapshots", pullRequestSnapshotColumns)+`
+		FROM pull_request_snapshots snapshots
+		JOIN ranked ON ranked.id = snapshots.id
+		WHERE ranked.row_number = 1
+		ORDER BY snapshots.captured_at DESC, snapshots.created_at DESC, snapshots.rowid DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list latest pull request snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	return scanPullRequestSnapshots(rows)
+}
+
 func (r *PullRequestSnapshotsRepository) ListLatestByRepoAndPR(ctx context.Context, repo string, prNumber int64) ([]PullRequestSnapshotRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `
 		WITH ranked AS (
 			SELECT id, ROW_NUMBER() OVER (
 				PARTITION BY project_id
-				ORDER BY captured_at DESC, created_at DESC, id DESC
+				ORDER BY captured_at DESC, created_at DESC, rowid DESC
 			) AS row_number
 			FROM pull_request_snapshots
 			WHERE repo = ? COLLATE NOCASE AND pr_number = ?
@@ -2343,7 +2533,7 @@ func (r *PullRequestSnapshotsRepository) ListLatestByRepoAndPR(ctx context.Conte
 		FROM pull_request_snapshots snapshots
 		JOIN ranked ON ranked.id = snapshots.id
 		WHERE ranked.row_number = 1
-		ORDER BY snapshots.captured_at DESC, snapshots.created_at DESC, snapshots.id DESC
+		ORDER BY snapshots.captured_at DESC, snapshots.created_at DESC, snapshots.rowid DESC
 	`, repo, prNumber)
 	if err != nil {
 		return nil, fmt.Errorf("list latest pull request snapshots by repository and pull request: %w", err)
@@ -2371,7 +2561,7 @@ func (r *PullRequestSnapshotsRepository) GetLatest(ctx context.Context, repo str
 }
 
 func (r *PullRequestSnapshotsRepository) GetLatestByProject(ctx context.Context, projectID, repo string, prNumber int64) (*PullRequestSnapshotRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT `+pullRequestSnapshotColumns+` FROM pull_request_snapshots WHERE project_id = ? AND repo = ? COLLATE NOCASE AND pr_number = ? ORDER BY captured_at DESC, created_at DESC LIMIT 1`, projectID, repo, prNumber)
+	row := r.q.QueryRowContext(ctx, `SELECT `+pullRequestSnapshotColumns+` FROM pull_request_snapshots WHERE project_id = ? AND repo = ? COLLATE NOCASE AND pr_number = ? ORDER BY captured_at DESC, created_at DESC, rowid DESC LIMIT 1`, projectID, repo, prNumber)
 	record, err := scanPullRequestSnapshot(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2671,6 +2861,24 @@ func (r *QueueRepository) List(ctx context.Context) ([]QueueItemRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `SELECT `+queueItemColumns+` FROM queue_items ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list queue items: %w", err)
+	}
+	defer rows.Close()
+
+	return scanQueueItems(rows)
+}
+
+// ListForTriage returns queue items whose status can still affect the
+// operator board. Terminal history remains available through List, while the
+// bounded read avoids decoding completed/failed/cancelled rows on every poll.
+func (r *QueueRepository) ListForTriage(ctx context.Context) ([]QueueItemRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT `+queueItemColumns+`
+		FROM queue_items
+		WHERE status IS NULL OR status NOT IN ('completed', 'failed', 'cancelled')
+		ORDER BY updated_at DESC, created_at DESC, id DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list queue items for triage: %w", err)
 	}
 	defer rows.Close()
 
@@ -3857,6 +4065,32 @@ func (r *WorktreesRepository) ListActive(ctx context.Context) ([]WorktreeRecord,
 	defer rows.Close()
 
 	return scanWorktrees(rows)
+}
+
+// ListAllPaths returns every worktree path this table has ever claimed,
+// including cleaned and retired rows. The disk sweeper needs the full set, not
+// the active one: a cleaned row whose directory still exists is a failed
+// removal that the record-driven pass owns, and treating it as unregistered
+// debris would delete it out from under that pass's provenance.
+func (r *WorktreesRepository) ListAllPaths(ctx context.Context) ([]string, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT worktree_path FROM worktrees`)
+	if err != nil {
+		return nil, fmt.Errorf("list worktree paths: %w", err)
+	}
+	defer rows.Close()
+
+	paths := make([]string, 0)
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, fmt.Errorf("scan worktree path: %w", err)
+		}
+		paths = append(paths, path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list worktree paths: %w", err)
+	}
+	return paths, nil
 }
 
 func (r *WorktreesRepository) TouchCleanupAttempt(ctx context.Context, id, updatedAt string) error {

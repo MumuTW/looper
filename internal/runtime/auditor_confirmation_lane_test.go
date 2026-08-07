@@ -39,6 +39,10 @@ func (g *confirmationAuditorGateway) ListCheckRunAnnotations(_ context.Context, 
 	return g.annotations[input.CheckRunID], nil
 }
 
+func (g *confirmationAuditorGateway) ListPullRequestFiles(context.Context, githubinfra.ViewPullRequestInput) ([]string, error) {
+	return []string{"internal/runtime/auditor.go"}, nil
+}
+
 func TestProgressAuditorConfirmationRerequestsOnceThenRecordsMatchingFailure(t *testing.T) {
 	ctx, repos, project, repo, head, now := auditorConfirmationFixture(t, []int64{7654})
 	gateway := &confirmationAuditorGateway{head: head, annotations: map[int64][]githubinfra.CheckRunAnnotation{99: {{Path: "internal/runtime/auditor.go", Level: "failure"}}}}
@@ -95,6 +99,28 @@ func TestProgressAuditorConfirmationRecordsFlakeWithoutRerequestingAgain(t *test
 	confirmation := onlyAuditorConfirmation(t, mustListAuditorEvents(t, ctx, repos, entityType, entityID))
 	if confirmation.Outcome != auditor.ConfirmationSuspectedFlake || confirmation.Decision != auditor.ActionRecordFlake {
 		t.Fatalf("confirmation = %#v, want durable flake record", confirmation)
+	}
+}
+
+func TestProgressAuditorConfirmationContinuesAfterHeadAdvances(t *testing.T) {
+	ctx, repos, project, repo, head, now := auditorConfirmationFixture(t, []int64{7654})
+	gateway := &confirmationAuditorGateway{head: head}
+	role := config.AuditorRoleConfig{Enabled: true, WindowMinutes: 60}
+	if err := progressAuditorConfirmation(ctx, repos, gateway, project, repo, "main", role, func() time.Time { return now }); err != nil {
+		t.Fatal(err)
+	}
+	gateway.head = "new-head"
+	gateway.checks = githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{ID: 99, Name: "ci", Status: "completed", Conclusion: "success", CheckSuiteID: 7654, StartedAt: eventlog.FormatJavaScriptISOString(now)}}}
+	if err := progressAuditorConfirmation(ctx, repos, gateway, project, repo, "main", role, func() time.Time { return now }); err != nil {
+		t.Fatal(err)
+	}
+	events, err := repos.Events.ListByEntity(ctx, "branch_head", repo+"@"+head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmation := onlyAuditorConfirmation(t, events)
+	if confirmation.Outcome != auditor.ConfirmationSuspectedFlake {
+		t.Fatalf("old-head confirmation = %#v, want rerun completion after branch advance", confirmation)
 	}
 }
 
@@ -185,6 +211,29 @@ func TestCompletedAuditorRerunWaitsForAResultNewerThanRequest(t *testing.T) {
 	checks := githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "failure", CheckSuiteID: 7654, StartedAt: eventlog.FormatJavaScriptISOString(requestedAt.Add(-time.Second)), CompletedAt: eventlog.FormatJavaScriptISOString(requestedAt.Add(time.Minute))}}}
 	if completed, failed := completedAuditorRerun(checks, []int64{7654}, map[int64]time.Time{7654: requestedAt}); completed || failed != nil {
 		t.Fatalf("completedAuditorRerun() = (%v, %#v), want pending", completed, failed)
+	}
+}
+
+func TestCompletedAuditorRerunWaitsForPendingStatus(t *testing.T) {
+	requestedAt := time.Date(2026, time.July, 31, 12, 0, 0, 0, time.UTC)
+	checks := githubinfra.PullRequestCheckRuns{
+		CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "success", CheckSuiteID: 7654, StartedAt: eventlog.FormatJavaScriptISOString(requestedAt.Add(time.Second))}},
+		Statuses:  []githubinfra.PullRequestStatus{{Context: "legacy", State: "pending"}},
+	}
+	if completed, _ := completedAuditorRerun(checks, []int64{7654}, map[int64]time.Time{7654: requestedAt}); completed {
+		t.Fatal("completedAuditorRerun() = true, want pending while a legacy status is unresolved")
+	}
+}
+
+func TestCompletedAuditorRerunReportsFailureStatusAsFailure(t *testing.T) {
+	requestedAt := time.Date(2026, time.July, 31, 12, 0, 0, 0, time.UTC)
+	checks := githubinfra.PullRequestCheckRuns{
+		CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "success", CheckSuiteID: 7654, StartedAt: eventlog.FormatJavaScriptISOString(requestedAt.Add(time.Second))}},
+		Statuses:  []githubinfra.PullRequestStatus{{Context: "legacy", State: "failure"}},
+	}
+	completed, failed := completedAuditorRerun(checks, []int64{7654}, map[int64]time.Time{7654: requestedAt})
+	if !completed || !equalStringSlices(failed, []string{"legacy"}) {
+		t.Fatalf("completedAuditorRerun() = (%v, %#v), want terminal failure evidence", completed, failed)
 	}
 }
 

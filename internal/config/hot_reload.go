@@ -12,9 +12,10 @@ import (
 )
 
 var hotEditablePaths = map[string]struct{}{
-	"agent.vendor": {},
-	"agent.model":  {},
-	"agent.env":    {},
+	"agent.vendor":          {},
+	"agent.model":           {},
+	"agent.reasoningEffort": {},
+	"agent.env":             {},
 	"agent.timeouts.plannerIdleTimeoutSeconds":  {},
 	"agent.timeouts.plannerMaxRuntimeSeconds":   {},
 	"agent.timeouts.workerIdleTimeoutSeconds":   {},
@@ -30,12 +31,13 @@ var hotEditablePaths = map[string]struct{}{
 	// The cleanup loop rereads these each iteration and a reload wakes it, so
 	// none of them replace a process-owned resource. Only the leaves are hot;
 	// the daemon.worktreeCleanup object itself stays restart-bound.
-	"daemon.worktreeCleanup.enabled":        {},
-	"daemon.worktreeCleanup.interval":       {},
-	"daemon.worktreeCleanup.retentionDays":  {},
-	"daemon.worktreeCleanup.maxPerTick":     {},
-	"daemon.worktreeCleanup.includeOrphans": {},
-	"daemon.worktreeCleanup.dryRun":         {},
+	"daemon.worktreeCleanup.enabled":             {},
+	"daemon.worktreeCleanup.interval":            {},
+	"daemon.worktreeCleanup.retentionDays":       {},
+	"daemon.worktreeCleanup.maxPerTick":          {},
+	"daemon.worktreeCleanup.maxDiskSweepPerTick": {},
+	"daemon.worktreeCleanup.includeOrphans":      {},
+	"daemon.worktreeCleanup.dryRun":              {},
 
 	// The host admission gate re-evaluates the cached sample against the live
 	// thresholds on every claim tick, so an operator can disable or relax a
@@ -184,6 +186,7 @@ func IsHotEditablePath(path string) bool {
 //   - agent.profiles.<id>           (whole profile set/unset)
 //   - agent.profiles.<id>.vendor
 //   - agent.profiles.<id>.model
+//   - agent.profiles.<id>.reasoningEffort
 //
 // Whole-map agent.profiles and unknown nested fields are rejected.
 func isHotAgentProfilePath(path string) bool {
@@ -202,7 +205,7 @@ func isHotAgentProfilePath(path string) bool {
 		return true
 	}
 	switch segments[3] {
-	case "vendor", "model":
+	case "vendor", "model", "reasoningEffort":
 		return true
 	default:
 		return false
@@ -210,7 +213,7 @@ func isHotAgentProfilePath(path string) bool {
 }
 
 // isHotRoleAgentPath allows coding-role agent binding leaves:
-// roles.{planner,worker,reviewer,fixer}.agent.{profile,vendor,model}
+// roles.{planner,worker,reviewer,fixer}.agent.{profile,vendor,model,reasoningEffort}
 func isHotRoleAgentPath(path string) bool {
 	segments := strings.Split(path, ".")
 	if len(segments) != 4 {
@@ -223,7 +226,7 @@ func isHotRoleAgentPath(path string) bool {
 		return false
 	}
 	switch segments[3] {
-	case "profile", "vendor", "model":
+	case "profile", "vendor", "model", "reasoningEffort":
 		return true
 	default:
 		return false
@@ -391,12 +394,12 @@ func appendResolvedVendorRestartGuards(oldConfig Config, newConfig Config, seen 
 	appendGlobalVendorLeaveSwitchGuard(oldConfig, newConfig, mark)
 
 	for _, role := range []string{CodingRolePlanner, CodingRoleWorker, CodingRoleReviewer, CodingRoleFixer} {
-		oldVendor, oldModel, _, oldOK := overlayAgentIdentity(oldConfig, role)
+		oldVendor, oldModel, _, _, oldOK := overlayAgentIdentity(oldConfig, role)
 		if !oldOK || oldVendor == nil {
 			// First activation (no prior vendor) remains hot, including prepared models.
 			continue
 		}
-		newVendor, newModel, _, newOK := overlayAgentIdentity(newConfig, role)
+		newVendor, newModel, _, _, newOK := overlayAgentIdentity(newConfig, role)
 		if !newOK {
 			continue
 		}

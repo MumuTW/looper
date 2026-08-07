@@ -163,13 +163,15 @@ func TestApplyFieldPatchAgentProfilesAndRoleBindings(t *testing.T) {
 	t.Parallel()
 
 	baseVendor := AgentVendorCodex
+	baseEffort := ReasoningEffortLow
 	base := PartialConfig{
 		Agent: &PartialAgentConfig{
 			Vendor: &baseVendor,
 			Profiles: map[string]AgentBindingConfig{
 				"fast": {
-					Vendor: agentVendorPtr(AgentVendorCodex),
-					Model:  stringPtr("gpt-4o-mini"),
+					Vendor:          agentVendorPtr(AgentVendorCodex),
+					Model:           stringPtr("gpt-4o-mini"),
+					ReasoningEffort: &baseEffort,
 				},
 				"strong": {
 					Vendor: agentVendorPtr(AgentVendorClaudeCode),
@@ -184,11 +186,13 @@ func TestApplyFieldPatchAgentProfilesAndRoleBindings(t *testing.T) {
 		},
 	}
 
-	t.Run("set profile leaf and role model", func(t *testing.T) {
+	t.Run("set profile and role leaves", func(t *testing.T) {
 		t.Parallel()
 		patched, err := ApplyFieldPatch(base, map[string]json.RawMessage{
-			"agent.profiles.fast.vendor": json.RawMessage(`"claude-code"`),
-			"roles.worker.agent.model":   json.RawMessage(`"claude-haiku"`),
+			"agent.profiles.fast.vendor":          json.RawMessage(`"claude-code"`),
+			"agent.profiles.fast.reasoningEffort": json.RawMessage(`"high"`),
+			"roles.worker.agent.model":            json.RawMessage(`"claude-haiku"`),
+			"roles.worker.agent.reasoningEffort":  json.RawMessage(`"xhigh"`),
 		}, nil)
 		if err != nil {
 			t.Fatalf("ApplyFieldPatch() error = %v", err)
@@ -199,6 +203,9 @@ func TestApplyFieldPatchAgentProfilesAndRoleBindings(t *testing.T) {
 		if patched.Agent.Profiles["fast"].Model == nil || *patched.Agent.Profiles["fast"].Model != "gpt-4o-mini" {
 			t.Fatalf("profile model = %#v, want preserved gpt-4o-mini", patched.Agent.Profiles["fast"])
 		}
+		if patched.Agent.Profiles["fast"].ReasoningEffort == nil || *patched.Agent.Profiles["fast"].ReasoningEffort != ReasoningEffortHigh {
+			t.Fatalf("profile reasoning effort = %#v, want high", patched.Agent.Profiles["fast"])
+		}
 		if patched.Roles == nil || patched.Roles.Worker == nil || patched.Roles.Worker.Agent == nil {
 			t.Fatalf("roles.worker.agent missing: %#v", patched.Roles)
 		}
@@ -207,6 +214,9 @@ func TestApplyFieldPatchAgentProfilesAndRoleBindings(t *testing.T) {
 		}
 		if patched.Roles.Worker.Agent.Model == nil || *patched.Roles.Worker.Agent.Model != "claude-haiku" {
 			t.Fatalf("worker model = %#v, want claude-haiku", patched.Roles.Worker.Agent)
+		}
+		if patched.Roles.Worker.Agent.ReasoningEffort == nil || *patched.Roles.Worker.Agent.ReasoningEffort != ReasoningEffortVeryHigh {
+			t.Fatalf("worker reasoning effort = %#v, want xhigh", patched.Roles.Worker.Agent)
 		}
 	})
 
@@ -265,9 +275,11 @@ func TestIsFieldLevelConfigPathAgentProfiles(t *testing.T) {
 		"agent.profiles.fast",
 		"agent.profiles.fast.vendor",
 		"agent.profiles.fast.model",
+		"agent.profiles.fast.reasoningEffort",
 		"roles.worker.agent.profile",
 		"roles.worker.agent.vendor",
 		"roles.worker.agent.model",
+		"roles.worker.agent.reasoningEffort",
 	} {
 		if !IsFieldLevelConfigPath(path) {
 			t.Fatalf("IsFieldLevelConfigPath(%q) = false, want true", path)

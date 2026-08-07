@@ -180,6 +180,7 @@ type GitHubGateway interface {
 	AddIssueAssignees(context.Context, IssueAssigneesInput) error
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
+	ViewPullRequestForDiscovery(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	CreatePullRequest(context.Context, CreatePullRequestInput) (CreatePullRequestResult, error)
 	UpdatePullRequestBody(context.Context, UpdatePullRequestBodyInput) error
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
@@ -256,9 +257,10 @@ type AgentRunInput struct {
 	IdempotencyKey   string
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
-	UseSnapshot    bool
-	SnapshotVendor string
-	SnapshotModel  *string
+	UseSnapshot             bool
+	SnapshotVendor          string
+	SnapshotModel           *string
+	SnapshotReasoningEffort *config.ReasoningEffort
 }
 
 type AgentResult struct {
@@ -311,6 +313,7 @@ type Options struct {
 	Disclosure              *config.DisclosureConfig
 	AgentRuntime            string
 	AgentProfileID          string
+	AgentReasoningEffort    *config.ReasoningEffort
 	CustomInstructions      *config.Config
 	AgentModel              *string
 	RetryBaseDelay          time.Duration
@@ -344,6 +347,7 @@ type Runner struct {
 	disclosure              config.DisclosureConfig
 	agentRuntime            string
 	agentProfileID          string
+	agentReasoningEffort    *config.ReasoningEffort
 	customInstructions      config.Config
 	projectRoleConfig       *config.Config
 	agentModel              *string
@@ -509,6 +513,7 @@ func New(options Options) *Runner {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultPlanTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
 	runner := &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), agentProfileID: strings.TrimSpace(options.AgentProfileID), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: cloneStringPtr(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
+	runner.agentReasoningEffort = cloneReasoningEffortPtr(options.AgentReasoningEffort)
 	runner.workGraphs = workgraphdispatch.New(workgraphdispatch.Options{DB: options.DB, Repositories: options.Repos, Now: now, RetryMaxAttempts: retryMax, OnEnqueued: options.OnQueueItemEnqueued})
 	return runner
 }
@@ -564,8 +569,9 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 	result := DiscoveryResult{}
 	eligible := 0
+	namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)
 	for _, issue := range issues {
-		if domain.IsAutoLaneHeld(domain.LoopTypePlanner, issue.Labels) {
+		if domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, issue.Labels, namespace) {
 			result.Skipped++
 			continue
 		}
@@ -721,7 +727,7 @@ func (r *Runner) RouteIssue(ctx context.Context, input RouteIssueInput) (Discove
 	if project == nil {
 		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
 	}
-	if project.Archived || domain.IsAutoLaneHeld(domain.LoopTypePlanner, input.Issue.Labels) {
+	if project.Archived || domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, input.Issue.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)) {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
 	fingerprint := loops.ComputeDiscoveryFingerprint(
@@ -827,7 +833,8 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	if !ok {
 		return r.discoveryPolicy
 	}
-	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser}
+	namespace := config.ProjectLabelNamespace(r.projectRoleConfig, projectID)
+	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: namespace.RemapAll(role.Discovery.Labels), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser}
 }
 
 func (r *Runner) workerRoleConfigured(projectID string) bool {
@@ -1257,7 +1264,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	}
 	if !writeSpecCompleted {
 		executionID := eventlog.NewEventID("agent")
-		agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+		agentVendor, agentModel, _, agentReasoningEffort, useSnapshot, err := r.identityFromRun(input.Run)
 		if err != nil {
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 		}
@@ -1273,12 +1280,12 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 				return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 			}
 		}
-		useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
+		useSnap, snapVendor, snapModel, snapReasoningEffort := agentRunSnapshotFields(agentVendor, agentModel, agentReasoningEffort, useSnapshot)
 		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
 			ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 			Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 			Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID),
-			UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+			UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
 		})
 		if err != nil {
 			return checkpoint, err
@@ -1514,6 +1521,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	if pr == nil || pr.Number == 0 {
 		return checkpoint, &runpipe.LoopError{Message: "Planner publish requires a pull request number", Kind: runpipe.FailureRetryableAfterResume}
 	}
+	namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)
 	if plannerQueueItemIsManual(input.QueueItem) {
 		// Phase 2 applies only to automatic planner lanes.
 	} else if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, input.Project, checkpoint); err != nil {
@@ -1521,11 +1529,12 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	} else if held {
 		return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 	}
-	if !stringInSlice(labels.SpecReviewing, checkpoint.Publish.LabelsAdded) {
-		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: issue.Repo, PRNumber: pr.Number, Labels: []string{labels.SpecReviewing}, CWD: input.Project.RepoPath}); err != nil {
+	specReviewingLabel := namespace.SpecReviewing()
+	if !stringInSlice(specReviewingLabel, checkpoint.Publish.LabelsAdded) {
+		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: issue.Repo, PRNumber: pr.Number, Labels: []string{specReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
 			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
-		checkpoint.Publish.LabelsAdded = append(checkpoint.Publish.LabelsAdded, labels.SpecReviewing)
+		checkpoint.Publish.LabelsAdded = append(checkpoint.Publish.LabelsAdded, specReviewingLabel)
 		if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
 			return checkpoint, wrapRetryableAfterResume(err)
 		}
@@ -1589,7 +1598,7 @@ func (r *Runner) plannerHoldSummary(ctx context.Context, project storage.Project
 	if err != nil {
 		return false, "", err
 	}
-	if !domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+	if !domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)) {
 		return false, "", nil
 	}
 	return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", repo, issueNumber), nil
@@ -1606,17 +1615,17 @@ func (r *Runner) plannerHoldSummaryForCheckpoint(ctx context.Context, project st
 	if err != nil {
 		return false, "", err
 	}
-	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+	if domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)) {
 		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", checkpoint.Issue.Repo, checkpoint.Issue.IssueNumber), nil
 	}
 	if checkpoint.Publish == nil || checkpoint.Publish.PullRequest == nil || checkpoint.Publish.PullRequest.Number == 0 {
 		return false, "", nil
 	}
-	prDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: checkpoint.Issue.Repo, PRNumber: checkpoint.Publish.PullRequest.Number, CWD: project.RepoPath})
+	prDetail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: checkpoint.Issue.Repo, PRNumber: checkpoint.Publish.PullRequest.Number, CWD: project.RepoPath})
 	if err != nil {
 		return false, "", err
 	}
-	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, prDetail.Labels) {
+	if domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, prDetail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)) {
 		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", checkpoint.Issue.Repo, checkpoint.Publish.PullRequest.Number), nil
 	}
 	return false, "", nil
@@ -1626,11 +1635,11 @@ func (r *Runner) plannerAdoptedPullRequestHoldSummary(ctx context.Context, proje
 	if plannerQueueItemIsManual(queueItem) || r.github == nil || repo == "" || prNumber == 0 {
 		return false, "", nil
 	}
-	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
+	detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
 	if err != nil {
 		return false, "", err
 	}
-	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+	if domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)) {
 		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", repo, prNumber), nil
 	}
 	return false, "", nil
@@ -1712,7 +1721,7 @@ func (r *Runner) validatedLifecyclePullRequest(ctx context.Context, input stepIn
 	if state == nil || state.PRNumber <= 0 {
 		return nil, nil
 	}
-	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: issue.Repo, PRNumber: state.PRNumber, CWD: input.Project.RepoPath})
+	detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: issue.Repo, PRNumber: state.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
 		return nil, nil
 	}
@@ -1733,7 +1742,7 @@ func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, run storage
 	if r.github == nil || prNumber <= 0 || !r.disclosure.Enabled || !r.disclosure.Channels.PullRequest {
 		return nil
 	}
-	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	detail, err := r.github.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		return err
 	}
@@ -1753,7 +1762,7 @@ func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, run storage
 // snapshot when present; falls back to runner identity on empty snapshot or
 // parse errors (stamp-only paths must not fail the run).
 func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string) {
-	vendor, modelPtr, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+	vendor, modelPtr, _, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID, r.agentReasoningEffort)
 	if err != nil {
 		// Present but invalid snapshot must not fall back to live runner identity.
 		return "", ""
@@ -2702,7 +2711,7 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky,
 	if previous != nil {
 		previousSnapshot = previous.AgentSnapshotJSON
 	}
-	snapshotJSON, refreshed, legacyResume, err := config.ResolveRunAgentSnapshotJSONForValidationGate(previousSnapshot, sticky, requireToolNetworkDenial, replaysAgentStep, r.agentRuntime, r.agentModel, r.agentProfileID)
+	snapshotJSON, refreshed, legacyResume, err := config.ResolveRunAgentSnapshotJSONForValidationGate(previousSnapshot, sticky, requireToolNetworkDenial, replaysAgentStep, r.agentRuntime, r.agentModel, r.agentProfileID, r.agentReasoningEffort)
 	if err != nil {
 		return nil, err
 	}
@@ -2729,17 +2738,17 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky,
 // identityFromRun returns the vendor/model/profile that must drive this run.
 // When the run has AgentSnapshotJSON, that identity is execution authority.
 // model is a pointer so nil (unset) and non-nil empty (suppress) stay distinct.
-func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, useSnapshot bool, err error) {
-	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, reasoningEffort *config.ReasoningEffort, useSnapshot bool, err error) {
+	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID, r.agentReasoningEffort)
 }
 
-func agentRunSnapshotFields(vendor string, model *string, useSnapshot bool) (bool, string, *string) {
+func agentRunSnapshotFields(vendor string, model *string, reasoningEffort *config.ReasoningEffort, useSnapshot bool) (bool, string, *string, *config.ReasoningEffort) {
 	if !useSnapshot {
-		return false, "", nil
+		return false, "", nil, nil
 	}
 	// Pass through including non-nil empty suppress so SnapshotModel stays
 	// distinct from unset and ParamsForRoleVendor can strip params --model/-m.
-	return true, vendor, model
+	return true, vendor, model, reasoningEffort
 }
 
 func cloneStringPtr(value *string) *string {
@@ -2748,6 +2757,14 @@ func cloneStringPtr(value *string) *string {
 	}
 	trimmed := strings.TrimSpace(*value)
 	return &trimmed
+}
+
+func cloneReasoningEffortPtr(value *config.ReasoningEffort) *config.ReasoningEffort {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func derefString(value *string) string {

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/domain"
 	"github.com/MumuTW/looper/internal/eventlog"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
@@ -352,7 +353,8 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if err != nil {
 			return result, err
 		}
-		if !eligibleTarget(detail) || (domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) && !configuredAdmission) {
+		namespace := config.ProjectLabelNamespaceForMetadata(nil, project.ID, project.MetadataJSON)
+		if !eligibleTarget(detail) || (domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, detail.Labels, namespace) && !configuredAdmission) {
 			result.Skipped++
 			continue
 		}
@@ -547,7 +549,8 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 	if !eligibleTarget(detail) {
 		return r.retireSource(ctx, state, "source_no_longer_eligible", result)
 	}
-	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) && (state.report != nil || !configuredAdmission) {
+	namespace := config.ProjectLabelNamespaceForMetadata(nil, project.ID, project.MetadataJSON)
+	if domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, detail.Labels, namespace) && (state.report != nil || !configuredAdmission) {
 		result.Skipped++
 		return nil
 	}
@@ -566,7 +569,7 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 			visibility = repositoryVisibility
 			admissionDecision = admission.Decide(projectPolicy.Admission, admission.Input{
 				AuthorAssociation: detail.AuthorAssociation, AuthorLogin: detail.Author, AuthorType: detail.AuthorType,
-				Visibility: visibility, Held: domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels),
+				Visibility: visibility, Held: domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, detail.Labels, namespace),
 			})
 		}
 		var decision Decision
@@ -595,7 +598,7 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 		if !eligibleTarget(refreshed) {
 			return r.retireSource(ctx, state, "source_no_longer_eligible", result)
 		}
-		if domain.IsAutoLaneHeld(domain.LoopTypePlanner, refreshed.Labels) && !configuredAdmission {
+		if domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, refreshed.Labels, namespace) && !configuredAdmission {
 			result.Skipped++
 			return nil
 		}
@@ -610,7 +613,7 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 		if configuredAdmission {
 			admissionDecision = admission.Decide(projectPolicy.Admission, admission.Input{
 				AuthorAssociation: detail.AuthorAssociation, AuthorLogin: detail.Author, AuthorType: detail.AuthorType,
-				Visibility: visibility, Held: domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels),
+				Visibility: visibility, Held: domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, detail.Labels, namespace),
 			})
 		}
 		policyDecision := validateDecision(decision, projectPolicy.Legacy)

@@ -65,6 +65,10 @@ func newQuarantineSettlementFixture(t *testing.T, loopStatus string, processAliv
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
+	// Settlement tests invoke the reconciliation pass synchronously. Stop the
+	// runtime scheduler after startup so its background tick cannot settle the
+	// same quarantined execution before the assertion-owned pass runs.
+	rt.stopSchedulerLoop()
 	t.Cleanup(func() { rt.Stop("test cleanup") })
 
 	repos := rt.Services().Repositories
@@ -144,7 +148,10 @@ func containsString(values []string, want string) bool {
 // a past incident, not an ongoing one: it settles, the daemon leaves the
 // degraded state without a restart, and the audit trail survives.
 func TestQuarantineSettlementRetiresOperatorDisposedExecution(t *testing.T) {
-	t.Parallel()
+	// Not parallel: the fixture starts a runtime whose scheduler calls
+	// reconcileLiveStaleRunningRuns on an interval. Running in parallel with
+	// the scheduler tick can race the explicit call below — the scheduler
+	// settles the execution first and the test sees SettledRuns=0.
 
 	fixture := newQuarantineSettlementFixture(t, "queued", false)
 	// The loop is already disposed, so the counter stops reporting it even
@@ -205,8 +212,7 @@ func TestQuarantineSettlementRetiresOperatorDisposedExecution(t *testing.T) {
 // The distinction #150 asks for: a quarantined execution whose process is still
 // there stays debt even after the operator disposed of the loop.
 func TestQuarantineSettlementRetainsLiveExecutionAsDebt(t *testing.T) {
-	t.Parallel()
-
+	// Not parallel: same scheduler race as TestQuarantineSettlementRetiresOperatorDisposedExecution
 	fixture := newQuarantineSettlementFixture(t, "queued", true)
 
 	summary, err := fixture.runtime.reconcileLiveStaleRunningRuns(context.Background())
@@ -239,8 +245,7 @@ func TestQuarantineSettlementRetainsLiveExecutionAsDebt(t *testing.T) {
 // work is genuinely outstanding and the daemon stays degraded until a human
 // decides something.
 func TestQuarantineSettlementKeepsParkedLoopAsDebt(t *testing.T) {
-	t.Parallel()
-
+	// Not parallel: same scheduler race
 	fixture := newQuarantineSettlementFixture(t, "paused", false)
 
 	before := fixture.debt(t)
@@ -270,8 +275,7 @@ func TestQuarantineSettlementKeepsParkedLoopAsDebt(t *testing.T) {
 
 // human_takeover is a deliberate park, not a disposition.
 func TestQuarantineSettlementKeepsHumanTakeoverAsDebt(t *testing.T) {
-	t.Parallel()
-
+	// Not parallel: same scheduler race
 	fixture := newQuarantineSettlementFixture(t, "human_takeover", false)
 
 	summary, err := fixture.runtime.reconcileLiveStaleRunningRuns(context.Background())
@@ -289,8 +293,7 @@ func TestQuarantineSettlementKeepsHumanTakeoverAsDebt(t *testing.T) {
 // Stopping the loop is a disposition too, so close/stop clears the debt the same
 // way retry does.
 func TestQuarantineSettlementRetiresStoppedLoop(t *testing.T) {
-	t.Parallel()
-
+	// Not parallel: same scheduler race
 	fixture := newQuarantineSettlementFixture(t, "terminated", false)
 
 	summary, err := fixture.runtime.reconcileLiveStaleRunningRuns(context.Background())

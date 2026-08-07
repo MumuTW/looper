@@ -101,7 +101,6 @@ Looper's frozen canonical top-level config roots are:
 - `storage`
 - `scheduler`
 - `webhook`
-- `network`
 - `agent`
 - `logging`
 - `notifications`

@@ -1,9 +1,12 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 
 	"github.com/MumuTW/looper/internal/config"
@@ -13,6 +16,7 @@ import (
 const (
 	dashboardBootstrapCodePath     = apiBasePath + "/dashboard/bootstrap/code"
 	dashboardBootstrapExchangePath = apiBasePath + "/dashboard/bootstrap/exchange"
+	dashboardSessionCookieName     = "looper_dashboard_session"
 )
 
 type bootstrapCodeResponse struct {
@@ -26,6 +30,46 @@ type bootstrapExchangeRequest struct {
 
 type bootstrapExchangeResponse struct {
 	Token string `json:"token"`
+}
+
+// dashboardSessionCookieValue is an encoded transport representation. A
+// configured local token is an opaque secret and may contain bytes that the
+// Set-Cookie grammar rejects; putting it in a cookie verbatim would silently
+// corrupt the browser session while the authorization path still compares the
+// original token.
+func dashboardSessionCookieValue(token string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(token))
+}
+
+func dashboardSessionTokenFromCookie(value string) (string, bool) {
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return "", false
+	}
+	return string(decoded), true
+}
+
+// dashboardSessionCookieAttributes follows the externally advertised server
+// URL. The daemon may sit behind a TLS-terminating proxy, so the inbound
+// connection is not authoritative for the browser-facing Secure attribute.
+func dashboardSessionCookieAttributes(cfg config.ServerConfig, request *http.Request) (secure bool, cookiePath string) {
+	cookiePath = "/"
+	if cfg.BaseURL != nil {
+		if parsed, err := url.Parse(strings.TrimSpace(*cfg.BaseURL)); err == nil {
+			secure = strings.EqualFold(parsed.Scheme, "https")
+			if parsed.Path != "" && parsed.Path != "/" {
+				cleaned := path.Clean("/" + strings.TrimPrefix(parsed.Path, "/"))
+				if cleaned != "." && cleaned != "" {
+					cookiePath = cleaned
+				}
+			}
+			return secure, cookiePath
+		}
+	}
+	// With no advertised URL, preserve the direct-connection behavior for
+	// local HTTPS requests while still using the configured URL whenever one
+	// exists.
+	return request != nil && request.TLS != nil, cookiePath
 }
 
 func isDashboardBootstrapExchange(path, method string) bool {
@@ -122,6 +166,20 @@ func (h *Handler) handleBootstrapExchange(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	secure, cookiePath := dashboardSessionCookieAttributes(h.context.Config.Server, r)
+	// Browser surfaces cannot attach an Authorization header to a top-level
+	// navigation, stylesheet, or htmx request. The one-shot exchange is the
+	// existing bootstrap authority, so bind its result to a path-scoped,
+	// browser-facing session cookie as well as returning the token for the SPA's
+	// in-memory client.
+	http.SetCookie(w, &http.Cookie{
+		Name:     dashboardSessionCookieName,
+		Value:    dashboardSessionCookieValue(token),
+		Path:     cookiePath,
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+	})
 	h.writeSuccessNoStore(w, requestID, bootstrapExchangeResponse{Token: token})
 }
 

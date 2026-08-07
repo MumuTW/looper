@@ -20,6 +20,7 @@ import {
 import {
   fetchLoop,
   openLoopLogsStream,
+  type ActiveRunProgress,
   type Loop,
   type LoopLogsChunk,
   type LoopLogsSnapshot,
@@ -175,6 +176,15 @@ function ReviewerConvergenceCard({
       </div>
     </Card>
   );
+}
+
+function formatTimeoutProgress(progress?: ActiveRunProgress | null): string {
+  if (!progress) return "—";
+  const head = progress.headSha?.trim() || "unknown HEAD";
+  const branch = progress.branch?.trim() || "unknown branch";
+  const files = `${progress.changedFileCount}/${progress.stagedFileCount}/${progress.untrackedFileCount} changed/staged/untracked`;
+  const fingerprint = progress.diffFingerprint?.trim();
+  return `${head} · ${branch} · ${files}${fingerprint ? ` · ${fingerprint}` : ""}`;
 }
 
 export function LogsPane({ selector }: { selector: string }) {
@@ -522,13 +532,18 @@ export function LoopDetailPage() {
     [data?.outcome],
   );
 
-  const hasActiveRun = useMemo(() => {
-    if (!data) return false;
+  const activeRun = useMemo(() => {
+    if (!data) return null;
     const items = activeRunItems ?? [];
-    return items.some(
+    return items.find(
       (r) => r.loopId === data.id || r.seq === data.seq,
     );
   }, [activeRunItems, data]);
+  // The loop detail response carries the latest run's redacted continuation
+  // evidence even after the run closes; fall back to the shared active-run
+  // projection while a retry is still live.
+  const continuation = data?.continuation ?? activeRun?.continuation;
+  const hasActiveRun = Boolean(activeRun);
 
   const onMutated = useCallback(async () => {
     await Promise.all([forceRefresh(), forceRefreshActiveRuns()]);
@@ -568,6 +583,43 @@ export function LoopDetailPage() {
             onMutated={onMutated}
             mode="full"
           />
+        </Card>
+      ) : null}
+
+      {continuation ? (
+        <Card title="Timeout continuation">
+          <dl className="m-0 columns-1 gap-x-6 md:columns-2">
+            <Kv label="Mode" value={continuation.mode ?? "—"} />
+            <Kv
+              label="Outcome"
+              value={
+                continuation.outcome ??
+                (continuation.mode === "timeout_observed"
+                  ? "awaiting retry"
+                  : "observation failed")
+              }
+            />
+            <Kv
+              label="Predecessor run"
+              value={continuation.predecessorRunId ?? "—"}
+            />
+            <Kv
+              label="Predecessor exec"
+              value={continuation.predecessorExecutionId ?? "—"}
+            />
+            <Kv
+              label="Before timeout"
+              value={formatTimeoutProgress(continuation.beforeTimeout)}
+            />
+            <Kv
+              label="Before retry"
+              value={formatTimeoutProgress(continuation.afterRestart)}
+            />
+            <Kv
+              label="Last progress"
+              value={formatTs(continuation.beforeTimeout?.lastProgressAt)}
+            />
+          </dl>
         </Card>
       ) : null}
 

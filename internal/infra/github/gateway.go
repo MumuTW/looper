@@ -39,7 +39,7 @@ var (
 	prViewMetadataJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
 	prViewFixerJSONFields      = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "statusCheckRollup", "mergeStateStatus"}
 	prViewReviewerJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "statusCheckRollup", "mergeStateStatus"}
-	prViewGatekeeperJSONFields = []string{"number", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "mergeStateStatus", "changedFiles", "deletions", "closingIssuesReferences"}
+	prViewGatekeeperJSONFields = []string{"number", "state", "closedAt", "mergedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "additions", "deletions", "mergeStateStatus", "changedFiles", "closingIssuesReferences"}
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
@@ -128,6 +128,7 @@ type PullRequestSummary struct {
 	URL                string
 	State              string
 	UpdatedAt          string
+	MergedAt           string
 	IsDraft            bool
 	ReviewDecision     string
 	Labels             []string
@@ -141,6 +142,10 @@ type PullRequestSummary struct {
 	ReviewRequests     []string
 	ReviewRequestUsers []GitHubUser
 	Reviews            []map[string]any
+	Additions          int
+	Deletions          int
+	AdditionsKnown     bool
+	DeletionsKnown     bool
 }
 
 type PullRequestDetail struct {
@@ -159,6 +164,10 @@ type PullRequestDetail struct {
 	BaseRefName        string
 	HeadSHA            string
 	BaseSHA            string
+	Additions          int
+	Deletions          int
+	AdditionsKnown     bool
+	DeletionsKnown     bool
 	Author             string
 	AuthorAssociation  string
 	CommentCount       int
@@ -431,10 +440,11 @@ type IssueAssigneesInput struct {
 }
 
 type IssueLabelsInput struct {
-	Repo        string
-	IssueNumber int64
-	Labels      []string
-	CWD         string
+	Repo           string
+	IssueNumber    int64
+	Labels         []string
+	LabelNamespace labels.Namespace
+	CWD            string
 }
 
 type IssueCommentResult struct {
@@ -641,10 +651,11 @@ type PullRequestCommentInput struct {
 }
 
 type PullRequestLabelsInput struct {
-	Repo     string
-	PRNumber int64
-	Labels   []string
-	CWD      string
+	Repo           string
+	PRNumber       int64
+	Labels         []string
+	LabelNamespace labels.Namespace
+	CWD            string
 }
 
 type PullRequestReviewersInput struct {
@@ -706,6 +717,12 @@ type ListOpenPullRequestsInput struct {
 	Author      string
 	BaseRefName string
 	Timeout     time.Duration
+}
+
+type ListMergedPullRequestsInput struct {
+	Repo  string
+	CWD   string
+	Limit int
 }
 
 type ListReviewRequestedPullRequestsInput struct {
@@ -868,6 +885,34 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 	return g.listOpenPullRequestsRaw(ctx, input)
 }
 
+// ListMergedPullRequests returns the newest merged pull requests so Gatekeeper
+// can make the post-merge review backlog observable. It is not used as merge
+// authority; branch protection already decided the merge.
+func (g *Gateway) ListMergedPullRequests(ctx context.Context, input ListMergedPullRequestsInput) ([]PullRequestSummary, error) {
+	fields := []string{"number", "url", "state", "mergedAt", "headRefOid", "additions", "deletions"}
+	args := []string{"pr", "list", "--repo", input.Repo, "--state", "merged", "--limit", fmt.Sprintf("%d", defaultLimit(input.Limit)), "--json", strings.Join(fields, ",")}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArray(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PullRequestSummary, 0, len(rows))
+	for _, row := range rows {
+		_, additionsKnown := firstPresentRowValue(row, "additions")
+		_, deletionsKnown := firstPresentRowValue(row, "deletions")
+		out = append(out, PullRequestSummary{
+			Number: asInt64(row["number"]), URL: asString(row["url"]), State: asString(row["state"]),
+			MergedAt: asString(row["mergedAt"]), HeadSHA: asString(row["headRefOid"]),
+			Additions: int(asInt64(row["additions"])), Deletions: int(asInt64(row["deletions"])),
+			AdditionsKnown: additionsKnown, DeletionsKnown: deletionsKnown,
+		})
+	}
+	return out, nil
+}
+
 func (g *Gateway) ListReviewRequestedPullRequests(ctx context.Context, input ListReviewRequestedPullRequestsInput) ([]PullRequestSummary, error) {
 	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
 		return snapshot.listReviewRequestedPullRequests(ctx, input)
@@ -959,6 +1004,8 @@ func (g *Gateway) listOpenPullRequestsWithFields(ctx context.Context, input List
 	}
 	out := make([]PullRequestSummary, 0, len(rows))
 	for _, row := range rows {
+		_, additionsKnown := firstPresentRowValue(row, "additions")
+		_, deletionsKnown := firstPresentRowValue(row, "deletions")
 		out = append(out, PullRequestSummary{
 			Number:             asInt64(row["number"]),
 			Title:              asString(row["title"]),
@@ -978,6 +1025,10 @@ func (g *Gateway) listOpenPullRequestsWithFields(ctx context.Context, input List
 			ReviewRequests:     extractReviewRequestLogins(row["reviewRequests"]),
 			ReviewRequestUsers: extractReviewRequestUsers(row["reviewRequests"]),
 			Reviews:            toObjectSlice(row["reviews"]),
+			Additions:          int(asInt64(row["additions"])),
+			Deletions:          int(asInt64(row["deletions"])),
+			AdditionsKnown:     additionsKnown,
+			DeletionsKnown:     deletionsKnown,
 		})
 	}
 	return out, nil
@@ -1389,9 +1440,24 @@ func (g *Gateway) ListIssueCommentsContaining(ctx context.Context, input ViewIss
 	return extractCommentInfos(rows), nil
 }
 
+// issueTimelineProjection keeps issue timeline reads independent of the size of
+// the discussion. Cross-referenced events embed the full source issue or pull
+// request body, so one busy issue can exceed the shell capture cap and erase
+// the whole timeline. gh applies this projection to each page before anything
+// crosses that boundary, keeping only the fields the coordinator and triager
+// consume: event kind, timestamp, event id, and the label for label events.
+//
+// The projection also retains the minimal identifying fields of a cross-
+// referenced source, a top-level pull_request, and a top-level issue — number,
+// html_url, url, and the nested pull_request marker — so linkedPullRequestNumbers
+// can still discover the PR a cross-referenced event points at and drive
+// merge-watch and mark-ready. The full bodies those objects carry are dropped,
+// which is what keeps the wire shape under the capture cap.
+const issueTimelineProjection = `.[] | {id, event, created_at, label: (.label | if . then {name} else null end), source: (.source | if . then {issue: (.issue | if . then {number, html_url, url, pull_request: (if .pull_request then {number, html_url, url} else null end)} else null end)} else null end), pull_request: (.pull_request | if . then {number, html_url, url} else null end), issue: (.issue | if . then {number, html_url, url, pull_request: (if .pull_request then {number, html_url, url} else null end)} else null end)}`
+
 func (g *Gateway) ListIssueTimeline(ctx context.Context, input IssueTimelineInput) ([]map[string]any, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
-	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/timeline", repo, input.IssueNumber), "-H", "Accept: application/vnd.github+json"}
+	args := []string{"api", "--paginate", fmt.Sprintf("repos/%s/issues/%d/timeline", repo, input.IssueNumber), "-H", "Accept: application/vnd.github+json", "--jq", issueTimelineProjection}
 	if hostname != "" {
 		args = append(args, "--hostname", hostname)
 	}
@@ -1399,7 +1465,7 @@ func (g *Gateway) ListIssueTimeline(ctx context.Context, input IssueTimelineInpu
 	if err != nil {
 		return nil, err
 	}
-	return decodeJSONArrayOrPages(result.Stdout)
+	return decodeJSONObjects(result.Stdout)
 }
 
 func (g *Gateway) ListIssueReactions(ctx context.Context, input IssueReactionInput) ([]IssueReaction, error) {
@@ -1629,7 +1695,7 @@ func (g *Gateway) AddIssueLabels(ctx context.Context, input IssueLabelsInput) er
 	if len(input.Labels) == 0 {
 		return nil
 	}
-	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD); err != nil {
+	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD, input.LabelNamespace); err != nil {
 		return err
 	}
 	hostname, repo := splitRepoHostname(input.Repo)
@@ -1836,6 +1902,25 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 	return g.viewPullRequestWithFields(ctx, input, prViewMetadataJSONFields, false, false)
 }
 
+// ViewPullRequestForDiscovery returns the lightweight metadata tier of a
+// pull request (no statusCheckRollup, no reviews, no review threads, no
+// issue comments) for discovery-path callers that only need
+// IsDraft/Author/ReviewRequests/Labels/State. During scheduler ticks it
+// shares the per-tick discovery snapshot's metadata cache so the whole
+// tick costs one thin view per PR; outside a snapshot it falls back to a
+// direct thin query.
+//
+// Callers that consume detail.Checks or detail.Reviews must keep using
+// ViewPullRequestForFixer / ViewPullRequestForReviewer (or ViewPullRequest
+// when the snapshot's full tier is required); this method deliberately
+// omits statusCheckRollup, the most expensive GraphQL field per tick.
+func (g *Gateway) ViewPullRequestForDiscovery(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
+		return snapshot.viewPullRequestMetadata(ctx, input)
+	}
+	return g.viewPullRequestWithFields(ctx, input, prViewMetadataJSONFields, false, false)
+}
+
 func (g *Gateway) ViewPullRequestForFixer(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
 	return g.viewPullRequestWithFields(ctx, input, prViewFixerJSONFields, true, true)
 }
@@ -1865,7 +1950,7 @@ func isUnsupportedClosingIssuesReferencesError(err error) bool {
 	if !strings.Contains(message, "closingissuesreferences") {
 		return false
 	}
-	for _, marker := range []string{"unknown field", "unknown argument", "doesn't exist", "does not exist", "invalid field"} {
+	for _, marker := range []string{"unknown field", "unknown argument", "unsupported field", "doesn't exist", "does not exist", "invalid field", "cannot query field", "could not resolve to a field"} {
 		if strings.Contains(message, marker) {
 			return true
 		}
@@ -1901,6 +1986,8 @@ func (g *Gateway) viewPullRequestWithFields(ctx context.Context, input ViewPullR
 }
 
 func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, issueComments []CommentInfo) PullRequestDetail {
+	_, additionsKnown := firstPresentRowValue(row, "additions")
+	_, deletionsKnown := firstPresentRowValue(row, "deletions")
 	return PullRequestDetail{
 		Number:             asInt64(row["number"]),
 		Title:              asString(row["title"]),
@@ -1917,6 +2004,10 @@ func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, 
 		BaseRefName:        asString(row["baseRefName"]),
 		HeadSHA:            asString(row["headRefOid"]),
 		BaseSHA:            asString(row["baseRefOid"]),
+		Additions:          int(asInt64(row["additions"])),
+		Deletions:          int(asInt64(row["deletions"])),
+		AdditionsKnown:     additionsKnown,
+		DeletionsKnown:     deletionsKnown,
 		Author:             extractAuthor(row["author"]),
 		AuthorAssociation:  asString(row["authorAssociation"]),
 		CommentCount:       len(issueComments),
@@ -1930,7 +2021,7 @@ func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, 
 		DiffStats:          pullRequestDiffStatsFromRow(row),
 		Mergeable:          boolPtrFromValue(row["mergeable"]),
 		MergeableState:     ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),
-		MergedAt:           asString(row["merged_at"]),
+		MergedAt:           firstNonEmpty(asString(row["mergedAt"]), asString(row["merged_at"])),
 		MergeCommitSHA:     nestedString(row, "mergeCommit", "oid"),
 		ClosingIssues:      extractIssueReferences(row["closingIssuesReferences"]),
 		AutoMerge:          extractAutoMerge(row["auto_merge"]),
@@ -1981,6 +2072,8 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
+	_, additionsKnown := firstPresentRowValue(row, "additions")
+	_, deletionsKnown := firstPresentRowValue(row, "deletions")
 	return PullRequestDetail{
 		Number:         asInt64(row["number"]),
 		Title:          asString(row["title"]),
@@ -1999,6 +2092,10 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		BaseRefName:    nestedString(row, "base", "ref"),
 		HeadSHA:        nestedString(row, "head", "sha"),
 		BaseSHA:        nestedString(row, "base", "sha"),
+		Additions:      int(asInt64(row["additions"])),
+		Deletions:      int(asInt64(row["deletions"])),
+		AdditionsKnown: additionsKnown,
+		DeletionsKnown: deletionsKnown,
 		DiffStats:      pullRequestDiffStatsFromRow(row),
 		Mergeable:      boolPtrFromValue(row["mergeable"]),
 		MergeableState: ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),
@@ -2039,7 +2136,6 @@ func qualifyIssueReferences(projectRepo string, references []IssueReference) []I
 	}
 	return qualified
 }
-
 func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullRequestCheckRunsInput) (PullRequestCheckRuns, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
 	args := []string{"api", fmt.Sprintf("repos/%s/commits/%s/check-runs?filter=latest&per_page=100", repo, encodeURIComponent(input.Ref)), "-H", "Accept: application/vnd.github+json"}
@@ -2110,7 +2206,8 @@ func (g *Gateway) ListCheckRunAnnotations(ctx context.Context, input CheckRunAnn
 	annotations := make([]CheckRunAnnotation, 0, len(rows))
 	for _, row := range rows {
 		if path := strings.TrimSpace(asString(row["path"])); path != "" {
-			annotations = append(annotations, CheckRunAnnotation{Path: path, Level: strings.ToLower(strings.TrimSpace(asString(row["level"])))})
+			level := firstNonEmpty(asString(row["annotation_level"]), asString(row["level"]))
+			annotations = append(annotations, CheckRunAnnotation{Path: path, Level: strings.ToLower(strings.TrimSpace(level))})
 		}
 	}
 	return annotations, nil
@@ -3372,7 +3469,7 @@ func (g *Gateway) AddPullRequestLabels(ctx context.Context, input PullRequestLab
 	if len(input.Labels) == 0 {
 		return nil
 	}
-	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD); err != nil {
+	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD, input.LabelNamespace); err != nil {
 		return err
 	}
 	hostname, repo := splitRepoHostname(input.Repo)
@@ -4072,7 +4169,7 @@ func (g *Gateway) getReviewThread(ctx context.Context, threadID, cwd string, hos
 // Presentation comes from labels.Standard when the label is one Looper owns,
 // and falls back to a neutral default for anything else — a project may
 // configure its own trigger labels, and those have no entry in the table.
-func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, wanted []string, cwd string) error {
+func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, wanted []string, cwd string, namespace labels.Namespace) error {
 	definitions := make([]labels.Definition, 0, len(wanted))
 	seen := map[string]struct{}{}
 	for _, label := range wanted {
@@ -4084,7 +4181,7 @@ func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, wanted []s
 			continue
 		}
 		seen[normalized] = struct{}{}
-		definitions = append(definitions, labelPresentation(label))
+		definitions = append(definitions, labelPresentationForNamespace(label, namespace))
 	}
 	return g.ensureLabels(ctx, repo, cwd, definitions)
 }
@@ -4102,13 +4199,22 @@ func isLabelAlreadyExistsError(err error) bool {
 
 // labelPresentation resolves the color and description to create a label with.
 func labelPresentation(label string) labels.Definition {
-	normalized := labels.Normalize(label)
-	for _, definition := range labels.Standard() {
-		if labels.Normalize(definition.Name) == normalized {
+	if namespace, ok := labels.NamespaceForLabel(label); ok {
+		if definition, ok := labels.DefinitionForNamespace(label, namespace); ok {
 			return definition
 		}
 	}
 	return labels.Definition{Name: label, Color: "5319e7", Description: "Managed by looper"}
+}
+
+func labelPresentationForNamespace(label string, namespace labels.Namespace) labels.Definition {
+	if strings.TrimSpace(namespace.Prefix) != "" {
+		if definition, ok := labels.DefinitionForNamespace(label, namespace); ok {
+			return definition
+		}
+		return labels.Definition{Name: label, Color: "5319e7", Description: "Managed by looper"}
+	}
+	return labelPresentation(label)
 }
 
 func (g *Gateway) listRepositoryLabels(ctx context.Context, repo string, cwd string) (map[string]labels.Definition, error) {
