@@ -1170,24 +1170,25 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		}
 	}
 	execution, err := a.executor.Start(ctx, agent.RunInput{
-		ExecutionID:             input.ExecutionID,
-		ProjectID:               input.ProjectID,
-		LoopID:                  input.LoopID,
-		RunID:                   input.RunID,
-		Prompt:                  input.Prompt,
-		NativeResumePrompt:      input.NativeResumePrompt,
-		WorkingDirectory:        input.WorkingDirectory,
-		Timeout:                 input.Timeout,
-		HeartbeatTimeout:        input.HeartbeatTimeout,
-		Metadata:                input.Metadata,
-		IdempotencyKey:          input.IdempotencyKey,
-		Env:                     reviewerTrustedReviewEnv(sock),
-		UseSnapshot:             input.UseSnapshot,
-		SnapshotVendor:          input.SnapshotVendor,
-		SnapshotModel:           input.SnapshotModel,
-		SnapshotReasoningEffort: input.SnapshotReasoningEffort,
-		CompletionContract:      input.CompletionContract,
-		CompletionValidator:     input.CompletionValidator,
+		ExecutionID:                input.ExecutionID,
+		ProjectID:                  input.ProjectID,
+		LoopID:                     input.LoopID,
+		RunID:                      input.RunID,
+		Prompt:                     input.Prompt,
+		NativeResumePrompt:         input.NativeResumePrompt,
+		WorkingDirectory:           input.WorkingDirectory,
+		Timeout:                    input.Timeout,
+		HeartbeatTimeout:           input.HeartbeatTimeout,
+		Metadata:                   input.Metadata,
+		IdempotencyKey:             input.IdempotencyKey,
+		Env:                        reviewerTrustedReviewEnv(sock),
+		UseSnapshot:                input.UseSnapshot,
+		SnapshotVendor:             input.SnapshotVendor,
+		SnapshotModel:              input.SnapshotModel,
+		SnapshotReasoningEffort:    input.SnapshotReasoningEffort,
+		CompletionContract:         input.CompletionContract,
+		CompletionValidator:        input.CompletionValidator,
+		CompletionOutcomeValidator: input.CompletionOutcomeValidator,
 	})
 	if err != nil {
 		proxyCleanup()
@@ -1903,6 +1904,7 @@ func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.Agen
 		RestrictToolNetwork: input.RestrictToolNetwork,
 		OnBeforeTimeout:     input.OnBeforeTimeout,
 		UseSnapshot:         input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel, SnapshotReasoningEffort: input.SnapshotReasoningEffort,
+		CompletionContract: input.CompletionContract, CompletionOutcomeValidator: input.CompletionOutcomeValidator,
 	})
 	if err != nil {
 		return nil, err
@@ -3774,7 +3776,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 			var lease OperationLease
 			if input.OperationOwner != nil {
 				var admitErr error
-				lease, admitErr = input.OperationOwner.AdmitOperation(ctx, OperationMeta{ClaimedBy: "scheduler"})
+				lease, admitErr = input.OperationOwner.AdmitOperation(ctx, OperationMeta{ClaimedBy: "scheduler", Vendor: vendor})
 				if admitErr != nil {
 					// Admission closed between AllowClaim and AdmitOperation.
 					return claimStop, nil
@@ -3827,6 +3829,14 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 				return claimEmpty, nil
 			}
 			if lease != nil {
+				if strings.TrimSpace(vendor) == "" {
+					// An atomic union claim does not know its winner until SQLite
+					// returns the row. Retain the resolved vendor on the pending
+					// operation before BindClaim publishes it as a bound owner.
+					if effectiveVendor, resolveErr := schedulerClaimEffectiveVendor(ctx, input, *item); resolveErr == nil {
+						lease.SetVendor(effectiveVendor)
+					}
+				}
 				permit, bindErr := lease.BindClaim(*item)
 				if bindErr != nil {
 					// Cancelled lease never starts the processor. Durable-requeue
@@ -3912,6 +3922,10 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs := codingClaimProjectScope(input.Config, quarantinedIDs)
 	stopClaiming := false
 	var claimFailure error
+	// A half-open provider's probe budget spans both retry phases. Keep this
+	// counter outside claimLanes so a non-long-term claim cannot be followed by
+	// another probe from the same provider during the long-term pass.
+	claimedByProvider := make(map[string]int, len(providerTypeSets))
 	claimLanes := func(longTerm bool) {
 		// Agent-free lifecycle work (currently fresh snapshot captures) has its
 		// own admission boundary. Keep it out of the provider union so its
@@ -3931,7 +3945,6 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 			// the accounting keyed by effective vendor, not by type-set index; the
 			// latter lets one ordinary and one sticky row consume the same probe
 			// budget twice before dispatch gets a chance to reserve it.
-			claimedByProvider := make(map[string]int, len(atomicTypeSets))
 			for i := range active {
 				active[i] = true
 			}
@@ -4065,7 +4078,6 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		// only prevents one lane from draining its backlog; it can still let a
 		// lower-priority worker consume the last slot ahead of a reviewer lane.
 		active := make([]bool, len(providerTypeSets))
-		claimedByProvider := make(map[string]int, len(providerTypeSets))
 		remaining := len(providerTypeSets)
 		for i := range active {
 			active[i] = true

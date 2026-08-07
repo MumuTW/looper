@@ -114,6 +114,10 @@ func (r *agentHealthRegistry) SetStickyVendorReferences(vendors []string) {
 	}
 	r.gateMu.Lock()
 	defer r.gateMu.Unlock()
+	r.setStickyVendorReferencesLocked(vendors)
+}
+
+func (r *agentHealthRegistry) setStickyVendorReferencesLocked(vendors []string) {
 	r.mu.Lock()
 	r.stickyVendorRefs = make(map[string]struct{}, len(vendors))
 	for _, vendor := range vendors {
@@ -123,6 +127,24 @@ func (r *agentHealthRegistry) SetStickyVendorReferences(vendors []string) {
 	}
 	r.pruneStickyBreakersLocked()
 	r.mu.Unlock()
+}
+
+// RefreshStickyVendorReferences reads the durable/live reference set while
+// holding the same provider gate used by spawn admission and config
+// publication. A provider cannot be admitted in the gap between the snapshot
+// and SetStickyVendorReferences.
+func (r *agentHealthRegistry) RefreshStickyVendorReferences(read func() ([]string, error)) error {
+	if r == nil || read == nil {
+		return nil
+	}
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	vendors, err := read()
+	if err != nil {
+		return err
+	}
+	r.setStickyVendorReferencesLocked(vendors)
+	return nil
 }
 
 func (r *agentHealthRegistry) pruneStickyBreakersLocked() {
@@ -546,6 +568,28 @@ func (r *agentHealthRegistry) SetConfig(cfg brownout.Config, daemonCfg config.Co
 	}
 	r.gateMu.Lock()
 	defer r.gateMu.Unlock()
+	r.setConfigLocked(cfg, daemonCfg)
+}
+
+// RefreshStickyVendorReferencesAndConfig publishes a config reload under one
+// provider gate. The reference read itself must be inside that boundary: a
+// spawn admitted after the read but before SetConfig would otherwise be absent
+// from the retention set and lose its provider breaker.
+func (r *agentHealthRegistry) RefreshStickyVendorReferencesAndConfig(read func() ([]string, error), cfg brownout.Config, daemonCfg config.Config) error {
+	if r == nil {
+		return nil
+	}
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	vendors, err := read()
+	if err == nil {
+		r.setStickyVendorReferencesLocked(vendors)
+	}
+	r.setConfigLocked(cfg, daemonCfg)
+	return err
+}
+
+func (r *agentHealthRegistry) setConfigLocked(cfg brownout.Config, daemonCfg config.Config) {
 	r.mu.Lock()
 	r.cfg = cfg
 	r.ensureConfiguredVendorsLocked(daemonCfg)

@@ -1830,11 +1830,14 @@ func (r *Runtime) publishCatalogConsumers(next config.Config) {
 	if webhook != nil {
 		webhook.updateConfig(next)
 	}
-	r.refreshAgentHealthStickyReferences()
 	// Reconfiguring the health gate must not clear an open one: an operator
 	// editing config during an outage would otherwise release the cooldown and
-	// resume the exact hammering the gate is there to stop.
-	r.agentHealth.SetConfig(agentBrownoutConfig(next), next)
+	// resume the exact hammering the gate is there to stop. Read durable/live
+	// sticky references under the same provider gate as this config publication
+	// so a spawn cannot enter the gap between the two operations.
+	if err := r.refreshAgentHealthStickyReferencesAndConfig(next); err != nil && r.logger != nil {
+		r.logger.Warn("agent health sticky-vendor reference refresh deferred", map[string]any{"error": err.Error()})
+	}
 }
 
 // refreshAgentHealthStickyReferences supplies the health registry with the
@@ -1846,36 +1849,38 @@ func (r *Runtime) refreshAgentHealthStickyReferences() {
 	if r == nil || r.agentHealth == nil {
 		return
 	}
+	if err := r.agentHealth.RefreshStickyVendorReferences(r.collectAgentHealthStickyReferences); err != nil && r.logger != nil {
+		r.logger.Warn("agent health sticky-vendor reference refresh deferred", map[string]any{"error": err.Error()})
+	}
+}
+
+func (r *Runtime) refreshAgentHealthStickyReferencesAndConfig(next config.Config) error {
+	if r == nil || r.agentHealth == nil {
+		return nil
+	}
+	return r.agentHealth.RefreshStickyVendorReferencesAndConfig(r.collectAgentHealthStickyReferences, agentBrownoutConfig(next), next)
+}
+
+func (r *Runtime) collectAgentHealthStickyReferences() ([]string, error) {
+	if r == nil {
+		return nil, nil
+	}
 	r.mu.RLock()
 	repos := r.services.Repositories
 	active := r.activeExecutions
-	logger := r.logger
 	r.mu.RUnlock()
 	refs := make([]string, 0)
 	if active != nil {
 		refs = append(refs, active.AgentVendors()...)
 	}
 	if repos != nil && repos.Queue != nil {
-		queued, err := repos.Queue.ListQueuedSnapshotVendors(context.Background(), []string{"planner", "reviewer", "fixer", "worker"})
+		queueVendors, err := repos.Queue.ListActiveSnapshotVendors(context.Background(), []string{"planner", "reviewer", "fixer", "worker"})
 		if err != nil {
-			// A failed reference read is not authority to discard retained health;
-			// leave the previous set intact and retry at the next publication.
-			if logger != nil {
-				logger.Warn("agent health sticky-vendor reference refresh deferred", map[string]any{"error": err.Error()})
-			}
-			return
+			return nil, err
 		}
-		refs = append(refs, queued...)
-		running, err := repos.Queue.ListRunningSnapshotVendors(context.Background(), []string{"planner", "reviewer", "fixer", "worker"})
-		if err != nil {
-			if logger != nil {
-				logger.Warn("agent health running-vendor reference refresh deferred", map[string]any{"error": err.Error()})
-			}
-			return
-		}
-		refs = append(refs, running...)
+		refs = append(refs, queueVendors...)
 	}
-	r.agentHealth.SetStickyVendorReferences(refs)
+	return refs, nil
 }
 
 // afterProjectsPublished deliberately runs outside configBoundary. Webhook

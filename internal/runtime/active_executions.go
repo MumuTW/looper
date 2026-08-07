@@ -169,6 +169,16 @@ func (r *ActiveExecutionRegistry) AgentVendors() []string {
 			add(lease.meta.Vendor)
 		}
 	}
+	for _, lease := range r.pendingOps {
+		if lease != nil {
+			add(lease.Vendor())
+		}
+	}
+	for _, lease := range r.boundOps {
+		if lease != nil {
+			add(lease.Vendor())
+		}
+	}
 	vendors := make([]string, 0, len(seen))
 	for vendor := range seen {
 		vendors = append(vendors, vendor)

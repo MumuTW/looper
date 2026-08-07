@@ -1036,6 +1036,10 @@ func TestClaimAndRunScheduledQueueItemsSharesHalfOpenBudgetAcrossStickyAndLiveLa
 	}
 	sticky := schedulerTestQueueItem("shared_budget_sticky", "reviewer", nowISO)
 	sticky.LoopID = &stickyLoopID
+	sticky.Attempts = storage.QueueLongTermRetryAttemptThreshold
+	sticky.MaxAttempts = -1
+	stickyErrorKind := "retryable_transient"
+	sticky.LastErrorKind = &stickyErrorKind
 	for _, item := range []storage.QueueItemRecord{live, sticky} {
 		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
 			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)

@@ -38,7 +38,7 @@ func (l agentLLM) Complete(ctx context.Context, req triage.Request) (string, err
 		Prompt:              req.Prompt,
 		WorkingDirectory:    workingDir,
 		CompletionContract:  agent.CompletionContractRawJSON,
-		CompletionValidator: triage.ValidateOutput,
+		CompletionValidator: func(raw string) bool { return triage.ValidateOutputForConfig(raw, req.Config) },
 		Timeout:             l.timeout,
 		HeartbeatTimeout:    l.idleTimeout,
 	})

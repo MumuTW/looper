@@ -3511,6 +3511,53 @@ func (r *QueueRepository) ListRunningSnapshotVendors(ctx context.Context, types 
 	return vendors, nil
 }
 
+// ListActiveSnapshotVendors returns the union of queued sticky retries and
+// durably running queue items in one SQLite statement. Keeping both statuses
+// in one read snapshot prevents a requeue/claim transition between separate
+// queries from temporarily pruning the only retained provider breaker.
+func (r *QueueRepository) ListActiveSnapshotVendors(ctx context.Context, types []string) ([]string, error) {
+	if len(types) == 0 {
+		return []string{}, nil
+	}
+	placeholders, typeArgs := queueTypeInClause(types)
+	latestSnapshot := `(SELECT agent_snapshot_json
+			FROM runs
+			WHERE loop_id = qi.loop_id
+			ORDER BY ` + latestRunOrder("runs") + `
+			LIMIT 1)`
+	safeSnapshot := "CASE WHEN json_valid(" + latestSnapshot + ") THEN " + latestSnapshot + " ELSE '{}' END"
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT DISTINCT trim(json_extract(`+safeSnapshot+`, '$.vendor'))
+		FROM queue_items qi
+		WHERE qi.status IN ('queued', 'running')
+			AND qi.type IN (`+placeholders+`)
+			AND length(trim(coalesce(json_extract(`+safeSnapshot+`, '$.vendor'), ''))) > 0
+			AND (
+				qi.status = 'running'
+				OR `+stickySnapshotQueuePredicate("")+`
+			)
+		ORDER BY 1 ASC
+	`, typeArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("list active snapshot vendors: %w", err)
+	}
+	defer rows.Close()
+	vendors := make([]string, 0)
+	for rows.Next() {
+		var vendor string
+		if err := rows.Scan(&vendor); err != nil {
+			return nil, fmt.Errorf("scan active snapshot vendor: %w", err)
+		}
+		if vendor = strings.TrimSpace(vendor); vendor != "" {
+			vendors = append(vendors, vendor)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate active snapshot vendors: %w", err)
+	}
+	return vendors, nil
+}
+
 func queueClaimProjectPredicate(projectScopedTypes, projectIDs []string, stickyOnlyProjectIDs ...[]string) (predicate string, args []any) {
 	if len(projectScopedTypes) == 0 {
 		return "", nil

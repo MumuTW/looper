@@ -3352,6 +3352,17 @@ func TestQueueListRunningSnapshotVendorsIncludesClaimedItems(t *testing.T) {
 	if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: "qi_running_snapshot_vendor", LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: "project_running", DedupeKey: "running-snapshot-vendor", Priority: 1, Status: "running", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
+	queuedLoopID := "loop_queued_snapshot_vendor"
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: queuedLoopID, Seq: 2, ProjectID: "project_running", Type: "worker", TargetType: "project", Status: "queued", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(queued) error = %v", err)
+	}
+	failed := "failed"
+	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_queued_snapshot_vendor", LoopID: queuedLoopID, Status: failed, AgentSnapshotJSON: &snapshot, StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert(queued) error = %v", err)
+	}
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: "qi_queued_snapshot_vendor", LoopID: &queuedLoopID, Type: "worker", TargetType: "project", TargetID: "project_running", DedupeKey: "queued-snapshot-vendor", Priority: 1, Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert(queued) error = %v", err)
+	}
 
 	vendors, err := repos.Queue.ListRunningSnapshotVendors(ctx, []string{"worker"})
 	if err != nil {
@@ -3359,6 +3370,13 @@ func TestQueueListRunningSnapshotVendorsIncludesClaimedItems(t *testing.T) {
 	}
 	if len(vendors) != 1 || vendors[0] != "codex" {
 		t.Fatalf("ListRunningSnapshotVendors() = %#v, want [codex]", vendors)
+	}
+	activeVendors, err := repos.Queue.ListActiveSnapshotVendors(ctx, []string{"worker"})
+	if err != nil {
+		t.Fatalf("ListActiveSnapshotVendors() error = %v", err)
+	}
+	if len(activeVendors) != 1 || activeVendors[0] != "codex" {
+		t.Fatalf("ListActiveSnapshotVendors() = %#v, want [codex] from queued+running snapshot", activeVendors)
 	}
 }
 
