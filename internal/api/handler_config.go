@@ -82,6 +82,7 @@ type configRolesResponse struct {
 	Fixer       config.FixerRoleConfig             `json:"fixer"`
 	Worker      config.WorkerRoleConfig            `json:"worker"`
 	Coordinator config.CoordinatorRoleConfig       `json:"coordinator"`
+	Gatekeeper  config.GatekeeperRoleConfig        `json:"gatekeeper"`
 	Escalator   config.EscalatorRoleConfig         `json:"escalator"`
 }
 
@@ -180,6 +181,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 			Fixer:       cfg.Roles.Fixer,
 			Worker:      cfg.Roles.Worker,
 			Coordinator: cfg.Roles.Coordinator,
+			Gatekeeper:  cfg.Roles.Gatekeeper,
 			Escalator:   cfg.Roles.Escalator,
 		},
 		Providers: append([]config.ProviderConfig{}, cfg.Providers...),

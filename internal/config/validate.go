@@ -96,14 +96,11 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Roles.Reviewer.Behavior.ThreadResolution.Mode == ReviewerThreadResolutionModeResolveObjective && !config.Roles.Reviewer.Behavior.ThreadResolution.RequireAuditComment {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.threadResolution.requireAuditComment", Message: "must be true when mode is resolve_objective"})
 	}
-	if !isValidReviewerAutoMergeStrategy(config.Roles.Reviewer.AutoMerge.Strategy) {
-		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.strategy", Message: fmt.Sprintf("must be one of: %s, %s, %s", ReviewerAutoMergeStrategySquash, ReviewerAutoMergeStrategyMerge, ReviewerAutoMergeStrategyRebase)})
+	if config.Roles.Reviewer.AutoMerge.Enabled {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.enabled", Message: "Reviewer auto-merge was removed; it previously required a Looper-owned label and tracked Issue link, while Gatekeeper auto evaluates every eligible open PR. Review that widened scope, cancel any pending GitHub auto-merge, then set roles.gatekeeper.trust = \"auto\" and move strategy to roles.gatekeeper.strategy"})
 	}
-	if config.Roles.Reviewer.AutoMerge.TransientRetries < 1 {
-		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.transientRetries", Message: "must be a positive integer"})
-	}
-	if config.Roles.Reviewer.AutoMerge.Scope != ReviewerAutoMergeScopeLooperOnly {
-		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.scope", Message: fmt.Sprintf("must be %s", ReviewerAutoMergeScopeLooperOnly)})
+	if strategy := config.Roles.Reviewer.AutoMerge.Strategy; strategy != "" && strategy != MergeStrategySquash {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.strategy", Message: "Reviewer auto-merge was removed; move strategy to roles.gatekeeper.strategy"})
 	}
 	if config.Roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment && config.Roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventApprove {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.reviewEvents.clean", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerReviewEventComment, ReviewerReviewEventApprove)})
@@ -271,11 +268,9 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateLoggingAndNotificationConfig(config, issues)
 	validateHITLConfig(config.HITL, issues)
 	validateTriagerRoleConfig(config.Roles.Triager, "roles.triager", issues)
-	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", config.Roles.Reviewer.AutoMerge.Enabled, issues)
+	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", issues)
 	validateGatekeeperReviewEventCompatibility(config, issues)
 	validateAuditorRoleConfig(config.Roles.Auditor, "roles.auditor", issues)
-	validateAuditorGatekeeperCompatibility(config, issues)
-	validatePostMergeDigestGatekeeperCompatibility(config, issues)
 	validateDeployerRoleConfig(config.Roles.Deployer, "roles.deployer", issues)
 	validateEscalatorRoleConfig(config.Roles.Escalator, "roles.escalator", issues)
 	for i, project := range config.Projects {
@@ -309,13 +304,9 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 			continue
 		}
 		roles := ProjectRoleConfigs(config, project.ID)
-		reviewerAutoMerge := config.Roles.Reviewer.AutoMerge.Enabled
-		if project.Roles.Reviewer != nil && project.Roles.Reviewer.AutoMerge != nil && project.Roles.Reviewer.AutoMerge.Enabled != nil {
-			reviewerAutoMerge = *project.Roles.Reviewer.AutoMerge.Enabled
-		}
 		validateGatekeeperRoleConfig(
 			roles.Gatekeeper,
-			fmt.Sprintf("projects[%d].roles.gatekeeper", i), reviewerAutoMerge, issues)
+			fmt.Sprintf("projects[%d].roles.gatekeeper", i), issues)
 	}
 	validateIntakeConfig(config, issues)
 	validateDaemonConfig(config.Daemon, issues)
@@ -416,81 +407,6 @@ func validateGatekeeperReviewEventCompatibility(config Config, issues *[]Validat
 			path = fmt.Sprintf("projects[%d].roles.gatekeeper.requiredReviewChangedLines", i)
 		}
 		*issues = append(*issues, ValidationIssue{Path: path, Message: gatekeeperAutoCleanCommentConflictMessage})
-	}
-}
-
-const auditorGatekeeperAutoConflictMessage = "requires Gatekeeper merge-outcome events or forge-observed merges; gatekeeper trust auto publishes commit status only and does not emit merge outcomes — disable auditor or use gatekeeper trust observe/advise until forge-observed merge evidence is implemented"
-
-// validateAuditorGatekeeperCompatibility rejects auditor enabled together with
-// gatekeeper auto on the same effective project scope. Auto trust is
-// status-only; Auditor still reads MergeOutcome events Gatekeeper no longer
-// emits.
-func validateAuditorGatekeeperCompatibility(config Config, issues *[]ValidationIssue) {
-	globalConflict := config.Roles.Auditor.Enabled && gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust)
-	if globalConflict {
-		*issues = append(*issues, ValidationIssue{
-			Path:    "roles.auditor.enabled",
-			Message: auditorGatekeeperAutoConflictMessage,
-		})
-	}
-	for i, project := range config.Projects {
-		overridesAuto := project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil && gatekeeperTrustIsAuto(*project.Roles.Gatekeeper.Trust)
-		overridesAuditorOn := project.Roles != nil && project.Roles.Auditor != nil && project.Roles.Auditor.Enabled != nil && *project.Roles.Auditor.Enabled
-		// Inherited global roles are already covered by the global issue; only
-		// project overrides can introduce a distinct conflict path.
-		if !overridesAuto && !overridesAuditorOn {
-			continue
-		}
-		roles := ProjectRoleConfigs(config, project.ID)
-		if !roles.Auditor.Enabled || !gatekeeperTrustIsAuto(roles.Gatekeeper.Trust) {
-			continue
-		}
-		if globalConflict {
-			continue
-		}
-		path := fmt.Sprintf("projects[%d].roles.auditor.enabled", i)
-		if overridesAuto {
-			path = fmt.Sprintf("projects[%d].roles.gatekeeper.trust", i)
-		}
-		*issues = append(*issues, ValidationIssue{Path: path, Message: auditorGatekeeperAutoConflictMessage})
-	}
-}
-
-const postMergeDigestGatekeeperAutoConflictMessage = "requires merge-outcome events that gatekeeper trust auto no longer emits; disable post-merge digest or use gatekeeper trust observe/advise until forge-observed merge evidence is implemented"
-
-func postMergeDigestEnabled(digest *CoordinatorPostMergeDigestConfig) bool {
-	return digest != nil && digest.Enabled
-}
-
-// validatePostMergeDigestGatekeeperCompatibility rejects post-merge digest enabled
-// together with gatekeeper auto on the same effective project scope. Auto trust
-// is status-only and does not emit merge-outcome events the digest still reads.
-// Post-merge digest is global-only, so the project loop only looks for an
-// explicit gatekeeper trust override into auto.
-func validatePostMergeDigestGatekeeperCompatibility(config Config, issues *[]ValidationIssue) {
-	globalConflict := postMergeDigestEnabled(config.Roles.Coordinator.PostMergeDigest) && gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust)
-	if globalConflict {
-		*issues = append(*issues, ValidationIssue{
-			Path:    "roles.coordinator.postMergeDigest.enabled",
-			Message: postMergeDigestGatekeeperAutoConflictMessage,
-		})
-	}
-	for i, project := range config.Projects {
-		overridesAuto := project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil && gatekeeperTrustIsAuto(*project.Roles.Gatekeeper.Trust)
-		if !overridesAuto {
-			continue
-		}
-		roles := ProjectRoleConfigs(config, project.ID)
-		if !postMergeDigestEnabled(roles.Coordinator.PostMergeDigest) || !gatekeeperTrustIsAuto(roles.Gatekeeper.Trust) {
-			continue
-		}
-		if globalConflict {
-			continue
-		}
-		*issues = append(*issues, ValidationIssue{
-			Path:    fmt.Sprintf("projects[%d].roles.gatekeeper.trust", i),
-			Message: postMergeDigestGatekeeperAutoConflictMessage,
-		})
 	}
 }
 
@@ -669,8 +585,8 @@ func validateIntakeConfig(config Config, issues *[]ValidationIssue) {
 	*issues = append(*issues, ValidationIssue{Path: "intake.telegram.defaultProjectId", Message: fmt.Sprintf("must name a configured project; %q is not in projects[]", defaultProject)})
 }
 
-// validateGatekeeperRoleConfig rejects unknown Gatekeeper trust levels.
-//
+// validateGatekeeperRoleConfig validates the graduated trust and merge strategy
+// that Gatekeeper itself owns.
 // validateDeployerRoleConfig fails startup rather than at deploy time. A project
 // configured to deploy but unable to is otherwise only discovered on the first
 // merge, which is the worst moment to learn it.
@@ -687,7 +603,7 @@ func validateDeployerRoleConfig(deployerRole DeployerRoleConfig, path string, is
 	validateEnvironmentNames(deployerRole.Environment, path+".environment", issues)
 }
 
-func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, reviewerAutoMerge bool, issues *[]ValidationIssue) {
+func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, issues *[]ValidationIssue) {
 	validateGatekeeperDiffBudget(gatekeeper.DiffBudget, path+".diffBudget", issues)
 	switch GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(gatekeeper.Trust)))) {
 	case "", GatekeeperTrustObserve, GatekeeperTrustAdvise, GatekeeperTrustAuto:
@@ -699,6 +615,9 @@ func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, 
 	}
 	if gatekeeper.RequiredReviewChangedLines < 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".requiredReviewChangedLines", Message: "must be zero (to disable the threshold) or a positive integer"})
+	}
+	if gatekeeper.Strategy != "" && !isValidMergeStrategy(gatekeeper.Strategy) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".strategy", Message: fmt.Sprintf("must be one of: %s, %s, %s", MergeStrategySquash, MergeStrategyMerge, MergeStrategyRebase)})
 	}
 }
 
@@ -1720,9 +1639,9 @@ func isValidFixerAuthorFilter(filter FixerAuthorFilter) bool {
 	}
 }
 
-func isValidReviewerAutoMergeStrategy(strategy ReviewerAutoMergeStrategy) bool {
+func isValidMergeStrategy(strategy MergeStrategy) bool {
 	switch strategy {
-	case ReviewerAutoMergeStrategySquash, ReviewerAutoMergeStrategyMerge, ReviewerAutoMergeStrategyRebase:
+	case MergeStrategySquash, MergeStrategyMerge, MergeStrategyRebase:
 		return true
 	default:
 		return false
@@ -1730,14 +1649,11 @@ func isValidReviewerAutoMergeStrategy(strategy ReviewerAutoMergeStrategy) bool {
 }
 
 func validatePartialReviewerAutoMerge(partial PartialReviewerAutoMergeConfig, path string, issues *[]ValidationIssue) {
-	if partial.Strategy != nil && !isValidReviewerAutoMergeStrategy(*partial.Strategy) {
-		*issues = append(*issues, ValidationIssue{Path: path + ".strategy", Message: fmt.Sprintf("must be one of: %s, %s, %s", ReviewerAutoMergeStrategySquash, ReviewerAutoMergeStrategyMerge, ReviewerAutoMergeStrategyRebase)})
+	if partial.Enabled != nil && *partial.Enabled {
+		*issues = append(*issues, ValidationIssue{Path: path + ".enabled", Message: "Reviewer auto-merge was removed; it previously required a Looper-owned label and tracked Issue link, while Gatekeeper auto evaluates every eligible open PR. Review that widened scope, cancel any pending GitHub auto-merge, then set the matching roles.gatekeeper.trust = \"auto\" and move strategy to roles.gatekeeper.strategy"})
 	}
-	if partial.TransientRetries != nil && *partial.TransientRetries < 1 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".transientRetries", Message: "must be a positive integer"})
-	}
-	if partial.Scope != nil && *partial.Scope != ReviewerAutoMergeScopeLooperOnly {
-		*issues = append(*issues, ValidationIssue{Path: path + ".scope", Message: fmt.Sprintf("must be %s", ReviewerAutoMergeScopeLooperOnly)})
+	if partial.Strategy != nil && *partial.Strategy != MergeStrategySquash {
+		*issues = append(*issues, ValidationIssue{Path: path + ".strategy", Message: "Reviewer auto-merge was removed; move strategy to roles.gatekeeper.strategy"})
 	}
 }
 

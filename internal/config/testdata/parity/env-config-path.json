@@ -281,7 +281,8 @@
           }
         },
         "gatekeeper": {
-          "requiredReviewChangedLines": 200
+          "requiredReviewChangedLines": 200,
+          "strategy": "squash"
         },
         "deployer": {
           "enabled": false
@@ -305,13 +306,6 @@
           }
         },
         "reviewer": {
-          "autoMerge": {
-            "enabled": false,
-            "requireBranchProtection": true,
-            "scope": "looper-only",
-            "strategy": "squash",
-            "transientRetries": 3
-          },
           "behavior": {
             "loop": {
               "enabledByDefault": true,

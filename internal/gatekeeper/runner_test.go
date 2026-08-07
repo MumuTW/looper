@@ -245,6 +245,13 @@ func TestEvaluatePullRequestBlocksEachSafetyCondition(t *testing.T) {
 			want: []ReasonCode{ReasonHold},
 		},
 		{
+			name: "do not merge veto",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.detail.Labels = []string{labels.DoNotMerge}
+			},
+			want: []ReasonCode{ReasonDoNotMerge},
+		},
+		{
 			name: "provider mergeability is ambiguous",
 			mutate: func(f *gatekeeperFixture) {
 				f.github.mergeable.Mergeable = nil
@@ -349,7 +356,7 @@ func newGatekeeperFixtureWithReview(t *testing.T, seedReview bool) *gatekeeperFi
 		now:   now,
 		github: &fakeGatekeeperGitHub{
 			detail:    githubinfra.PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-1", BaseRefName: "main", BaseSHA: "base-1", ReviewDecision: "APPROVED", AdditionsKnown: true, DeletionsKnown: true},
-			mergeable: githubinfra.PullRequestDetail{Number: 42, HeadSHA: "head-1", BaseSHA: "base-1", Mergeable: &mergeable, MergeableState: "clean", AdditionsKnown: true, DeletionsKnown: true},
+			mergeable: githubinfra.PullRequestDetail{Number: 42, HeadSHA: "head-1", BaseSHA: "base-1", MergeCommitSHA: "merge-commit-1", Mergeable: &mergeable, MergeableState: "clean", AdditionsKnown: true, DeletionsKnown: true},
 			protection: githubinfra.BranchProtection{
 				Enabled: true, HasRequiredChecks: true, RequiredChecks: []string{"ci", RequiredStatusContext},
 				RequiredCheckRules: []githubinfra.RequiredCheckRule{{Context: "ci", AppID: 15368}},
@@ -469,8 +476,8 @@ func TestAutoGatekeeperAllowsSmallChangeWithoutCleanReview(t *testing.T) {
 	if !report.Eligible || report.Evidence.ReviewRequiredByPolicy || report.Evidence.ChangedLines != DefaultRequiredReviewChangedLines-1 {
 		t.Fatalf("report = %#v, want eligible below threshold", report)
 	}
-	if len(fixture.github.reviewMarkerCalls) != 1 {
-		t.Fatalf("review marker calls = %#v, want one blocking-marker check", fixture.github.reviewMarkerCalls)
+	if len(fixture.github.reviewMarkerCalls) != 2 {
+		t.Fatalf("review marker calls = %#v, want primary + confirming marker checks", fixture.github.reviewMarkerCalls)
 	}
 	if got := fixture.github.statusCalls; len(got) != 1 || got[0].State != "success" {
 		t.Fatalf("status calls = %#v, want success", got)
@@ -735,9 +742,14 @@ type fakeGatekeeperGitHub struct {
 	// makes, so a test can prove a pull request was skipped rather than evaluated.
 	perPullRequestCalls int
 
-	currentLogin          string
-	commentErr            error
-	deletedIDs            []int64
+	currentLogin string
+	commentErr   error
+	deletedIDs   []int64
+	merges       []githubinfra.PullRequestMergeInput
+	mergeErr     error
+	// beforeView, when set, runs before each pull-request read, so a test can
+	// change forge state between the primary and confirming evaluations.
+	beforeView            func(*fakeGatekeeperGitHub)
 	listCalls             int
 	loginCalls            int
 	comments              []githubinfra.CommentInfo
@@ -748,13 +760,21 @@ type fakeGatekeeperGitHub struct {
 	reviewMarkerCalls     []githubinfra.VerifyReviewMarkerInput
 	statusCalls           []githubinfra.CommitStatusInput
 	callSequence          []string
+	callOrder             []string
 	statusErr             error
+	statusErrState        string
 	viewErr               error
 	mergedPullRequestsErr error
 	listReviewThreadsHook func(*fakeGatekeeperGitHub) error
-	// beforeView, when set, runs before each pull-request read, so a test can
-	// inject a state change between the first evaluation and a later one.
-	beforeView func(*fakeGatekeeperGitHub)
+}
+
+func (f *fakeGatekeeperGitHub) MergePullRequest(_ context.Context, input githubinfra.PullRequestMergeInput) error {
+	if f.mergeErr != nil {
+		return f.mergeErr
+	}
+	f.callOrder = append(f.callOrder, "merge")
+	f.merges = append(f.merges, input)
+	return nil
 }
 
 func (f *fakeGatekeeperGitHub) GetCurrentUserLoginForRepo(context.Context, string, string) (string, error) {
@@ -875,8 +895,12 @@ func (f *fakeGatekeeperGitHub) FindReviewMarker(_ context.Context, input githubi
 	return f.reviewMarker, f.reviewMarkerErr
 }
 func (f *fakeGatekeeperGitHub) SetCommitStatus(_ context.Context, input githubinfra.CommitStatusInput) error {
+	f.callOrder = append(f.callOrder, "status")
 	f.statusCalls = append(f.statusCalls, input)
 	f.callSequence = append(f.callSequence, "commit-status")
+	if f.statusErrState != "" && input.State != f.statusErrState {
+		return nil
+	}
 	return f.statusErr
 }
 

@@ -16,6 +16,7 @@ type reviewerReviewPostedPayload struct {
 	Repo           string `json:"repo"`
 	PRNumber       int64  `json:"prNumber"`
 	Event          string `json:"event"`
+	Outcome        string `json:"outcome"`
 	HeadSHA        string `json:"headSha"`
 	MarkerVerified bool   `json:"markerVerified"`
 }
@@ -70,6 +71,7 @@ func latestCodexReviewForHead(ctx context.Context, repos *storage.Repositories, 
 		}
 		evidence.ReviewedHeadSHA = reviewedHead
 		evidence.Event = reviewEvent
+		evidence.Outcome = strings.ToLower(strings.TrimSpace(payload.Outcome))
 		evidence.RecordedAt = event.CreatedAt
 	}
 	evidence.CurrentHeadValid = evidence.ReviewedHeadSHA != "" && strings.EqualFold(evidence.ReviewedHeadSHA, evidence.RequiredHeadSHA)
