@@ -105,3 +105,51 @@ func TestStartDeployLaneWithholdsUnderHostPressure(t *testing.T) {
 	}
 	deployInFlight.Delete(projectID)
 }
+
+func TestStartDeployLaneOwnsDetachedLifecycleUntilShutdown(t *testing.T) {
+	projectID := "detached-deploy-operation"
+	repo := "acme/looper"
+	baseBranch := "main"
+	headEntered := make(chan struct{})
+	var enteredOnce sync.Once
+
+	ghGateway := githubinfra.New(githubinfra.Options{
+		GHRun: func(ctx context.Context, _ shell.Options) (shell.Result, error) {
+			enteredOnce.Do(func() { close(headEntered) })
+			<-ctx.Done()
+			return shell.Result{}, ctx.Err()
+		},
+	})
+	gitGateway := gitinfra.New(gitinfra.Options{})
+	cfg := &config.Config{
+		Defaults: config.DefaultsConfig{BaseBranch: baseBranch},
+		Roles:    config.RoleConfigs{Deployer: config.DeployerRoleConfig{Enabled: true, Command: "true"}},
+		Daemon:   config.DaemonConfig{LogDir: t.TempDir()},
+	}
+	project := storage.ProjectRecord{ID: projectID, RepoPath: t.TempDir()}
+	registry := NewActiveExecutionRegistry()
+	input := defaultSchedulerTickInput{
+		Config: cfg, GitHubGateway: ghGateway, GitGateway: gitGateway,
+		Now: func() time.Time { return time.Now() }, OperationOwner: registry,
+	}
+
+	startDeployLane(context.Background(), input, project, repo)
+	select {
+	case <-headEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("detached deploy did not reach its GitHub read")
+	}
+	if snapshot := registry.DrainSnapshot(); snapshot.BoundOperations != 1 {
+		t.Fatalf("drain snapshot while GitHub read is blocked = %#v, want one bound deploy operation", snapshot)
+	}
+
+	if err := registry.BeginShutdown("test deploy shutdown"); err != nil {
+		t.Fatalf("BeginShutdown() error = %v", err)
+	}
+	if snapshot := registry.DrainSnapshot(); !snapshot.Drained() {
+		t.Fatalf("drain snapshot after deploy shutdown = %#v, want fully drained", snapshot)
+	}
+	if _, running := deployInFlight.Load(projectID); running {
+		t.Fatalf("deployInFlight still contains %s after shutdown", projectID)
+	}
+}

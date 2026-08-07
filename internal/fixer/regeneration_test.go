@@ -290,6 +290,40 @@ func TestRegenerationRequiresPlannerAuthorityAvailability(t *testing.T) {
 	}
 }
 
+func TestRegenerateConflictEscalatesBeforeCloseWhenPlannerUnavailable(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadRefName: "looper/fix-42", BaseRefName: "main", HeadSHA: "head-42"}}},
+		issue:             IssueDetail{Number: 7, State: "OPEN"},
+		commits:           []PullRequestCommit{{AuthorLogin: "looper", CommitterLogin: "looper"}},
+	}
+	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error {
+		t.Fatal("planner route should not run while unavailable")
+		return nil
+	})
+	runner.regenerationAvailability = func(string) string { return "Planner agent is not configured" }
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	result, err := runner.RegenerateConflict(context.Background(), ConflictRegenerationInput{
+		ProjectID: "project_1", Repo: "acme/looper", IssueRepo: "acme/looper",
+		IssueNumber: 7, PRNumber: 42, ConflictRepairs: 2, CWD: project.RepoPath,
+	})
+	if err != nil {
+		t.Fatalf("RegenerateConflict() error = %v", err)
+	}
+	if !result.Escalated || result.Completed {
+		t.Fatalf("RegenerateConflict() result = %#v, want escalation without completion", result)
+	}
+	if len(gateway.closeCalls) != 0 {
+		t.Fatalf("close calls = %#v, want none while Planner is unavailable", gateway.closeCalls)
+	}
+	if len(gateway.addLabelCalls) != 1 || len(gateway.addLabelCalls[0].Labels) != 1 || gateway.addLabelCalls[0].Labels[0] != labels.NeedsHuman {
+		t.Fatalf("PR labels = %#v, want needs-human escalation", gateway.addLabelCalls)
+	}
+	if len(gateway.fakeGitHubGateway.createIssueComments) != 1 || !strings.Contains(gateway.fakeGitHubGateway.createIssueComments[0].Body, "Planner agent is not configured") {
+		t.Fatalf("escalation comments = %#v, want availability reason", gateway.fakeGitHubGateway.createIssueComments)
+	}
+}
+
 func TestRegenerationDiscoveryLabelsUseProjectRoleOverrides(t *testing.T) {
 	cfg, err := config.DefaultConfig(t.TempDir())
 	if err != nil {

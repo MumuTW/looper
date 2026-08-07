@@ -351,7 +351,21 @@ func startDeployLane(ctx context.Context, input defaultSchedulerTickInput, proje
 		}
 		return
 	}
+	var operation DetachedOperationLease
+	if input.OperationOwner != nil {
+		admitted, err := input.OperationOwner.AdmitDetachedOperation(context.WithoutCancel(ctx), OperationMeta{ClaimedBy: "deployer"})
+		if err != nil {
+			if input.Logger != nil {
+				input.Logger.Debug("deployer: operation admission refused", map[string]any{"projectId": project.ID, "repo": repo, "error": err.Error()})
+			}
+			return
+		}
+		operation = admitted
+	}
 	if _, running := deployInFlight.LoadOrStore(project.ID, struct{}{}); running {
+		if operation != nil {
+			operation.Release()
+		}
 		if input.Logger != nil {
 			input.Logger.Debug("deployer: a deploy is already running for this project", map[string]any{"projectId": project.ID})
 		}
@@ -360,8 +374,17 @@ func startDeployLane(ctx context.Context, input defaultSchedulerTickInput, proje
 	// Detached from the tick's context so a finished tick does not cancel a deploy
 	// mid-flight; the command's own timeout is what bounds it.
 	deployCtx := context.WithoutCancel(ctx)
+	if operation != nil {
+		deployCtx = operation.Context()
+	}
 	go func() {
 		defer deployInFlight.Delete(project.ID)
+		if operation != nil {
+			defer operation.Release()
+		}
+		if deployCtx.Err() != nil {
+			return
+		}
 		runDeployLane(deployCtx, input, project, repo)
 	}()
 }

@@ -384,12 +384,10 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 			return regenerationNone, fmt.Errorf("mark originating issue for planner: %w", err)
 		}
 	}
-	}
 	if workerLabels := r.regenerationDiscoveryLabels(project.ID, config.CodingRoleWorker, namespace.WorkerReadyTrigger()); len(workerLabels) > 0 {
 		if err := bridge.RemoveIssueLabels(ctx, IssueLabelsInput{Repo: originRepo, IssueNumber: originNumber, Labels: workerLabels, CWD: project.RepoPath}); err != nil {
 			return regenerationNone, fmt.Errorf("clear worker-ready label from originating issue: %w", err)
 		}
-	}
 	}
 	state.Routed = true
 	if _, err := r.mergeLoopMetadata(ctx, current, map[string]any{"fixerRegeneration": state}); err != nil {
@@ -447,6 +445,14 @@ func (r *Runner) RegenerateConflict(ctx context.Context, input ConflictRegenerat
 		return ConflictRegenerationResult{}, nil
 	}
 	authority := fmt.Sprintf("coordinator-conflict:%s#%d", input.Repo, input.PRNumber)
+	if r.regenerationAvailability != nil {
+		if reason := strings.TrimSpace(r.regenerationAvailability(project.ID)); reason != "" {
+			if err := r.persistConflictRegenerationEscalation(ctx, bridge, input, authority, reason); err != nil {
+				return ConflictRegenerationResult{}, err
+			}
+			return ConflictRegenerationResult{Escalated: true}, nil
+		}
+	}
 	login, err := r.github.GetCurrentUserLogin(ctx, input.Repo, input.CWD)
 	if err != nil || strings.TrimSpace(login) == "" {
 		return ConflictRegenerationResult{}, fmt.Errorf("authenticate conflict regeneration comments")
@@ -672,12 +678,10 @@ func (r *Runner) persistRegenerationEscalation(ctx context.Context, loop storage
 			return fmt.Errorf("comment human escalation: %w", err)
 		}
 	}
-		}
-	}
 	if contextWithheld {
 		state.EscalationCommented = true
 	}
-	state.Commented = true
+	state.Commented = state.Commented || state.EscalationCommented || contextWithheld
 	// Checkpoint the escalation marker before the label mutation. If labeling
 	// fails, a replay finds the same authority marker instead of posting a
 	// duplicate, while a prior pending marker cannot suppress this escalation.

@@ -116,17 +116,77 @@ func TestObservePostMergeFailureSkipsDisabledProject(t *testing.T) {
 	}
 }
 
-func TestObservePostMergeFailureSkipsProviderWhenNoMergeCandidate(t *testing.T) {
+func TestObservePostMergeFailureRecordsBaselineDuringQuietPeriod(t *testing.T) {
 	ctx := context.Background()
 	coordinator := openMigratedCoordinator(t, filepath.Join(t.TempDir(), "auditor.sqlite"), t.TempDir())
 	repos := storage.NewRepositories(coordinator.DB())
+	repo := "acme/looper"
 	project := storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}
-	gateway := &fakeAuditorGateway{head: "base", checks: githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "failure"}}}}
-	if err := observePostMergeFailure(ctx, repos, gateway, project, "acme/looper", "main", config.AuditorRoleConfig{Enabled: true, WindowMinutes: 60}, time.Now); err != nil {
+	if err := repos.Projects.Upsert(ctx, project); err != nil {
+		t.Fatal(err)
+	}
+	gateway := &fakeAuditorGateway{head: "base", checks: githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{ID: 1, Name: "ci", Status: "completed", Conclusion: "success"}}}}
+	if err := observePostMergeFailure(ctx, repos, gateway, project, repo, "main", config.AuditorRoleConfig{Enabled: true, WindowMinutes: 60}, time.Now); err != nil {
 		t.Fatalf("observe without merge candidate error = %v", err)
 	}
-	if gateway.headCalls != 0 || gateway.checkCalls != 0 {
-		t.Fatalf("provider calls = head:%d checks:%d, want none without a local merge candidate", gateway.headCalls, gateway.checkCalls)
+	if gateway.headCalls != 1 || gateway.checkCalls != 1 {
+		t.Fatalf("provider calls = head:%d checks:%d, want one baseline sample during quiet period", gateway.headCalls, gateway.checkCalls)
+	}
+	baselineEvents, err := repos.Events.ListByEntity(ctx, "branch_head", repo+"@base")
+	if err != nil || countAuditorEvents(baselineEvents, auditor.BaselineEventType) != 1 {
+		t.Fatalf("baseline events = %#v, %v; want one quiet-period baseline", baselineEvents, err)
+	}
+}
+
+func TestObservePostMergeFailureAttributesFirstMergeAfterQuietPeriod(t *testing.T) {
+	ctx := context.Background()
+	workdir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workdir, "auditor.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 31, 12, 0, 0, 0, time.UTC)
+	projectID, repo, base := "project_1", "acme/looper", "main"
+	project := storage.ProjectRecord{ID: projectID, RepoPath: workdir}
+	if err := repos.Projects.Upsert(ctx, project); err != nil {
+		t.Fatal(err)
+	}
+	role := config.AuditorRoleConfig{Enabled: true, WindowMinutes: 60}
+	gateway := &fakeAuditorGateway{
+		head:   "clean-head",
+		checks: githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{ID: 1, Name: "ci", Status: "completed", Conclusion: "success"}}},
+	}
+	if err := observePostMergeFailure(ctx, repos, gateway, project, repo, base, role, func() time.Time { return now }); err != nil {
+		t.Fatalf("quiet-period observePostMergeFailure() error = %v", err)
+	}
+	if err := eventlog.Append(ctx, repos, eventlog.AppendInput{
+		EventType: gatekeeper.MergeOutcomeEventType, ProjectID: &projectID,
+		Payload:   gatekeeper.MergeOutcome{Version: 1, ProjectID: projectID, Repo: repo, PRNumber: 42, HeadSHA: "merged-pr-sha", Merged: true},
+		CreatedAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("Append merge outcome error = %v", err)
+	}
+	gateway.head = "failed-head"
+	gateway.checks = githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{ID: 99, Name: "ci", Status: "completed", Conclusion: "failure", CheckSuiteID: 7}}}
+	gateway.annotations = map[int64][]githubinfra.CheckRunAnnotation{99: {{Path: "internal/runtime/auditor.go", Level: "failure"}}}
+	if err := observePostMergeFailure(ctx, repos, gateway, project, repo, base, role, func() time.Time { return now.Add(2 * time.Minute) }); err != nil {
+		t.Fatalf("post-merge observePostMergeFailure() error = %v", err)
+	}
+	if gateway.headCalls != 2 || gateway.checkCalls != 2 {
+		t.Fatalf("provider calls = head:%d checks:%d, want quiet baseline plus post-merge sample", gateway.headCalls, gateway.checkCalls)
+	}
+	events, err := repos.Events.ListByEntity(ctx, "branch_head", repo+"@failed-head")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var observation auditor.FailureObservation
+	for _, event := range events {
+		if event.EventType == auditor.ObservedFailureEventType {
+			if err := json.Unmarshal([]byte(event.PayloadJSON), &observation); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if !observation.BaselineKnown || observation.BaselineHeadSHA != "clean-head" || len(observation.CandidatePRs) != 1 || observation.CandidatePRs[0] != 42 {
+		t.Fatalf("failure observation = %#v, want quiet baseline and first merge attribution", observation)
 	}
 }
 
@@ -193,7 +253,7 @@ func TestFailedAuditorCheckPathsFiltersNonFailuresAndReportsReadGaps(t *testing.
 		},
 		annotationErrors: map[int64]error{100: errors.New("annotations unavailable")},
 	}
-	paths, _, complete := failedAuditorCheckEvidenceWithPaths(context.Background(), gateway, "acme/looper", t.TempDir(), githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{
+	paths, _, complete := failedAuditorCheckEvidenceWithPaths(context.Background(), &gateway, "acme/looper", t.TempDir(), githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{
 		{ID: 99, Status: "completed", Conclusion: "failure"},
 		{ID: 100, Status: "completed", Conclusion: "failure"},
 	}})

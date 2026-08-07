@@ -76,7 +76,12 @@ func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, g
 		}
 	}
 	if len(candidatePRSet) == 0 {
-		return nil
+		// A recent clean baseline is enough to avoid repeating the provider read.
+		// Without one, sample the provider even during a quiet period so the first
+		// post-quiet merge can still be attributed against a durable baseline.
+		if known, _ := auditorCleanBaseline(mergeEvents, project.ID, repo, since); known {
+			return nil
+		}
 	}
 	headSHA, err := gateway.GetBranchHeadSHA(ctx, githubinfra.BranchHeadInput{Repo: repo, Branch: baseBranch, CWD: project.RepoPath})
 	if err != nil {

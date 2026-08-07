@@ -75,7 +75,7 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 		return false, err
 	}
 	if marker != nil && marker.Marker.ConflictRegenerationPending && !marker.Marker.ConflictRegenerationEscalated {
-		snapshot, temporaryErr, snapshotErr := r.mergeWatchSnapshot(ctx, repo, cwd, issue.detail.Number, watchedPR, currentLogin)
+		snapshot, temporaryErr, snapshotErr := r.mergeWatchSnapshot(ctx, repo, cwd, issue.detail.Number, watchedPR, namespace, currentLogin)
 		if snapshotErr != nil {
 			return false, snapshotErr
 		}
@@ -89,7 +89,7 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 		// PR so a pushed head, re-enabled auto-merge, label change, or resolved
 		// conflict can explicitly reopen classification; an unchanged conflict
 		// remains parked without invoking Planner again.
-		escalationSnapshot, temporaryErr, snapshotErr := r.mergeWatchSnapshot(ctx, repo, cwd, issue.detail.Number, watchedPR, currentLogin)
+		escalationSnapshot, temporaryErr, snapshotErr := r.mergeWatchSnapshot(ctx, repo, cwd, issue.detail.Number, watchedPR, namespace, currentLogin)
 		if snapshotErr != nil {
 			return false, snapshotErr
 		}
