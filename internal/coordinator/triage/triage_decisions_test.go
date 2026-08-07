@@ -109,7 +109,7 @@ func TestBuildPromptCustomNamespaceUsesNamespacedDispatchSchema(t *testing.T) {
 
 func TestValidateOutputRequiresSemanticFields(t *testing.T) {
 	t.Parallel()
-	if !ValidateOutput(`{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["dispatch/plan"]}}`) {
+	if !ValidateOutput(`{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["looper:dispatch:plan"]}}`) {
 		t.Fatal("ValidateOutput() = false, want true for a complete classifier result")
 	}
 	if ValidateOutput(`{}`) {
