@@ -3,6 +3,7 @@ package fixer
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -118,6 +119,88 @@ func TestFixerReproductionFailsClosedForLegacyUnknownAbsence(t *testing.T) {
 	_ = expected
 }
 
+func TestFixerLegacyFailureEvidenceOnlyBlocksAfterCaptureBoundary(t *testing.T) {
+	root, expected := writeFixerReproductionFixture(t)
+	preRepair := fixerCheckpoint{
+		Outcome: &FixerRunOutcome{PrimaryFailure: &FixerOutcomeFailure{Step: string(stepCollectFixes)}},
+	}
+	if err := captureFixerReproduction(&preRepair, root); err != nil {
+		t.Fatalf("pre-repair legacy capture = %v, want base manifest adoption", err)
+	}
+	if preRepair.Reproduction == nil || !preRepair.Reproduction.Equal(*expected) {
+		t.Fatalf("pre-repair Reproduction = %#v, want %#v", preRepair.Reproduction, expected)
+	}
+
+	postRepair := fixerCheckpoint{
+		Outcome: &FixerRunOutcome{PrimaryFailure: &FixerOutcomeFailure{Step: string(stepRepair)}},
+	}
+	err := captureFixerReproduction(&postRepair, root)
+	if err == nil || !strings.Contains(err.Error(), "legacy checkpoint") {
+		t.Fatalf("post-repair legacy capture = %v, want fail-closed refusal", err)
+	}
+}
+
+func TestFixerReproductionMergePhaseDefersConflictUntilResolution(t *testing.T) {
+	root, expected := writeFixerReproductionFixture(t)
+	conflicted := []byte("<<<<<<< HEAD\n{}\n=======\n{}\n>>>>>>> origin/main\n")
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), conflicted, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := fixerCheckpoint{
+		Reproduction:                expected,
+		ReproductionMergePhase:      fixerReproductionMergeConflicted,
+		ReproductionMergeUnresolved: true,
+	}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("conflicted capture = %v, want deferred recovery", err)
+	}
+	if checkpoint.ReproductionMergePhase != fixerReproductionMergeConflicted {
+		t.Fatalf("phase after conflict = %q, want conflicted", checkpoint.ReproductionMergePhase)
+	}
+
+	valid := []byte(`{"version":1,"testPath":"internal/bug_test.go","testName":"TestBug","testCommand":"go test ./internal -run '^TestBug$'","testSha256":"` + expected.TestSHA256 + `"}`)
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), valid, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("resolved capture = %v, want verified resolution", err)
+	}
+	if checkpoint.ReproductionMergePhase != "" {
+		t.Fatalf("phase after resolution = %q, want cleared", checkpoint.ReproductionMergePhase)
+	}
+	if checkpoint.ReproductionMergeUnresolved {
+		t.Fatal("ReproductionMergeUnresolved = true, want cleared after verified resolution")
+	}
+}
+
+func TestFixerReproductionDoesNotDeferLiteralConflictMarkersAfterGitResolution(t *testing.T) {
+	root, expected := writeFixerReproductionFixture(t)
+	literalContent := []byte("func TestBug(t *testing.T) { _ = \"<<<<<<<\"; _ = \"=======\"; _ = \">>>>>>>\" }\n")
+	if err := os.WriteFile(filepath.Join(root, expected.TestPath), literalContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(literalContent)
+	expected.TestSHA256 = hex.EncodeToString(hash[:])
+	data, err := json.Marshal(expected)
+	if err != nil {
+		t.Fatalf("json.Marshal(manifest) = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := fixerCheckpoint{
+		Reproduction:                expected,
+		ReproductionMergePhase:      fixerReproductionMergeConflicted,
+		ReproductionMergeUnresolved: false,
+	}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("captureFixerReproduction() = %v, want literal markers treated as valid content", err)
+	}
+	if checkpoint.ReproductionMergePhase != "" {
+		t.Fatalf("phase = %q, want cleared after Git reports resolution", checkpoint.ReproductionMergePhase)
+	}
+}
+
 func TestFixerReproductionRefusesAgentAuthoredManifestAfterAbsentStart(t *testing.T) {
 	root := t.TempDir()
 	checkpoint := fixerCheckpoint{}
@@ -146,6 +229,97 @@ func TestFixerReproductionRefusesAgentAuthoredManifestAfterAbsentStart(t *testin
 	err := captureFixerReproduction(&checkpoint, root)
 	if err == nil || !strings.Contains(err.Error(), "appeared after run start") {
 		t.Fatalf("capture after agent-authored manifest = %v, want refusal", err)
+	}
+}
+
+func TestFixerReproductionIgnoresNewManifestDuringRetry(t *testing.T) {
+	root := t.TempDir()
+	checkpoint := fixerCheckpoint{}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("initial capture = %v", err)
+	}
+	if !checkpoint.ReproductionAbsent {
+		t.Fatal("ReproductionAbsent = false, want durable negative observation")
+	}
+
+	testPath := filepath.Join(root, "internal", "bug_test.go")
+	if err := os.MkdirAll(filepath.Dir(testPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testContent := []byte("func TestBug(t *testing.T) {}\n")
+	if err := os.WriteFile(testPath, testContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(testContent)
+	if err := os.MkdirAll(filepath.Join(root, ".looper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{"version":1,"testPath":"internal/bug_test.go","testName":"TestBug","testCommand":"go test ./internal -run '^TestBug$'","testSha256":"` + hex.EncodeToString(hash[:]) + `"}`
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	checkpoint.Repair = &checkpointRepair{Status: "failed", Summary: "agent timed out"}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("retry capture = %v, want the untrusted manifest ignored", err)
+	}
+	if checkpoint.Reproduction != nil || !checkpoint.ReproductionAbsent {
+		t.Fatalf("checkpoint after retry capture = %#v, want nil reproduction with absence retained", checkpoint)
+	}
+
+	checkpoint.Repair = nil
+	err := captureFixerReproduction(&checkpoint, root)
+	if err == nil || !strings.Contains(err.Error(), "appeared after run start") {
+		t.Fatalf("capture without unfinished repair = %v, want fail-closed refusal", err)
+	}
+}
+
+func TestFixerReproductionDefersMalformedManifestDuringRetry(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".looper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), []byte(`{"version":`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := fixerCheckpoint{
+		ReproductionAbsent: true,
+		Repair:             &checkpointRepair{Status: "failed", Summary: "agent timed out"},
+	}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("retry capture = %v, want malformed manifest deferred", err)
+	}
+	if checkpoint.Reproduction != nil || !checkpoint.ReproductionAbsent {
+		t.Fatalf("checkpoint after retry capture = %#v, want nil reproduction with absence retained", checkpoint)
+	}
+}
+
+func TestFixerReproductionDefersManifestWhileAgentWaitIsPending(t *testing.T) {
+	root, _ := writeFixerReproductionFixture(t)
+	checkpoint := fixerCheckpoint{ReproductionAbsent: true, PendingAgentExecutionID: "agent_live_1"}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("captureFixerReproduction() = %v, want manifest deferred for retry", err)
+	}
+	if checkpoint.Reproduction != nil || !checkpoint.ReproductionAbsent {
+		t.Fatalf("checkpoint after retry capture = %#v, want untrusted manifest deferred", checkpoint)
+	}
+}
+
+func TestRewindCheckpointForPrepareRetryPreservesOnlyUnfinishedRepair(t *testing.T) {
+	t.Parallel()
+
+	unfinished := rewindCheckpointForPrepareRetry(fixerCheckpoint{
+		Repair: &checkpointRepair{Status: "failed"},
+	})
+	if unfinished.Repair == nil || unfinished.Repair.Status != "failed" {
+		t.Fatalf("unfinished retry checkpoint Repair = %#v, want preserved non-completed record", unfinished.Repair)
+	}
+
+	completed := rewindCheckpointForPrepareRetry(fixerCheckpoint{
+		Repair: &checkpointRepair{Status: "completed"},
+	})
+	if completed.Repair != nil {
+		t.Fatalf("completed retry checkpoint Repair = %#v, want cleared for a fresh repair", completed.Repair)
 	}
 }
 

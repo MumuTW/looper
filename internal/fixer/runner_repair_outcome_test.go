@@ -152,11 +152,8 @@ func TestIsTemplateCompletionPayloadSkipsEchoedFixerTemplate(t *testing.T) {
 }
 
 // TestRunRepairStepReplaysAfterRejectedOutcome is the regression guard for the
-// replay hole. The guard at the top of runRepairStep treats any stored repair
-// record whose ParseStatus is "parsed" as a finished repair. Recording one for a
-// blocked or unauthorized attempt therefore let the next automatic retry skip the
-// agent and advance to reconcile/validate/push, publishing whatever the blocked
-// attempt left in the worktree.
+// replay hole. Retry-pending records preserve the reproduction boundary while
+// the guard at the top of runRepairStep still starts the replacement agent.
 func TestRunRepairStepReplaysAfterRejectedOutcome(t *testing.T) {
 	t.Parallel()
 	for _, testCase := range []struct {
@@ -206,10 +203,8 @@ func TestRunRepairStepReplaysAfterRejectedOutcome(t *testing.T) {
 				t.Fatalf("Runs.GetByID() = (%#v, %v)", run, err)
 			}
 			stored := parseCheckpoint(run.CheckpointJSON)
-			// Errorf, not Fatalf: the replay assertions below are the behavioral half
-			// of this guard and must still run when the record leaks through.
-			if stored.Repair != nil {
-				t.Errorf("stored checkpoint.Repair = %#v, want no repair record so the step stays replayable", stored.Repair)
+			if stored.Repair == nil || stored.Repair.Status != "retry_pending" {
+				t.Errorf("stored checkpoint.Repair = %#v, want retry_pending provenance", stored.Repair)
 			}
 			// The replay guard must not treat this checkpoint as a finished repair:
 			// re-running the step has to start the agent again, not return early.

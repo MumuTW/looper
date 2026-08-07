@@ -1526,7 +1526,7 @@ func (a fixerGitAdapter) InspectHead(ctx context.Context, input fixer.InspectHea
 	if err != nil {
 		return fixer.InspectHeadResult{}, err
 	}
-	return fixer.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles}, nil
+	return fixer.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles, HasUnresolvedConflicts: result.HasUnresolvedConflicts, UnresolvedConflictFiles: result.UnresolvedConflictFiles}, nil
 }
 
 func (a fixerGitAdapter) Commit(ctx context.Context, input fixer.CommitInput) (fixer.CommitResult, error) {
@@ -1879,7 +1879,7 @@ func (a workerAgentExecutionAdapter) Wait(ctx context.Context) (worker.AgentResu
 	if err != nil {
 		return worker.AgentResult{}, err
 	}
-	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt, PreTimeoutError: result.PreTimeoutError, NativeResumeMode: result.NativeResumeMode, NativeResumeStatus: result.NativeResumeStatus}, nil
+	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, CompletionPayload: result.CompletionPayload, ChangedFiles: result.ChangedFiles, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt, PreTimeoutError: result.PreTimeoutError, NativeResumeMode: result.NativeResumeMode, NativeResumeStatus: result.NativeResumeStatus}, nil
 }
 
 func (a workerAgentExecutionAdapter) Kill(reason string) error {
