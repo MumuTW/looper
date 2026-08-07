@@ -25,11 +25,12 @@ type loopLogsCombinedState struct {
 }
 
 type loopLogsFileCursor struct {
-	path       string
-	offset     int64
-	fileInfo   os.FileInfo
-	lastInline string
-	snapshot   string
+	path          string
+	offset        int64
+	fileInfo      os.FileInfo
+	lastInline    string
+	pendingInline string
+	snapshot      string
 }
 
 type loopLogsCombinedCursor struct {
@@ -138,13 +139,16 @@ var errLoopLogsClientWrite = errors.New("loop logs client write failed")
 
 func (h *Handler) buildLoopLogsCombinedState(ctx context.Context, loop storage.LoopRecord) (loopLogsCombinedState, error) {
 	h.observeLoopLogsFollow("state_refresh", 0)
-	services := h.context.Runtime.Services()
-	if latestLoop, err := services.Repositories.Loops.GetByID(ctx, loop.ID); err != nil {
+	repos, err := h.logsRepositories()
+	if err != nil {
+		return loopLogsCombinedState{}, err
+	}
+	if latestLoop, err := repos.Loops.GetByID(ctx, loop.ID); err != nil {
 		return loopLogsCombinedState{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	} else if latestLoop != nil {
 		loop = *latestLoop
 	}
-	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
+	latestRun, err := repos.Runs.GetLatestByLoopID(ctx, loop.ID)
 	if err != nil {
 		return loopLogsCombinedState{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
@@ -171,6 +175,98 @@ func (h *Handler) newLoopLogsCombinedCursor(state loopLogsCombinedState) (loopLo
 	return loopLogsCombinedCursor{executionID: executionID, stdout: stdout, stderr: stderr}, nil
 }
 
+func (h *Handler) newLoopLogsSingleCursor(state loopLogsCombinedState, stderr bool) (loopLogsFileCursor, error) {
+	path, inline := singleLoopLogsOutput(state.output, stderr)
+	return h.newLoopLogsFileCursor(path, inline)
+}
+
+func singleLoopLogsOutput(output agentOutputPayload, stderr bool) (string, string) {
+	if stderr {
+		return output.StderrLogPath, output.Stderr
+	}
+	return output.StdoutLogPath, output.Stdout
+}
+
+func applyLoopLogsSingleSnapshot(response *loopLogsResponse, cursor loopLogsFileCursor, stderr bool) {
+	if response == nil || response.Agent == nil {
+		return
+	}
+	content := tailLogBytes(cursor.snapshotContent(), loopLogsFollowSnapshotBytes)
+	if stderr {
+		response.Agent.Stderr = content
+	} else {
+		response.Agent.Stdout = content
+	}
+}
+
+func (h *Handler) updateLoopLogsSingleCursor(w io.Writer, flusher http.Flusher, response loopLogsResponse, output agentOutputPayload, cursor *loopLogsFileCursor, stderr bool, executionID string) error {
+	if cursor == nil {
+		return nil
+	}
+	path, inline := singleLoopLogsOutput(output, stderr)
+	validPath := strings.TrimSpace(path) != "" && isPathWithinDirectory(path, h.context.Config.Daemon.LogDir)
+	if cursor.path != "" && cursor.path != path {
+		known := cursor.lastInline
+		if err := h.emitLoopLogsSingleChunks(w, flusher, response, cursor, true); err != nil {
+			return err
+		}
+		if validPath {
+			next, err := h.newLoopLogsFileCursor(path, inline)
+			if err != nil {
+				return err
+			}
+			*cursor = next
+			return writeLoopLogsChunk(w, flusher, response, "", logContentAfterKnown(next.snapshotContent(), known))
+		}
+		*cursor = loopLogsFileCursor{lastInline: inline}
+		return writeLoopLogsChunk(w, flusher, response, "", appendedLogChunk(executionID, known, executionID, inline))
+	}
+	if cursor.path == "" && validPath {
+		known := cursor.lastInline
+		next, err := h.newLoopLogsFileCursor(path, inline)
+		if err != nil {
+			return err
+		}
+		*cursor = next
+		return writeLoopLogsChunk(w, flusher, response, "", logContentAfterKnown(next.snapshotContent(), known))
+	}
+	if cursor.path == "" {
+		chunk := appendedLogChunk(executionID, cursor.lastInline, executionID, inline)
+		cursor.lastInline = inline
+		return writeLoopLogsChunk(w, flusher, response, "", chunk)
+	}
+	// Defer the inline baseline advance until the next file read succeeds. If
+	// the file disappears before readNext opens it, the old lastInline stays as
+	// the fallback baseline so the inline delta on the next poll captures the
+	// output added during the file-to-inline transition instead of skipping it.
+	cursor.pendingInline = inline
+	return nil
+}
+
+func (h *Handler) emitLoopLogsSingleChunks(w io.Writer, flusher http.Flusher, response loopLogsResponse, cursor *loopLogsFileCursor, drain bool) error {
+	if cursor == nil {
+		return nil
+	}
+	for {
+		chunk, attempted, err := cursor.readNext(loopLogsFollowMaxChunkBytes)
+		if attempted {
+			h.observeLoopLogsFollow("file_read", len(chunk))
+		}
+		if err != nil {
+			return apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		if chunk == "" {
+			return nil
+		}
+		if err := writeLoopLogsChunk(w, flusher, response, "", chunk); err != nil {
+			return errLoopLogsClientWrite
+		}
+		if !drain {
+			return nil
+		}
+	}
+}
+
 func (h *Handler) newLoopLogsFileCursor(path, inline string) (loopLogsFileCursor, error) {
 	cursor := loopLogsFileCursor{lastInline: inline}
 	if strings.TrimSpace(path) == "" || !isPathWithinDirectory(path, h.context.Config.Daemon.LogDir) {
@@ -181,10 +277,21 @@ func (h *Handler) newLoopLogsFileCursor(path, inline string) (loopLogsFileCursor
 		return loopLogsFileCursor{}, err
 	}
 	if found {
+		// readLoopLogsSnapshot records the file's full size as the offset even
+		// when the snapshot ends with an incomplete UTF-8 rune. Back the offset
+		// up to the last complete rune boundary — the same rule readNext applies
+		// — so the remaining continuation bytes arrive as part of the full rune
+		// on the next poll instead of being consumed as a lead-byte fragment
+		// that decodes to replacement characters.
+		raw := []byte(content)
+		if cut := utf8ChunkBoundary(raw, len(raw)); cut < len(raw) {
+			offset -= int64(len(raw) - cut)
+			raw = raw[:cut]
+		}
 		cursor.path = path
 		cursor.offset = offset
 		cursor.fileInfo = info
-		cursor.snapshot = content
+		cursor.snapshot = string(raw)
 	}
 	return cursor, nil
 }
@@ -205,7 +312,10 @@ func (cursor loopLogsFileCursor) snapshotContent() string {
 }
 
 func (h *Handler) updateLoopLogsCombinedCursor(w io.Writer, flusher http.Flusher, previous loopLogsResponse, state loopLogsCombinedState, cursor *loopLogsCombinedCursor) error {
-	nextExecutionID := ""
+	// Keep the previous execution identity when the terminal projection has no
+	// Agent row. Its durable inline output still belongs to the same cursor and
+	// must be emitted before the stream ends.
+	nextExecutionID := cursor.executionID
 	if state.response.Agent != nil {
 		nextExecutionID = state.response.Agent.ExecutionID
 	}
@@ -231,9 +341,6 @@ func (h *Handler) updateLoopLogsCombinedCursor(w io.Writer, flusher http.Flusher
 		return nil
 	}
 
-	if state.response.Agent == nil {
-		return nil
-	}
 	for _, update := range []struct {
 		stream string
 		cursor *loopLogsFileCursor
@@ -263,7 +370,12 @@ func (h *Handler) updateLoopLogsCombinedCursor(w io.Writer, flusher http.Flusher
 				return errLoopLogsClientWrite
 			}
 		} else {
-			update.cursor.lastInline = update.inline
+			// Defer the inline baseline advance until the next file read
+			// succeeds, matching updateLoopLogsSingleCursor. If the file
+			// disappears before readNext opens it, the old lastInline stays as
+			// the fallback baseline so the inline delta captures the transition
+			// output instead of skipping it.
+			update.cursor.pendingInline = update.inline
 		}
 	}
 	return nil
@@ -345,16 +457,25 @@ func (cursor *loopLogsFileCursor) readNext(maxBytes int) (string, bool, error) {
 	if errors.Is(err, os.ErrNotExist) {
 		// A disappeared file must not suppress the durable inline fallback.
 		// The next state refresh will either reopen a replacement or resume
-		// incremental inline delivery.
+		// incremental inline delivery. Discard the pending inline without
+		// committing it so the old lastInline remains the fallback baseline
+		// and the inline delta on the next poll captures transition output.
 		cursor.path = ""
 		cursor.offset = 0
 		cursor.fileInfo = nil
+		cursor.pendingInline = ""
 		return "", true, nil
 	}
 	if err != nil {
 		return "", true, err
 	}
 	defer file.Close()
+	// The file is readable, so the inline baseline can safely advance to the
+	// value staged by updateLoopLogsSingleCursor / updateLoopLogsCombinedCursor.
+	if cursor.pendingInline != "" {
+		cursor.lastInline = cursor.pendingInline
+		cursor.pendingInline = ""
+	}
 	info, err := file.Stat()
 	if err != nil {
 		return "", true, err
