@@ -132,7 +132,7 @@ func TestAuditorConfirmationEscalatesWhenCandidateLacksRevertProvenance(t *testi
 			t.Fatal(err)
 		}
 	}
-	decision, err := auditorConfirmationDecision(context.Background(), repos.Events, "project_1", "acme/looper", observation, confirmation, 60)
+	decision, err := auditorConfirmationDecision(context.Background(), repos.Events, "project_1", "acme/looper", observation, confirmation, nil, 60)
 	if err != nil || decision.Action != auditor.ActionEscalate || decision.Reason != "missing_merge_commit_provenance" {
 		t.Fatalf("auditorConfirmationDecision() = %#v, %v", decision, err)
 	}
@@ -160,7 +160,7 @@ func TestAuditorConfirmationRejectsRebaseCandidate(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	decision, err := auditorConfirmationDecision(context.Background(), repos.Events, "project_1", "acme/looper", observation, confirmation, 60)
+	decision, err := auditorConfirmationDecision(context.Background(), repos.Events, "project_1", "acme/looper", observation, confirmation, nil, 60)
 	if err != nil || decision.Action != auditor.ActionEscalate || decision.Reason != "rebase_merge_not_revertable" {
 		t.Fatalf("auditorConfirmationDecision() = %#v, %v; want explicit rebase refusal", decision, err)
 	}
@@ -182,9 +182,34 @@ func TestProgressAuditorConfirmationEscalatesObservationWithoutSuiteIdentity(t *
 
 func TestCompletedAuditorRerunWaitsForAResultNewerThanRequest(t *testing.T) {
 	requestedAt := time.Date(2026, time.July, 31, 12, 0, 0, 0, time.UTC)
-	checks := githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "failure", CheckSuiteID: 7654, StartedAt: eventlog.FormatJavaScriptISOString(requestedAt.Add(-time.Second))}}}
+	checks := githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "failure", CheckSuiteID: 7654, StartedAt: eventlog.FormatJavaScriptISOString(requestedAt.Add(-time.Second)), CompletedAt: eventlog.FormatJavaScriptISOString(requestedAt.Add(time.Minute))}}}
 	if completed, failed := completedAuditorRerun(checks, []int64{7654}, map[int64]time.Time{7654: requestedAt}); completed || failed != nil {
 		t.Fatalf("completedAuditorRerun() = (%v, %#v), want pending", completed, failed)
+	}
+}
+
+func TestIntersectAuditorPathsByCheckUsesOnlyRepeatedPaths(t *testing.T) {
+	got := intersectAuditorPathsByCheck(
+		map[string][]string{"ci": {"a.go", "b.go"}, "lint": {"lint.go"}},
+		map[string][]string{"CI": {"b.go"}, "lint": {"other.go"}},
+		[]string{"ci"},
+	)
+	if len(got) != 1 || len(got["ci"]) != 1 || got["ci"][0] != "b.go" {
+		t.Fatalf("intersectAuditorPathsByCheck() = %#v, want only repeated ci path", got)
+	}
+}
+
+func TestIntersectAuditorPathsByCheckDoesNotFallBackWhenNoPathRepeats(t *testing.T) {
+	got := intersectAuditorPathsByCheck(
+		map[string][]string{"ci": {"a.go", "b.go"}},
+		map[string][]string{"ci": {"c.go"}},
+		[]string{"ci"},
+	)
+	if got == nil {
+		t.Fatal("intersectAuditorPathsByCheck() = nil, want empty intersection marker")
+	}
+	if len(got) != 0 {
+		t.Fatalf("intersectAuditorPathsByCheck() = %#v, want no paths", got)
 	}
 }
 

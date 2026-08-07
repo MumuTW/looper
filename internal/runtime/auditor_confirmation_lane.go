@@ -101,7 +101,8 @@ func progressAuditorConfirmation(ctx context.Context, repos *storage.Repositorie
 		return appendAuditorConfirmation(ctx, repos, project.ID, entityType, entityID, observationEvent.ID, headSHA, auditor.ConfirmationResult{Outcome: auditor.ConfirmationInconclusive}, auditor.Decision{Action: auditor.ActionEscalate, Reason: "failure_path_evidence_incomplete"}, now())
 	}
 	confirmation := auditor.ConfirmFailure(auditor.ConfirmationInput{InitialFailedChecks: observation.FailedChecks, InitialFailedPaths: observation.FailingPaths, InitialFailedPathsByCheck: observation.FailingPathsByCheck, RerunCompleted: true, RerunFailedChecks: rerunFailedChecks, RerunFailedPaths: rerunPaths, RerunFailedPathsByCheck: rerunPathsByCheck})
-	decision, err := auditorConfirmationDecision(ctx, repos.Events, project.ID, repo, observation, confirmation, role.WindowMinutes)
+	confirmedPathsByCheck := intersectAuditorPathsByCheck(observation.FailingPathsByCheck, rerunPathsByCheck, confirmation.ConfirmedChecks)
+	decision, err := auditorConfirmationDecision(ctx, repos.Events, project.ID, repo, observation, confirmation, confirmedPathsByCheck, role.WindowMinutes)
 	if err != nil {
 		return err
 	}
@@ -256,16 +257,14 @@ func failedAuditorRerunPathEvidence(ctx context.Context, gateway auditorGateway,
 }
 
 func checkRunStartedAfter(check githubinfra.PullRequestCheckRun, requestedAt time.Time) bool {
-	for _, value := range []string{check.StartedAt, check.CompletedAt} {
-		when, err := time.Parse(time.RFC3339Nano, value)
-		if err == nil && !when.Before(requestedAt) {
-			return true
-		}
+	startedAt, err := time.Parse(time.RFC3339Nano, check.StartedAt)
+	if err != nil {
+		return false
 	}
-	return false
+	return !startedAt.UTC().Before(requestedAt.UTC())
 }
 
-func auditorConfirmationDecision(ctx context.Context, events *storage.EventsRepository, projectID, repo string, observation auditor.FailureObservation, confirmation auditor.ConfirmationResult, windowMinutes int) (auditor.Decision, error) {
+func auditorConfirmationDecision(ctx context.Context, events *storage.EventsRepository, projectID, repo string, observation auditor.FailureObservation, confirmation auditor.ConfirmationResult, confirmedPathsByCheck map[string][]string, windowMinutes int) (auditor.Decision, error) {
 	if confirmation.Outcome != auditor.ConfirmationConfirmed {
 		return auditor.Decide(confirmation, auditor.Attribution{}), nil
 	}
@@ -296,7 +295,11 @@ func auditorConfirmationDecision(ctx context.Context, events *storage.EventsRepo
 			projectCandidates = append(projectCandidates, candidate)
 		}
 	}
-	failingPaths := auditorPathsForChecks(observation.FailingPathsByCheck, confirmation.ConfirmedChecks)
+	pathsByCheck := observation.FailingPathsByCheck
+	if confirmedPathsByCheck != nil {
+		pathsByCheck = confirmedPathsByCheck
+	}
+	failingPaths := auditorPathsForChecks(pathsByCheck, confirmation.ConfirmedChecks)
 	if len(observation.FailingPathsByCheck) == 0 && len(observation.FailingPaths) > 0 {
 		return auditor.Decision{Action: auditor.ActionEscalate, Reason: "failure_path_evidence_incomplete"}, nil
 	}
@@ -323,6 +326,54 @@ func auditorConfirmationDecision(ctx context.Context, events *storage.EventsRepo
 		return auditor.Decision{Action: auditor.ActionEscalate, Reason: "missing_unambiguous_source_issue"}, nil
 	}
 	return decision, nil
+}
+
+func intersectAuditorPathsByCheck(initial, rerun map[string][]string, checks []string) map[string][]string {
+	if len(initial) == 0 || len(checks) == 0 {
+		return nil
+	}
+	wanted := make(map[string]struct{}, len(checks))
+	for _, check := range checks {
+		if normalized := strings.ToLower(strings.TrimSpace(check)); normalized != "" {
+			wanted[normalized] = struct{}{}
+		}
+	}
+	result := make(map[string][]string)
+	if len(rerun) == 0 {
+		return result
+	}
+	for initialName, initialPaths := range initial {
+		normalizedName := strings.ToLower(strings.TrimSpace(initialName))
+		if _, ok := wanted[normalizedName]; !ok {
+			continue
+		}
+		var rerunPaths []string
+		for rerunName, paths := range rerun {
+			if strings.EqualFold(strings.TrimSpace(rerunName), strings.TrimSpace(initialName)) {
+				rerunPaths = paths
+				break
+			}
+		}
+		if len(rerunPaths) == 0 {
+			continue
+		}
+		rerunSet := make(map[string]struct{}, len(rerunPaths))
+		for _, path := range rerunPaths {
+			if normalized := strings.TrimSpace(path); normalized != "" {
+				rerunSet[normalized] = struct{}{}
+			}
+		}
+		for _, path := range initialPaths {
+			normalized := strings.TrimSpace(path)
+			if _, ok := rerunSet[normalized]; ok && normalized != "" {
+				result[initialName] = append(result[initialName], normalized)
+			}
+		}
+		if len(result[initialName]) == 0 {
+			delete(result, initialName)
+		}
+	}
+	return result
 }
 
 func cloneAuditorPathMap(paths map[string][]string) map[string][]string {

@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -21,6 +22,8 @@ type fakeAuditorProposalGit struct {
 	inspectInput gitinfra.InspectHeadInput
 	inspect      gitinfra.InspectHeadResult
 	reverts      []gitinfra.RevertCommitInput
+	verifyCalls  []gitinfra.VerifyRevertCommitInput
+	verifyErr    error
 	pushes       []gitinfra.PushInput
 }
 
@@ -39,6 +42,11 @@ func (g *fakeAuditorProposalGit) RevertCommit(_ context.Context, input gitinfra.
 	return gitinfra.CommitResult{CommitSHA: "revert-commit"}, nil
 }
 
+func (g *fakeAuditorProposalGit) VerifyRevertCommit(_ context.Context, input gitinfra.VerifyRevertCommitInput) error {
+	g.verifyCalls = append(g.verifyCalls, input)
+	return g.verifyErr
+}
+
 func (g *fakeAuditorProposalGit) Push(_ context.Context, input gitinfra.PushInput) error {
 	g.pushes = append(g.pushes, input)
 	return nil
@@ -48,6 +56,7 @@ type fakeAuditorProposalGitHub struct {
 	head        string
 	openPRs     []githubinfra.PullRequestSummary
 	createPRs   []githubinfra.CreatePullRequestInput
+	createErr   error
 	labelCalls  []githubinfra.PullRequestLabelsInput
 	reopenCalls []githubinfra.ReopenIssueInput
 }
@@ -62,6 +71,9 @@ func (g *fakeAuditorProposalGitHub) ListOpenPullRequests(context.Context, github
 
 func (g *fakeAuditorProposalGitHub) CreatePullRequest(_ context.Context, input githubinfra.CreatePullRequestInput) (githubinfra.CreatePullRequestResult, error) {
 	g.createPRs = append(g.createPRs, input)
+	if g.createErr != nil {
+		return githubinfra.CreatePullRequestResult{}, g.createErr
+	}
 	return githubinfra.CreatePullRequestResult{Number: 99, URL: "https://example.test/acme/looper/pull/99"}, nil
 }
 
@@ -86,8 +98,11 @@ func TestProgressAuditorRevertProposalCreatesOneDraftAndReopensSourceIssue(t *te
 	if len(git.reverts) != 1 || git.reverts[0].CommitSHA != "abcdef1234567890" || len(git.pushes) != 1 {
 		t.Fatalf("git operations = reverts:%#v pushes:%#v", git.reverts, git.pushes)
 	}
-	if git.inspectInput.BaseRef != "origin/main" {
-		t.Fatalf("InspectHead BaseRef = %q, want fetched remote base", git.inspectInput.BaseRef)
+	if git.inspectInput.BaseRef != head {
+		t.Fatalf("InspectHead BaseRef = %q, want captured base SHA", git.inspectInput.BaseRef)
+	}
+	if len(git.createCalls) != 1 || git.createCalls[0].BaseSHA != head {
+		t.Fatalf("CreateWorktree BaseSHA = %#v, want %q", git.createCalls, head)
 	}
 	if len(github.createPRs) != 1 || !github.createPRs[0].Draft || github.createPRs[0].BaseBranch != "main" || github.createPRs[0].HeadBranch != "looper/auditor/revert-pr-42-abcdef123456" {
 		t.Fatalf("create PR = %#v, want one draft proposal branch", github.createPRs)
@@ -141,12 +156,41 @@ func TestProgressAuditorRevertProposalUsesFrozenCandidateAfterHistoryChanges(t *
 
 func TestProgressAuditorRevertProposalRejectsUnverifiedPushedBranch(t *testing.T) {
 	ctx, repos, project, repo, head, now := auditorRevertFixture(t)
-	git := &fakeAuditorProposalGit{inspect: gitinfra.InspectHeadResult{HeadSHA: "existing-revert", NewCommitSHAs: []string{"existing-revert"}}}
+	git := &fakeAuditorProposalGit{inspect: gitinfra.InspectHeadResult{HeadSHA: "existing-revert", NewCommitSHAs: []string{"existing-revert"}}, verifyErr: errors.New("tree mismatch")}
 	github := &fakeAuditorProposalGitHub{head: head}
 
 	err := progressAuditorRevertProposal(ctx, repos, git, github, project, repo, "main", func() time.Time { return now })
 	if err == nil || len(git.reverts) != 0 || len(git.pushes) != 0 || len(github.createPRs) != 0 || len(github.reopenCalls) != 0 {
 		t.Fatalf("unverified branch replay = err:%v git:%#v create=%#v reopen=%#v", err, git, github.createPRs, github.reopenCalls)
+	}
+}
+
+func TestProgressAuditorRevertProposalResumesPushedBranchAfterCreateFailure(t *testing.T) {
+	ctx, repos, project, repo, head, now := auditorRevertFixture(t)
+	branch := "looper/auditor/revert-pr-42-abcdef123456"
+	git := &fakeAuditorProposalGit{inspect: gitinfra.InspectHeadResult{HeadSHA: "existing-revert", NewCommitSHAs: []string{"existing-revert"}}}
+	github := &fakeAuditorProposalGitHub{head: head}
+	github.createErr = errors.New("create pull request failed")
+
+	if err := progressAuditorRevertProposal(ctx, repos, git, github, project, repo, "main", func() time.Time { return now }); err == nil {
+		t.Fatal("first progressAuditorRevertProposal() error = nil, want PR creation failure")
+	}
+	if len(git.reverts) != 0 || len(git.verifyCalls) != 1 || len(git.pushes) != 1 || len(github.createPRs) != 1 {
+		t.Fatalf("first attempt = git:%#v github:%#v, want verify/push/create before failure", git, github)
+	}
+	if git.createCalls[0].BaseSHA != head || git.inspectInput.BaseRef != head {
+		t.Fatalf("frozen base was not forwarded: create=%#v inspect=%#v", git.createCalls[0], git.inspectInput)
+	}
+
+	github.createErr = nil
+	if err := progressAuditorRevertProposal(ctx, repos, git, github, project, repo, "main", func() time.Time { return now }); err != nil {
+		t.Fatalf("retry progressAuditorRevertProposal() error = %v", err)
+	}
+	if len(git.reverts) != 0 || len(git.verifyCalls) != 2 || len(git.pushes) != 2 || len(github.createPRs) != 2 || len(github.reopenCalls) != 1 {
+		t.Fatalf("retry did not adopt the exact pushed inverse: git:%#v github:%#v", git, github)
+	}
+	if github.createPRs[1].HeadBranch != branch {
+		t.Fatalf("retry CreatePullRequest head branch = %q, want %q", github.createPRs[1].HeadBranch, branch)
 	}
 }
 

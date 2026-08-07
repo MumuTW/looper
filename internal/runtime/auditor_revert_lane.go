@@ -20,6 +20,7 @@ type auditorRevertGit interface {
 	CreateWorktree(context.Context, gitinfra.CreateWorktreeInput) (storage.WorktreeRecord, error)
 	InspectHead(context.Context, gitinfra.InspectHeadInput) (gitinfra.InspectHeadResult, error)
 	RevertCommit(context.Context, gitinfra.RevertCommitInput) (gitinfra.CommitResult, error)
+	VerifyRevertCommit(context.Context, gitinfra.VerifyRevertCommitInput) error
 	Push(context.Context, gitinfra.PushInput) error
 }
 
@@ -76,11 +77,11 @@ func progressAuditorRevertProposal(ctx context.Context, repos *storage.Repositor
 		if err != nil {
 			return fmt.Errorf("auditor resolve worktree root: %w", err)
 		}
-		worktree, err := git.CreateWorktree(ctx, gitinfra.CreateWorktreeInput{ProjectID: project.ID, RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, Branch: branch, BaseBranch: baseBranch, ProtectedBranches: []string{baseBranch}})
+		worktree, err := git.CreateWorktree(ctx, gitinfra.CreateWorktreeInput{ProjectID: project.ID, RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, Branch: branch, BaseBranch: baseBranch, BaseSHA: headSHA, ProtectedBranches: []string{baseBranch}})
 		if err != nil {
 			return fmt.Errorf("auditor create proposal worktree: %w", err)
 		}
-		inspect, err := git.InspectHead(ctx, gitinfra.InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.WorktreePath, BaseRef: "origin/" + baseBranch})
+		inspect, err := git.InspectHead(ctx, gitinfra.InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.WorktreePath, BaseRef: headSHA})
 		if err != nil {
 			return fmt.Errorf("auditor inspect proposal branch: %w", err)
 		}
@@ -96,10 +97,13 @@ func progressAuditorRevertProposal(ctx context.Context, repos *storage.Repositor
 			}
 			commitSHA = result.CommitSHA
 		case 1:
-			// A commit-count signal is infrastructure evidence, not authority that
-			// this branch still reverses the frozen merge. Without a tree-level
-			// comparison, fail closed rather than pushing arbitrary branch state.
-			return fmt.Errorf("auditor proposal branch contains an unverified existing revert commit")
+			if err := git.VerifyRevertCommit(ctx, gitinfra.VerifyRevertCommitInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.WorktreePath, BaseSHA: headSHA, ExistingCommitSHA: inspect.NewCommitSHAs[0], RevertedCommitSHA: confirmation.Candidate.MergeCommitSHA}); err != nil {
+				return fmt.Errorf("auditor proposal branch existing commit is not the exact inverse: %w", err)
+			}
+			commitSHA = inspect.HeadSHA
+			if strings.TrimSpace(commitSHA) == "" {
+				commitSHA = inspect.NewCommitSHAs[0]
+			}
 		default:
 			return fmt.Errorf("auditor proposal branch has %d commits beyond %s", len(inspect.NewCommitSHAs), baseBranch)
 		}

@@ -1854,7 +1854,23 @@ func (g *Gateway) ViewPullRequestForGatekeeper(ctx context.Context, input ViewPu
 	// closingIssuesReferences is provenance enrichment, not merge authority.
 	// Older GitHub Enterprise APIs may reject the optional field; retry the
 	// authoritative gate read without it rather than blocking every evaluation.
+	if !isUnsupportedClosingIssuesReferencesError(err) {
+		return PullRequestDetail{}, err
+	}
 	return g.viewPullRequestWithFields(ctx, input, withoutJSONField(prViewGatekeeperJSONFields, "closingIssuesReferences"), false, false)
+}
+
+func isUnsupportedClosingIssuesReferencesError(err error) bool {
+	message := strings.ToLower(ErrorMessage(err))
+	if !strings.Contains(message, "closingissuesreferences") {
+		return false
+	}
+	for _, marker := range []string{"unknown field", "unknown argument", "doesn't exist", "does not exist", "invalid field"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Gateway) viewPullRequestWithFields(ctx context.Context, input ViewPullRequestInput, fields []string, includeReviewThreads bool, includeIssueComments bool) (PullRequestDetail, error) {

@@ -815,6 +815,25 @@ func TestViewPullRequestForGatekeeperRetriesWithoutOptionalClosingIssues(t *test
 	}
 }
 
+func TestViewPullRequestForGatekeeperDoesNotRetryUnrelatedErrors(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	call := 0
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		call++
+		if !strings.Contains(strings.Join(options.Args, " "), "closingIssuesReferences") {
+			t.Fatalf("gatekeeper view args = %q, want original optional provenance field", strings.Join(options.Args, " "))
+		}
+		return shell.Result{}, errors.New("authentication failed")
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	_, err := gateway.ViewPullRequestForGatekeeper(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err == nil || !strings.Contains(err.Error(), "authentication failed") || call != 1 {
+		t.Fatalf("ViewPullRequestForGatekeeper() = %v; calls=%d, want one unchanged error", err, call)
+	}
+}
+
 func TestIssueReferenceUsesLowerCamelJSON(t *testing.T) {
 	raw, err := json.Marshal(IssueReference{Number: 118, Repo: "acme/looper", URL: "https://github.com/acme/looper/issues/118"})
 	if err != nil {
