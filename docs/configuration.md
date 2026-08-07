@@ -948,9 +948,30 @@ must add the required check before relying on `auto`.
 ```toml
 [roles.gatekeeper]
 trust = "auto"
+# additions + deletions; omitted uses the normalized default of 200
+requiredReviewChangedLines = 200
 ```
 
-Project overrides use `projects[].roles.gatekeeper.trust`.
+`requiredReviewChangedLines` is the additions-plus-deletions threshold for the
+current pull request head. When the field is omitted, configuration normalizes
+it to `200`; an explicit global or project value of `0` disables the capacity
+requirement for that scope. A change at or above the effective threshold
+requires a verified current-head Reviewer marker. Below the threshold, Gatekeeper
+still checks all other merge conditions and still inspects blocking review
+markers, but it does not require a clean review to proceed. The counts and
+threshold are persisted as Gate evidence, and the provider's pull-request
+statistics plus merge-base SHA are the authority for the verdict.
+
+Project overrides use `projects[].roles.gatekeeper.trust` and
+`projects[].roles.gatekeeper.requiredReviewChangedLines`.
+
+Reviewer writes `pr.review.completed` only after it re-reads and verifies the
+GitHub marker. A structured `type = "rate_limit"` completion writes
+`pr.review.refused`; prose mentioning a rate limit is not evidence. Gatekeeper's
+bounded recent-merged-PR scan writes `pr.review.unreviewed` for merged pull
+requests at or above the threshold with no completed/refused evidence. These
+events describe merged **pull requests**, not commits, and remain queryable
+through the existing event API.
 
 ### The owned comment and its lifecycle
 
@@ -1219,6 +1240,7 @@ shutdownTimeoutMs = 1000
 [daemon.worktreeCleanup]
 enabled = false
 interval = "24h"
+maxDiskSweepPerTick = 2000
 retentionDays = 7
 maxPerTick = 10
 includeOrphans = false
@@ -1765,6 +1787,7 @@ Defaults:
 - `daemon.worktreeCleanup.interval = "24h"`
 - `daemon.worktreeCleanup.retentionDays = 7`
 - `daemon.worktreeCleanup.maxPerTick = 10`
+- `daemon.worktreeCleanup.maxDiskSweepPerTick = 2000` — the shared per-pass budget for unregistered directories and unreachable containers. Set to `0` to disable only the filesystem disk-sweep tier while keeping record-driven cleanup enabled.
 - `daemon.worktreeCleanup.includeOrphans = true` — a worktree record that no loop, run, or queue item references is still gated by `retentionDays`, because the planner ages every candidate by its own `createdAt`/`updatedAt`. Set this to `false` only to keep unreferenced worktrees indefinitely; the sweeper then reclaims almost nothing, since the reference graph drops old worktrees as loops move on.
 - `daemon.worktreeCleanup.dryRun = false`
 
@@ -1797,4 +1820,4 @@ looper worktree cleanup --confirm
 looper worktree cleanup --json
 ```
 
-Cleanup removes Looper-managed worktree checkouts only. It does not delete branches, skips dirty worktrees, preserves worktrees referenced by active loop state, and does not automatically delete filesystem-only orphan directories that are not present in Looper's worktree records.
+Record-driven cleanup removes only clean Looper-managed worktree checkouts and preserves filesystem-only paths that have no worktrees row. The separate disk-sweep tier may remove eligible unregistered directories and unreachable containers when `maxDiskSweepPerTick` is positive. Neither tier deletes branches; both skip dirty or otherwise protected work.

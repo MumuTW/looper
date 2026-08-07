@@ -347,6 +347,11 @@ Auditor requires merge-outcome evidence that status-only auto does not emit
 Post-merge digest likewise only sees Coordinator merge-watch merges (and
 historical Gatekeeper merge-outcome rows) while `auto` is status-only.
 
+Review capacity defaults to 200 changed lines (additions plus deletions). Set
+`roles.gatekeeper.requiredReviewChangedLines` or the project override to tune
+it; an explicit `0` disables that requirement. Smaller changes still block on
+an explicit blocking review marker, but do not wait for a clean review.
+
 Comment markers used by this flow:
 
 - `<!-- looper:reviewer:criteria-fail -->` — Reviewer found at least one acceptance criterion without satisfying evidence in the diff and returned the linked Issue to re-Triage

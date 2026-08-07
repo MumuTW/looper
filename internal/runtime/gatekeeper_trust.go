@@ -63,3 +63,10 @@ func gatekeeperDiffBudgetForProject(cfg config.Config, projectID string) config.
 	}
 	return budget
 }
+
+// gatekeeperRequiredReviewChangedLinesForProject resolves the effective review
+// capacity threshold. The normalized global default is 200; a project override
+// may explicitly set zero to disable the threshold for that project.
+func gatekeeperRequiredReviewChangedLinesForProject(cfg config.Config, projectID string) int {
+	return config.ProjectRoleConfigs(cfg, projectID).Gatekeeper.RequiredReviewChangedLines
+}

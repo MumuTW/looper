@@ -272,6 +272,7 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateHITLConfig(config.HITL, issues)
 	validateTriagerRoleConfig(config.Roles.Triager, "roles.triager", issues)
 	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", config.Roles.Reviewer.AutoMerge.Enabled, issues)
+	validateGatekeeperReviewEventCompatibility(config, issues)
 	validateAuditorRoleConfig(config.Roles.Auditor, "roles.auditor", issues)
 	validateAuditorGatekeeperCompatibility(config, issues)
 	validatePostMergeDigestGatekeeperCompatibility(config, issues)
@@ -304,21 +305,17 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 		validateAuditorRoleConfig(role, fmt.Sprintf("projects[%d].roles.auditor", i), issues)
 	}
 	for i, project := range config.Projects {
-		if project.Roles == nil || project.Roles.Gatekeeper == nil || (project.Roles.Gatekeeper.Trust == nil && project.Roles.Gatekeeper.DiffBudget == nil) {
+		if project.Roles == nil || project.Roles.Gatekeeper == nil {
 			continue
 		}
+		roles := ProjectRoleConfigs(config, project.ID)
 		reviewerAutoMerge := config.Roles.Reviewer.AutoMerge.Enabled
 		if project.Roles.Reviewer != nil && project.Roles.Reviewer.AutoMerge != nil && project.Roles.Reviewer.AutoMerge.Enabled != nil {
 			reviewerAutoMerge = *project.Roles.Reviewer.AutoMerge.Enabled
 		}
-		if project.Roles.Gatekeeper.Trust != nil {
-			validateGatekeeperRoleConfig(
-				GatekeeperRoleConfig{Trust: *project.Roles.Gatekeeper.Trust},
-				fmt.Sprintf("projects[%d].roles.gatekeeper", i), reviewerAutoMerge, issues)
-		}
-		validatePartialGatekeeperDiffBudget(
-			project.Roles.Gatekeeper.DiffBudget,
-			fmt.Sprintf("projects[%d].roles.gatekeeper.diffBudget", i), issues)
+		validateGatekeeperRoleConfig(
+			roles.Gatekeeper,
+			fmt.Sprintf("projects[%d].roles.gatekeeper", i), reviewerAutoMerge, issues)
 	}
 	validateIntakeConfig(config, issues)
 	validateDaemonConfig(config.Daemon, issues)
@@ -386,6 +383,40 @@ func validateAuditorRoleConfig(auditor AuditorRoleConfig, path string, issues *[
 
 func gatekeeperTrustIsAuto(trust GatekeeperTrustLevel) bool {
 	return GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(trust)))) == GatekeeperTrustAuto
+}
+
+const gatekeeperAutoCleanCommentConflictMessage = "requires a verified current-head review marker; set roles.reviewer.behavior.reviewEvents.clean to APPROVE or use gatekeeper trust observe/advise"
+
+func validateGatekeeperReviewEventCompatibility(config Config, issues *[]ValidationIssue) {
+	if gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust) && config.Roles.Gatekeeper.RequiredReviewChangedLines > 0 && config.Roles.Reviewer.Behavior.ReviewEvents.Clean == ReviewerReviewEventComment {
+		*issues = append(*issues, ValidationIssue{Path: "roles.reviewer.behavior.reviewEvents.clean", Message: gatekeeperAutoCleanCommentConflictMessage})
+	}
+	for i, project := range config.Projects {
+		if project.Roles == nil {
+			continue
+		}
+		projectGatekeeperOverride := project.Roles.Gatekeeper != nil && (project.Roles.Gatekeeper.Trust != nil || project.Roles.Gatekeeper.RequiredReviewChangedLines != nil)
+		projectReviewerCleanOverride := project.Roles.Reviewer != nil && project.Roles.Reviewer.Behavior != nil && project.Roles.Reviewer.Behavior.ReviewEvents != nil && project.Roles.Reviewer.Behavior.ReviewEvents.Clean != nil
+		if !projectGatekeeperOverride && !projectReviewerCleanOverride {
+			continue
+		}
+		roles := ProjectRoleConfigs(config, project.ID)
+		if !gatekeeperTrustIsAuto(roles.Gatekeeper.Trust) || roles.Gatekeeper.RequiredReviewChangedLines <= 0 || roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment {
+			continue
+		}
+		path := fmt.Sprintf("projects[%d].roles.reviewer.behavior.reviewEvents.clean", i)
+		if !projectReviewerCleanOverride {
+			path = "roles.reviewer.behavior.reviewEvents.clean"
+		}
+		if projectReviewerCleanOverride {
+			path = fmt.Sprintf("projects[%d].roles.reviewer.behavior.reviewEvents.clean", i)
+		} else if project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil {
+			path = fmt.Sprintf("projects[%d].roles.gatekeeper.trust", i)
+		} else if project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.RequiredReviewChangedLines != nil {
+			path = fmt.Sprintf("projects[%d].roles.gatekeeper.requiredReviewChangedLines", i)
+		}
+		*issues = append(*issues, ValidationIssue{Path: path, Message: gatekeeperAutoCleanCommentConflictMessage})
+	}
 }
 
 const auditorGatekeeperAutoConflictMessage = "requires Gatekeeper merge-outcome events or forge-observed merges; gatekeeper trust auto publishes commit status only and does not emit merge outcomes — disable auditor or use gatekeeper trust observe/advise until forge-observed merge evidence is implemented"
@@ -666,6 +697,9 @@ func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, 
 			Message: fmt.Sprintf("must be one of: %s, %s, %s", GatekeeperTrustObserve, GatekeeperTrustAdvise, GatekeeperTrustAuto),
 		})
 	}
+	if gatekeeper.RequiredReviewChangedLines < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".requiredReviewChangedLines", Message: "must be zero (to disable the threshold) or a positive integer"})
+	}
 }
 
 func validateGatekeeperDiffBudget(budget *GatekeeperDiffBudget, path string, issues *[]ValidationIssue) {
@@ -676,18 +710,6 @@ func validateGatekeeperDiffBudget(budget *GatekeeperDiffBudget, path string, iss
 		*issues = append(*issues, ValidationIssue{Path: path + ".maxChangedFiles", Message: "must be zero or a positive integer"})
 	}
 	if budget.MaxDeletions < 0 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".maxDeletions", Message: "must be zero or a positive integer"})
-	}
-}
-
-func validatePartialGatekeeperDiffBudget(budget *PartialGatekeeperDiffBudget, path string, issues *[]ValidationIssue) {
-	if budget == nil {
-		return
-	}
-	if budget.MaxChangedFiles != nil && *budget.MaxChangedFiles < 0 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".maxChangedFiles", Message: "must be zero or a positive integer"})
-	}
-	if budget.MaxDeletions != nil && *budget.MaxDeletions < 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".maxDeletions", Message: "must be zero or a positive integer"})
 	}
 }
@@ -1099,9 +1121,19 @@ func validateWorktreeCleanupConfig(config WorktreeCleanupConfig, path string, is
 	}
 	if config.RetentionDays < 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".retentionDays", Message: "must be an integer >= 0"})
+	} else if config.RetentionDays > 106751 {
+		// time.Duration is nanoseconds; larger day counts overflow when the
+		// runtime computes the retention cutoff and would turn a long retention
+		// into an immediate-delete window.
+		*issues = append(*issues, ValidationIssue{Path: path + ".retentionDays", Message: "must not exceed 106751 days"})
 	}
 	if config.MaxPerTick < 1 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".maxPerTick", Message: "must be a positive integer"})
+	}
+	// Zero is the documented way to disable the disk sweep without disabling
+	// the record-driven pass, so only negatives are invalid.
+	if config.MaxDiskSweepPerTick < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxDiskSweepPerTick", Message: "must be an integer >= 0"})
 	}
 }
 

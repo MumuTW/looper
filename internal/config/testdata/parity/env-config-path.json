@@ -207,7 +207,8 @@
           "retentionDays": 7,
           "maxPerTick": 10,
           "includeOrphans": true,
-          "dryRun": false
+          "dryRun": false,
+          "maxDiskSweepPerTick": 2000
         },
         "resourceGuard": {
           "enabled": true,
@@ -279,7 +280,9 @@
             "assignTo": ""
           }
         },
-        "gatekeeper": {},
+        "gatekeeper": {
+          "requiredReviewChangedLines": 200
+        },
         "deployer": {
           "enabled": false
         },
