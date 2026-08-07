@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/MumuTW/looper/internal/version"
@@ -95,10 +96,42 @@ func TestUpgradePreflightReportsTargetConfigFailure(t *testing.T) {
 	}
 }
 
+func TestTargetConfigFlagsExcludeClientEndpointOverrides(t *testing.T) {
+	if got, want := targetConfigFlags([]string{"--host", "127.0.0.1", "--config", "/etc/looper.toml", "--port=9443"}), []string{"--config", "/etc/looper.toml"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("targetConfigFlags() = %#v, want %#v", got, want)
+	}
+}
+
 func TestTargetBuildIdentityRejectsIncompleteJSON(t *testing.T) {
 	path := writeRawIdentityProgram(t, version.Info{})
 	if _, err := targetBuildIdentity(context.Background(), path, "version", "--json"); err == nil {
 		t.Fatal("targetBuildIdentity() error = nil, want incomplete identity rejection")
+	}
+}
+
+func TestUpgradePostStartBlocksIgnoresResumedWork(t *testing.T) {
+	// CompleteStartup marks admission ready and wakes the scheduler before
+	// verify-start can observe status, so queued work left in the drained
+	// database can legitimately be running here; it must not fail the cutover.
+	build := completeUpgradeIdentity("commit-a")
+	started := "2026-08-01T12:00:00Z"
+	report := upgradePostStartReport{
+		ExpectedBuild:   build,
+		ExpectedRelease: "release-b",
+		DaemonBuild:     build,
+		CurrentRelease:  "release-b",
+		StartedEvent:    true,
+	}
+	report.Status.Service.Healthy = true
+	report.Status.Service.Version = build.Version
+	report.Status.Service.Build = build.Metadata
+	report.Status.Service.AdmissionState = "ready"
+	report.Status.Service.StartedAt = &started
+	report.Status.Storage.Healthy = true
+	report.Status.Scheduler.ActiveRuns = 2
+	report.Status.Scheduler.RunningItems = 1
+	if blocks := upgradePostStartBlocks(report); len(blocks) != 0 {
+		t.Fatalf("blocks = %v, want none for a healthy cutover with resumed work", blocks)
 	}
 }
 

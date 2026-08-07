@@ -117,6 +117,33 @@ func parseRoundBudgetState(metadata map[string]any) (roundBudgetState, bool) {
 func (r *Runner) chargeFixerRound(ctx context.Context, loop storage.LoopRecord, headSHA string) (storage.LoopRecord, bool, error) {
 	metadata := parseJSONObject(loop.MetadataJSON)
 	previous, hasPrevious := parseRoundBudgetState(metadata)
+	lastFixHeadSHA, _ := stringFromAny(metadata["lastFixHeadSha"])
+	seededByDiscovery, _ := metadata["fixerRoundBudgetSeeded"].(bool)
+	headSHA = strings.TrimSpace(headSHA)
+	// A head that differs from the last Fixer-authored head may be a human or
+	// another automation push. Record it as the latest observation without
+	// charging the Fixer budget; a later Fixer push updates lastFixHeadSha and
+	// will be charged on its first discovery.
+	if hasPrevious && headSHA != "" && previous.LastHeadSHA != headSHA && ((seededByDiscovery && strings.TrimSpace(lastFixHeadSHA) == "" && previous.Rounds == 0) || (strings.TrimSpace(lastFixHeadSHA) != "" && headSHA != strings.TrimSpace(lastFixHeadSHA))) {
+		state := previous
+		state.LastHeadSHA = headSHA
+		state.RecordedAt = r.nowISO()
+		updated, err := r.mergeLoopMetadata(ctx, loop, map[string]any{"fixerRoundBudget": state})
+		return updated, false, err
+	}
+	// Migrate an older loop that has persisted its latest Fixer head but no
+	// round-budget state. That first authored head is round one, not a free seed.
+	if !hasPrevious && headSHA != "" && headSHA == strings.TrimSpace(lastFixHeadSHA) {
+		state := roundBudgetState{Rounds: 1, LastHeadSHA: headSHA, FirstRoundAt: r.nowISO(), RecordedAt: r.nowISO()}
+		updated, err := r.mergeLoopMetadata(ctx, loop, map[string]any{"fixerRoundBudget": state})
+		if err != nil {
+			return loop, false, err
+		}
+		if state.Rounds >= r.maxFixerRounds {
+			return r.parkLoopForRoundBudget(ctx, updated, state)
+		}
+		return updated, false, nil
+	}
 	state, charged := nextRoundBudget(previous, hasPrevious, headSHA, r.nowISO())
 	if charged {
 		updated, err := r.mergeLoopMetadata(ctx, loop, map[string]any{"fixerRoundBudget": state})

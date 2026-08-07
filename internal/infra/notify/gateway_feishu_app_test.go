@@ -344,14 +344,14 @@ func TestBuildFeishuAskCardRendersMention(t *testing.T) {
 func TestBuildFeishuAskCardRendersDecisionBrief(t *testing.T) {
 	card, err := buildFeishuAskCard(HITLAskCard{
 		LoopSeq:  132,
-		Repo:     "nexu-io/synclo-test",
+		Repo:     "MumuTW/synclo-test",
 		Title:    "welcome.txt 用哪种语言?",
 		Question: "welcome.txt 用哪种语言?",
 		Options:  []string{"中文", "英文"},
 
 		SourceType:   "GitHub Issue",
 		SourceRef:    "#132",
-		SourceURL:    "https://github.com/nexu-io/synclo-test/issues/132",
+		SourceURL:    "https://github.com/MumuTW/synclo-test/issues/132",
 		TriggerLogin: "lefarcen",
 
 		Recommendation:    "README 都是中文,推荐中文。",
@@ -365,7 +365,7 @@ func TestBuildFeishuAskCardRendersDecisionBrief(t *testing.T) {
 	raw := string(card)
 	for _, want := range []string{
 		"GitHub Issue #132", // source label
-		"https://github.com/nexu-io/synclo-test/issues/132", // clickable link
+		"https://github.com/MumuTW/synclo-test/issues/132", // clickable link
 		"由 @lefarcen 提出",                                    // trigger attribution
 		"README 都是中文",                                       // recommendation
 		"⭐ 中文 · 推荐",                                         // recommended option marked prominently

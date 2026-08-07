@@ -152,9 +152,12 @@ looper upgrade preflight --target-looper /path/to/candidate/looper --target-loop
 
 Preflight only calls `GET /api/v1/version` and `GET /api/v1/status` on the running daemon and executes the candidate binaries' identity (and optional `--check-config`) commands. It does not start a second production daemon or mutate the production database. Incomplete build identities never count as a matching CLI/daemon pair.
 
-After a clean preflight, create an explicit rollback bundle (daemon-owned SQLite online backup + config + matching binaries + checksums):
+After a clean preflight, close work admission and wait for the Supervisor to report
+that all owned work has drained before taking the rollback snapshot. This ordering
+keeps the SQLite backup aligned with the final quiescent runtime state:
 
 ```bash
+looper upgrade drain --deadline 10m
 looper upgrade backup
 looper upgrade verify --bundle <directory>
 ```
@@ -217,9 +220,9 @@ go run ./cmd/looper stop 12
 Stage a matching CLI/daemon pair, then activate via an atomic release pointer:
 
 ```bash
-looper upgrade stage-release --root <dir> --release-id <id> --target-looper <path> --target-looperd <path>
-looper upgrade activate-release --root <dir> --release-id <id>
-looper upgrade verify-start --root <dir>
+looper upgrade stage-release --release-root <dir> --target-looper <path> --target-looperd <path>
+looper upgrade activate-release --release-root <dir> --release <id>
+looper upgrade verify-start --release-root <dir> --release <id>
 ```
 
 `verify-start` must succeed before declaring cutover success. `package.autoUpgradeEnabled` is not a supported managed upgrade path (legacy decode only).

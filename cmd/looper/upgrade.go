@@ -288,7 +288,12 @@ func runUpgradeDrain(ctx context.Context, global []string, deadline time.Duratio
 }
 
 func targetConfigCompatibility(ctx context.Context, binary string, global []string) (bool, string) {
-	args := append([]string{"--check-config"}, global...)
+	// --host and --port are client endpoint overrides used to reach the
+	// currently running daemon. Forwarding them to looperd would validate a
+	// different server configuration from the one the replacement daemon will
+	// load. The config path is the only global flag that selects configuration
+	// for the target process.
+	args := append([]string{"--check-config"}, targetConfigFlags(global)...)
 	out, err := exec.CommandContext(ctx, binary, args...).CombinedOutput()
 	if err == nil {
 		return true, ""
@@ -298,6 +303,29 @@ func targetConfigCompatibility(ctx context.Context, binary string, global []stri
 		message = err.Error()
 	}
 	return false, message
+}
+
+func targetConfigFlags(global []string) []string {
+	var result []string
+	for index := 0; index < len(global); index++ {
+		name, value, inline := strings.Cut(global[index], "=")
+		if name != "--config" {
+			if !inline && (name == "--host" || name == "--port") && index+1 < len(global) {
+				index++
+			}
+			continue
+		}
+		if inline {
+			result = append(result, name+"="+value)
+			continue
+		}
+		result = append(result, global[index])
+		if index+1 < len(global) {
+			result = append(result, global[index+1])
+			index++
+		}
+	}
+	return result
 }
 
 func parseUpgradePreflightArgs(args []string) (string, string, bool, error) {
@@ -369,7 +397,11 @@ func runUpgradeStageRelease(ctx context.Context, targetLooper, targetLooperd, ro
 		return err
 	}
 	if err := verifyStagedReleaseIdentity(ctx, staged); err != nil {
-		return err
+		cleanupErr := upgraderelease.Remove(root, releaseID)
+		if cleanupErr != nil {
+			return fmt.Errorf("verify staged release identity: %w (cleanup failed: %v)", err, cleanupErr)
+		}
+		return fmt.Errorf("verify staged release identity: %w", err)
 	}
 	return writeVersionJSON(stdout, staged)
 }
@@ -475,9 +507,6 @@ func upgradePostStartBlocks(report upgradePostStartReport) []string {
 	}
 	if len(report.Status.Storage.PendingMigrations) > 0 {
 		blocks = append(blocks, "daemon storage has pending migrations")
-	}
-	if report.Status.Scheduler.ActiveRuns > 0 || report.Status.Scheduler.RunningItems > 0 {
-		blocks = append(blocks, "scheduler still owns active work after cutover")
 	}
 	if report.Status.Service.Recovery.Outstanding.QuarantinedActiveExecutions > 0 || report.Status.Service.Recovery.Outstanding.QuarantinedRunningRuns > 0 {
 		blocks = append(blocks, "daemon has outstanding quarantine debt")

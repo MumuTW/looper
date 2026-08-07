@@ -184,7 +184,7 @@ func TestSafetyFloorMidTickAdmissionCloseStopsLaterDiscovery(t *testing.T) {
 	nowISO := formatJavaScriptISOString(now)
 	baseBranch := "main"
 	for _, projectID := range []string{"project_a", "project_b"} {
-		meta := `{"repo":"nexu-io/` + projectID + `"}`
+		meta := `{"repo":"MumuTW/` + projectID + `"}`
 		if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
 			ID: projectID, Name: projectID, RepoPath: filepath.Join(workingDir, projectID),
 			BaseBranch: &baseBranch, MetadataJSON: &meta, CreatedAt: nowISO, UpdatedAt: nowISO,

@@ -10,10 +10,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/MumuTW/looper/internal/version"
 )
 
 const ManifestVersion = 1
@@ -75,13 +78,19 @@ func Create(ctx context.Context, input Input) (Result, error) {
 	}
 	fail := func(err error) (Result, error) { _ = os.RemoveAll(bundle); return Result{}, err }
 	files := map[string]File{}
-	if err := moveAndRecord(snapshot, filepath.Join(bundle, "database.sqlite"), files, "database.sqlite"); err != nil {
-		return fail(err)
-	}
 	for _, item := range []struct{ source, name string }{{input.ConfigPath, "config" + filepath.Ext(input.ConfigPath)}, {input.CLIBinaryPath, "looper"}, {input.DaemonBinaryPath, "looperd"}} {
 		if err := copyAndRecord(item.source, filepath.Join(bundle, item.name), files, item.name); err != nil {
 			return fail(err)
 		}
+	}
+	// Check the copied pair before moving the snapshot into its final place or
+	// publishing a manifest. A stale CLI beside the current daemon would make a
+	// self-consistent but unusable rollback bundle.
+	if err := verifyBinaryPair(ctx, filepath.Join(bundle, "looper"), filepath.Join(bundle, "looperd")); err != nil {
+		return fail(err)
+	}
+	if err := moveAndRecord(snapshot, filepath.Join(bundle, "database.sqlite"), files, "database.sqlite"); err != nil {
+		return fail(err)
 	}
 	manifest := Manifest{Version: ManifestVersion, CreatedAt: now().UTC().Format(time.RFC3339Nano), Files: files}
 	encoded, err := json.MarshalIndent(manifest, "", "  ")
@@ -92,6 +101,36 @@ func Create(ctx context.Context, input Input) (Result, error) {
 		return fail(fmt.Errorf("write backup manifest: %w", err))
 	}
 	return Result{Directory: bundle, Manifest: manifest}, nil
+}
+
+func verifyBinaryPair(ctx context.Context, cliPath, daemonPath string) error {
+	cli, err := readBuildIdentity(ctx, cliPath, "version", "--json")
+	if err != nil {
+		return fmt.Errorf("verify backup CLI identity: %w", err)
+	}
+	daemon, err := readBuildIdentity(ctx, daemonPath, "--version-json")
+	if err != nil {
+		return fmt.Errorf("verify backup daemon identity: %w", err)
+	}
+	if !cli.SameBuild(daemon) {
+		return fmt.Errorf("backup CLI and daemon build identities differ")
+	}
+	return nil
+}
+
+func readBuildIdentity(ctx context.Context, binary string, args ...string) (version.Info, error) {
+	output, err := exec.CommandContext(ctx, binary, args...).Output()
+	if err != nil {
+		return version.Info{}, err
+	}
+	var identity version.Info
+	if err := json.Unmarshal(output, &identity); err != nil {
+		return version.Info{}, fmt.Errorf("decode build identity: %w", err)
+	}
+	if !identity.Complete() {
+		return version.Info{}, fmt.Errorf("build identity is incomplete")
+	}
+	return identity, nil
 }
 
 func moveAndRecord(source, destination string, files map[string]File, name string) error {

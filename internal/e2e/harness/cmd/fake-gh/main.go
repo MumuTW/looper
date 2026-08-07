@@ -961,6 +961,8 @@ func pullRequestFieldValue(pr pullRequestState, field string) any {
 		return pr.UpdatedAt
 	case "closedAt":
 		return pr.ClosedAt
+	case "mergedAt":
+		return pr.MergedAt
 	case "isDraft":
 		return pr.IsDraft
 	case "reviewDecision":

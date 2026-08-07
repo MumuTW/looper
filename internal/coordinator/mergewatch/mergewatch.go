@@ -26,11 +26,21 @@ const (
 // state across ticks. Public, durable, idempotent; preserves ADR-0001's
 // stateless property.
 type PriorWatchMarker struct {
-	PRNumber       int64
-	HeadSHA        string
-	Retries        int
-	FirstUnknownAt *time.Time
-	NextRetryAt    *time.Time
+	PRNumber int64
+	HeadSHA  string
+	Retries  int
+	// ConflictRepairs is intentionally independent from Retries: transient
+	// provider failures may reset while the same PR keeps losing races with
+	// the moving base branch.
+	ConflictRepairs               int
+	ConflictRegenerationPending   bool
+	ConflictRegenerationEscalated bool
+	// ConflictRegenerationEscalatedState records the fresh PR observation at
+	// the human-escalation boundary so later ticks can distinguish an unchanged
+	// pause from a pushed head, restored auto-merge, or resolved conflict.
+	ConflictRegenerationEscalatedState string
+	FirstUnknownAt                     *time.Time
+	NextRetryAt                        *time.Time
 }
 
 type RetryBudget struct {

@@ -57,27 +57,9 @@ func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, g
 	if baseBranch == "" {
 		return fmt.Errorf("auditor project %s has no base branch", project.ID)
 	}
-	headSHA, err := gateway.GetBranchHeadSHA(ctx, githubinfra.BranchHeadInput{Repo: repo, Branch: baseBranch, CWD: project.RepoPath})
-	if err != nil {
-		return fmt.Errorf("auditor read default branch head: %w", err)
-	}
-	headSHA = strings.TrimSpace(headSHA)
-	if headSHA == "" {
-		return fmt.Errorf("auditor read default branch head: empty SHA")
-	}
-	checks, err := gateway.ListPullRequestCheckRuns(ctx, githubinfra.PullRequestCheckRunsInput{Repo: repo, Ref: headSHA, CWD: project.RepoPath})
-	if err != nil {
-		return fmt.Errorf("auditor read default branch checks: %w", err)
-	}
-	failureEvidence := failedAuditorCheckEvidence(checks)
-	if len(failureEvidence.Names) == 0 {
-		if !cleanAuditorCheckEvidence(checks) {
-			// Absence of a visible failure is not a clean baseline while any
-			// check/status is pending, non-success, or truncated by pagination.
-			return nil
-		}
-		return recordAuditorBaseline(ctx, repos, project, repo, headSHA, observedAt)
-	}
+	// Merge events are local durable evidence. Filter them before touching the
+	// provider so an enabled auditor with no recent Looper merges costs no GitHub
+	// API calls on every scheduler tick.
 	since := eventlog.FormatJavaScriptISOString(observedAt.Add(-time.Duration(role.WindowMinutes) * time.Minute))
 	mergeEvents, err := events.ListSince(ctx, since)
 	if err != nil {
@@ -94,7 +76,36 @@ func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, g
 		}
 	}
 	if len(candidatePRSet) == 0 {
-		return nil
+		// A recent clean baseline is enough to avoid repeating the provider read.
+		// Without one, sample the provider even during a quiet period so the first
+		// post-quiet merge can still be attributed against a durable baseline.
+		if known, _ := auditorCleanBaseline(mergeEvents, project.ID, repo, since); known {
+			return nil
+		}
+	}
+	headSHA, err := gateway.GetBranchHeadSHA(ctx, githubinfra.BranchHeadInput{Repo: repo, Branch: baseBranch, CWD: project.RepoPath})
+	if err != nil {
+		return fmt.Errorf("auditor read default branch head: %w", err)
+	}
+	headSHA = strings.TrimSpace(headSHA)
+	if headSHA == "" {
+		return fmt.Errorf("auditor read default branch head: empty SHA")
+	}
+	checks, err := gateway.ListPullRequestCheckRuns(ctx, githubinfra.PullRequestCheckRunsInput{Repo: repo, Ref: headSHA, CWD: project.RepoPath})
+	if err != nil {
+		return fmt.Errorf("auditor read default branch checks: %w", err)
+	}
+	if checks.TotalCount > len(checks.CheckRuns) {
+		return fmt.Errorf("auditor read default branch checks: truncated check-run snapshot (%d of %d)", len(checks.CheckRuns), checks.TotalCount)
+	}
+	failureEvidence := failedAuditorCheckEvidence(checks)
+	if len(failureEvidence.Names) == 0 {
+		if !cleanAuditorCheckEvidence(checks) {
+			// Absence of a visible failure is not a clean baseline while any
+			// check/status is pending, non-success, or truncated by pagination.
+			return nil
+		}
+		return recordAuditorBaseline(ctx, repos, project, repo, headSHA, observedAt)
 	}
 	candidatePRs := make([]int64, 0, len(candidatePRSet))
 	for prNumber := range candidatePRSet {

@@ -100,17 +100,39 @@ type RepositoryInspector interface {
 	Inspect(context.Context, string, triage.Issue) (triage.RepoContext, error)
 }
 
+// ConflictRegenerationInput is the coordinator-to-fixer handoff used when a
+// PR has lost the race with the base branch too many times. The fixer owns the
+// close-and-regenerate side effects; Coordinator owns the observed PR and the
+// durable conflict count.
+type ConflictRegenerationInput struct {
+	ProjectID       string
+	Repo            string
+	IssueRepo       string
+	IssueNumber     int64
+	PRNumber        int64
+	ConflictRepairs int
+	CWD             string
+}
+
+type ConflictRegenerationResult struct {
+	Completed bool
+	Escalated bool
+}
+
+type ConflictRegenerationFunc func(context.Context, ConflictRegenerationInput) (ConflictRegenerationResult, error)
+
 type Options struct {
-	Repos      *storage.Repositories
-	GitHub     GitHubGateway
-	Config     *config.Config
-	Logger     bootstrap.Logger
-	Now        func() time.Time
-	TriageLLM  triage.LLM
-	Inspector  RepositoryInspector
-	Disclosure *config.DisclosureConfig
-	Network    NetworkGateway
-	State      *RuntimeState
+	Repos              *storage.Repositories
+	GitHub             GitHubGateway
+	Config             *config.Config
+	Logger             bootstrap.Logger
+	Now                func() time.Time
+	TriageLLM          triage.LLM
+	Inspector          RepositoryInspector
+	Disclosure         *config.DisclosureConfig
+	Network            NetworkGateway
+	State              *RuntimeState
+	RegenerateConflict ConflictRegenerationFunc
 }
 
 // RuntimeState contains coordinator lifecycle state that must outlive one
@@ -140,16 +162,17 @@ func NewRuntimeState() *RuntimeState {
 // timing and watch locks), which does not survive restarts and is never an
 // authority.
 type Runner struct {
-	repos      *storage.Repositories
-	github     GitHubGateway
-	config     *config.Config
-	logger     bootstrap.Logger
-	now        func() time.Time
-	triageLLM  triage.LLM
-	inspector  RepositoryInspector
-	disclosure *config.DisclosureConfig
-	network    NetworkGateway
-	state      *RuntimeState
+	repos              *storage.Repositories
+	github             GitHubGateway
+	config             *config.Config
+	logger             bootstrap.Logger
+	now                func() time.Time
+	triageLLM          triage.LLM
+	inspector          RepositoryInspector
+	disclosure         *config.DisclosureConfig
+	network            NetworkGateway
+	regenerateConflict ConflictRegenerationFunc
+	state              *RuntimeState
 }
 
 type loadedIssue struct {
@@ -198,16 +221,17 @@ func New(options Options) *Runner {
 		state = NewRuntimeState()
 	}
 	runner := &Runner{
-		repos:      options.Repos,
-		github:     options.GitHub,
-		config:     options.Config,
-		logger:     options.Logger,
-		now:        now,
-		triageLLM:  options.TriageLLM,
-		inspector:  inspector,
-		network:    options.Network,
-		disclosure: options.Disclosure,
-		state:      state,
+		repos:              options.Repos,
+		github:             options.GitHub,
+		config:             options.Config,
+		logger:             options.Logger,
+		now:                now,
+		triageLLM:          options.TriageLLM,
+		inspector:          inspector,
+		network:            options.Network,
+		disclosure:         options.Disclosure,
+		regenerateConflict: options.RegenerateConflict,
+		state:              state,
 	}
 	runner.warnMarkReadyReviewerUnreachable()
 	return runner

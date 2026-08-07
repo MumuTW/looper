@@ -139,6 +139,7 @@ var hotEditablePaths = map[string]struct{}{
 	"roles.coordinator.dispatch.autonomous.holdLabel":                      {},
 	"roles.coordinator.dispatch.assignTo":                                  {},
 	"roles.coordinator.mergeWatch.maxIndeterminateDuration":                {},
+	"roles.coordinator.conflictPolicy.maxRepairs":                          {},
 
 	"tools.looperPath":    {},
 	"tools.osascriptPath": {},
