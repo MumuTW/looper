@@ -163,8 +163,7 @@ func (h *Handler) buildUpdateProjectResponse(r *http.Request, service projectSer
 	updated, err := service.UpdateProject(r.Context(), identifier, projects.UpdateInput{
 		Repo: updateProjectField(body.Repo), Name: updateProjectField(body.Name),
 		BaseBranch: updateProjectField(body.BaseBranch), WorktreeRoot: updateProjectField(body.WorktreeRoot),
-		Validation:      body.Validation,
-		GatekeeperTrust: updateProjectField(body.GatekeeperTrust),
+		Validation: body.Validation, GatekeeperTrust: updateProjectField(body.GatekeeperTrust),
 	})
 	if err != nil {
 		var notFound projects.ProjectNotFoundError
@@ -281,20 +280,18 @@ func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultB
 	}
 
 	response := projectResponse{
-		ID:           project.ID,
-		Name:         project.Name,
-		RepoPath:     project.RepoPath,
-		BaseBranch:   baseBranch,
-		Archived:     project.Archived,
-		Provider:     resolveProjectProviderKind(cfg, project.ID, metadata),
-		Repo:         stringMetadataPtr(metadata, "repo"),
-		WorktreeRoot: stringMetadataPtr(metadata, "worktreeRoot"),
-		Validation:   serializeProjectValidation(metadata, cfg),
-		CreatedAt:    project.CreatedAt,
-		UpdatedAt:    project.UpdatedAt,
-	}
-	if trust := projectGatekeeperTrust(project, cfg); trust != config.GatekeeperTrustObserve {
-		response.GatekeeperTrust = string(trust)
+		ID:              project.ID,
+		Name:            project.Name,
+		RepoPath:        project.RepoPath,
+		BaseBranch:      baseBranch,
+		Archived:        project.Archived,
+		Provider:        resolveProjectProviderKind(cfg, project.ID, metadata),
+		Repo:            stringMetadataPtr(metadata, "repo"),
+		WorktreeRoot:    stringMetadataPtr(metadata, "worktreeRoot"),
+		GatekeeperTrust: resolveProjectGatekeeperTrust(cfg, project.ID, metadata),
+		Validation:      serializeProjectValidation(metadata, cfg),
+		CreatedAt:       project.CreatedAt,
+		UpdatedAt:       project.UpdatedAt,
 	}
 	if state := projects.DiscoveryStateFromRecord(project); state.Status != "" {
 		serialized := serializeDiscovery(state)
@@ -303,24 +300,23 @@ func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultB
 	return response
 }
 
-// projectGatekeeperTrust reads the effective catalog policy while allowing a
-// freshly updated API-managed record to be reflected before the caller's
-// handler snapshot is refreshed. Empty trust is the documented observe level.
-func projectGatekeeperTrust(project storage.ProjectRecord, cfg config.Config) config.GatekeeperTrustLevel {
-	trust := config.ProjectRoleConfigs(cfg, project.ID).Gatekeeper.Trust
-	metadata := parseProjectMetadata(project.MetadataJSON)
+func resolveProjectGatekeeperTrust(cfg config.Config, projectID string, metadata map[string]any) string {
 	if roles, ok := metadata["roles"].(map[string]any); ok {
 		if gatekeeper, ok := roles["gatekeeper"].(map[string]any); ok {
-			if value, ok := gatekeeper["trust"].(string); ok && strings.TrimSpace(value) != "" {
-				trust = config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(value)))
+			if trust, ok := gatekeeper["trust"].(string); ok {
+				return serializeGatekeeperTrust(trust)
 			}
 		}
 	}
-	switch normalized := config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(trust)))); normalized {
+	return serializeGatekeeperTrust(string(config.ProjectRoleConfigs(cfg, projectID).Gatekeeper.Trust))
+}
+
+func serializeGatekeeperTrust(trust string) string {
+	switch config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(trust))) {
 	case config.GatekeeperTrustAdvise, config.GatekeeperTrustAuto:
-		return normalized
+		return strings.ToLower(strings.TrimSpace(trust))
 	default:
-		return config.GatekeeperTrustObserve
+		return ""
 	}
 }
 
