@@ -334,6 +334,135 @@ func TestFailedNodeBlocksChildAndQueuesPlannerReplan(t *testing.T) {
 	}
 }
 
+func TestRetireGraphStopsLiveSiblingLoops(t *testing.T) {
+	t.Parallel()
+	fixture := newFixture(t)
+	graph := mustGraph(t,
+		workgraph.Node{Key: "storage", Goal: "Persist records", AcceptanceCriteria: []string{"migration"}, ExpectedPRScope: "storage"},
+		workgraph.Node{Key: "api", Goal: "Expose records", AcceptanceCriteria: []string{"route"}, ExpectedPRScope: "api"},
+	)
+	stopped := []string{}
+	fixture.service.stopLoop = func(_ context.Context, loopID, _ string) error {
+		stopped = append(stopped, loopID)
+		return nil
+	}
+	created, err := fixture.service.Create(fixture.ctx, CreateInput{ProjectID: fixture.projectID, ParentRepo: "acme/looper", ParentIssueNumber: 339, PlannerLoopID: fixture.plannerLoopID, BaseBranch: "main", Graph: graph})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := fixture.service.Activate(fixture.ctx, created.GraphID); err != nil {
+		t.Fatalf("Activate() error = %v", err)
+	}
+	nodes, _ := fixture.repos.PlannerWorkGraphs.ListNodes(fixture.ctx, created.GraphID)
+	apiNode := nodeByKey(t, nodes, "api")
+	apiLoop, err := fixture.repos.Loops.GetByID(fixture.ctx, apiNode.WorkerLoopID)
+	if err != nil || apiLoop == nil {
+		t.Fatalf("GetByID(api loop) = %#v, %v", apiLoop, err)
+	}
+	apiLoop.Status = "running"
+	if err := fixture.repos.Loops.Upsert(fixture.ctx, *apiLoop); err != nil {
+		t.Fatalf("Upsert running api loop: %v", err)
+	}
+	if err := fixture.repos.PlannerWorkGraphs.UpdateStatus(fixture.ctx, created.GraphID, "replan_required", stringPointer("root failed"), "2026-07-31T08:00:00.000Z"); err != nil {
+		t.Fatalf("UpdateStatus() error = %v", err)
+	}
+	replacement := mustGraph(t,
+		workgraph.Node{Key: "worker", Goal: "Replacement", AcceptanceCriteria: []string{"route"}, ExpectedPRScope: "worker"},
+	)
+	if _, err := fixture.service.Create(fixture.ctx, CreateInput{ProjectID: fixture.projectID, ParentRepo: "acme/looper", ParentIssueNumber: 339, PlannerLoopID: fixture.plannerLoopID, BaseBranch: "main", Graph: replacement}); err != nil {
+		t.Fatalf("Create(replan) error = %v", err)
+	}
+	if got, want := stopped, []string{apiNode.WorkerLoopID}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("stopped loops = %v, want %v", got, want)
+	}
+}
+
+func TestSettleSkippedWorkerNodeRoutesGraphToReplan(t *testing.T) {
+	t.Parallel()
+	fixture := newFixture(t)
+	graph := mustGraph(t,
+		workgraph.Node{Key: "storage", Goal: "Persist records", AcceptanceCriteria: []string{"migration"}, ExpectedPRScope: "storage"},
+	)
+	created, err := fixture.service.Create(fixture.ctx, CreateInput{ProjectID: fixture.projectID, ParentRepo: "acme/looper", ParentIssueNumber: 339, PlannerLoopID: fixture.plannerLoopID, BaseBranch: "main", Graph: graph})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := fixture.service.Activate(fixture.ctx, created.GraphID); err != nil {
+		t.Fatalf("Activate() error = %v", err)
+	}
+	nodes, _ := fixture.repos.PlannerWorkGraphs.ListNodes(fixture.ctx, created.GraphID)
+	storageNode := nodeByKey(t, nodes, "storage")
+	if claimed, err := fixture.service.ClaimWorkerNode(fixture.ctx, storageNode.WorkerLoopID); err != nil || !claimed {
+		t.Fatalf("ClaimWorkerNode() = (%t, %v)", claimed, err)
+	}
+	if err := fixture.service.SettleSkippedWorkerNode(fixture.ctx, storageNode.WorkerLoopID, "manual publish required"); err != nil {
+		t.Fatalf("SettleSkippedWorkerNode() error = %v", err)
+	}
+	graphRecord, _ := fixture.repos.PlannerWorkGraphs.GetByID(fixture.ctx, created.GraphID)
+	if graphRecord.Status != "replan_required" {
+		t.Fatalf("graph status = %q, want replan_required", graphRecord.Status)
+	}
+	queued, err := fixture.repos.Queue.ListQueued(fixture.ctx, 10)
+	if err != nil {
+		t.Fatalf("ListQueued() error = %v", err)
+	}
+	plannerQueued := 0
+	for _, item := range queued {
+		if item.Type == "planner" {
+			plannerQueued++
+		}
+	}
+	if plannerQueued != 1 {
+		t.Fatalf("queued = %#v, want exactly one planner replan", queued)
+	}
+}
+
+func TestConcurrentFailuresCoalesceGraphReplan(t *testing.T) {
+	t.Parallel()
+	fixture := newFixture(t)
+	graph := mustGraph(t,
+		workgraph.Node{Key: "storage", Goal: "Persist records", AcceptanceCriteria: []string{"migration"}, ExpectedPRScope: "storage"},
+		workgraph.Node{Key: "api", Goal: "Expose records", AcceptanceCriteria: []string{"route"}, ExpectedPRScope: "api"},
+	)
+	created, err := fixture.service.Create(fixture.ctx, CreateInput{ProjectID: fixture.projectID, ParentRepo: "acme/looper", ParentIssueNumber: 339, PlannerLoopID: fixture.plannerLoopID, BaseBranch: "main", Graph: graph})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := fixture.service.Activate(fixture.ctx, created.GraphID); err != nil {
+		t.Fatalf("Activate() error = %v", err)
+	}
+	nodes, _ := fixture.repos.PlannerWorkGraphs.ListNodes(fixture.ctx, created.GraphID)
+	storageNode := nodeByKey(t, nodes, "storage")
+	apiNode := nodeByKey(t, nodes, "api")
+	if claimed, err := fixture.service.ClaimWorkerNode(fixture.ctx, storageNode.WorkerLoopID); err != nil || !claimed {
+		t.Fatalf("ClaimWorkerNode(storage) = (%t, %v)", claimed, err)
+	}
+	if claimed, err := fixture.service.ClaimWorkerNode(fixture.ctx, apiNode.WorkerLoopID); err != nil || !claimed {
+		t.Fatalf("ClaimWorkerNode(api) = (%t, %v)", claimed, err)
+	}
+	replannedA, err := fixture.service.FailWorkerNode(fixture.ctx, storageNode.WorkerLoopID, "validation failed")
+	if err != nil || !replannedA {
+		t.Fatalf("FailWorkerNode(storage) = (%t, %v), want replan", replannedA, err)
+	}
+	replannedB, err := fixture.service.FailWorkerNode(fixture.ctx, apiNode.WorkerLoopID, "tests failed")
+	if err != nil || replannedB {
+		t.Fatalf("FailWorkerNode(api) = (%t, %v), want coalesced no-op replan", replannedB, err)
+	}
+	queued, err := fixture.repos.Queue.ListQueued(fixture.ctx, 10)
+	if err != nil {
+		t.Fatalf("ListQueued() error = %v", err)
+	}
+	plannerQueued := 0
+	for _, item := range queued {
+		if item.Type == "planner" {
+			plannerQueued++
+		}
+	}
+	if plannerQueued != 1 {
+		t.Fatalf("queued = %#v, want exactly one planner replan", queued)
+	}
+}
+
 type fixture struct {
 	ctx           context.Context
 	db            *sql.DB

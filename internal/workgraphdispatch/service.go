@@ -22,6 +22,9 @@ type Options struct {
 	Now              func() time.Time
 	RetryMaxAttempts int64
 	OnEnqueued       func()
+	// StopLoop drains live sibling executions before graph supersede retires
+	// their queue rows. Nil skips in-process stop (unit tests only).
+	StopLoop func(ctx context.Context, loopID, reason string) error
 }
 
 type Service struct {
@@ -30,6 +33,7 @@ type Service struct {
 	now              func() time.Time
 	retryMaxAttempts int64
 	onEnqueued       func()
+	stopLoop         func(ctx context.Context, loopID, reason string) error
 }
 
 func New(options Options) *Service {
@@ -41,7 +45,7 @@ func New(options Options) *Service {
 	if retries == 0 {
 		retries = 3
 	}
-	return &Service{db: options.DB, repos: options.Repositories, now: now, retryMaxAttempts: retries, onEnqueued: options.OnEnqueued}
+	return &Service{db: options.DB, repos: options.Repositories, now: now, retryMaxAttempts: retries, onEnqueued: options.OnEnqueued, stopLoop: options.StopLoop}
 }
 
 type CreateInput struct {
@@ -224,11 +228,16 @@ func (s *Service) retireGraph(ctx context.Context, repos *storage.Repositories, 
 	}
 	reason := "work graph superseded"
 	for _, node := range nodes {
-		if _, err := repos.Queue.CancelByLoop(ctx, node.WorkerLoopID, nowISO, &reason); err != nil {
-			return err
-		}
 		loop, err := repos.Loops.GetByID(ctx, node.WorkerLoopID)
 		if err != nil {
+			return err
+		}
+		if loop != nil && loop.Status == "running" && s.stopLoop != nil {
+			if err := s.stopLoop(ctx, node.WorkerLoopID, reason); err != nil {
+				return fmt.Errorf("stop live graph worker %s: %w", node.WorkerLoopID, err)
+			}
+		}
+		if _, err := repos.Queue.CancelByLoop(ctx, node.WorkerLoopID, nowISO, &reason); err != nil {
 			return err
 		}
 		if loop == nil {
@@ -483,16 +492,25 @@ func (s *Service) FailWorkerNodeInTransaction(ctx context.Context, repos *storag
 	return s.failWorkerNode(ctx, repos, workerLoopID, reason, true)
 }
 
-// SettleSkippedWorkerNode records a non-success Worker outcome without
-// unlocking dependents or queueing Planner replan.
+// SettleSkippedWorkerNode records a non-success Worker outcome and routes the
+// graph out of active state so manual or replan recovery can proceed.
 func (s *Service) SettleSkippedWorkerNode(ctx context.Context, workerLoopID, reason string) error {
 	if s.db == nil || strings.TrimSpace(workerLoopID) == "" {
 		return nil
 	}
-	return storage.WithTransaction(ctx, s.db, nil, func(tx *sql.Tx) error {
-		_, err := s.failWorkerNode(ctx, storage.NewRepositories(tx), workerLoopID, reason, false)
+	replanned := false
+	err := storage.WithTransaction(ctx, s.db, nil, func(tx *sql.Tx) error {
+		var err error
+		replanned, err = s.failWorkerNode(ctx, storage.NewRepositories(tx), workerLoopID, reason, true)
 		return err
 	})
+	if err != nil {
+		return err
+	}
+	if replanned && s.onEnqueued != nil {
+		s.onEnqueued()
+	}
+	return nil
 }
 
 func (s *Service) failWorkerNode(ctx context.Context, repos *storage.Repositories, workerLoopID, reason string, replan bool) (bool, error) {
@@ -522,6 +540,19 @@ func (s *Service) failWorkerNode(ctx context.Context, repos *storage.Repositorie
 		return false, err
 	}
 	if !replan {
+		return false, nil
+	}
+	dedupeKey := "planner:workgraph-replan:" + graph.ID
+	existing, err := repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
+	if err != nil {
+		return false, err
+	}
+	if existing != nil {
+		if graph.Status != "replan_required" {
+			if err := repos.PlannerWorkGraphs.UpdateStatus(ctx, graph.ID, "replan_required", stringPtr(reason), s.nowISO()); err != nil {
+				return false, err
+			}
+		}
 		return false, nil
 	}
 	if err := repos.PlannerWorkGraphs.UpdateStatus(ctx, graph.ID, "replan_required", stringPtr(reason), s.nowISO()); err != nil {

@@ -3508,13 +3508,46 @@ func workerWorkForPullRequest(work workerInput, pr PullRequestSummary) workerInp
 func (r *Runner) finishHeldWorkerQueueItem(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint, summary string) (runpipe.ProcessResult, error) {
 	checkpoint.SkipReason = summary
 	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
-	if graphQueueItem(queueItem) && queueItem.LoopID != nil {
+	heldGraph := graphQueueItem(queueItem) && queueItem.LoopID != nil
+	if heldGraph {
 		if err := r.workGraphs.ReleaseWorkerNode(ctx, *queueItem.LoopID); err != nil {
 			return runpipe.ProcessResult{}, err
 		}
 	}
+	finishedAt := r.nowISO()
+	if heldGraph {
+		err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+			repos := storage.NewRepositories(tx)
+			if run != nil {
+				completed := completedRunRecord(*run, "success", summary, "", checkpoint, finishedAt)
+				if err := repos.Runs.Upsert(ctx, completed); err != nil {
+					return err
+				}
+			}
+			requeued, err := repos.Queue.RequeueRunningByLoop(ctx, loop.ID, finishedAt)
+			if err != nil {
+				return err
+			}
+			if requeued == 0 {
+				return fmt.Errorf("held graph worker queue item was not requeued")
+			}
+			loop.Status = "queued"
+			loop.LastRunAt = &finishedAt
+			loop.NextRunAt = &finishedAt
+			loop.UpdatedAt = finishedAt
+			return repos.Loops.Upsert(ctx, loop)
+		})
+		if err != nil {
+			return runpipe.ProcessResult{}, err
+		}
+		r.workGraphs.Wake()
+		result := runpipe.ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
+		if run != nil {
+			result.RunID = run.ID
+		}
+		return result, nil
+	}
 	if run != nil {
-		finishedAt := r.nowISO()
 		completed := completedRunRecord(*run, "success", summary, "", checkpoint, finishedAt)
 		if err := storage.FinalizeWorkerSuccess(ctx, r.db, storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "queued", FinishedAt: finishedAt}); err != nil {
 			return runpipe.ProcessResult{}, err
