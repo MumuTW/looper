@@ -112,7 +112,7 @@ func TestBackfillIssuesPreservesPreAnalysisCommentSnapshot(t *testing.T) {
 	if result.Triaged != 1 || len(fixture.github.createdBodies) != 0 || countAddedIssueOperations(fixture.github.addedLabels, 1, "triaged") != 0 {
 		t.Fatalf("result = %#v ops=%v addedLabels=%v, want human comment and triaged marker veto", result, fixture.github.ops, fixture.github.addedLabels)
 	}
-	if countAddedIssueOperations(fixture.github.addedLabels, 1, "kind/bug", "area/coordinator", "complexity/m", "dispatch/plan") != 1 {
+	if countAddedIssueOperations(fixture.github.addedLabels, 1, "kind/bug", "area/coordinator", "complexity/m", labels.DispatchPlan) != 1 {
 		t.Fatalf("addedLabels = %v, want the documented partial classification application", fixture.github.addedLabels)
 	}
 }
@@ -190,7 +190,7 @@ func (l concurrentHumanCommentLLM) Complete(context.Context, triage.Request) (st
 	detail.Comments = append(detail.Comments, l.comment)
 	l.github.details[1] = detail
 	l.github.comments[1] = [][]githubinfra.CommentInfo{{detail.Comments[0], l.comment}}
-	return `{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["dispatch/plan"]}}`, nil
+	return `{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["looper:dispatch:plan"]}}`, nil
 }
 
 func (l selectionMutationLLM) Complete(context.Context, triage.Request) (string, error) {
@@ -198,7 +198,7 @@ func (l selectionMutationLLM) Complete(context.Context, triage.Request) (string,
 	detail.State = l.state
 	detail.Labels = append([]string(nil), l.labels...)
 	l.github.details[1] = detail
-	return `{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["dispatch/plan"]}}`, nil
+	return `{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["looper:dispatch:plan"]}}`, nil
 }
 
 func (l holdAfterAnalysisLLM) Complete(context.Context, triage.Request) (string, error) {
@@ -207,5 +207,5 @@ func (l holdAfterAnalysisLLM) Complete(context.Context, triage.Request) (string,
 		State: "open", Labels: []string{labels.HoldGlobal},
 		CreatedAt: l.github.details[1].CreatedAt,
 	}
-	return `{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["dispatch/plan"]}}`, nil
+	return `{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["looper:dispatch:plan"]}}`, nil
 }

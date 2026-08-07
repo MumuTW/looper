@@ -1537,7 +1537,7 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID, repo,
 			unlock()
 			continue
 		}
-		if preemptWorkers && isWorkerDispatch(fresh.issue) {
+		if preemptWorkers && isWorkerDispatch(fresh.issue, triageCfg.Namespace) {
 			unlock()
 			continue
 		}
