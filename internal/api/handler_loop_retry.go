@@ -211,6 +211,21 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			if err := h.assertDiscardSharedPRWorktreeClear(ctx, repos, *loop); err != nil {
 				return retryResult{}, err
 			}
+			// The operator's discard request is the authority to stop preserving a
+			// timed-out worker's old edits. Clear only that evidence in the same
+			// transaction that publishes its replacement, so a failed requeue never
+			// converts a preservation checkpoint into an unacknowledged discard.
+			if loop.Type == string(domain.LoopTypeWorker) {
+				latestRun, err := repos.Runs.GetLatestByLoopID(ctx, loop.ID)
+				if err != nil {
+					return retryResult{}, err
+				}
+				if latestRun != nil && latestRun.CheckpointJSON != nil {
+					if err := repos.Runs.ClearTimeoutProgress(ctx, latestRun.ID, nowISO); err != nil {
+						return retryResult{}, err
+					}
+				}
+			}
 		}
 
 		target, targetErr := loopTargetFromRecordCompat(*loop)

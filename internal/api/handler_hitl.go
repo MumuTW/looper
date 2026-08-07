@@ -56,7 +56,7 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 	// Role runs already filter via ParamsForRoleVendor; takeover must do the same
 	// so a Claude role session is not handed a global Codex wrapper resume line.
 	params := agent.ParamsForRoleVendor(h.context.Config.Agent.Params, h.context.Config.Agent.Vendor, vendor, nil)
-	cmdLine, ok := agent.InteractiveResumeCommandLine(agent.ExecutorConfig{Vendor: vendor, Params: params}, result.WorktreePath, result.SessionID)
+	cmdLine, ok := agent.InteractiveResumeCommandLine(agent.ExecutorConfig{Vendor: vendor, ReasoningEffort: result.ReasoningEffort, Params: params}, result.WorktreePath, result.SessionID)
 	resp.Supported = ok
 	if ok {
 		resp.ResumeCommand = cmdLine
