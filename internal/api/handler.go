@@ -313,10 +313,29 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// (ADR-0015 / #575). Reads remain available while starting/stopping/degraded.
 	// Feishu url_verification is a non-mutating challenge echo and is gated
 	// inside handleFeishuCardActionRoute after the handshake branch.
-	if isMutatingHTTPMethod(r.Method) && !isAdmissionExemptMutationPath(path) && path != apiBasePath+"/hitl/feishu" {
-		if typed, denied := h.admissionMutationDenial(); denied {
+	//
+	// upgrade/backup is not unconditionally exempt: it is allowed while ready
+	// (pre-cutover) or once drain has completed (final quiescent backup), not
+	// during starting/degraded recovery.
+	if isMutatingHTTPMethod(r.Method) && path == apiBasePath+"/upgrade/backup" {
+		release, denied, typed := h.beginTrackedAdmittedMutationForBackup()
+		if denied {
 			h.writeError(w, requestID, typed)
 			return
+		}
+		if release != nil {
+			defer release()
+		}
+	} else if isMutatingHTTPMethod(r.Method) && !isAdmissionExemptMutationPath(path) && path != apiBasePath+"/hitl/feishu" {
+		// AllowMutations + mutation lease under one runtime boundary so drain
+		// cannot observe empty admitted mutations between the two steps.
+		release, denied, typed := h.beginTrackedAdmittedMutation()
+		if denied {
+			h.writeError(w, requestID, typed)
+			return
+		}
+		if release != nil {
+			defer release()
 		}
 	}
 
@@ -798,8 +817,106 @@ func isAdmissionExemptMutationPath(path string) bool {
 	switch path {
 	case dashboardBootstrapCodePath, dashboardBootstrapExchangePath:
 		return true
+	// Drain must stay reachable after admission closes so operators can
+	// re-POST (idempotent) and poll.
+	case apiBasePath + "/upgrade/drain":
+		return true
 	default:
 		return false
+	}
+}
+
+// upgradeBackupMutationDenial allows backup only when admission is ready
+// (normal online backup) or when drain has completed (final cutover backup).
+func (h *Handler) upgradeBackupMutationDenial() (apiError, bool) {
+	if h == nil || h.context.Runtime == nil {
+		return apiError{}, false
+	}
+	rt, ok := any(h.context.Runtime).(upgradeDrainRuntime)
+	if !ok {
+		// Without drain capability, fall back to ordinary mutation readiness.
+		return h.admissionMutationDenial()
+	}
+	state := rt.AdmissionState()
+	switch state {
+	case looperdruntime.AdmissionReady:
+		return apiError{}, false
+	case looperdruntime.AdmissionDraining, looperdruntime.AdmissionStopping:
+		if rt.DrainSnapshot().Drained() {
+			return apiError{}, false
+		}
+		return apiError{
+			code:    pkgapi.ErrorCodeServiceUnavailable,
+			status:  http.StatusServiceUnavailable,
+			message: "Upgrade backup after drain requires a drained supervisor work set",
+		}, true
+	default:
+		return apiError{
+			code:    pkgapi.ErrorCodeServiceUnavailable,
+			status:  http.StatusServiceUnavailable,
+			message: "Upgrade backup requires ready admission or a completed drain",
+		}, true
+	}
+}
+
+func (h *Handler) beginTrackedAdmittedMutation() (release func(), denied bool, typed apiError) {
+	if h == nil || h.context.Runtime == nil {
+		return nil, false, apiError{}
+	}
+	if tracker, ok := any(h.context.Runtime).(interface {
+		BeginAdmittedMutationIfAllowed() (func(), error)
+	}); ok {
+		rel, err := tracker.BeginAdmittedMutationIfAllowed()
+		if err != nil {
+			return nil, true, admissionDenialAPIError(err)
+		}
+		return rel, false, apiError{}
+	}
+	// Fallback: separate allow then track (older embeds).
+	if typed, denied := h.admissionMutationDenial(); denied {
+		return nil, true, typed
+	}
+	if tracker, ok := any(h.context.Runtime).(interface{ BeginAdmittedMutation() func() }); ok {
+		return tracker.BeginAdmittedMutation(), false, apiError{}
+	}
+	return nil, false, apiError{}
+}
+
+func (h *Handler) beginTrackedAdmittedMutationForBackup() (release func(), denied bool, typed apiError) {
+	// Prefer the atomic ready-or-drained + lease path so drain cannot observe a
+	// gap between the backup gate and the admitted-mutation counter.
+	if h == nil || h.context.Runtime == nil {
+		return nil, false, apiError{}
+	}
+	if tracker, ok := any(h.context.Runtime).(interface {
+		BeginBackupMutationIfAllowed() (func(), error)
+	}); ok {
+		rel, err := tracker.BeginBackupMutationIfAllowed()
+		if err != nil {
+			return nil, true, apiError{
+				code:    pkgapi.ErrorCodeServiceUnavailable,
+				status:  http.StatusServiceUnavailable,
+				message: err.Error(),
+			}
+		}
+		return rel, false, apiError{}
+	}
+	// Fallback: separate gate then track (older embeds / test doubles).
+	if typed, denied := h.upgradeBackupMutationDenial(); denied {
+		return nil, true, typed
+	}
+	if tracker, ok := any(h.context.Runtime).(interface{ BeginAdmittedMutation() func() }); ok {
+		return tracker.BeginAdmittedMutation(), false, apiError{}
+	}
+	return nil, false, apiError{}
+}
+
+func admissionDenialAPIError(err error) apiError {
+	// Match admissionMutationDenial mapping for service-unavailable gates.
+	return apiError{
+		code:    pkgapi.ErrorCodeServiceUnavailable,
+		status:  http.StatusServiceUnavailable,
+		message: err.Error(),
 	}
 }
 

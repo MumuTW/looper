@@ -283,7 +283,7 @@ func splitGlobalFlags(args []string) (parsedArgs, error) {
 			parsed.Verb = arg
 			continue
 		}
-		if strings.HasPrefix(arg, "-") && arg != "-" && parsed.Verb != "review" && parsed.Verb != "retry" && parsed.Verb != "version" && parsed.Verb != "--version" && parsed.Verb != "provider" {
+		if strings.HasPrefix(arg, "-") && arg != "-" && parsed.Verb != "review" && parsed.Verb != "retry" && parsed.Verb != "version" && parsed.Verb != "--version" && parsed.Verb != "provider" && parsed.Verb != "upgrade" {
 			return parsedArgs{}, fmt.Errorf("unknown flag %q", name)
 		}
 		if parsed.Verb == "" {
@@ -1616,7 +1616,7 @@ Usage:
                                Compare local and running-daemon build identity
   looper upgrade preflight --target-looper <path> --target-looperd <path>
                                Report upgrade compatibility without changing the daemon
-  looper upgrade backup / verify / drain / stage-release / activate-release / verify-start
+  looper upgrade backup / verify / drain / stage-release / activate-release / verify-start / recover
                                Controlled cutover steps (see docs/installation.md)
 
 Global flags, accepted before or after the verb:
