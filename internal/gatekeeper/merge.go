@@ -18,7 +18,10 @@ type MergeOutcome struct {
 	PRNumber  int64  `json:"prNumber"`
 	// HeadSHA is the commit the decision was made about and, on success, the
 	// commit that was merged.
-	HeadSHA        string                      `json:"headSha"`
+	HeadSHA string `json:"headSha"`
+	// MergeStrategy records the configured forge strategy so Auditor can reject
+	// a rebase tip as incomplete revert provenance.
+	MergeStrategy  string                      `json:"mergeStrategy,omitempty"`
 	MergeCommitSHA string                      `json:"mergeCommitSha,omitempty"`
 	SourceIssue    *githubinfra.IssueReference `json:"sourceIssue,omitempty"`
 	// TouchedFiles is GitHub's authoritative pull-request file list captured

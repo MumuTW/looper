@@ -42,6 +42,7 @@ func TestIsHotEditablePathUsesExplicitAllowlist(t *testing.T) {
 		"disclosure.channels.gitCommit",
 		"defaults.allowAutoPush",
 		"instructions.enabled",
+		"roles.auditor.allowRevertProposals",
 		"roles.reviewer.behavior.scope",
 		"roles.reviewer.behavior.convergence.maxConsecutiveUnproductive",
 		"roles.reviewer.behavior.convergence.maxFixerAttemptsPerItem",
