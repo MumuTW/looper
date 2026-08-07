@@ -2790,6 +2790,7 @@ func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemR
 	if latestRun != nil {
 		view.Outcome = fixer.DeriveRunOutcome(*latestRun)
 	}
+	view.Continuation = buildActiveRunContinuation(latestRun)
 	if latestQueue != nil {
 		attempts := latestQueue.Attempts
 		maxAttempts := latestQueue.MaxAttempts
