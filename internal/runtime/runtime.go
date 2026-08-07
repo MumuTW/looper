@@ -216,8 +216,8 @@ type Runtime struct {
 	worktreeCleanupCancel       context.CancelFunc
 	worktreeCleanupRunning      bool
 	worktreeCleanupInitialDelay time.Duration
-	worktreeCleanupStatus      WorktreeCleanupStatus
-	worktreeCleanupSweepCursor int
+	worktreeCleanupStatus       WorktreeCleanupStatus
+	worktreeCleanupSweepCursor  int
 	// workProducerJoinStarted latches the first BeginDrain producer join for
 	// the process lifetime (under mu with workProducerJoinDone). Never clear:
 	// a second POST must not overwrite residual done-channels.
