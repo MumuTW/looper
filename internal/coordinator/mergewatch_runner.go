@@ -24,6 +24,11 @@ import (
 var mergeWatchPRURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
 var mergeWatchClosingReferencePattern = regexp.MustCompile(`(?i)(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+((?:https?://[^\s)]+/issues/\d+)|(?:[\w.-]+/[\w.-]+#\d+)|#\d+)`)
 
+const (
+	routedMergeWatchCheckInterval    = 5 * time.Minute
+	maxRoutedMergeWatchChecksPerTick = 20
+)
+
 type mergeWatchComment struct {
 	ID      int64
 	Summary string
@@ -243,7 +248,14 @@ func (r *Runner) applyRoutedMergeWatch(ctx context.Context, projectID, repo, cwd
 	for prNumber := range registrations {
 		prNumbers = append(prNumbers, prNumber)
 	}
-	sort.Slice(prNumbers, func(i, j int) bool { return prNumbers[i] < prNumbers[j] })
+	sort.Slice(prNumbers, func(i, j int) bool {
+		left, right := r.routedMergeWatchLastCheck(projectID, repo, prNumbers[i]), r.routedMergeWatchLastCheck(projectID, repo, prNumbers[j])
+		if left.Equal(right) {
+			return prNumbers[i] < prNumbers[j]
+		}
+		return left.Before(right)
+	})
+	checksThisTick := 0
 	for _, prNumber := range prNumbers {
 		registration := registrations[prNumber]
 		headSHA := registration.HeadSHA
@@ -260,6 +272,10 @@ func (r *Runner) applyRoutedMergeWatch(ctx context.Context, projectID, repo, cwd
 			}
 			continue
 		}
+		if checksThisTick >= maxRoutedMergeWatchChecksPerTick || !r.claimRoutedMergeWatchCheck(projectID, repo, prNumber) {
+			continue
+		}
+		checksThisTick++
 		detail, err := r.github.ViewPullRequestMergeWatch(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 		if err != nil {
 			if isTransientMergeWatchError(err) {
@@ -306,6 +322,34 @@ func (r *Runner) applyRoutedMergeWatch(ctx context.Context, projectID, repo, cwd
 		}
 	}
 	return nil
+}
+
+func (r *Runner) claimRoutedMergeWatchCheck(projectID, repo string, prNumber int64) bool {
+	if r == nil || r.state == nil {
+		return true
+	}
+	now := r.now().UTC()
+	key := strings.Join([]string{strings.TrimSpace(projectID), strings.TrimSpace(repo), strconv.FormatInt(prNumber, 10)}, "\x00")
+	r.state.mu.Lock()
+	defer r.state.mu.Unlock()
+	if r.state.lastRoutedWatchCheckByID == nil {
+		r.state.lastRoutedWatchCheckByID = map[string]time.Time{}
+	}
+	if last, ok := r.state.lastRoutedWatchCheckByID[key]; ok && now.Sub(last) < routedMergeWatchCheckInterval {
+		return false
+	}
+	r.state.lastRoutedWatchCheckByID[key] = now
+	return true
+}
+
+func (r *Runner) routedMergeWatchLastCheck(projectID, repo string, prNumber int64) time.Time {
+	if r == nil || r.state == nil {
+		return time.Time{}
+	}
+	key := strings.Join([]string{strings.TrimSpace(projectID), strings.TrimSpace(repo), strconv.FormatInt(prNumber, 10)}, "\x00")
+	r.state.mu.Lock()
+	defer r.state.mu.Unlock()
+	return r.state.lastRoutedWatchCheckByID[key]
 }
 
 // upsertRoutedMergeWatch writes a routed-PR merge-watch registration. Settled
@@ -604,7 +648,7 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 			AutoMergeEnabled:       detail.AutoMerge != nil,
 			AutoMergeOwnedByLooper: autoMergeOwnedByLooper,
 			AutoMergeRouteEnabled:  autoMergeOwnedByLooper || labels.Has(detail.Labels, labels.AutoMerge),
-			HasLooperLabel:         labels.AnyLooperOwned(detail.Labels),
+			HasLooperLabel:         namespace.AnyOwned(detail.Labels),
 			Mergeable:              detail.Mergeable,
 			MergeableState:         detail.MergeableState,
 		}, nil, nil

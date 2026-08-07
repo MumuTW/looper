@@ -176,6 +176,25 @@ func TestApplyMergeWatchShortCircuitsMergedSnapshotBeforeCheckRuns(t *testing.T)
 	}
 }
 
+func TestApplyMergeWatchMergedSnapshotUsesProjectNamespace(t *testing.T) {
+	fixture := newCoordinatorFixture(t)
+	fixture.github.prDetails[42] = githubinfra.PullRequestDetail{
+		Number: 42, State: "closed", HeadSHA: "head-42", BaseRefName: "main",
+		Labels: []string{"team.looper:plan"}, MergedAt: "2026-05-14T11:58:07.000Z", MergedBy: "mergify[bot]",
+	}
+
+	snapshot, tempErr, err := fixture.runner.mergeWatchSnapshot(context.Background(), "acme/looper", t.TempDir(), 7, 42, labels.NewNamespace("team.looper:"), "looper")
+	if err != nil {
+		t.Fatalf("mergeWatchSnapshot() error = %v", err)
+	}
+	if tempErr != nil {
+		t.Fatalf("mergeWatchSnapshot() TemporaryError = %v, want authoritative merge", tempErr)
+	}
+	if !snapshot.Merged || !snapshot.HasLooperLabel {
+		t.Fatalf("snapshot = %#v, want merged snapshot with custom-namespace Looper label", snapshot)
+	}
+}
+
 func TestApplyMergeWatchRetiresHumanOwnedNativeAutoMergeWithoutEvidence(t *testing.T) {
 	fixture := newCoordinatorFixture(t)
 	fixture.github.currentLogin = "looper"
@@ -273,6 +292,56 @@ func TestApplyRoutedMergeWatchSettlesHumanOwnedMergeWithoutEvidence(t *testing.T
 		if event.EventType == eventlog.CoordinatorPullRequestMergedEventType {
 			t.Fatalf("human-owned routed merge recorded as Looper merge evidence: %#v", event)
 		}
+	}
+}
+
+func TestApplyRoutedMergeWatchBoundsOutOfPagePollingAndServicesLaterRegistrations(t *testing.T) {
+	fixture := newCoordinatorFixture(t)
+	ctx := context.Background()
+	fixture.runner.now = func() time.Time { return fixture.now }
+	open := make([]githubinfra.PullRequestSummary, 0, 100)
+	for prNumber := int64(1); prNumber <= 100; prNumber++ {
+		open = append(open, githubinfra.PullRequestSummary{Number: prNumber, State: "OPEN"})
+	}
+	fixture.github.openPullRequestSummaries = open
+	for prNumber := int64(101); prNumber <= 130; prNumber++ {
+		head := fmt.Sprintf("head-%d", prNumber)
+		seedCoordinatorGatekeeperRoute(t, fixture, prNumber, head)
+		fixture.github.prDetails[prNumber] = githubinfra.PullRequestDetail{
+			Number: prNumber, State: "OPEN", HeadSHA: head, BaseRefName: "main", Labels: []string{labels.AutoMerge},
+		}
+		if err := fixture.runner.upsertRoutedMergeWatch(ctx, fixture.projectID, "acme/looper", prNumber, head, false); err != nil {
+			t.Fatalf("seed routed merge watch %d: %v", prNumber, err)
+		}
+	}
+
+	if err := fixture.runner.applyRoutedMergeWatch(ctx, fixture.projectID, "acme/looper", t.TempDir()); err != nil {
+		t.Fatalf("first applyRoutedMergeWatch() error = %v", err)
+	}
+	if fixture.github.mergeWatchReads != maxRoutedMergeWatchChecksPerTick {
+		t.Fatalf("first merge-watch reads = %d, want cap %d", fixture.github.mergeWatchReads, maxRoutedMergeWatchChecksPerTick)
+	}
+
+	if err := fixture.runner.applyRoutedMergeWatch(ctx, fixture.projectID, "acme/looper", t.TempDir()); err != nil {
+		t.Fatalf("immediate second applyRoutedMergeWatch() error = %v", err)
+	}
+	if fixture.github.mergeWatchReads != maxRoutedMergeWatchChecksPerTick+10 {
+		t.Fatalf("immediate merge-watch reads = %d, want the 10 never-serviced registrations to receive their first check", fixture.github.mergeWatchReads)
+	}
+
+	if err := fixture.runner.applyRoutedMergeWatch(ctx, fixture.projectID, "acme/looper", t.TempDir()); err != nil {
+		t.Fatalf("immediate third applyRoutedMergeWatch() error = %v", err)
+	}
+	if fixture.github.mergeWatchReads != maxRoutedMergeWatchChecksPerTick+10 {
+		t.Fatalf("third merge-watch reads = %d, want cadence to suppress repeats", fixture.github.mergeWatchReads)
+	}
+
+	fixture.now = fixture.now.Add(routedMergeWatchCheckInterval)
+	if err := fixture.runner.applyRoutedMergeWatch(ctx, fixture.projectID, "acme/looper", t.TempDir()); err != nil {
+		t.Fatalf("cadence applyRoutedMergeWatch() error = %v", err)
+	}
+	if fixture.github.mergeWatchReads != maxRoutedMergeWatchChecksPerTick*2+10 {
+		t.Fatalf("later merge-watch reads = %d, want one bounded batch after the cadence interval", fixture.github.mergeWatchReads)
 	}
 }
 

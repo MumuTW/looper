@@ -3,6 +3,7 @@ package gatekeeper
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,6 +38,27 @@ func TestSourceFingerprintIncludesExactDiffBudgetBounds(t *testing.T) {
 	second := runner.sourceFingerprintForProjectWithContract(pullRequest, "project_1", "acme/looper", "")
 	if first == second {
 		t.Fatalf("fingerprint unchanged after tightening diff budget: %q", first)
+	}
+}
+
+func TestSourceFingerprintIncludesReviewCapacityPolicy(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	pullRequest := openPullRequestFixture()
+	threshold := 200
+	runner := New(Options{
+		Repos: fixture.repos, GitHub: fixture.github,
+		PolicyPermitsTarget:                  func(string, string, string) bool { return true },
+		TrustForProject:                      func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+		RequiredReviewChangedLinesForProject: func(string) int { return threshold },
+	})
+	first := runner.sourceFingerprintForProjectWithContract(pullRequest, "project_1", "acme/looper", "")
+	threshold = 300
+	second := runner.sourceFingerprintForProjectWithContract(pullRequest, "project_1", "acme/looper", "")
+	if first == second {
+		t.Fatalf("fingerprint unchanged after tightening review-capacity threshold: %q", first)
+	}
+	if !strings.Contains(first, "\x1f200\x1f") {
+		t.Fatalf("fingerprint = %q, want effective review threshold", first)
 	}
 }
 

@@ -734,6 +734,7 @@ type fakeGatekeeperGitHub struct {
 	// merge timestamp is set; the default detail keeps the pre-reconcile
 	// behavior of returning the mergeable view.
 	mergeWatch       githubinfra.PullRequestDetail
+	mergeWatchInputs []githubinfra.ViewPullRequestInput
 	protection       githubinfra.BranchProtection
 	checks           githubinfra.PullRequestCheckRuns
 	threads          []githubinfra.ReviewThread
@@ -878,7 +879,8 @@ func (f *fakeGatekeeperGitHub) ViewPullRequestForGatekeeper(context.Context, git
 	}
 	return f.detail, nil
 }
-func (f *fakeGatekeeperGitHub) ViewPullRequestMergeWatch(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
+func (f *fakeGatekeeperGitHub) ViewPullRequestMergeWatch(_ context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
+	f.mergeWatchInputs = append(f.mergeWatchInputs, input)
 	if f.mergeWatch.State != "" || f.mergeWatch.MergedAt != "" {
 		return f.mergeWatch, nil
 	}

@@ -69,6 +69,9 @@ func decideVerdictAction(trust config.GatekeeperTrustLevel, previous *Report, ne
 // Reports predating the trust ladder carry the historical mode and never
 // published.
 func previousPublished(report Report) bool {
+	if report.PendingProjection {
+		return false
+	}
 	switch config.GatekeeperTrustLevel(strings.TrimSpace(report.Mode)) {
 	case config.GatekeeperTrustAdvise, config.GatekeeperTrustAuto:
 		return true
@@ -100,6 +103,7 @@ var reasonExplanations = map[ReasonCode]string{
 	ReasonProviderStateUnavailable: "the forge did not return the state needed to judge this",
 	ReasonProviderStateAmbiguous:   "the forge returned ambiguous state for this",
 	ReasonRoutingProjectionFailed:  "the merge-route label could not be reconciled; Looper will retry",
+	ReasonRouteTemporarilyBlocked:  "the out-of-page route is temporarily blocked; Looper will retry",
 }
 
 // BuildVerdictComment renders a report as the comment published at advise.

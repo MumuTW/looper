@@ -116,15 +116,17 @@ type Options struct {
 // RuntimeState contains coordinator lifecycle state that must outlive one
 // immutable configuration snapshot. Snapshot-specific policy remains on Runner.
 type RuntimeState struct {
-	mu                sync.Mutex
-	lastTickByProject map[string]time.Time
-	watchLocks        map[string]*sync.Mutex
+	mu                       sync.Mutex
+	lastTickByProject        map[string]time.Time
+	watchLocks               map[string]*sync.Mutex
+	lastRoutedWatchCheckByID map[string]time.Time
 }
 
 func NewRuntimeState() *RuntimeState {
 	return &RuntimeState{
-		lastTickByProject: map[string]time.Time{},
-		watchLocks:        map[string]*sync.Mutex{},
+		lastTickByProject:        map[string]time.Time{},
+		watchLocks:               map[string]*sync.Mutex{},
+		lastRoutedWatchCheckByID: map[string]time.Time{},
 	}
 }
 

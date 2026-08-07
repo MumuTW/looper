@@ -21,6 +21,11 @@ const protectedPathTouchedReason = "protected_path_touched"
 type routingLabelPlan struct {
 	autoMerge        bool
 	needsHumanReview bool
+	// revokeGateStatus is set when an already-established auto route becomes
+	// blocked. The status is a second queue admission signal, so revoke it
+	// before attempting the veto label: if that label write fails, Mergify must
+	// still see a non-success status and refuse the stale route.
+	revokeGateStatus bool
 }
 
 // reconcileRoutingLabels projects the durable Gate report onto the two labels
@@ -49,6 +54,10 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 	// signal.
 	if trust != config.GatekeeperTrustAuto && previous != nil && reportRouteEstablished(*previous) && !reportIsTerminal(report) {
 		plan.needsHumanReview = true
+		plan.revokeGateStatus = true
+	}
+	if trust == config.GatekeeperTrustAuto && previous != nil && reportRouteEstablished(*previous) && plan.needsHumanReview && !reportIsTerminal(report) {
+		plan.revokeGateStatus = true
 	}
 	// Removal-only projections are fail-safe and do not need an authority read:
 	// deleting a stale route can never authorize a merge. This also lets observe
@@ -253,7 +262,8 @@ func (r *Runner) revalidateRoutingState(ctx context.Context, report Report, expe
 		return fmt.Errorf("skip routing labels because review decision changed from %s to %s", report.Evidence.ReviewDecision, strings.TrimSpace(detail.ReviewDecision))
 	}
 	recordedHold := len(report.Evidence.HoldLabels) > 0
-	currentHold := labels.Has(detail.Labels, labels.HoldGlobal)
+	holdLabel := r.projectLabelNamespace(ctx, report.ProjectID).HoldGlobal()
+	currentHold := labels.Has(detail.Labels, holdLabel)
 	if recordedHold != currentHold {
 		return fmt.Errorf("skip routing labels because hold state changed")
 	}
@@ -285,6 +295,7 @@ func (r *Runner) retireRoutingLabels(ctx context.Context, report Report, previou
 	plan := routingLabelPlan{}
 	if r.trustFor(report.ProjectID) == config.GatekeeperTrustAuto && previous != nil && reportRouteEstablished(*previous) {
 		plan.needsHumanReview = true
+		plan.revokeGateStatus = true
 	}
 	cleanupErr := r.applyRoutingLabelPlan(ctx, report, plan)
 	if cleanupErr != nil {
@@ -311,6 +322,11 @@ func (r *Runner) applyRoutingLabelPlan(ctx context.Context, report Report, plan 
 			return fmt.Errorf("remove stale %s label: %w", labels.NeedsHumanReview, err)
 		}
 	case plan.needsHumanReview:
+		if plan.revokeGateStatus {
+			if err := r.revokeGatekeeperStatus(ctx, report); err != nil {
+				return fmt.Errorf("revoke successful Gatekeeper status before queue veto: %w", err)
+			}
+		}
 		// Add the durable queue veto before removing the trigger. If the second
 		// mutation fails, the accepted queue entry remains blocked rather than
 		// becoming an unvetoed stale authorization between mutations.
@@ -333,6 +349,24 @@ func (r *Runner) applyRoutingLabelPlan(ctx context.Context, report Report, plan 
 		}
 	}
 	return nil
+}
+
+func (r *Runner) revokeGatekeeperStatus(ctx context.Context, report Report) error {
+	sha := strings.TrimSpace(report.Evidence.FinalObservedHeadSHA)
+	if sha == "" {
+		sha = strings.TrimSpace(report.ObservedHeadSHA)
+	}
+	if sha == "" {
+		return fmt.Errorf("report carries no observed pull-request head")
+	}
+	return r.github.SetCommitStatus(ctx, githubinfra.CommitStatusInput{
+		Repo:        reportRepositoryTarget(report),
+		SHA:         sha,
+		Context:     RequiredStatusContext,
+		State:       "failure",
+		Description: "Gatekeeper route blocked; human review required",
+		CWD:         r.projectCWD(ctx, report.ProjectID),
+	})
 }
 
 func reportNeedsHumanReview(previous *Report, report Report) bool {

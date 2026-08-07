@@ -731,11 +731,15 @@ func (r *Runner) departedFromOpenSet(
 func (r *Runner) sourceFingerprintForProjectWithContract(pullRequest githubinfra.PullRequestSummary, projectID, repo, contractFingerprint string) string {
 	budget := r.diffBudget(projectID)
 	budgetEnabled := budget.MaxChangedFiles > 0 || budget.MaxDeletions > 0
-	base := sourceFingerprint(pullRequest, budgetEnabled)
+	reviewThreshold := r.requiredReviewChangedLinesFor(projectID)
+	reviewPolicyEnabled := r.trustFor(projectID) == config.GatekeeperTrustAuto && reviewThreshold > 0
+	base := sourceFingerprint(pullRequest, budgetEnabled, reviewPolicyEnabled)
 	permitsTarget := r.policyPermitsTarget(projectID, repo, pullRequest.BaseRefName)
 	return strings.Join([]string{
 		base,
 		string(r.trustFor(projectID)),
+		fmt.Sprintf("%t", reviewPolicyEnabled),
+		fmt.Sprintf("%d", reviewThreshold),
 		fmt.Sprintf("%t", permitsTarget),
 		fmt.Sprintf("%d", budget.MaxChangedFiles),
 		fmt.Sprintf("%d", budget.MaxDeletions),

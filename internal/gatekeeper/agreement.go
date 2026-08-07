@@ -81,8 +81,12 @@ func (r *Runner) recordTerminalAdviceOutcomes(ctx context.Context, terminal Repo
 			resolved[key] = struct{}{}
 		}
 	}
-	for _, record := range events {
+	previousTerminalIndex := previousTerminalAdviceBoundary(events, terminalReportEventID)
+	for index, record := range events {
 		if record.EventType != GateReportEventType || record.ID == terminalReportEventID {
+			continue
+		}
+		if index <= previousTerminalIndex {
 			continue
 		}
 		var verdict Report
@@ -120,7 +124,40 @@ func isAdviseVerdict(report Report) bool {
 	// `observe_only` for its observe reports. Keep historical advise records
 	// readable across upgrades, while refusing future schemas whose Mode may
 	// have changed semantics.
-	return report.Version > 0 && report.Version <= reportVersion && config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(report.Mode))) == config.GatekeeperTrustAdvise
+	return !report.PendingProjection && !hasReasonCode(report.Reasons, ReasonRoutingProjectionFailed) &&
+		report.Version > 0 && report.Version <= reportVersion && config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(report.Mode))) == config.GatekeeperTrustAdvise
+}
+
+// previousTerminalAdviceBoundary returns the last terminal Gate report before
+// the current terminal evaluation. Advice written before that boundary belongs
+// to an earlier close/merge epoch and must not be re-resolved when the PR is
+// closed again after a reopen.
+func previousTerminalAdviceBoundary(events []storage.EventLogRecord, currentReportID string) int {
+	currentIndex := len(events)
+	for index, record := range events {
+		if record.ID == currentReportID {
+			currentIndex = index
+			break
+		}
+	}
+	previous := -1
+	for index := 0; index < currentIndex; index++ {
+		record := events[index]
+		if record.EventType != GateReportEventType {
+			continue
+		}
+		var report Report
+		if err := json.Unmarshal([]byte(record.PayloadJSON), &report); err != nil {
+			continue
+		}
+		if report.PendingProjection || hasReasonCode(report.Reasons, ReasonRoutingProjectionFailed) {
+			continue
+		}
+		if isTerminalAdviceReport(report) {
+			previous = index
+		}
+	}
+	return previous
 }
 
 func isTerminalAdviceReport(report Report) bool {

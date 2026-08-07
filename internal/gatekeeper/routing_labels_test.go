@@ -40,6 +40,44 @@ func evaluateRoutingReport(t *testing.T, runner *Runner) Report {
 	return report
 }
 
+func TestRoutingRevalidationUsesProjectHoldNamespace(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	metadata := `{"labelNamespace":"team.looper:"}`
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = %#v, %v", project, err)
+	}
+	project.MetadataJSON = &metadata
+	if err := fixture.repos.Projects.Upsert(context.Background(), *project); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	fixture.github.detail.Labels = []string{"team.looper:hold"}
+
+	runner := routingRunner(fixture, config.GatekeeperTrustAuto)
+	_, err = runner.persist(context.Background(), Report{
+		ProjectID:       "project_1",
+		Repo:            "acme/looper",
+		PRNumber:        42,
+		ObservedHeadSHA: "head-1",
+		Evidence: Evidence{
+			FinalObservedHeadSHA:       "head-1",
+			PullRequestState:           "OPEN",
+			BaseRefName:                "main",
+			ReviewDecision:             "APPROVED",
+			ProjectPolicyPermitsTarget: true,
+		},
+	})
+	if err == nil {
+		t.Fatal("persist() succeeded despite a hold in the configured project namespace")
+	}
+	if len(fixture.github.labelAdds) != 0 {
+		t.Fatalf("label adds = %#v, want no auto-merge route under custom hold", fixture.github.labelAdds)
+	}
+	if len(fixture.github.labelRemoves) != 2 || !slices.Equal(fixture.github.labelRemoves[0].Labels, []string{labels.AutoMerge}) || !slices.Equal(fixture.github.labelRemoves[1].Labels, []string{labels.NeedsHumanReview}) {
+		t.Fatalf("label removals = %#v, want both stale routes retired", fixture.github.labelRemoves)
+	}
+}
+
 func TestAutoTrustRoutesEligiblePullRequestThroughMergify(t *testing.T) {
 	t.Parallel()
 	fixture := newGatekeeperFixture(t)
@@ -96,17 +134,27 @@ func TestRoutingLabelsSkipWhenStatusPublicationFails(t *testing.T) {
 
 type orderedRoutingGitHub struct {
 	*fakeGatekeeperGitHub
-	operations []string
+	operations           []string
+	failNeedsHuman       bool
+	failRemoveNeedsHuman bool
 }
 
 func (g *orderedRoutingGitHub) AddPullRequestLabels(ctx context.Context, input githubinfra.PullRequestLabelsInput) error {
 	g.operations = append(g.operations, "add:"+strings.Join(input.Labels, ","))
+	if g.failNeedsHuman && slices.Equal(input.Labels, []string{labels.NeedsHumanReview}) {
+		return errors.New("needs-human-review add failed")
+	}
 	return g.fakeGatekeeperGitHub.AddPullRequestLabels(ctx, input)
+}
+
+func (g *orderedRoutingGitHub) SetCommitStatus(ctx context.Context, input githubinfra.CommitStatusInput) error {
+	g.operations = append(g.operations, "status:"+input.State)
+	return g.fakeGatekeeperGitHub.SetCommitStatus(ctx, input)
 }
 
 func (g *orderedRoutingGitHub) RemovePullRequestLabels(ctx context.Context, input githubinfra.PullRequestLabelsInput) error {
 	g.operations = append(g.operations, "remove:"+strings.Join(input.Labels, ","))
-	if slices.Equal(input.Labels, []string{labels.NeedsHumanReview}) {
+	if g.failRemoveNeedsHuman && slices.Equal(input.Labels, []string{labels.NeedsHumanReview}) {
 		return errors.New("needs-human-review removal failed")
 	}
 	return g.fakeGatekeeperGitHub.RemovePullRequestLabels(ctx, input)
@@ -114,7 +162,7 @@ func (g *orderedRoutingGitHub) RemovePullRequestLabels(ctx context.Context, inpu
 
 func TestAutoRouteAddsBeforeRemovingQueueVeto(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
-	github := &orderedRoutingGitHub{fakeGatekeeperGitHub: fixture.github}
+	github := &orderedRoutingGitHub{fakeGatekeeperGitHub: fixture.github, failRemoveNeedsHuman: true}
 	runner := New(Options{
 		Repos: fixture.repos, GitHub: github, Now: func() time.Time { return fixture.now },
 		PolicyPermitsTarget: func(string, string, string) bool { return fixture.policyPermits },
@@ -129,6 +177,39 @@ func TestAutoRouteAddsBeforeRemovingQueueVeto(t *testing.T) {
 	}
 	if len(fixture.github.labelAdds) != 1 || !slices.Equal(fixture.github.labelAdds[0].Labels, []string{labels.AutoMerge}) {
 		t.Fatalf("label adds = %#v, want auto-merge retained after veto-removal failure", fixture.github.labelAdds)
+	}
+}
+
+func TestBlockedEstablishedRouteRevokesStatusBeforeQueueVeto(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	github := &orderedRoutingGitHub{fakeGatekeeperGitHub: fixture.github, failNeedsHuman: true}
+	runner := New(Options{
+		Repos: fixture.repos, GitHub: github, Now: func() time.Time { return fixture.now },
+		PolicyPermitsTarget: func(string, string, string) bool { return fixture.policyPermits },
+		TrustForProject:     func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+	})
+	eligible, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("eligible EvaluatePullRequest() error = %v", err)
+	}
+	if eligible.RouteEstablished == nil || !*eligible.RouteEstablished {
+		t.Fatalf("eligible report = %#v, want established route", eligible)
+	}
+
+	blocked := eligible
+	blocked.Reasons = []Reason{{Code: ReasonHold, Subject: labels.HoldGlobal}}
+	blocked.Evidence.HoldLabels = []string{labels.HoldGlobal}
+	if _, err := runner.persist(context.Background(), blocked); err == nil {
+		t.Fatal("blocked persist() succeeded despite queue-veto label failure")
+	}
+
+	if len(github.operations) < 4 || !slices.Equal(github.operations[len(github.operations)-2:], []string{"status:failure", "add:needs-human-review"}) {
+		t.Fatalf("blocked projection operations = %#v, want status failure before veto add", github.operations)
+	}
+	if got := fixture.github.commitStatuses[len(fixture.github.commitStatuses)-1]; got.State != "failure" || got.SHA != "head-1" || got.Context != RequiredStatusContext {
+		t.Fatalf("last commit status = %#v, want failure for current head", got)
 	}
 }
 

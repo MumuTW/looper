@@ -25,7 +25,12 @@ func trustRunner(fixture *gatekeeperFixture, trust config.GatekeeperTrustLevel) 
 func TestReconcileRecordsMergeEvidenceForOutOfPageMergedRoute(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
-	runner := trustRunner(fixture, config.GatekeeperTrustAuto)
+	runner := New(Options{
+		Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now },
+		PolicyPermitsTarget: func(string, string, string) bool { return fixture.policyPermits },
+		TrustForProject:     func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+		RepositoryIdentity:  func(string) string { return "ghe.example.test/acme/looper" },
+	})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
 		t.Fatalf("initial discovery() error = %v", err)
@@ -39,6 +44,16 @@ func TestReconcileRecordsMergeEvidenceForOutOfPageMergedRoute(t *testing.T) {
 	}
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
 		t.Fatalf("reconcile discovery() error = %v", err)
+	}
+	qualifiedTargetSeen := false
+	for _, input := range fixture.github.mergeWatchInputs {
+		if input.Repo == "ghe.example.test/acme/looper" {
+			qualifiedTargetSeen = true
+			break
+		}
+	}
+	if !qualifiedTargetSeen {
+		t.Fatalf("merge-watch inputs = %#v, want a provider-qualified repository target", fixture.github.mergeWatchInputs)
 	}
 
 	mergeOutcomes := func() []MergeOutcome {
@@ -186,6 +201,68 @@ func TestReconcileReevaluatesOutOfPageRouteAfterHeadChange(t *testing.T) {
 	}
 	if !removedAuto {
 		t.Fatalf("label removals = %#v, want stale auto-merge route removed", fixture.github.labelRemoves)
+	}
+}
+
+func TestReconcileRetriesTemporarilyBlockedOutOfPageRoute(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	runner := trustRunner(fixture, config.GatekeeperTrustAuto)
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("initial discovery() error = %v", err)
+	}
+
+	// The route is still open but a required check is temporarily pending. The
+	// out-of-page pass must retire the live route without turning that transient
+	// blocker into a permanent route_revoked tombstone.
+	mergeable := true
+	fixture.github.openPullRequests = nil
+	fixture.now = fixture.now.Add(outOfPageRouteReconcileInterval)
+	fixture.github.mergeWatch = githubinfra.PullRequestDetail{
+		Number: 42, State: "OPEN", HeadSHA: "head-1", BaseSHA: "base-1",
+		Mergeable: &mergeable, MergeableState: "clean", AdditionsKnown: true, DeletionsKnown: true,
+	}
+	fixture.github.checks = githubinfra.PullRequestCheckRuns{
+		TotalCount: 1,
+		CheckRuns:  []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "in_progress", AppID: 15368}},
+	}
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("temporary out-of-page block discovery() error = %v", err)
+	}
+	reports, err := latestGateReports(context.Background(), fixture.repos, "project_1")
+	if err != nil {
+		t.Fatalf("latestGateReports() after temporary block: %v", err)
+	}
+	blocked := reports["acme/looper#42"]
+	if !hasReason(blocked, ReasonRouteTemporarilyBlocked) {
+		t.Fatalf("temporary block report = %#v, want recheck marker", blocked)
+	}
+	if hasReason(blocked, ReasonRouteRevoked) {
+		t.Fatalf("temporary block report = %#v, must not be permanently revoked", blocked)
+	}
+
+	// Once the check recovers, the next cadence window must re-evaluate the
+	// still-out-of-page PR and restore the route. A route_revoked marker would
+	// skip this read forever.
+	fixture.now = fixture.now.Add(outOfPageRouteReconcileInterval)
+	fixture.github.checks = githubinfra.PullRequestCheckRuns{
+		TotalCount: 1,
+		CheckRuns:  []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "success", AppID: 15368}},
+	}
+	fixture.github.mergeWatch = githubinfra.PullRequestDetail{}
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("recovered out-of-page discovery() error = %v", err)
+	}
+	reports, err = latestGateReports(context.Background(), fixture.repos, "project_1")
+	if err != nil {
+		t.Fatalf("latestGateReports() after recovery: %v", err)
+	}
+	recovered := reports["acme/looper#42"]
+	if recovered.RouteEstablished == nil || !*recovered.RouteEstablished || hasReason(recovered, ReasonRouteTemporarilyBlocked) || hasReason(recovered, ReasonRouteRevoked) {
+		t.Fatalf("recovered report = %#v, want an established route without lifecycle tombstones", recovered)
+	}
+	if len(fixture.github.labelAdds) == 0 || !slices.Equal(fixture.github.labelAdds[len(fixture.github.labelAdds)-1].Labels, []string{labels.AutoMerge}) {
+		t.Fatalf("label adds = %#v, want auto-merge route restored after recovery", fixture.github.labelAdds)
 	}
 }
 

@@ -22,6 +22,13 @@ import (
 // keeps the reconcile pass idempotent across ticks.
 const ReasonRouteRevoked ReasonCode = "route_revoked"
 
+// ReasonRouteTemporarilyBlocked marks an open route that was blocked during an
+// out-of-page re-evaluation. Unlike RouteRevoked, it keeps the entity eligible
+// for the next cadence-bounded check: a pending check, transient provider
+// outage, or newly satisfied human gate must not strand a route forever just
+// because the pull request is beyond the discovery page.
+const ReasonRouteTemporarilyBlocked ReasonCode = "route_temporarily_blocked"
+
 const (
 	outOfPageRouteReconcileInterval = 5 * time.Minute
 	maxOutOfPageRouteChecksPerTick  = 20
@@ -52,6 +59,11 @@ func reportNeedsRouteRecovery(report Report) bool {
 		!hasReasonCode(report.Reasons, ReasonRoutingProjectionFailed)
 }
 
+func reportNeedsOutOfPageRouteRecheck(report Report) bool {
+	return hasReasonCode(report.Reasons, ReasonRouteTemporarilyBlocked) ||
+		hasReasonCode(report.Reasons, ReasonRoutingProjectionFailed)
+}
+
 // reconcileRoutedReportsOutsideDiscoveryPage reconciles previously published
 // routes whose pull requests are absent from the bounded discovery page.
 // Discovery is not paginated, so a routed pull request beyond
@@ -75,7 +87,7 @@ func (r *Runner) reconcileRoutedReportsOutsideDiscoveryPage(ctx context.Context,
 		if _, inPage := pageEntityIDs[entityID]; inPage {
 			continue
 		}
-		if !reportRouteEstablished(previous) && !reportNeedsRouteRecovery(previous) {
+		if !reportRouteEstablished(previous) && !reportNeedsRouteRecovery(previous) && !reportNeedsOutOfPageRouteRecheck(previous) {
 			continue
 		}
 		if hasReasonCode(previous.Reasons, ReasonRouteRevoked) {
@@ -118,7 +130,7 @@ func (r *Runner) reconcileRoutedReportsOutsideDiscoveryPage(ctx context.Context,
 		// observed by the page evaluation; without this read a demoted project
 		// could not tell a merged pull request from an open one.
 		detail, err := r.github.ViewPullRequestMergeWatch(ctx, githubinfra.ViewPullRequestInput{
-			Repo: previous.Repo, PRNumber: previous.PRNumber, CWD: r.projectCWD(ctx, input.ProjectID),
+			Repo: reportRepositoryTarget(previous), PRNumber: previous.PRNumber, CWD: r.projectCWD(ctx, input.ProjectID),
 		})
 		if err != nil {
 			// Not knowing the state means not knowing whether the route is stale or
@@ -170,15 +182,17 @@ func (r *Runner) reconcileRoutedReportsOutsideDiscoveryPage(ctx context.Context,
 				CWD: r.projectCWD(ctx, input.ProjectID), ExpectedHeadSHA: expectedHead,
 			})
 			if evalErr != nil {
+				markerReport := revalidated
+				if markerReport.PRNumber != previous.PRNumber || strings.TrimSpace(markerReport.Repo) == "" {
+					markerReport = previous
+				}
+				if markerErr := r.markRouteTemporarilyBlocked(ctx, markerReport); markerErr != nil {
+					errs = append(errs, fmt.Errorf("mark out-of-page route %s temporarily blocked: %w", entityID, markerErr))
+				}
 				errs = append(errs, fmt.Errorf("re-evaluate out-of-page routed pull request %s: %w", entityID, evalErr))
 				continue
 			}
 			if revalidated.Eligible && revalidated.RouteEstablished != nil && *revalidated.RouteEstablished {
-				continue
-			}
-			if hasReasonCode(revalidated.Reasons, ReasonRoutingProjectionFailed) {
-				// The failed projection has its own empty-fingerprint retry marker;
-				// do not append a terminal revoke that would suppress that retry.
 				continue
 			}
 			if !revalidated.Eligible && r.trustFor(input.ProjectID) == config.GatekeeperTrustObserve {
@@ -189,8 +203,16 @@ func (r *Runner) reconcileRoutedReportsOutsideDiscoveryPage(ctx context.Context,
 					errs = append(errs, fmt.Errorf("retain demotion veto for %s: %w", entityID, err))
 					continue
 				}
+				replacementReport = &revalidated
+				break
 			}
 			replacementReport = &revalidated
+		}
+		if replacementReport != nil && !reportIsTerminal(*replacementReport) && r.trustFor(input.ProjectID) != config.GatekeeperTrustObserve {
+			if err := r.markRouteTemporarilyBlocked(ctx, *replacementReport); err != nil {
+				errs = append(errs, fmt.Errorf("mark out-of-page route %s temporarily blocked: %w", entityID, err))
+			}
+			continue
 		}
 		// Mark revoked only after the retirement succeeded: marking first would
 		// make the next reconcile pass skip the entity (ReasonRouteRevoked) and
@@ -206,6 +228,28 @@ func (r *Runner) reconcileRoutedReportsOutsideDiscoveryPage(ctx context.Context,
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// markRouteTemporarilyBlocked appends a non-terminal, empty-fingerprint marker
+// after an out-of-page evaluation. The marker is deliberately separate from
+// the evaluation's provider/review reasons: those reasons explain why the
+// route is blocked, while this reason tells the next reconciliation pass that
+// it must try again after the cadence interval.
+func (r *Runner) markRouteTemporarilyBlocked(ctx context.Context, report Report) error {
+	blocked := report
+	blocked.SourceFingerprint = ""
+	blocked.Reasons = append([]Reason(nil), report.Reasons...)
+	if !hasReasonCode(blocked.Reasons, ReasonRouteTemporarilyBlocked) {
+		blocked.Reasons = append(blocked.Reasons, Reason{Code: ReasonRouteTemporarilyBlocked})
+	}
+	sortReasons(blocked.Reasons)
+	blocked.Eligible = false
+	blocked.RouteEstablished = boolPointer(false)
+	blocked.PendingProjection = false
+	blocked.Status = StatusBlocked
+	blocked.EvaluatedAt = r.now().UTC().Format(time.RFC3339Nano)
+	entityType, entityID := "pull_request", fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
+	return r.appendGateReportAt(ctx, blocked, entityType, entityID, r.now().Add(2*time.Millisecond))
 }
 
 func (r *Runner) allowOutOfPageRouteCheck(key string) bool {
