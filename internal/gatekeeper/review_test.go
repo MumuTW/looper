@@ -200,14 +200,19 @@ func seedReviewerReviewEventWithMarkerVerified(t *testing.T, fixture *gatekeeper
 
 func seedReviewerReviewEventWithProjectID(t *testing.T, fixture *gatekeeperFixture, projectID, headSHA, reviewEvent, actorID string, ordinal int, markerVerified bool) {
 	t.Helper()
+	seedReviewerReviewEventForPR(t, fixture, projectID, 42, headSHA, reviewEvent, actorID, ordinal, markerVerified)
+}
+
+func seedReviewerReviewEventForPR(t *testing.T, fixture *gatekeeperFixture, projectID string, prNumber int64, headSHA, reviewEvent, actorID string, ordinal int, markerVerified bool) {
+	t.Helper()
 	entityType := "pull_request"
-	entityID := "acme/looper#42"
+	entityID := fmt.Sprintf("acme/looper#%d", prNumber)
 	actorType := "system"
 	if err := eventlog.Append(context.Background(), fixture.repos, eventlog.AppendInput{
 		ID: fmt.Sprintf("review-posted-%d", ordinal), EventType: reviewerReviewPostedEventType,
 		ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
 		ActorType: &actorType, ActorID: &actorID,
-		Payload:   map[string]any{"repo": "acme/looper", "prNumber": int64(42), "event": reviewEvent, "headSha": headSHA, "markerVerified": markerVerified},
+		Payload:   map[string]any{"repo": "acme/looper", "prNumber": prNumber, "event": reviewEvent, "headSha": headSHA, "markerVerified": markerVerified},
 		CreatedAt: fixture.now.Add(time.Duration(ordinal) * time.Second),
 	}); err != nil {
 		t.Fatalf("append reviewer review event: %v", err)
@@ -245,7 +250,7 @@ func TestDiscoverPullRequestsReevaluatesAfterCodexReviewProviderBlock(t *testing
 	// Seed a provider-block report matching the shape EvaluatePullRequest now
 	// produces when the codex_review read fails: the provider reason plus an
 	// invalid CodexReview placeholder (CurrentHeadValid=false).
-	fingerprint := sourceFingerprint(pr, false) + "\x1fdiff-budget=0,0" + "\x1fgatekeeper-trust=observe" + "\x1fconfigured-target=" + "\x1fpolicy-permits=true" + "\x1freview-threshold=200"
+	fingerprint := runner.sourceFingerprintForProjectWithContract(pr, "project_1", "acme/looper", "")
 	seedGateReport(t, fixture, Report{
 		Version: reportVersion, Status: StatusBlocked, ProjectID: "project_1",
 		Mode: string(config.GatekeeperTrustObserve),

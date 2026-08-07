@@ -29,25 +29,27 @@ func TestAuditorConfigRejectsNonPositiveEnabledWindow(t *testing.T) {
 	}
 }
 
-func TestAuditorRejectsGatekeeperAutoTrust(t *testing.T) {
+func TestAuditorAcceptsGatekeeperAutoTrust(t *testing.T) {
 	t.Parallel()
 	var issues []ValidationIssue
-	validateAuditorGatekeeperCompatibility(Config{
+	validateCoreConfig(Config{
 		Roles: RoleConfigs{
 			Auditor:    AuditorRoleConfig{Enabled: true, WindowMinutes: 60},
 			Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto},
 		},
 	}, &issues)
-	if len(issues) != 1 || issues[0].Path != "roles.auditor.enabled" {
-		t.Fatalf("issues = %#v, want global auditor/auto conflict", issues)
+	for _, issue := range issues {
+		if issue.Path == "roles.auditor.enabled" {
+			t.Fatalf("auditor/auto compatibility was rejected: %#v", issues)
+		}
 	}
 }
 
-func TestAuditorRejectsProjectGatekeeperAutoOverride(t *testing.T) {
+func TestAuditorAcceptsProjectGatekeeperAutoOverride(t *testing.T) {
 	t.Parallel()
 	auto := GatekeeperTrustAuto
 	var issues []ValidationIssue
-	validateAuditorGatekeeperCompatibility(Config{
+	validateCoreConfig(Config{
 		Roles: RoleConfigs{Auditor: AuditorRoleConfig{Enabled: true, WindowMinutes: 60}},
 		Projects: []ProjectRefConfig{{
 			ID: "demo",
@@ -57,79 +59,28 @@ func TestAuditorRejectsProjectGatekeeperAutoOverride(t *testing.T) {
 			},
 		}},
 	}, &issues)
-	if len(issues) != 1 || issues[0].Path != "projects[0].roles.gatekeeper.trust" {
-		t.Fatalf("issues = %#v, want project gatekeeper/auto conflict", issues)
-	}
-}
-
-func TestAuditorRejectsProjectAuditorEnableAgainstGlobalAutoTrust(t *testing.T) {
-	t.Parallel()
-	auto := GatekeeperTrustAuto
-	enabled := true
-	var issues []ValidationIssue
-	validateAuditorGatekeeperCompatibility(Config{
-		Roles: RoleConfigs{
-			Auditor:    AuditorRoleConfig{Enabled: false, WindowMinutes: 60},
-			Gatekeeper: GatekeeperRoleConfig{Trust: auto},
-		},
-		Projects: []ProjectRefConfig{
-			{ID: "inherited"},
-			{ID: "audited", Roles: &PartialRoleConfigs{Auditor: &PartialAuditorRoleConfig{Enabled: &enabled}}},
-		},
-	}, &issues)
-	if len(issues) != 1 || issues[0].Path != "projects[1].roles.auditor.enabled" {
-		t.Fatalf("issues = %#v, want only explicit project auditor conflict", issues)
+	for _, issue := range issues {
+		if issue.Path == "projects[0].roles.gatekeeper.trust" {
+			t.Fatalf("project auditor/auto compatibility was rejected: %#v", issues)
+		}
 	}
 }
 
 func ptrBool(v bool) *bool { return &v }
 
-func TestPostMergeDigestRejectsGatekeeperAutoTrust(t *testing.T) {
+func TestPostMergeDigestAcceptsGatekeeperAutoTrust(t *testing.T) {
 	t.Parallel()
 	var issues []ValidationIssue
-	validatePostMergeDigestGatekeeperCompatibility(Config{
+	validateCoreConfig(Config{
 		Roles: RoleConfigs{
 			Gatekeeper:  GatekeeperRoleConfig{Trust: GatekeeperTrustAuto},
 			Coordinator: CoordinatorRoleConfig{PostMergeDigest: &CoordinatorPostMergeDigestConfig{Enabled: true, Schedule: "08:00", Timezone: "UTC", MaxItems: 20}},
 		},
-		Projects: []ProjectRefConfig{{ID: "demo"}, {ID: "other"}},
 	}, &issues)
-	if len(issues) != 1 || issues[0].Path != "roles.coordinator.postMergeDigest.enabled" {
-		t.Fatalf("issues = %#v, want single global post-merge digest/auto conflict", issues)
-	}
-}
-
-func TestPostMergeDigestRejectsProjectGatekeeperAutoOverride(t *testing.T) {
-	t.Parallel()
-	auto := GatekeeperTrustAuto
-	var issues []ValidationIssue
-	validatePostMergeDigestGatekeeperCompatibility(Config{
-		Roles: RoleConfigs{
-			Gatekeeper:  GatekeeperRoleConfig{Trust: GatekeeperTrustAdvise},
-			Coordinator: CoordinatorRoleConfig{PostMergeDigest: &CoordinatorPostMergeDigestConfig{Enabled: true, Schedule: "08:00", Timezone: "UTC", MaxItems: 20}},
-		},
-		Projects: []ProjectRefConfig{{
-			ID:    "demo",
-			Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto}},
-		}},
-	}, &issues)
-	if len(issues) != 1 || issues[0].Path != "projects[0].roles.gatekeeper.trust" {
-		t.Fatalf("issues = %#v, want project gatekeeper/auto conflict with global digest", issues)
-	}
-}
-
-func TestAuditorRejectsGatekeeperAutoTrustOnceWithProjects(t *testing.T) {
-	t.Parallel()
-	var issues []ValidationIssue
-	validateAuditorGatekeeperCompatibility(Config{
-		Roles: RoleConfigs{
-			Auditor:    AuditorRoleConfig{Enabled: true, WindowMinutes: 60},
-			Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto},
-		},
-		Projects: []ProjectRefConfig{{ID: "demo"}, {ID: "other"}},
-	}, &issues)
-	if len(issues) != 1 || issues[0].Path != "roles.auditor.enabled" {
-		t.Fatalf("issues = %#v, want single global auditor/auto conflict", issues)
+	for _, issue := range issues {
+		if issue.Path == "roles.coordinator.postMergeDigest.enabled" {
+			t.Fatalf("post-merge digest/auto compatibility was rejected: %#v", issues)
+		}
 	}
 }
 

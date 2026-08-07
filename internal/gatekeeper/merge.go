@@ -4,10 +4,10 @@ import (
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 )
 
-// MergeOutcomeEventType records a historical Gatekeeper merge attempt at the
-// auto trust level. Auto trust now publishes commit status only and does not
-// merge; this event type remains so Auditor and post-merge digest can read
-// outcomes written before that contract change.
+// MergeOutcomeEventType is retained for historical direct-merge audit events.
+// Gatekeeper now routes eligible auto-trust reports through the Mergify label
+// contract, so new evaluations do not emit this event; post-merge consumers must
+// continue to understand records written by older daemon versions.
 const MergeOutcomeEventType = "pull_request.merge_gate.merge_attempted"
 
 // MergeOutcome is the durable record of one merge attempt.

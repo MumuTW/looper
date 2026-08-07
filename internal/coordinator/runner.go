@@ -116,15 +116,17 @@ type Options struct {
 // RuntimeState contains coordinator lifecycle state that must outlive one
 // immutable configuration snapshot. Snapshot-specific policy remains on Runner.
 type RuntimeState struct {
-	mu                sync.Mutex
-	lastTickByProject map[string]time.Time
-	watchLocks        map[string]*sync.Mutex
+	mu                       sync.Mutex
+	lastTickByProject        map[string]time.Time
+	watchLocks               map[string]*sync.Mutex
+	lastRoutedWatchCheckByID map[string]time.Time
 }
 
 func NewRuntimeState() *RuntimeState {
 	return &RuntimeState{
-		lastTickByProject: map[string]time.Time{},
-		watchLocks:        map[string]*sync.Mutex{},
+		lastTickByProject:        map[string]time.Time{},
+		watchLocks:               map[string]*sync.Mutex{},
+		lastRoutedWatchCheckByID: map[string]time.Time{},
 	}
 }
 
@@ -381,6 +383,13 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if err := r.applyDecision(ctx, input.Repo, project.RepoPath, loadedIssue.issue, triageCfg, analysisStartedAt, decision); err != nil {
 			return DiscoveryResult{}, err
 		}
+	}
+	// Observe routed merges after the issue lifecycle has completed. The routed
+	// lane is an optional audit projection: a transient PR-list or registry
+	// outage must not starve dependency actions, dispatch, assignments, or
+	// triage for a project that has no routed watch.
+	if err := r.applyRoutedMergeWatch(ctx, input.ProjectID, input.Repo, project.RepoPath); err != nil {
+		return DiscoveryResult{Ticked: true}, err
 	}
 	return DiscoveryResult{Ticked: true}, nil
 }

@@ -87,8 +87,16 @@ func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, g
 	if err != nil {
 		return fmt.Errorf("auditor project merge evidence: %w", err)
 	}
+	windowStart := observedAt.Add(-time.Duration(role.WindowMinutes) * time.Minute)
 	candidatePRSet := make(map[int64]struct{}, len(candidates))
 	for _, candidate := range candidates {
+		// Index by the authoritative forge merge time. The event may have been
+		// observed late (downtime, reopened issue) while its payload still
+		// carries the real MergedAt; a merge that actually happened outside the
+		// window must not become a candidate for a current failure.
+		if candidate.MergedAt.Before(windowStart) {
+			continue
+		}
 		if candidate.ProjectID == project.ID && strings.EqualFold(candidate.Repo, repo) {
 			candidatePRSet[candidate.PRNumber] = struct{}{}
 		}
