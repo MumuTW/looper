@@ -2107,7 +2107,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				if project.BaseBranch != nil && strings.TrimSpace(*project.BaseBranch) != "" {
 					configuredBase = strings.TrimSpace(*project.BaseBranch)
 				}
-				return strings.EqualFold(strings.TrimSpace(configuredBase), strings.TrimSpace(baseRefName))
+				return gatekeeperTargetBranchMatches(configuredBase, baseRefName)
 			},
 			ConfiguredTargetBranch: func(projectID string) string {
 				project, ok := runtimeProjectBinding(cfg, projectID)
@@ -2749,6 +2749,10 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		})
 	}
 	return handlers
+}
+
+func gatekeeperTargetBranchMatches(configuredBase, observedBase string) bool {
+	return strings.TrimSpace(configuredBase) == strings.TrimSpace(observedBase)
 }
 
 // fixerRegenerationUnavailableReason is checked before Fixer closes an

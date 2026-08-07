@@ -3451,10 +3451,14 @@ func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepIn
 	// The pr.review.posted event is the authority Gatekeeper uses for the
 	// current-head review projection. It is written before advancing the loop
 	// checkpoint so a failed local append leaves the publish step retryable.
+	outcome := normalizeCommentOnlyOutcome(pending.Outcome)
+	if outcome == "" {
+		outcome = normalizeCommentOnlyOutcome(marker.Outcome)
+	}
 	if err := r.appendEventChecked(ctx, eventInput{
 		eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID,
 		entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber),
-		payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA, "markerVerified": markerVerified},
+		payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "outcome": outcome, "headSha": pending.HeadSHA, "markerVerified": markerVerified},
 	}); err != nil {
 		return fmt.Errorf("record published review progress: append pr.review.posted: %w", err)
 	}

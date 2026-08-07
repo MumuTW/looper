@@ -53,6 +53,22 @@ func TestAutoGatekeeperAcceptsMarkerlessCleanReviewFromDurableEvidence(t *testin
 	}
 }
 
+func TestAutoGatekeeperRejectsMarkerlessBlockingReviewFromDurableEvidence(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	seedReviewerReviewEventWithOutcome(t, fixture, "head-1", "COMMENT", "blocking", "reviewer-loop", 1, true)
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{}
+
+	report, err := fixture.autoRunner().EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !hasReason(report, ReasonCodexReviewBlocked) || report.Evidence.CodexReviewOutcome != "blocking" {
+		t.Fatalf("report = %#v, want markerless blocking review to remain blocking", report)
+	}
+}
+
 func TestAutoGatekeeperPublishesErrorStatusWhenPullRequestReadFails(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	fixture.github.viewErr = errors.New("provider unavailable")

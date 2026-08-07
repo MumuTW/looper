@@ -99,7 +99,7 @@ func TestAutoMergesAnEligiblePullRequest(t *testing.T) {
 		t.Fatalf("merge base branch = %q, want main", fixture.github.merges[0].BaseBranch)
 	}
 	outcomes := mergeOutcomes(t, fixture.repos)
-	if len(outcomes) != 1 || !outcomes[0].Merged {
+	if len(outcomes) != 1 || !outcomes[0].Merged || outcomes[0].MergeCommitSHA != "merge-commit-1" {
 		t.Fatalf("outcomes = %+v", outcomes)
 	}
 }
@@ -269,11 +269,12 @@ func TestReconcilePendingMergeOutcomeAfterStaleStateFailure(t *testing.T) {
 	}
 	fixture.github.mergeable.State = "MERGED"
 	fixture.github.mergeable.MergedAt = fixture.now.Format(time.RFC3339Nano)
+	fixture.github.mergeable.MergeCommitSHA = "merge-commit-1"
 	if err := runner.reconcilePendingMergeOutcomes(context.Background(), "project_1", "acme/looper", ""); err != nil {
 		t.Fatalf("reconcilePendingMergeOutcomes() error = %v", err)
 	}
 	outcomes := mergeOutcomes(t, fixture.repos)
-	if len(outcomes) != 1 || !outcomes[0].Merged || outcomes[0].HeadSHA != "head-1" {
+	if len(outcomes) != 1 || !outcomes[0].Merged || outcomes[0].HeadSHA != "head-1" || outcomes[0].MergeCommitSHA != "merge-commit-1" {
 		t.Fatalf("settled outcomes = %+v, want one successful outcome", outcomes)
 	}
 	events, err := fixture.repos.Events.ListByEntityAndEventTypes(context.Background(), "pull_request", "acme/looper#42", []string{MergeOutcomeEventType})

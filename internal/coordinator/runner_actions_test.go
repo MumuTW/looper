@@ -2123,6 +2123,32 @@ func TestRunnerRetiredAutoMergeReconciliationFindsClosedUntriagedIssue(t *testin
 	}
 }
 
+func TestRunnerRetiredAutoMergeReconciliationUsesMarkerAuthorAfterCredentialRotation(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = false })
+	fixture.runner.cancelRetiredAutoMerge = true
+	fixture.github.currentLogin = "new-looper"
+	fixture.github.mergeWatchIssues = []githubinfra.IssueSummary{{Number: 1, State: "closed"}}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{
+		ID: 44, Author: "old-looper",
+		Body: mergeWatchCommentBody(fixture.cfg, 77, "abc123", 2, nil, nil, "watching"),
+	}}}
+	fixture.github.prDetails[77] = githubinfra.PullRequestDetail{
+		Number: 77, State: "open", HeadSHA: "abc123", BaseRefName: "main",
+		AutoMerge: &githubinfra.PullRequestAutoMerge{EnabledBy: "old-looper"},
+	}
+
+	if err := fixture.runner.ReconcileRetiredAutoMerge(context.Background(), RetiredAutoMergeInput{
+		ProjectID: fixture.projectID, Repo: "acme/looper", CWD: "repo",
+	}); err != nil {
+		t.Fatalf("ReconcileRetiredAutoMerge() error = %v", err)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"disable-auto", "delete-comment"})
+	if len(fixture.github.disabledAutoMerges) != 1 || fixture.github.disabledAutoMerges[0].PRNumber != 77 {
+		t.Fatalf("disabledAutoMerges = %#v, want PR #77 after credential rotation", fixture.github.disabledAutoMerges)
+	}
+}
+
 func TestRunnerMergeWatchDoesNotCancelMarkerlessSameIdentityAutoMerge(t *testing.T) {
 	t.Parallel()
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })

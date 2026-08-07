@@ -23,6 +23,7 @@ var mergeWatchClosingReferencePattern = regexp.MustCompile(`(?i)(?:close|closes|
 
 type mergeWatchComment struct {
 	ID      int64
+	Author  string
 	Summary string
 	Marker  mergewatch.PriorWatchMarker
 	Body    string
@@ -527,7 +528,7 @@ func pullRequestNumberFromURL(raw string) int64 {
 
 func findMergeWatchComment(comments []githubinfra.CommentInfo, currentLogin string) *mergeWatchComment {
 	for i := len(comments) - 1; i >= 0; i-- {
-		if !strings.EqualFold(strings.TrimSpace(comments[i].Author), strings.TrimSpace(currentLogin)) {
+		if strings.TrimSpace(currentLogin) != "" && !strings.EqualFold(strings.TrimSpace(comments[i].Author), strings.TrimSpace(currentLogin)) {
 			continue
 		}
 		marker, ok := parseMergeWatchComment(comments[i])
@@ -574,7 +575,7 @@ func parseMergeWatchComment(comment githubinfra.CommentInfo) (mergeWatchComment,
 		if idx := strings.Index(comment.Body, line); idx > 0 {
 			summary = strings.TrimSpace(comment.Body[:idx])
 		}
-		return mergeWatchComment{ID: comment.ID, Summary: summary, Marker: marker, Body: comment.Body}, true
+		return mergeWatchComment{ID: comment.ID, Author: comment.Author, Summary: summary, Marker: marker, Body: comment.Body}, true
 	}
 	return mergeWatchComment{}, false
 }

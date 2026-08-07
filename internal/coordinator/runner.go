@@ -448,8 +448,7 @@ func (r *Runner) ReconcileRetiredAutoMerge(ctx context.Context, input RetiredAut
 	if strings.TrimSpace(input.Repo) == "" {
 		return fmt.Errorf("retired auto-merge reconciliation repository is required")
 	}
-	currentLogin, err := r.github.GetCurrentUserLoginForRepo(ctx, input.Repo, input.CWD)
-	if err != nil {
+	if _, err := r.github.GetCurrentUserLoginForRepo(ctx, input.Repo, input.CWD); err != nil {
 		return err
 	}
 	issues, err := r.github.ListMergeWatchIssues(ctx, githubinfra.ListMergeWatchIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: 1000})
@@ -461,7 +460,11 @@ func (r *Runner) ReconcileRetiredAutoMerge(ctx context.Context, input RetiredAut
 		if err != nil {
 			return fmt.Errorf("read retired merge-watch marker for issue #%d: %w", summary.Number, err)
 		}
-		marker := findMergeWatchComment(comments, currentLogin)
+		// A credential rotation can leave a valid historical marker authored by
+		// the old bot login. The marker's author is the provenance for the
+		// native auto-merge request; the current login is only the identity used
+		// for the provider calls below.
+		marker := findMergeWatchComment(comments, "")
 		if marker == nil || marker.Marker.PRNumber <= 0 {
 			continue
 		}
@@ -474,7 +477,8 @@ func (r *Runner) ReconcileRetiredAutoMerge(ctx context.Context, input RetiredAut
 			// gone. Preserve the marker for a later authoritative read.
 			continue
 		}
-		owned := detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin))
+		markerAuthor := strings.TrimSpace(marker.Author)
+		owned := markerAuthor != "" && detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), markerAuthor)
 		if owned && !strings.EqualFold(strings.TrimSpace(detail.State), "merged") && strings.TrimSpace(detail.MergedAt) == "" {
 			if err := r.github.DisablePullRequestAutoMerge(ctx, githubinfra.DisablePullRequestAutoMergeInput{Repo: input.Repo, PRNumber: marker.Marker.PRNumber, CWD: input.CWD}); err != nil {
 				return fmt.Errorf("disable retired auto-merge for PR #%d: %w", marker.Marker.PRNumber, err)

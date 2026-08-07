@@ -105,6 +105,7 @@ type CodexReviewEvidence struct {
 	RequiredHeadSHA  string `json:"requiredHeadSha"`
 	ReviewedHeadSHA  string `json:"reviewedHeadSha,omitempty"`
 	Event            string `json:"event,omitempty"`
+	Outcome          string `json:"outcome,omitempty"`
 	RecordedAt       string `json:"recordedAt,omitempty"`
 	CurrentHeadValid bool   `json:"currentHeadValid"`
 }
@@ -764,8 +765,12 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "codex_review")
 	}
 	report.Evidence.CodexReview = &codexReview
+	report.Evidence.CodexReviewOutcome = strings.ToLower(strings.TrimSpace(codexReview.Outcome))
 	if !codexReview.CurrentHeadValid {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewMissing, Subject: codexReviewReasonSubject(codexReview)})
+	}
+	if codexReview.CurrentHeadValid && report.Evidence.CodexReviewOutcome == "blocking" {
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewBlocked, Subject: report.Evidence.CodexReviewOutcome})
 	}
 	if r.trustFor(input.ProjectID) == config.GatekeeperTrustAuto && !report.Evidence.ReviewRequiredByPolicy {
 		// Small changes and an explicit zero threshold waive only the clean-review
@@ -1023,11 +1028,12 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 			if report.Evidence.CodexReviewOutcome == "blocking" {
 				report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewBlocked, Subject: report.Evidence.CodexReviewOutcome})
 			}
-		} else if report.Evidence.CodexReview != nil && report.Evidence.CodexReview.CurrentHeadValid && report.Evidence.CodexReview.Event == "COMMENT" {
+		} else if report.Evidence.CodexReview != nil && report.Evidence.CodexReview.CurrentHeadValid && report.Evidence.CodexReview.Event == "COMMENT" && strings.EqualFold(strings.TrimSpace(report.Evidence.CodexReview.Outcome), "clean") {
 			// Markerless clean COMMENT policy records pr.review.posted with
-			// markerVerified=true but leaves no forge marker for FindReviewMarker.
+			// markerVerified=true and outcome=clean, but leaves no forge marker
+			// for FindReviewMarker. An empty or blocking outcome must fail closed.
 			report.Evidence.CodexReviewOutcome = "clean"
-		} else if report.Evidence.ReviewRequiredByPolicy {
+		} else if report.Evidence.ReviewRequiredByPolicy && !strings.EqualFold(strings.TrimSpace(report.Evidence.CodexReview.Outcome), "blocking") {
 			report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewRequired, Subject: "current_head"})
 		}
 	}

@@ -35,6 +35,26 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 	return runOwnedQueueClaims(ctx, owned, input)
 }
 
+func TestGatekeeperTargetBranchMatchIsCaseSensitive(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		configured string
+		observed   string
+		want       bool
+	}{
+		{name: "exact", configured: "main", observed: "main", want: true},
+		{name: "surrounding whitespace", configured: " main ", observed: "main", want: true},
+		{name: "different case", configured: "Main", observed: "main", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := gatekeeperTargetBranchMatches(tc.configured, tc.observed); got != tc.want {
+				t.Fatalf("gatekeeperTargetBranchMatches(%q, %q) = %t, want %t", tc.configured, tc.observed, got, tc.want)
+			}
+		})
+	}
+}
+
 func allowedQueueTypesFromRunners(input defaultSchedulerTickInput) []string {
 	unrestricted, stickySnapshotOnly := claimTypeSetsFromInput(input)
 	return append(unrestricted, stickySnapshotOnly...)

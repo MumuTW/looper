@@ -139,11 +139,12 @@ func (r *Runner) confirmAndMerge(ctx context.Context, input EvaluationInput, rep
 		return Report{}, err
 	}
 
+	cwd := r.projectCWD(ctx, report.ProjectID)
 	if err := r.github.MergePullRequest(ctx, githubinfra.PullRequestMergeInput{
 		Repo: report.Repo, PRNumber: report.PRNumber,
 		Strategy: r.mergeStrategy(report.ProjectID), HeadSHA: outcome.HeadSHA,
 		BaseBranch: confirmation.Evidence.BaseRefName,
-		CWD:        r.projectCWD(ctx, report.ProjectID),
+		CWD:        cwd,
 	}); err != nil {
 		if githubinfra.IsTransientError(err) {
 			return Report{}, err
@@ -163,6 +164,19 @@ func (r *Runner) confirmAndMerge(ctx context.Context, input EvaluationInput, rep
 		return confirmation, nil
 	}
 
+	// MergePullRequest only reports whether the forge accepted the mutation.
+	// Read the merged PR back before recording success so the durable outcome
+	// carries the forge-assigned merge commit and can be attributed downstream.
+	mergedDetail, err := r.github.ViewPullRequestMergeWatch(ctx, githubinfra.ViewPullRequestInput{
+		Repo: report.Repo, PRNumber: report.PRNumber, CWD: cwd,
+	})
+	if err != nil {
+		return Report{}, fmt.Errorf("read merged pull request #%d: %w", report.PRNumber, err)
+	}
+	outcome.MergeCommitSHA = strings.TrimSpace(mergedDetail.MergeCommitSHA)
+	if outcome.MergeCommitSHA == "" {
+		return Report{}, fmt.Errorf("read merged pull request #%d: merge commit SHA is missing", report.PRNumber)
+	}
 	outcome.Merged = true
 	outcome.Pending = false
 	if err := r.persistMergeOutcome(ctx, outcome); err != nil {
@@ -259,11 +273,18 @@ func (r *Runner) reconcilePendingMergeOutcomes(ctx context.Context, projectID, r
 			// a later read instead of settling a success we cannot attribute.
 			continue
 		}
+		if merged && strings.TrimSpace(detail.MergeCommitSHA) == "" {
+			// A merged state without the forge-assigned commit is not enough to
+			// attribute the durable success. Keep the pre-forge marker pending
+			// until a later authoritative read supplies the identity.
+			continue
+		}
 		if merged && !strings.EqualFold(observedHead, strings.TrimSpace(outcome.HeadSHA)) {
 			outcome.Merged = false
 			outcome.Reason = refusalHeadMoved
 		} else if merged {
 			outcome.Merged = true
+			outcome.MergeCommitSHA = strings.TrimSpace(detail.MergeCommitSHA)
 		} else {
 			outcome.Merged = false
 			outcome.Reason = refusalClosedUnmerged

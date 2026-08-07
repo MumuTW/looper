@@ -3,6 +3,7 @@ package gatekeeper
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -200,6 +201,21 @@ func seedReviewerReviewEventWithMarkerVerified(t *testing.T, fixture *gatekeeper
 
 func seedReviewerReviewEventWithProjectID(t *testing.T, fixture *gatekeeperFixture, projectID, headSHA, reviewEvent, actorID string, ordinal int, markerVerified bool) {
 	t.Helper()
+	outcome := "blocking"
+	switch strings.ToUpper(strings.TrimSpace(reviewEvent)) {
+	case "COMMENT", "APPROVE":
+		outcome = "clean"
+	}
+	seedReviewerReviewEventWithProjectIDAndOutcome(t, fixture, projectID, headSHA, reviewEvent, outcome, actorID, ordinal, markerVerified)
+}
+
+func seedReviewerReviewEventWithOutcome(t *testing.T, fixture *gatekeeperFixture, headSHA, reviewEvent, outcome, actorID string, ordinal int, markerVerified bool) {
+	t.Helper()
+	seedReviewerReviewEventWithProjectIDAndOutcome(t, fixture, "project_1", headSHA, reviewEvent, outcome, actorID, ordinal, markerVerified)
+}
+
+func seedReviewerReviewEventWithProjectIDAndOutcome(t *testing.T, fixture *gatekeeperFixture, projectID, headSHA, reviewEvent, outcome, actorID string, ordinal int, markerVerified bool) {
+	t.Helper()
 	entityType := "pull_request"
 	entityID := "acme/looper#42"
 	actorType := "system"
@@ -207,7 +223,7 @@ func seedReviewerReviewEventWithProjectID(t *testing.T, fixture *gatekeeperFixtu
 		ID: fmt.Sprintf("review-posted-%d", ordinal), EventType: reviewerReviewPostedEventType,
 		ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
 		ActorType: &actorType, ActorID: &actorID,
-		Payload:   map[string]any{"repo": "acme/looper", "prNumber": int64(42), "event": reviewEvent, "headSha": headSHA, "markerVerified": markerVerified},
+		Payload:   map[string]any{"repo": "acme/looper", "prNumber": int64(42), "event": reviewEvent, "outcome": outcome, "headSha": headSHA, "markerVerified": markerVerified},
 		CreatedAt: fixture.now.Add(time.Duration(ordinal) * time.Second),
 	}); err != nil {
 		t.Fatalf("append reviewer review event: %v", err)
