@@ -26,6 +26,7 @@ import (
 	"github.com/MumuTW/looper/internal/agent"
 	"github.com/MumuTW/looper/internal/agentdiscovery"
 	"github.com/MumuTW/looper/internal/config"
+	coordinatorrole "github.com/MumuTW/looper/internal/coordinator"
 	"github.com/MumuTW/looper/internal/daemonbinary"
 	"github.com/MumuTW/looper/internal/domain"
 	"github.com/MumuTW/looper/internal/escalator"
@@ -135,6 +136,10 @@ type Context struct {
 	// returns a vendor suggestion. Optional: when nil, the endpoint reports
 	// discovery as unavailable.
 	DiscoverAgentProviders func(ctx context.Context, cfg config.Config) (agentdiscovery.Report, error)
+	// BackfillIssues is the explicitly enabled, bounded historical intake lane.
+	// Production wires this to Runtime.BackfillIssues; tests and embeddings may
+	// inject the same Coordinator authority directly.
+	BackfillIssues func(context.Context, coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error)
 }
 
 // PullRequestTarget is the minimum a caller needs to decide whether a pull
@@ -204,15 +209,15 @@ func (h *Handler) effectiveConfig() config.Config {
 	return h.context.Config
 }
 
-func NewHandler(context Context) *Handler {
-	now := context.Now
+func NewHandler(contextValue Context) *Handler {
+	now := contextValue.Now
 	if now == nil {
 		now = time.Now
 	}
 
-	recoverySummary := context.RecoverySummary
+	recoverySummary := contextValue.RecoverySummary
 	if recoverySummary == nil {
-		if runtimeWithRecovery, ok := any(context.Runtime).(interface {
+		if runtimeWithRecovery, ok := any(contextValue.Runtime).(interface {
 			RecoverySummary() looperdruntime.RecoverySummary
 		}); ok {
 			recoverySummary = func() any {
@@ -224,12 +229,19 @@ func NewHandler(context Context) *Handler {
 			}
 		}
 	}
-	forwarder := context.WebhookForwarder
+	forwarder := contextValue.WebhookForwarder
 	if forwarder == nil {
-		if runtimeWithForwarder, ok := any(context.Runtime).(interface {
+		if runtimeWithForwarder, ok := any(contextValue.Runtime).(interface {
 			WebhookForwarder() looperdruntime.WebhookForwarder
 		}); ok {
 			forwarder = runtimeWithForwarder.WebhookForwarder()
+		}
+	}
+	if contextValue.BackfillIssues == nil {
+		if runtimeWithBackfill, ok := any(contextValue.Runtime).(interface {
+			BackfillIssues(context.Context, coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error)
+		}); ok {
+			contextValue.BackfillIssues = runtimeWithBackfill.BackfillIssues
 		}
 	}
 
@@ -237,7 +249,7 @@ func NewHandler(context Context) *Handler {
 	bootstrap.now = now
 
 	return &Handler{
-		context:             context,
+		context:             contextValue,
 		now:                 now,
 		recoverySummary:     recoverySummary,
 		webhookForwarder:    forwarder,
@@ -433,6 +445,18 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		report.ConfigRevision = h.buildConfigMetadata().Revision
 		h.writeSuccess(w, requestID, report)
+		return
+	case apiBasePath + "/backfill":
+		payload, err := h.buildBackfillResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+		h.writeSuccess(w, requestID, payload)
 		return
 	case apiBasePath + "/webhook/status":
 		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {

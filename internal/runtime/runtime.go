@@ -19,6 +19,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/bootstrap"
 	"github.com/MumuTW/looper/internal/config"
+	coordinatorrole "github.com/MumuTW/looper/internal/coordinator"
 	"github.com/MumuTW/looper/internal/domain"
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
@@ -182,6 +183,7 @@ type Runtime struct {
 	runSchedulerTick       RunSchedulerTickFunc
 	defaultSchedulerTick   RunSchedulerTickFunc
 	defaultSchedulerClaim  RunSchedulerTickFunc
+	backfillIssues         func(context.Context, coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error)
 	customSchedulerTick    bool
 	customSchedulerClaim   bool
 	customWebhookForwarder bool
@@ -245,6 +247,54 @@ type Runtime struct {
 	// storageRetained is true when Stop skipped coordinator.Close after a
 	// drain failure so undrained ownership is not closed under SQLite.
 	storageRetained bool
+}
+
+// BackfillIssues is the runtime-owned entry point for the explicitly enabled
+// historical intake lane. The callback comes from the current scheduler
+// snapshot, so a config reload changes policy without leaving the API bound to
+// a stale Coordinator runner.
+func (r *Runtime) BackfillIssues(ctx context.Context, input coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error) {
+	if err := r.allowBackfillOnHost(); err != nil {
+		return coordinatorrole.BackfillResult{}, err
+	}
+	r.mu.RLock()
+	backfill := r.backfillIssues
+	activeExecutions := r.activeExecutions
+	r.mu.RUnlock()
+	if backfill == nil {
+		return coordinatorrole.BackfillResult{}, coordinatorrole.ErrBackfillUnavailable
+	}
+	if activeExecutions == nil {
+		return backfill(ctx, input)
+	}
+	operation, err := activeExecutions.AdmitBackground(ctx, BackgroundOperationMeta{Name: "coordinator-backfill"})
+	if err != nil {
+		return coordinatorrole.BackfillResult{}, fmt.Errorf("%w: %v", coordinatorrole.ErrBackfillUnavailable, err)
+	}
+	defer operation.Release()
+	return backfill(operation.Context(), input)
+}
+
+func (r *Runtime) allowBackfillOnHost() error {
+	if r == nil {
+		return fmt.Errorf("%w: runtime is unavailable", coordinatorrole.ErrBackfillUnavailable)
+	}
+	cfg := r.Config().Daemon.ResourceGuard
+	r.mu.RLock()
+	gate := r.hostAdmission
+	logger := r.logger
+	r.mu.RUnlock()
+	if gate == nil {
+		return nil
+	}
+	decision := gate.Decide(cfg)
+	if decision == nil || decision.Admit {
+		return nil
+	}
+	if gate.ShouldLogHold(decision) {
+		logHostAdmissionHold(logger, "backfill", 0, *decision)
+	}
+	return fmt.Errorf("%w: host resource guard: %s", coordinatorrole.ErrBackfillUnavailable, decision.Summary())
 }
 
 const reviewerRecoveryLoginTimeout = 3 * time.Second
@@ -556,6 +606,7 @@ type workProducerCancels struct {
 	recovery         context.CancelFunc
 	cleanup          context.CancelFunc
 	projectDiscovery *projectDiscoveryRunner
+	background       *ActiveExecutionRegistry
 	forwarder        interface{ CancelExecute() }
 }
 
@@ -574,6 +625,9 @@ func (c workProducerCancels) invokeForDegrade() {
 	}
 	if c.projectDiscovery != nil {
 		c.projectDiscovery.Cancel()
+	}
+	if c.background != nil {
+		c.background.CancelBackgroundOperations(errors.New("daemon admission degraded"))
 	}
 }
 
@@ -597,6 +651,7 @@ func (r *Runtime) snapshotWorkProducerCancels() workProducerCancels {
 		recovery:         r.recoveryCancel,
 		cleanup:          r.worktreeCleanupCancel,
 		projectDiscovery: r.projectDiscovery,
+		background:       r.activeExecutions,
 		forwarder:        r.webhookForwarder,
 	}
 }
@@ -697,8 +752,9 @@ func (r *Runtime) WithAllowClaim(fn func()) error {
 }
 
 // MarkDegraded sticks admission until process restart and cancels work-producing
-// contexts (scheduler, recovery, cleanup) so new discovery/claims/cleanup that
-// already passed AllowClaim cannot complete after the transition. Unlike
+// contexts (scheduler, recovery, cleanup, and already-admitted background
+// operations) so new discovery/claims/cleanup/backfills that already passed
+// AllowClaim cannot complete after the transition. Unlike
 // BeginShutdown, this does not drain active agent handles and does not
 // CancelExecute webhook workers: Forward may already have returned accepted/202
 // for in-memory queue entries, and sticky degrade leaves the daemon up with no
@@ -1077,6 +1133,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
 		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim, r.hostAdmission)
+		r.backfillIssues = handlers.backfill
 		if !r.customSchedulerTick {
 			r.defaultSchedulerTick = handlers.tick
 			if !r.customWebhookForwarder {

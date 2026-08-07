@@ -2,6 +2,8 @@ package coordinator
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/url"
@@ -35,6 +37,13 @@ const mergeWatchCommentMarkerPrefix = "<!-- looper:coordinator:merge-watch"
 const noEligibleNodeStatus = "no-eligible-node"
 const backlogPageSize = 100
 const backlogPageCount = 2
+const issueLockPollInterval = 10 * time.Millisecond
+
+// ErrBackfillUnavailable marks an operational/configuration failure that
+// should be surfaced as HTTP 503 rather than mistaken for invalid input.
+var ErrBackfillUnavailable = errors.New("coordinator backfill is unavailable")
+
+var errCoordinatorProjectNotFound = errors.New("coordinator project not found")
 
 type backlogLane struct {
 	dispatchLabel string
@@ -56,6 +65,257 @@ type DiscoveryInput struct {
 type DiscoveryResult struct {
 	Skipped bool
 	Ticked  bool
+}
+
+// BackfillInput defines the scope of a historical issue backfill operation.
+type BackfillInput struct {
+	ProjectID     string
+	Repo          string
+	IssueNumbers  []int64
+	LabelFilter   string
+	MaxAgeDays    int
+	MaxCount      int
+	SkipTriaged   bool
+	ForceRetriage bool
+}
+
+// BackfillResult reports what was considered, triaged, skipped, and why.
+type BackfillResult struct {
+	Considered      int              `json:"considered"`
+	Triaged         int              `json:"triaged"`
+	Skipped         int              `json:"skipped"`
+	SkipReasons     map[string]int   `json:"skipReasons,omitempty"`
+	ProcessedIssues []int64          `json:"processedIssues,omitempty"`
+	FailedIssues    map[int64]string `json:"failedIssues,omitempty"`
+}
+
+// backfillSkipReason is the deterministic selection authority for one
+// candidate. It is intentionally reusable after the inspection/LLM phase so
+// an issue that changed while analysis was running cannot bypass the original
+// scope before mutation.
+func backfillSkipReason(loaded loadedIssue, input BackfillInput, triageCfg triage.Config, labelFilter string, now time.Time) string {
+	if loaded.detail.State != "" && !strings.EqualFold(strings.TrimSpace(loaded.detail.State), "open") {
+		return "not_open"
+	}
+	if loaded.detail.IsPullRequest {
+		return "pull_request"
+	}
+	if labelFilter != "" && !labels.Has(loaded.issue.Labels, labelFilter) {
+		return "label_mismatch"
+	}
+	if labels.Has(loaded.issue.Labels, triageCfg.TriagedLabel) && !input.ForceRetriage {
+		if input.SkipTriaged {
+			return "already_triaged"
+		}
+		return "force_retriage_required"
+	}
+	if labels.Has(loaded.issue.Labels, labels.HoldGlobal) {
+		return "hold"
+	}
+	createdAt, ok := parseCoordinatorTime(loaded.issue.CreatedAt)
+	if !ok || createdAt.After(now) {
+		return "invalid_created_at"
+	}
+	if now.Sub(createdAt) > time.Duration(input.MaxAgeDays)*24*time.Hour {
+		return "too_old"
+	}
+	return ""
+}
+
+func (r *Runner) BackfillIssues(ctx context.Context, input BackfillInput) (BackfillResult, error) {
+	result := BackfillResult{
+		SkipReasons:  make(map[string]int),
+		FailedIssues: make(map[int64]string),
+	}
+
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	if r.github == nil || r.repos == nil || r.repos.Projects == nil {
+		return result, fmt.Errorf("%w: repositories not configured", ErrBackfillUnavailable)
+	}
+	input.Repo = strings.TrimSpace(input.Repo)
+	if input.Repo == "" {
+		return result, fmt.Errorf("repo is required")
+	}
+	if input.MaxAgeDays <= 0 {
+		input.MaxAgeDays = 30
+	}
+	if input.MaxAgeDays > 365 {
+		input.MaxAgeDays = 365
+	}
+	if input.MaxCount <= 0 {
+		input.MaxCount = 50
+	}
+	if input.MaxCount > 200 {
+		input.MaxCount = 200
+	}
+
+	project, roleCfg, err := r.projectConfig(ctx, input.ProjectID)
+	if err != nil {
+		if !errors.Is(err, errCoordinatorProjectNotFound) {
+			return result, fmt.Errorf("%w: %v", ErrBackfillUnavailable, err)
+		}
+		return result, err
+	}
+	if project.Archived || !roleCfg.Enabled {
+		return result, fmt.Errorf("project is archived or disabled")
+	}
+	if !roleCfg.BackfillEnabled {
+		return result, fmt.Errorf("coordinator backfill is disabled for project %q", input.ProjectID)
+	}
+	configuredRepo, ok := configuredProjectRepo(project)
+	if !ok {
+		return result, fmt.Errorf("project %q has no configured repository metadata", input.ProjectID)
+	}
+	if !strings.EqualFold(configuredRepo, input.Repo) {
+		return result, fmt.Errorf("repo %q is not configured for project %q (configured repo: %q)", input.Repo, input.ProjectID, configuredRepo)
+	}
+	if err := r.requireBackfillCoordinatorLease(ctx, input.ProjectID, ""); err != nil {
+		return result, err
+	}
+
+	triageCfg := roleConfigToTriageConfig(roleCfg)
+	labelFilter := strings.TrimSpace(input.LabelFilter)
+	var candidates []githubinfra.IssueSummary
+	if len(input.IssueNumbers) > 0 {
+		seen := make(map[int64]struct{}, len(input.IssueNumbers))
+		for _, number := range input.IssueNumbers {
+			if number <= 0 {
+				result.Skipped++
+				result.SkipReasons["invalid_issue_number"]++
+				continue
+			}
+			if _, duplicate := seen[number]; duplicate {
+				continue
+			}
+			seen[number] = struct{}{}
+			// Explicit numbers are fetched directly. ListOpenIssues is an
+			// intentionally bounded listing API and must not silently omit a
+			// requested issue before the selection is applied.
+			candidates = append(candidates, githubinfra.IssueSummary{Number: number})
+		}
+	} else {
+		issues, listErr := r.github.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{
+			Repo: input.Repo, CWD: project.RepoPath, Limit: input.MaxCount, Label: labelFilter,
+		})
+		if listErr != nil {
+			return result, fmt.Errorf("%w: list open issues: %v", ErrBackfillUnavailable, listErr)
+		}
+		candidates = issues
+	}
+
+	for _, summary := range candidates {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		// MaxCount bounds candidates attempted, not only successful writes. A
+		// malformed issue or provider failure must not grant another LLM call.
+		if result.Considered >= input.MaxCount {
+			break
+		}
+		result.Considered++
+		unlock, locked := r.lockIssue(ctx, input.ProjectID, input.Repo, summary.Number)
+		if !locked {
+			return result, ctx.Err()
+		}
+
+		loaded, err := r.loadIssue(ctx, input.Repo, project.RepoPath, summary)
+		if err != nil {
+			unlock()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return result, ctxErr
+			}
+			result.FailedIssues[summary.Number] = err.Error()
+			continue
+		}
+		issueNumber := summary.Number
+		if loaded.issue.Number != 0 {
+			issueNumber = loaded.issue.Number
+		}
+		if reason := backfillSkipReason(loaded, input, triageCfg, labelFilter, r.now().UTC()); reason != "" {
+			result.Skipped++
+			result.SkipReasons[reason]++
+			unlock()
+			continue
+		}
+
+		analysisStartedAt := r.now().UTC()
+
+		decision, err := r.decideBackfill(ctx, project.RepoPath, input.Repo, loaded.issue, triageCfg)
+		if err != nil {
+			unlock()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return result, ctxErr
+			}
+			result.FailedIssues[issueNumber] = err.Error()
+			continue
+		}
+		if decision.NoOp {
+			result.Skipped++
+			result.SkipReasons["no_op_decision"]++
+			unlock()
+			continue
+		}
+
+		// The LLM/inspection phase can take long enough for an operator to add
+		// the global hold. Re-read the authoritative issue state under the same
+		// per-issue lock immediately before any mutation and abandon the stale
+		// decision when the veto appeared.
+		fresh, err := r.loadIssue(ctx, input.Repo, project.RepoPath, loaded.summary)
+		if err != nil {
+			unlock()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return result, ctxErr
+			}
+			result.FailedIssues[issueNumber] = err.Error()
+			continue
+		}
+		if reason := backfillSkipReason(fresh, input, triageCfg, labelFilter, r.now().UTC()); reason != "" {
+			result.Skipped++
+			result.SkipReasons[reason]++
+			unlock()
+			continue
+		}
+		// Keep the pre-analysis comment snapshot for the human-comment veto.
+		// Fresh labels/state are authoritative for selection, but comments that
+		// arrived during inspection must remain new evidence rather than being
+		// folded into the known set passed to postOrEditComment.
+		fresh.issue.Comments = append([]triage.Comment(nil), loaded.issue.Comments...)
+		loaded = fresh
+		if err := r.requireBackfillCoordinatorLease(ctx, input.ProjectID, loaded.issue.URL); err != nil {
+			unlock()
+			return result, err
+		}
+
+		if err := r.applyBackfillDecision(ctx, input.Repo, project.RepoPath, loaded.issue, triageCfg, analysisStartedAt, decision); err != nil {
+			unlock()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return result, ctxErr
+			}
+			result.FailedIssues[issueNumber] = err.Error()
+			continue
+		}
+
+		result.Triaged++
+		result.ProcessedIssues = append(result.ProcessedIssues, issueNumber)
+		unlock()
+	}
+
+	return result, nil
+}
+
+func configuredProjectRepo(project *storage.ProjectRecord) (string, bool) {
+	if project == nil || project.MetadataJSON == nil {
+		return "", false
+	}
+	var metadata struct {
+		Repo string `json:"repo"`
+	}
+	if err := json.Unmarshal([]byte(*project.MetadataJSON), &metadata); err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(metadata.Repo), strings.TrimSpace(metadata.Repo) != ""
 }
 
 type IssueSummary struct {
@@ -119,12 +379,19 @@ type RuntimeState struct {
 	mu                sync.Mutex
 	lastTickByProject map[string]time.Time
 	watchLocks        map[string]*sync.Mutex
+	issueLocks        map[string]*issueLockEntry
+}
+
+type issueLockEntry struct {
+	mu   sync.Mutex
+	refs int
 }
 
 func NewRuntimeState() *RuntimeState {
 	return &RuntimeState{
 		lastTickByProject: map[string]time.Time{},
 		watchLocks:        map[string]*sync.Mutex{},
+		issueLocks:        map[string]*issueLockEntry{},
 	}
 }
 
@@ -366,21 +633,40 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if !mightNeedCoordinatorAction(loadedIssue.summary, triageCfg) {
 			continue
 		}
+		unlock, locked := r.lockIssue(ctx, input.ProjectID, input.Repo, loadedIssue.summary.Number)
+		if !locked {
+			return DiscoveryResult{}, ctx.Err()
+		}
+		// Re-read under the same per-project/issue lock used by the explicit
+		// backfill lane. The batch hydration above is only a candidate snapshot;
+		// the locked read is what prevents a stale periodic tick from issuing a
+		// duplicate LLM call or comment after backfill has changed the labels.
+		fresh, err := r.loadIssue(ctx, input.Repo, project.RepoPath, loadedIssue.summary)
+		if err != nil {
+			unlock()
+			return DiscoveryResult{}, err
+		}
+		loadedIssue = fresh
 		if !triage.ShouldReTriage(loadedIssue.issue, triageCfg, r.now().UTC()) && !triage.ShouldTriage(loadedIssue.issue, triageCfg, r.now().UTC()) {
+			unlock()
 			continue
 		}
 		analysisStartedAt := r.now().UTC()
 		processed++
-		decision, err := r.decide(ctx, project.RepoPath, input.Repo, loadedIssue.issue, triageCfg)
+		decision, err := r.decide(ctx, project.RepoPath, input.Repo, loadedIssue.issue, triageCfg, false)
 		if err != nil {
+			unlock()
 			return DiscoveryResult{}, err
 		}
 		if decision.NoOp {
+			unlock()
 			continue
 		}
 		if err := r.applyDecision(ctx, input.Repo, project.RepoPath, loadedIssue.issue, triageCfg, analysisStartedAt, decision); err != nil {
+			unlock()
 			return DiscoveryResult{}, err
 		}
+		unlock()
 	}
 	return DiscoveryResult{Ticked: true}, nil
 }
@@ -640,10 +926,12 @@ func (r *Runner) hasDispatchWork(action dispatch.Action) bool {
 	return action.ReactionCommentID != 0 || len(action.TriggerLabels) != 0 || action.FailureCommentBody != ""
 }
 
-func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue triage.Issue, cfg triage.Config) (triage.Decision, error) {
-	reTriage := triage.ShouldReTriage(issue, cfg, r.now().UTC())
-	if !reTriage && !triage.ShouldTriage(issue, cfg, r.now().UTC()) {
-		return triage.NoOpDecision(), nil
+func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue triage.Issue, cfg triage.Config, forceRetriage bool) (triage.Decision, error) {
+	if !forceRetriage {
+		reTriage := triage.ShouldReTriage(issue, cfg, r.now().UTC())
+		if !reTriage && !triage.ShouldTriage(issue, cfg, r.now().UTC()) {
+			return triage.NoOpDecision(), nil
+		}
 	}
 	repoCtx, err := r.inspector.Inspect(ctx, repoPath, issue)
 	if err != nil {
@@ -654,7 +942,84 @@ func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue
 	return triage.Decide(ctx, r.triageLLM, triage.Input{Issue: issue, RepoContext: repoCtx, Config: cfg, Now: r.now().UTC()}), nil
 }
 
+func (r *Runner) decideBackfill(ctx context.Context, repoPath string, repo string, issue triage.Issue, cfg triage.Config) (triage.Decision, error) {
+	repoCtx, err := r.inspector.Inspect(ctx, repoPath, issue)
+	if err != nil {
+		return triage.Decision{}, err
+	}
+	repoCtx.Repo = repo
+	repoCtx.WorkingDirectory = repoPath
+	return triage.DecideWithError(ctx, r.triageLLM, triage.Input{Issue: issue, RepoContext: repoCtx, Config: cfg, Now: r.now().UTC()})
+}
+
+func (r *Runner) lockIssue(ctx context.Context, projectID, repo string, issueNumber int64) (func(), bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if r == nil || r.state == nil {
+		return func() {}, true
+	}
+	key := fmt.Sprintf("%s\x00%s\x00%d", strings.TrimSpace(projectID), strings.ToLower(strings.TrimSpace(repo)), issueNumber)
+	r.state.mu.Lock()
+	if r.state.issueLocks == nil {
+		r.state.issueLocks = make(map[string]*issueLockEntry)
+	}
+	entry := r.state.issueLocks[key]
+	if entry == nil {
+		entry = &issueLockEntry{}
+		r.state.issueLocks[key] = entry
+	}
+	entry.refs++
+	r.state.mu.Unlock()
+
+	releaseReference := func() {
+		r.state.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 && r.state.issueLocks[key] == entry {
+			delete(r.state.issueLocks, key)
+		}
+		r.state.mu.Unlock()
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			releaseReference()
+			return func() {}, false
+		}
+		if entry.mu.TryLock() {
+			// Do not let a cancellation race turn a successful lock into new
+			// work after the caller's request/shutdown has ended.
+			if err := ctx.Err(); err != nil {
+				entry.mu.Unlock()
+				releaseReference()
+				return func() {}, false
+			}
+			return func() {
+				entry.mu.Unlock()
+				releaseReference()
+			}, true
+		}
+		timer := time.NewTimer(issueLockPollInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			releaseReference()
+			return func() {}, false
+		case <-timer.C:
+		}
+	}
+}
+
 func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, issue triage.Issue, cfg triage.Config, analysisStartedAt time.Time, decision triage.Decision) error {
+	return r.applyDecisionWithPolicy(ctx, repo, cwd, issue, cfg, analysisStartedAt, decision, false)
+}
+
+func (r *Runner) applyBackfillDecision(ctx context.Context, repo string, cwd string, issue triage.Issue, cfg triage.Config, analysisStartedAt time.Time, decision triage.Decision) error {
+	return r.applyDecisionWithPolicy(ctx, repo, cwd, issue, cfg, analysisStartedAt, decision, true)
+}
+
+func (r *Runner) applyDecisionWithPolicy(ctx context.Context, repo string, cwd string, issue triage.Issue, cfg triage.Config, analysisStartedAt time.Time, decision triage.Decision, suppressStaleComment bool) error {
 	remainingLabels := append([]string(nil), issue.Labels...)
 	hadTriaged := hasExactLabel(remainingLabels, cfg.TriagedLabel)
 	if decision.MarkTriaged && hadTriaged {
@@ -673,6 +1038,11 @@ func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, iss
 		return err
 	}
 	remainingLabels = removeMatchingLabels(remainingLabels, removeNow)
+	// Classification labels are deterministic, evidence-derived state and are
+	// intentionally retained when backfill's comment veto fires. Only the
+	// proposed narrative and triaged authority marker are suppressed; this
+	// keeps the partial-application contract explicit instead of pretending the
+	// whole decision was rolled back without a compensating transaction.
 	applyNow := removeExactLabels(decision.ApplyLabels, cfg.TriagedLabel)
 	if len(applyNow) > 0 {
 		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: applyNow, LabelNamespace: cfg.Namespace, CWD: cwd}); err != nil {
@@ -689,7 +1059,14 @@ func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, iss
 		}
 		commentPosted = posted
 	}
+	// A backfill human-comment veto means the LLM decision is stale. Do not add
+	// the triaged marker when the decision carried a comment that was
+	// suppressed; periodic legacy triage retains its historical label-only
+	// completion semantics.
 	shouldMarkTriaged := decision.MarkTriaged && (!hadTriaged || commentPosted)
+	if suppressStaleComment && strings.TrimSpace(decision.CommentBody) != "" && !commentPosted {
+		shouldMarkTriaged = false
+	}
 	if shouldMarkTriaged && !hasExactLabel(remainingLabels, cfg.TriagedLabel) {
 		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: []string{cfg.TriagedLabel}, LabelNamespace: cfg.Namespace, CWD: cwd}); err != nil {
 			return err
@@ -1076,17 +1453,29 @@ func (r *Runner) applyDispatches(ctx context.Context, projectID, repo, cwd strin
 		if _, skip := deps.retriageIssueNumbers[item.issue.Number]; skip {
 			continue
 		}
-		dispatchIssue, err := r.dispatchIssue(ctx, repo, cwd, item.issue, triageCfg.TriagedLabel, dispatchCfg)
+		unlock, locked := r.lockIssue(ctx, projectID, repo, item.summary.Number)
+		if !locked {
+			return ctx.Err()
+		}
+		fresh, err := r.loadIssue(ctx, repo, cwd, item.summary)
 		if err != nil {
+			unlock()
+			return err
+		}
+		dispatchIssue, err := r.dispatchIssue(ctx, repo, cwd, fresh.issue, triageCfg.TriagedLabel, dispatchCfg)
+		if err != nil {
+			unlock()
 			return err
 		}
 		action := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC(), &deps.graph)
-		action = applyHumanDependencyGate(action, item.issue.Number, deps)
-		if r.hasDispatchWork(action) || r.workerAdmissionIntent(item.issue, action, dispatchCfg).Active {
-			if _, err := r.applyDispatchAction(ctx, projectID, repo, cwd, item.issue, action, dispatchCfg); err != nil {
+		action = applyHumanDependencyGate(action, fresh.issue.Number, deps)
+		if r.hasDispatchWork(action) || r.workerAdmissionIntent(fresh.issue, action, dispatchCfg).Active {
+			if _, err := r.applyDispatchAction(ctx, projectID, repo, cwd, fresh.issue, action, dispatchCfg); err != nil {
+				unlock()
 				return err
 			}
 		}
+		unlock()
 	}
 	return nil
 }
@@ -1125,16 +1514,39 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID, repo,
 	}
 	dispatched := 0
 	for _, candidate := range ready {
-		if preemptWorkers && candidate.worker {
-			continue
-		}
 		if dispatched >= budget {
 			break
 		}
-		mutated, err := r.applyDispatchAction(ctx, projectID, repo, cwd, candidate.issue, candidate.action, dispatchCfg)
+		unlock, locked := r.lockIssue(ctx, projectID, repo, candidate.issue.Number)
+		if !locked {
+			return ctx.Err()
+		}
+		fresh, err := r.loadIssue(ctx, repo, cwd, githubinfra.IssueSummary{Number: candidate.issue.Number})
 		if err != nil {
+			unlock()
 			return err
 		}
+		dispatchIssue, err := r.dispatchIssue(ctx, repo, cwd, fresh.issue, triageCfg.TriagedLabel, dispatchCfg)
+		if err != nil {
+			unlock()
+			return err
+		}
+		action := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC(), &deps.graph)
+		action = applyHumanDependencyGate(action, fresh.issue.Number, deps)
+		if strings.TrimSpace(action.FailureCommentBody) != "" || (!r.hasDispatchWork(action) && !r.workerAdmissionIntent(fresh.issue, action, dispatchCfg).Active) {
+			unlock()
+			continue
+		}
+		if preemptWorkers && isWorkerDispatch(fresh.issue, triageCfg.Namespace) {
+			unlock()
+			continue
+		}
+		mutated, err := r.applyDispatchAction(ctx, projectID, repo, cwd, fresh.issue, action, dispatchCfg)
+		if err != nil {
+			unlock()
+			return err
+		}
+		unlock()
 		if mutated {
 			dispatched++
 		}
@@ -2008,7 +2420,7 @@ func (r *Runner) projectConfig(ctx context.Context, projectID string) (*storage.
 		return nil, config.CoordinatorRoleConfig{}, err
 	}
 	if project == nil {
-		return nil, config.CoordinatorRoleConfig{}, fmt.Errorf("project %q not found", projectID)
+		return nil, config.CoordinatorRoleConfig{}, fmt.Errorf("%w: %s", errCoordinatorProjectNotFound, projectID)
 	}
 	if r.config == nil {
 		return nil, config.CoordinatorRoleConfig{}, fmt.Errorf("coordinator config is not configured")
@@ -2031,6 +2443,35 @@ func (r *Runner) projectNetworkMode(projectID string) config.ProjectNetworkMode 
 		break
 	}
 	return config.ProjectNetworkModeOff
+}
+
+// requireBackfillCoordinatorLease is the routed-mode mutation authority for
+// explicit backfill. A backfill can spend a long time in inspection/LLM work,
+// so the initial status check only admits the lane; the call immediately before
+// applyDecision repeats status and fencing-token validation. The Coordinator
+// LLM is a proposal, while the live lease holder is the authority for routed
+// GitHub side effects.
+func (r *Runner) requireBackfillCoordinatorLease(ctx context.Context, projectID, issueURL string) error {
+	if r.projectNetworkMode(projectID) != config.ProjectNetworkModeRouted {
+		return nil
+	}
+	if r.network == nil {
+		return fmt.Errorf("%w: routed coordinator network is not configured", ErrBackfillUnavailable)
+	}
+	status, err := r.network.Status(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: coordinator lease status: %v", ErrBackfillUnavailable, err)
+	}
+	if !r.currentNodeHoldsLease(status) {
+		return fmt.Errorf("%w: this node does not hold the routed Coordinator lease", ErrBackfillUnavailable)
+	}
+	if strings.TrimSpace(issueURL) == "" {
+		return nil
+	}
+	if err := r.revalidateCoordinatorLease(ctx, issueURL, status.Lease.FencingToken); err != nil {
+		return fmt.Errorf("%w: coordinator lease revalidation: %v", ErrBackfillUnavailable, err)
+	}
+	return nil
 }
 
 func (r *Runner) shouldRunTick(projectID string) bool {

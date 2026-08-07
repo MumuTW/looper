@@ -259,8 +259,9 @@ func DefaultConfig(cwd string) (Config, error) {
 				RequiredReviewChangedLines: 200,
 			},
 			Coordinator: CoordinatorRoleConfig{
-				Enabled:      false,
-				PollInterval: "5m",
+				Enabled:         false,
+				BackfillEnabled: false,
+				PollInterval:    "5m",
 				Triage: CoordinatorTriageConfig{
 					TriagedLabel:    "triaged",
 					MaxIssueAgeDays: 7,

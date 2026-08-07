@@ -1390,6 +1390,9 @@ func mergeCoordinatorRoleConfig(config *CoordinatorRoleConfig, partial PartialCo
 	if partial.Enabled != nil {
 		config.Enabled = *partial.Enabled
 	}
+	if partial.BackfillEnabled != nil {
+		config.BackfillEnabled = *partial.BackfillEnabled
+	}
 	if partial.PollInterval != nil {
 		config.PollInterval = *partial.PollInterval
 	}
@@ -2292,6 +2295,10 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 	}
 	if configs.Coordinator != nil {
 		coordinator := *configs.Coordinator
+		if configs.Coordinator.BackfillEnabled != nil {
+			backfillEnabled := *configs.Coordinator.BackfillEnabled
+			coordinator.BackfillEnabled = &backfillEnabled
+		}
 		if configs.Coordinator.Triage != nil {
 			triage := *configs.Coordinator.Triage
 			if configs.Coordinator.Triage.Disposition != nil {

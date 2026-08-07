@@ -116,18 +116,30 @@ type llmOutput struct {
 }
 
 func Decide(ctx context.Context, llm LLM, input Input) Decision {
-	if llm == nil {
-		return NoOpDecision()
-	}
-	raw, err := llm.Complete(ctx, Request{Prompt: BuildPrompt(input), WorkingDirectory: input.RepoContext.WorkingDirectory})
-	if err != nil {
-		return NoOpDecision()
-	}
-	decision, err := parseDecision(raw, input.Config)
+	decision, err := DecideWithError(ctx, llm, input)
 	if err != nil {
 		return NoOpDecision()
 	}
 	return decision
+}
+
+// DecideWithError is the strict form used by operator-triggered lanes. The
+// legacy periodic triage path intentionally keeps Decide's fail-closed NoOp
+// contract, while bounded backfill must report provider/LLM/parse failures as
+// failed work rather than pretending they were an ordinary no-op.
+func DecideWithError(ctx context.Context, llm LLM, input Input) (Decision, error) {
+	if llm == nil {
+		return Decision{}, fmt.Errorf("triage LLM is not configured")
+	}
+	raw, err := llm.Complete(ctx, Request{Prompt: BuildPrompt(input), WorkingDirectory: input.RepoContext.WorkingDirectory})
+	if err != nil {
+		return Decision{}, fmt.Errorf("triage LLM completion failed: %w", err)
+	}
+	decision, err := parseDecision(raw, input.Config)
+	if err != nil {
+		return Decision{}, fmt.Errorf("triage LLM returned invalid decision: %w", err)
+	}
+	return decision, nil
 }
 
 func NoOpDecision() Decision {

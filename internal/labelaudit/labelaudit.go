@@ -221,7 +221,8 @@ func isLegacyDispatchFixture(path, normalized string) bool {
 		"internal/coordinator/triage/triage_guards_test.go",
 		"internal/e2e/dependency_gate_sandbox_test.go",
 		"internal/reviewer/runner_labels_test.go",
-		"internal/reviewer/runner_test.go":
+		"internal/reviewer/runner_test.go",
+		"internal/coordinator/backfill_review_followup_test.go":
 		return true
 	default:
 		return false

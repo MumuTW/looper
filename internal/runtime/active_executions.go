@@ -89,6 +89,10 @@ type ActiveExecutionRegistry struct {
 	// registered via Track (processcontainment.LiveTracker).
 	nonAgentHandles map[uint64]*nonAgentTracked
 	nextNonAgentID  uint64
+	// backgroundOps tracks non-agent operations that have no process
+	// containment handle but still own work across an upgrade/shutdown drain.
+	backgroundOps    map[uint64]*backgroundOperation
+	nextBackgroundID uint64
 	// nonAgentDrainErr accumulates ReportDrainFailure and force-kill failures
 	// from non-agent handles so Runtime.Stop can retain SQLite.
 	nonAgentDrainErr error
@@ -115,14 +119,15 @@ const defaultKillTimeout = 20 * time.Second
 // DrainSnapshot is the complete in-memory Supervisor-owned work set relevant
 // to a graceful drain.
 type DrainSnapshot struct {
-	LiveExecutions    int `json:"liveExecutions"`
-	PendingSpawns     int `json:"pendingSpawns"`
-	BoundOperations   int `json:"boundOperations"`
-	PendingOperations int `json:"pendingOperations"`
+	LiveExecutions       int `json:"liveExecutions"`
+	PendingSpawns        int `json:"pendingSpawns"`
+	BoundOperations      int `json:"boundOperations"`
+	PendingOperations    int `json:"pendingOperations"`
+	BackgroundOperations int `json:"backgroundOperations"`
 }
 
 func (s DrainSnapshot) Drained() bool {
-	return s.LiveExecutions == 0 && s.PendingSpawns == 0 && s.BoundOperations == 0 && s.PendingOperations == 0
+	return s.LiveExecutions == 0 && s.PendingSpawns == 0 && s.BoundOperations == 0 && s.PendingOperations == 0 && s.BackgroundOperations == 0
 }
 
 func (r *ActiveExecutionRegistry) DrainSnapshot() DrainSnapshot {
@@ -131,7 +136,13 @@ func (r *ActiveExecutionRegistry) DrainSnapshot() DrainSnapshot {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return DrainSnapshot{LiveExecutions: len(r.executions), PendingSpawns: len(r.pending), BoundOperations: len(r.boundOps), PendingOperations: len(r.pendingOps)}
+	return DrainSnapshot{
+		LiveExecutions:       len(r.executions),
+		PendingSpawns:        len(r.pending),
+		BoundOperations:      len(r.boundOps),
+		PendingOperations:    len(r.pendingOps),
+		BackgroundOperations: len(r.backgroundOps),
+	}
 }
 
 func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
@@ -145,6 +156,7 @@ func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
 		boundOps:         make(map[uint64]*operationLease),
 		boundByQueueItem: make(map[string]uint64),
 		nonAgentHandles:  make(map[uint64]*nonAgentTracked),
+		backgroundOps:    make(map[uint64]*backgroundOperation),
 	}
 }
 
@@ -950,6 +962,7 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 		cause = agent.ErrSpawnAdmissionClosed
 	}
 	opWait := r.cancelPendingOperationsLocked(cause)
+	backgroundWait := r.cancelBackgroundOperationsLocked(cause)
 	r.cancelBoundOperationsLocked(cause, "")
 	r.mu.Unlock()
 
@@ -963,10 +976,11 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 		}
 	}
 	deadline := time.Now().Add(r.killBudget())
-	waitChans := make([]<-chan struct{}, 0, len(spawnWait)+len(rebindWait)+len(opWait))
+	waitChans := make([]<-chan struct{}, 0, len(spawnWait)+len(rebindWait)+len(opWait)+len(backgroundWait))
 	waitChans = append(waitChans, spawnWait...)
 	waitChans = append(waitChans, rebindWait...)
 	waitChans = append(waitChans, opWait...)
+	waitChans = append(waitChans, backgroundWait...)
 	for _, done := range waitChans {
 		if done == nil {
 			continue

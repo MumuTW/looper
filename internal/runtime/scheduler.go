@@ -196,6 +196,7 @@ type defaultSchedulerTickInput struct {
 type defaultSchedulerHandlers struct {
 	tick                 RunSchedulerTickFunc
 	claim                RunSchedulerTickFunc
+	backfill             func(context.Context, coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error)
 	webhook              WebhookForwarder
 	reviewer             reviewerScheduler
 	fixer                fixerScheduler
@@ -1906,7 +1907,9 @@ func (f *schedulerNotificationGatewayFactory) New(options notify.Options) *notif
 func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error, hostGate *hostAdmissionGate) defaultSchedulerHandlers {
 	if source == nil {
 		fail := func(context.Context, Services) error { return fmt.Errorf("project catalog is not configured") }
-		return defaultSchedulerHandlers{tick: fail, claim: fail}
+		return defaultSchedulerHandlers{tick: fail, claim: fail, backfill: func(context.Context, coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error) {
+			return coordinatorrole.BackfillResult{}, fmt.Errorf("project catalog is not configured")
+		}}
 	}
 	claimMu := &sync.Mutex{}
 	notificationGateways := newSchedulerNotificationGatewayFactory()
@@ -1936,6 +1939,13 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	handlers := defaultSchedulerHandlers{
 		snapshot:             buildSnapshot,
 		notificationGateways: notificationGateways,
+	}
+	handlers.backfill = func(ctx context.Context, input coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error) {
+		snapshot := handlers.snapshot()
+		if snapshot.backfill == nil {
+			return coordinatorrole.BackfillResult{}, fmt.Errorf("coordinator backfill is not configured")
+		}
+		return snapshot.backfill(ctx, input)
 	}
 	if coordinator != nil && repos != nil {
 		handlers.webhook = webhookforward.New(webhookforward.Options{
@@ -2023,7 +2033,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		fail := func(context.Context, Services) error {
 			return fmt.Errorf("default scheduler dependencies are not configured")
 		}
-		return defaultSchedulerHandlers{tick: fail, claim: fail}
+		return defaultSchedulerHandlers{tick: fail, claim: fail, backfill: func(context.Context, coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error) {
+			return coordinatorrole.BackfillResult{}, fmt.Errorf("default scheduler dependencies are not configured")
+		}}
 	}
 	view := projects.OperationViewFromConfig(cfg)
 	// Always build coding-role runners, even when live ResolveAgent fails.
@@ -2710,6 +2722,15 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		},
 		claim: func(ctx context.Context, services Services) error {
 			return runIndependentClaimPass(ctx, inputForServices(services))
+		},
+		backfill: func(ctx context.Context, input coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error) {
+			backfillRunner, ok := any(coordinatorRunner).(interface {
+				BackfillIssues(context.Context, coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error)
+			})
+			if !ok {
+				return coordinatorrole.BackfillResult{}, fmt.Errorf("%w: coordinator is not configured", coordinatorrole.ErrBackfillUnavailable)
+			}
+			return backfillRunner.BackfillIssues(ctx, input)
 		},
 		reviewer:             webhookReviewer,
 		fixer:                webhookFixer,

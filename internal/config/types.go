@@ -745,7 +745,11 @@ type CoordinatorPostMergeDigestConfig struct {
 }
 
 type CoordinatorRoleConfig struct {
-	Enabled         bool                              `json:"enabled"`
+	Enabled bool `json:"enabled"`
+	// BackfillEnabled is an explicit operator opt-in for the bounded
+	// historical-intake API. A daemon must never widen its triage scope merely
+	// because a new endpoint was added.
+	BackfillEnabled bool                              `json:"backfillEnabled,omitempty"`
 	PollInterval    string                            `json:"pollInterval"`
 	Triage          CoordinatorTriageConfig           `json:"triage"`
 	Dispatch        CoordinatorDispatchConfig         `json:"dispatch"`
@@ -1536,6 +1540,7 @@ type PartialCoordinatorPostMergeDigestConfig struct {
 
 type PartialCoordinatorRoleConfig struct {
 	Enabled         *bool                                    `json:"enabled,omitempty"`
+	BackfillEnabled *bool                                    `json:"backfillEnabled,omitempty"`
 	PollInterval    *string                                  `json:"pollInterval,omitempty"`
 	Triage          *PartialCoordinatorTriageConfig          `json:"triage,omitempty"`
 	Dispatch        *PartialCoordinatorDispatchConfig        `json:"dispatch,omitempty"`
