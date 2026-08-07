@@ -17,17 +17,59 @@ import (
 // or trimmed comparison can stop on the wrong project when two configured IDs
 // differ only by case or surrounding whitespace, applying the wrong override.
 func gatekeeperTrustForProject(cfg config.Config, projectID string) config.GatekeeperTrustLevel {
-	trust := gatekeeperRoleConfigForProject(cfg, projectID).Trust
+	trust := cfg.Roles.Gatekeeper.Trust
+	for _, project := range cfg.Projects {
+		if project.ID != projectID {
+			continue
+		}
+		if project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil {
+			trust = *project.Roles.Gatekeeper.Trust
+		}
+		break
+	}
 	if strings.TrimSpace(string(trust)) == "" {
 		return config.GatekeeperTrustObserve
 	}
 	return config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(trust))))
 }
 
+// gatekeeperDiffBudgetForProject resolves only the small project override used
+// by the Gatekeeper lane, avoiding a full ProjectRoleConfigs registry clone on
+// every pull request.
+//
+// Project IDs are matched by exact equality, matching runtimeProjectBinding and
+// config.ProjectRoleConfigs: a case-insensitive or trimmed comparison can select
+// the wrong project's budget when two configured IDs differ only by case or
+// surrounding whitespace, letting Gatekeeper apply limits that belong to another
+// project.
+func gatekeeperDiffBudgetForProject(cfg config.Config, projectID string) config.GatekeeperDiffBudget {
+	var budget config.GatekeeperDiffBudget
+	if cfg.Roles.Gatekeeper.DiffBudget != nil {
+		budget = *cfg.Roles.Gatekeeper.DiffBudget
+	}
+	for _, project := range cfg.Projects {
+		if project.ID != projectID {
+			continue
+		}
+		if project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.DiffBudget != nil {
+			if project.Roles.Gatekeeper.DiffBudget.MaxChangedFiles != nil {
+				budget.MaxChangedFiles = *project.Roles.Gatekeeper.DiffBudget.MaxChangedFiles
+			}
+			if project.Roles.Gatekeeper.DiffBudget.MaxDeletions != nil {
+				budget.MaxDeletions = *project.Roles.Gatekeeper.DiffBudget.MaxDeletions
+			}
+		}
+		break
+	}
+	return budget
+}
+
+// gatekeeperRoleConfigForProject resolves the effective GatekeeperRoleConfig
+// for a project, applying project-level overrides on top of the global config.
 func gatekeeperRoleConfigForProject(cfg config.Config, projectID string) config.GatekeeperRoleConfig {
 	role := cfg.Roles.Gatekeeper
 	for _, project := range cfg.Projects {
-		if !strings.EqualFold(strings.TrimSpace(project.ID), strings.TrimSpace(projectID)) {
+		if project.ID != projectID {
 			continue
 		}
 		if project.Roles != nil && project.Roles.Gatekeeper != nil {
@@ -41,4 +83,11 @@ func gatekeeperRoleConfigForProject(cfg config.Config, projectID string) config.
 		break
 	}
 	return role
+}
+
+// gatekeeperRequiredReviewChangedLinesForProject resolves the effective review
+// capacity threshold. The normalized global default is 200; a project override
+// may explicitly set zero to disable the threshold for that project.
+func gatekeeperRequiredReviewChangedLinesForProject(cfg config.Config, projectID string) int {
+	return config.ProjectRoleConfigs(cfg, projectID).Gatekeeper.RequiredReviewChangedLines
 }

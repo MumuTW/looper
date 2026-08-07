@@ -62,4 +62,3 @@ func TestThreadResolutionReplyPassesStampedGitHubPublicationBoundary(t *testing.
 		t.Fatalf("thread comments = %#v, want stamped audit reply", thread.Comments)
 	}
 }
- (refactor(gatekeeper): retire reviewer merge authority)

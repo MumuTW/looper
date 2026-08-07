@@ -3,12 +3,15 @@ package escalator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/MumuTW/looper/internal/eventlog"
 	notifyinfra "github.com/MumuTW/looper/internal/infra/notify"
 	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/triager"
 )
 
 type fakeCollector struct {
@@ -112,6 +115,51 @@ func TestRunnerRejectsUnboundedBaseline(t *testing.T) {
 	runner := NewRunner(collector, &fakeNotifier{status: "success"}, openCollectorRepositories(t), RunnerOptions{MaxItems: 1})
 	if _, err := runner.Run(context.Background()); err == nil {
 		t.Fatal("oversized baseline was accepted")
+	}
+}
+
+func TestRunnerDoesNotBaselineRotatingPartialTriageWindow(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	old := eventlog.FormatJavaScriptISOString(now.Add(-2 * time.Hour))
+	repos := openCollectorRepositories(t)
+	projectID, repo := "project-window", "acme/widget"
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: projectID, Name: "Window", RepoPath: "/tmp/window", CreatedAt: old, UpdatedAt: old}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < triageSourceScanLimit+1; i++ {
+		key := fmt.Sprintf("triage-window-%03d", i)
+		appendEvent(t, repos, "enrollment-"+key, triager.EnrollmentEventType, "github_issue", triager.Enrollment{
+			IdempotencyKey: key, ProjectID: projectID, Repo: repo, IssueNumber: int64(i + 1), EnrolledAt: old,
+		}, projectID, old)
+	}
+
+	collector := NewCollector(repos, testLinks{}, CollectorOptions{Now: func() time.Time { return now }, UnroutedAfter: time.Hour})
+	notifier := &fakeNotifier{status: "success"}
+	runner := NewRunner(collector, notifier, repos, RunnerOptions{Now: func() time.Time { return now }})
+	first, err := runner.Run(ctx)
+	if err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+	if !first.Snapshot.Partial || !first.Suppressed || first.Notified || len(notifier.payloads) != 0 {
+		t.Fatalf("first result = %#v, payloads = %d; want suppressed partial census", first, len(notifier.payloads))
+	}
+	events, err := repos.Events.ListByEntityTypeAndEventTypes(ctx, digestEntityType, []string{DigestEventType})
+	if err != nil || len(events) != 0 {
+		t.Fatalf("partial census baseline events = %d, error = %v; want none", len(events), err)
+	}
+
+	second, err := runner.Run(ctx)
+	if err != nil {
+		t.Fatalf("second Run() error = %v", err)
+	}
+	if second.Snapshot.Partial || !second.Notified || second.Suppressed || len(second.Snapshot.Items) != triageSourceScanLimit+1 {
+		t.Fatalf("second result = %#v, payloads = %d; want complete 65-item digest", second, len(notifier.payloads))
+	}
+	events, err = repos.Events.ListByEntityTypeAndEventTypes(ctx, digestEntityType, []string{DigestEventType})
+	if err != nil || len(events) != 1 {
+		t.Fatalf("complete census baseline events = %d, error = %v; want one", len(events), err)
 	}
 }
 

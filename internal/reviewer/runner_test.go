@@ -1134,6 +1134,26 @@ func TestReviewerFailedLoopRecoveryEligibilityHonorsStopOnConfig(t *testing.T) {
 	}
 }
 
+// TestReviewerFailedLoopRecoveryEligibilityHonorsCustomNamespaceReadyLabel
+// pins the spec-ready stop gate for a custom namespace: with StopOnReadyLabel
+// enabled, a failed reviewer loop must not auto-recover once the PR carries the
+// project's namespaced spec-ready label rather than the default looper:spec-ready.
+func TestReviewerFailedLoopRecoveryEligibilityHonorsCustomNamespaceReadyLabel(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish: expected old, got new"})
+	cfg := &config.Config{Projects: []config.ProjectRefConfig{{ID: "project_1", RepoPath: t.TempDir(), LabelNamespace: "team.looper:"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true}, CustomInstructions: cfg})
+	loop, _ := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	eligible, _, reason, err := runner.failedReviewerLoopRecoveryEligibility(context.Background(), *loop, PullRequestSummary{Number: 42, State: "OPEN", Labels: []string{"team.looper:spec-ready"}})
+	if err != nil {
+		t.Fatalf("failedReviewerLoopRecoveryEligibility() error = %v", err)
+	}
+	if eligible || reason != "ready_label" {
+		t.Fatalf("eligible = %t, reason = %q, want false / ready_label", eligible, reason)
+	}
+}
+
 func TestReviewerFailedLoopRecoveryEligibilitySkipsCurrentLoginForLocalBlockers(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -3494,6 +3514,30 @@ func TestFilterSkipMetadataRecordsReviewerForNotRequested(t *testing.T) {
 	}
 	if got, _ := stringFromAny(metadata["reviewerLogin"]); got != "bob" {
 		t.Fatalf("metadata.reviewerLogin = %q, want bob", got)
+	}
+	if got, _ := stringFromAny(metadata["headSha"]); got != "abc123" {
+		t.Fatalf("metadata.headSha = %q, want abc123", got)
+	}
+}
+
+// TestFilterSkipMetadataRecordsNamespacedRequiredLabel pins the persisted
+// ready_label skip metadata to the project's effective spec-ready label, so a
+// custom-namespaced spec PR is not rediscovered while its namespaced
+// promotion label is still present.
+func TestFilterSkipMetadataRecordsNamespacedRequiredLabel(t *testing.T) {
+	t.Parallel()
+	namespace := labels.NewNamespace("team.looper:")
+	metadata := filterSkipMetadata(reviewerCheckpoint{
+		SkipKind:   "ready_label",
+		SkipReason: "Skipped because spec-ready label is present",
+		Detail:     &checkpointDetail{HeadSHA: "abc123", Labels: []string{namespace.SpecReady()}},
+	}, "2026-05-01T00:00:00Z", namespace.SpecReady())
+	if metadata == nil {
+		t.Fatalf("filterSkipMetadata() = nil, want metadata")
+	}
+	got, _ := stringFromAny(metadata["requiredLabel"])
+	if got != namespace.SpecReady() {
+		t.Fatalf("metadata.requiredLabel = %q, want %q", got, namespace.SpecReady())
 	}
 	if got, _ := stringFromAny(metadata["headSha"]); got != "abc123" {
 		t.Fatalf("metadata.headSha = %q, want abc123", got)
@@ -9211,6 +9255,33 @@ func testReviewerLoopConfig() config.ReviewerLoopConfig {
 	return config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 60, MinPublishIntervalSeconds: 300, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: false, StopOnReadyLabel: true, StopOnIdenticalOutput: true}
 }
 
+func TestReviewCapacityRefusalRequiresStructuredRateLimitResult(t *testing.T) {
+	t.Parallel()
+	refusal, ok := reviewCapacityRefusal(AgentResult{Stdout: `__LOOPER_RESULT__={"type":"rate_limit","message":"review quota exhausted"}`})
+	if !ok || refusal.reason != "rate_limit" || refusal.message != "review quota exhausted" {
+		t.Fatalf("reviewCapacityRefusal() = %#v, %t", refusal, ok)
+	}
+	if _, ok := reviewCapacityRefusal(AgentResult{Summary: "rate limit exceeded"}); ok {
+		t.Fatal("prose rate-limit message must not become durable refusal evidence")
+	}
+}
+
+func TestAppendReviewEvidencePersistsPullRequestEntity(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	runner := New(Options{Repos: fixture.repos, Now: fixture.now})
+	input := stepInput{Project: storage.ProjectRecord{ID: "project_1"}, Repo: "acme/looper", PRNumber: 42}
+	if err := runner.appendReviewEvidence(context.Background(), input, "pr.review.refused", map[string]any{"headSha": "abc123", "reason": "rate_limit"}); err != nil {
+		t.Fatalf("appendReviewEvidence() error = %v", err)
+	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if len(events) != 1 || events[0].EventType != "pr.review.refused" || !strings.Contains(events[0].PayloadJSON, `"reason":"rate_limit"`) {
+		t.Fatalf("events = %#v, want durable rate-limit refusal", events)
+	}
+}
+
 func (f *runnerFixture) advance(delta time.Duration) { f.current = f.current.Add(delta) }
 
 func (f *runnerFixture) nowISO() string {
@@ -9469,7 +9540,7 @@ func (g *fakeGitHubGateway) ViewIssue(_ context.Context, input githubinfra.ViewI
 	if g.issueDetail.Number != 0 {
 		return g.issueDetail, nil
 	}
-	return githubinfra.IssueDetail{Number: input.IssueNumber, Title: "Issue", Body: "", State: "open", Labels: []string{"triaged", "dispatch/plan"}}, nil
+	return githubinfra.IssueDetail{Number: input.IssueNumber, Title: "Issue", Body: "", State: "open", Labels: []string{"triaged", "looper:dispatch:plan"}}, nil
 }
 
 func (g *fakeGitHubGateway) GetPullRequestHeadSHA(context.Context, ViewPullRequestInput) (string, error) {

@@ -14,6 +14,31 @@ import (
 	"time"
 )
 
+func TestRuntimePathsPutSealedNodeDirectoryFirstOnPATH(t *testing.T) {
+	paths := runtimePaths{command: "/runtime/srt", moduleRoot: "/runtime/lib/node_modules", node: "/sealed/node", ripgrep: "/tools/rg", bwrap: "/tools/bwrap", socat: "/tools/socat"}
+	got := paths.executableDirectories()
+	if len(got) == 0 || got[0] != "/sealed" {
+		t.Fatalf("executableDirectories() = %#v, want sealed Node directory first", got)
+	}
+}
+
+func TestRuntimePathsAllowReadSealedModuleRoot(t *testing.T) {
+	paths := runtimePaths{command: "/runtime/bin/srt", moduleRoot: "/runtime/lib/node_modules"}
+	if got := paths.directories(); !contains(got, "/runtime/lib/node_modules") {
+		t.Fatalf("directories() = %#v, want sealed module root", got)
+	}
+}
+
+func TestRuntimePathsAllowReadVerifiedClosureDirectories(t *testing.T) {
+	paths := runtimePaths{closureDirectories: []string{"/opt/runtime/lib", "/nix/store/hash/lib"}}
+	got := paths.directories()
+	for _, want := range []string{"/opt/runtime/lib", "/nix/store/hash/lib"} {
+		if !contains(got, want) {
+			t.Fatalf("directories() = %#v, want verified closure directory %s", got, want)
+		}
+	}
+}
+
 func TestRunSuppliesReviewedPolicyAndIsolatedEnvironment(t *testing.T) {
 	root := t.TempDir()
 	resolvedRoot, err := filepath.EvalSymlinks(root)

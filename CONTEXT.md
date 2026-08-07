@@ -58,10 +58,8 @@ The per-project merge authority Merge Gatekeeper holds, defined at
 `config.GatekeeperTrustLevel` in `internal/config`. `observe` writes a Gate
 report and nothing else; `advise` additionally publishes the verdict and its
 reasons on the pull request so a human can act without redoing the judgement;
-`auto` publishes the required `Looper Gatekeeper` commit status for the current
-pull request head and never merges itself — GitHub branch protection (or
-Mergify queue injection of that protection) remains the merge authority. A level
-is reached only by explicit operator promotion.
+`auto` confirms every gate again against the same head and merges immediately.
+A level is reached only by explicit operator promotion.
 _Avoid_: mode, autonomy, permission.
 
 **Owned verdict comment**:
@@ -189,12 +187,6 @@ Defined at `internal/coordinator/depgraph.DependencyGraph` (the `ReadySet`
 method), whose doc comment carries the semantics: the tracked Issues whose
 **Dependency gate** is currently released.
 
-**Acceptance criterion**:
-Defined at `internal/reviewer/criteria.AcceptanceCriterion`, whose doc comment
-records the legacy diff-evidence representation retained by review formatting.
-It is not merge authority; Gatekeeper independently re-establishes every merge
-gate immediately before an `auto` merge.
-
 **Merge-pending state**:
 The GitHub-native state of a Pull Request after a human enables GitHub auto-merge and before GitHub merges or a **Veto signal** arrives. Looper no longer creates this state; Gatekeeper merges immediately after confirmation. Coordinator's merge-watch can still classify an observed merge-pending PR into WatchActions. (Prose-only: a GitHub-native state; the classifier over it is `internal/coordinator/mergewatch.WatchAction`.)
 
@@ -244,6 +236,9 @@ posts it; there is deliberately no shared type.)
 A Role-specific HTML comment marker (e.g. `<!-- looper:coordinator:triage -->`) used by a stateless Role to recognise its own prior comments and avoid duplicate posts.
 
 ### Network
+
+> Product status: withdrawn by #84. The terms below describe dormant code and
+> historical ADRs; supported configuration and runtime behavior are local-only.
 
 **Network**:
 (Prose-only: a system-of-instances concept; its code-defined parts — Node,
@@ -301,16 +296,15 @@ _Avoid_: local sandbox, mock sandbox.
 - A **Coordinator** performs **Dispatch** on a Triaged Issue, producing a **Trigger label** that a **Planner** or **Worker** observes
 - A **Coordinator** may perform **PR review assignment**, producing a GitHub review request that **Reviewer** observes
 - A **Coordinator** consults the **Dependency gate** before performing **Dispatch** when `roles.coordinator.dependencies.enabled = true`
-- **Reviewer** opts approved code PRs (carrying **Auto-merge scope**) into GitHub-native auto-merge after verifying each **Acceptance criterion** has satisfying-evidence in the diff
+- **Reviewer** reviews code PRs and publishes review signals; it never opts a PR into merge
 - **Merge Gatekeeper** evaluates every active GitHub-backed Project Pull Request from source discovery, then re-evaluates after head, check, review, thread, or hold changes and writes a head-bound **Gate report**
-- **Coordinator**'s per-tick poll classifies **Merge-pending state** PRs into WatchActions, routing mechanical failures (conflict, red CI) to **Fixer** via **Trigger label** and policy failures (branch protection change) to re-Triage by removing the Issue's `triaged` and `dispatch/*` labels
+- **Merge Gatekeeper** at `auto` confirms every gate and performs an immediate head-matched merge; **Coordinator**'s per-tick poll only classifies human-created **Merge-pending state** PRs and cancels legacy Looper-owned auto-merge requests during migration cleanup
 - The **Watch marker** carries merge-watch retry state on the linked Issue, preserving Coordinator's stateless property
 - A **Veto signal** from a human overrides Coordinator's autonomous Dispatch but does not override **Triage** itself
 - In a **Routed project**, the **Coordinator control plane** applies GitHub-native coarse authority (`looper:worker-ready` plus assignee for Worker, review request for Reviewer) and writes the **Target label** last. The **Lease** gates Coordinator control-plane action; current GitHub issue/PR state remains the claim Authority.
 
 ## Flagged ambiguities
 
-- **Disposition (name collision)** — `criteria.AggregateDisposition` (pass/fail/unverifiable) and `depgraph`'s blocker disposition reuse the word for unrelated concepts; only `internal/coordinator/triage.Disposition` is the glossary's Disposition. Qualify on first use anywhere the packages meet.
 - **classification** — used by humans to mean both Disposition and the kind/area labels. Resolved: Disposition is the high-level conclusion (`valid` / `out-of-scope` / `unclear`); kind/area/complexity are classification *labels* applied during a `valid` Triage. The unqualified word "classification" is avoided in favor of "Disposition" or "label".
 - **handoff** — already used in code (`authoritative handoff fields`) for the PR-seed contract between Reviewer and Fixer. Not used for Coordinator's Dispatch action, which is a different concept. Use "Dispatch" exclusively for the Coordinator action.
 - **manager / commander / maintainer** — early names considered for the Coordinator Role. Rejected: "manager" implies it directs other Roles (it doesn't, it sets labels), "commander" overpromises authority, "maintainer" is a human role.
@@ -333,4 +327,4 @@ _Avoid_: local sandbox, mock sandbox.
 > **Domain expert:** Then **Coordinator** dispatches immediately unless the **Dependency gate** is blocked. Human-gated mode is the default; autonomous mode requires the grace window. Either way the **Authority** for dispatch is the durable label on the **Issue**, never an in-memory decision.
 >
 > **Dev:** What happens after **Reviewer** APPROVEs a Looper PR?
-> **Domain expert:** If **Auto-merge scope** matches and the linked Issue has stated **Acceptance criterion**s, **Reviewer** verifies each criterion against the diff. On all-pass, it submits APPROVE with per-criterion evidence and calls `gh pr merge --auto`. **GitHub branch protection** is the named **Authority** for "safe to merge" — Looper does not check CI itself. **Coordinator**'s per-tick poll then watches the **Merge-pending state** PR and classifies it into WatchActions; the **Watch marker** on the linked Issue carries retry-counter state without private storage.
+> **Domain expert:** Reviewer only publishes the review signal. Gatekeeper evaluates the current PR against checks, reviews, threads, holds, mergeability, and project policy. At `auto`, it confirms every gate again and performs an immediate head-matched merge; `observe` and `advise` never merge. Coordinator only watches human-created **Merge-pending state** and cleans up legacy Looper-owned auto-merge requests.

@@ -53,6 +53,14 @@ type DiscoveryInput struct {
 	Snapshot  *githubinfra.DiscoverySnapshot
 }
 
+// RetiredAutoMergeInput identifies the repository whose durable merge-watch
+// markers must be reconciled during the Reviewer-to-Gatekeeper migration.
+type RetiredAutoMergeInput struct {
+	ProjectID string
+	Repo      string
+	CWD       string
+}
+
 type DiscoveryResult struct {
 	Skipped bool
 	Ticked  bool
@@ -65,12 +73,14 @@ type IssueSummary struct {
 
 type GitHubGateway interface {
 	ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error)
+	ListMergeWatchIssues(context.Context, githubinfra.ListMergeWatchIssuesInput) ([]githubinfra.IssueSummary, error)
 	ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error)
 	ListLinkedPullRequests(context.Context, githubinfra.LinkedPullRequestsInput) ([]githubinfra.LinkedPullRequest, error)
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
 	ViewPullRequest(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
 	ViewPullRequestForDiscovery(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
 	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
+	ListIssueCommentsContaining(context.Context, githubinfra.ViewIssueInput, []string) ([]githubinfra.CommentInfo, error)
 	ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error)
 	ListIssueBlockedBy(context.Context, githubinfra.ListIssueBlockedByInput) ([]githubinfra.IssueDependency, error)
 	GetIssueState(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueState, error)
@@ -89,6 +99,7 @@ type GitHubGateway interface {
 	AddPullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
 	RemovePullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
 	ViewPullRequestMergeWatch(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
+	DisablePullRequestAutoMerge(context.Context, githubinfra.DisablePullRequestAutoMergeInput) error
 	ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error)
 	ListPullRequestCommits(context.Context, githubinfra.ListPullRequestCommitsInput) ([]githubinfra.PullRequestCommit, error)
 	ListPullRequestDraftEvents(context.Context, githubinfra.PullRequestDraftEventsInput) ([]githubinfra.PullRequestDraftEvent, error)
@@ -101,31 +112,69 @@ type RepositoryInspector interface {
 }
 
 type Options struct {
-	Repos      *storage.Repositories
-	GitHub     GitHubGateway
-	Config     *config.Config
-	Logger     bootstrap.Logger
-	Now        func() time.Time
-	TriageLLM  triage.LLM
-	Inspector  RepositoryInspector
-	Disclosure *config.DisclosureConfig
-	Network    NetworkGateway
-	State      *RuntimeState
+	Repos                  *storage.Repositories
+	GitHub                 GitHubGateway
+	Config                 *config.Config
+	Logger                 bootstrap.Logger
+	Now                    func() time.Time
+	TriageLLM              triage.LLM
+	Inspector              RepositoryInspector
+	Disclosure             *config.DisclosureConfig
+	Network                NetworkGateway
+	State                  *RuntimeState
+	CancelRetiredAutoMerge bool
 }
 
 // RuntimeState contains coordinator lifecycle state that must outlive one
 // immutable configuration snapshot. Snapshot-specific policy remains on Runner.
 type RuntimeState struct {
-	mu                sync.Mutex
-	lastTickByProject map[string]time.Time
-	watchLocks        map[string]*sync.Mutex
+	mu                        sync.Mutex
+	lastTickByProject         map[string]time.Time
+	watchLocks                map[string]*sync.Mutex
+	retiredAutoMergeCleanupOK map[string]bool
 }
 
 func NewRuntimeState() *RuntimeState {
 	return &RuntimeState{
-		lastTickByProject: map[string]time.Time{},
-		watchLocks:        map[string]*sync.Mutex{},
+		lastTickByProject:         map[string]time.Time{},
+		watchLocks:                map[string]*sync.Mutex{},
+		retiredAutoMergeCleanupOK: map[string]bool{},
 	}
+}
+
+// RetiredAutoMergeCleanupReady reports whether the process-local maintenance
+// pass has completed successfully for this project and repository binding.
+// The key includes the repository because a config reassignment must not reuse
+// readiness earned for a different forge target.
+func (s *RuntimeState) RetiredAutoMergeCleanupReady(projectID, repo string) bool {
+	if s == nil {
+		return true
+	}
+	key := retiredAutoMergeCleanupKey(projectID, repo)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.retiredAutoMergeCleanupOK[key]
+}
+
+// SetRetiredAutoMergeCleanupReady records the result of the latest maintenance
+// pass. A failure clears prior readiness so scheduled and webhook Gatekeeper
+// paths share the same fail-closed project barrier.
+func (s *RuntimeState) SetRetiredAutoMergeCleanupReady(projectID, repo string, ready bool) {
+	if s == nil {
+		return
+	}
+	key := retiredAutoMergeCleanupKey(projectID, repo)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ready {
+		s.retiredAutoMergeCleanupOK[key] = true
+	} else {
+		delete(s.retiredAutoMergeCleanupOK, key)
+	}
+}
+
+func retiredAutoMergeCleanupKey(projectID, repo string) string {
+	return strings.TrimSpace(projectID) + "\x1f" + strings.TrimSpace(repo)
 }
 
 // Runner is the Coordinator: a proactive, LLM-driven Role for the legacy
@@ -140,16 +189,17 @@ func NewRuntimeState() *RuntimeState {
 // timing and watch locks), which does not survive restarts and is never an
 // authority.
 type Runner struct {
-	repos      *storage.Repositories
-	github     GitHubGateway
-	config     *config.Config
-	logger     bootstrap.Logger
-	now        func() time.Time
-	triageLLM  triage.LLM
-	inspector  RepositoryInspector
-	disclosure *config.DisclosureConfig
-	network    NetworkGateway
-	state      *RuntimeState
+	repos                  *storage.Repositories
+	github                 GitHubGateway
+	config                 *config.Config
+	logger                 bootstrap.Logger
+	now                    func() time.Time
+	triageLLM              triage.LLM
+	inspector              RepositoryInspector
+	disclosure             *config.DisclosureConfig
+	network                NetworkGateway
+	state                  *RuntimeState
+	cancelRetiredAutoMerge bool
 }
 
 type loadedIssue struct {
@@ -198,16 +248,17 @@ func New(options Options) *Runner {
 		state = NewRuntimeState()
 	}
 	runner := &Runner{
-		repos:      options.Repos,
-		github:     options.GitHub,
-		config:     options.Config,
-		logger:     options.Logger,
-		now:        now,
-		triageLLM:  options.TriageLLM,
-		inspector:  inspector,
-		network:    options.Network,
-		disclosure: options.Disclosure,
-		state:      state,
+		repos:                  options.Repos,
+		github:                 options.GitHub,
+		config:                 options.Config,
+		logger:                 options.Logger,
+		now:                    now,
+		triageLLM:              options.TriageLLM,
+		inspector:              inspector,
+		network:                options.Network,
+		disclosure:             options.Disclosure,
+		state:                  state,
+		cancelRetiredAutoMerge: options.CancelRetiredAutoMerge,
 	}
 	runner.warnMarkReadyReviewerUnreachable()
 	return runner
@@ -260,15 +311,23 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
+	triageCfg.Namespace = r.projectLabelNamespace(input.ProjectID, project.MetadataJSON)
+	triageCfg.TriagedLabel = triageCompletionLabel(triageCfg.TriagedLabel, triageCfg.Namespace)
+	triageCfg.ProjectClassificationLabels = config.ProjectClassificationLabels(r.config, input.ProjectID)
+	dispatchCfg.Namespace = triageCfg.Namespace
+	dispatchCfg.TriagedLabel = triageCfg.TriagedLabel
+	dispatchCfg.HoldLabel = triageCfg.Namespace.Remap(dispatchCfg.HoldLabel)
+	dispatchCfg.PlannerTriggerLabels = triageCfg.Namespace.RemapAll(dispatchCfg.PlannerTriggerLabels)
+	dispatchCfg.WorkerTriggerLabels = triageCfg.Namespace.RemapAll(dispatchCfg.WorkerTriggerLabels)
 	reviewerRole, _ := config.ProjectCodingRoleConfig(*r.config, input.ProjectID, config.CodingRoleReviewer)
 	fixerRole, _ := config.ProjectCodingRoleConfig(*r.config, input.ProjectID, config.CodingRoleFixer)
 	workerRole, _ := config.ProjectCodingRoleConfig(*r.config, input.ProjectID, config.CodingRoleWorker)
 	downstreamLabels := downstreamTriggerLabels{
-		reviewer:     append([]string(nil), reviewerRole.Discovery.Labels...),
+		reviewer:     triageCfg.Namespace.RemapAll(reviewerRole.Discovery.Labels),
 		reviewerMode: reviewerRole.Discovery.LabelMode,
-		fixer:        append([]string(nil), fixerRole.Discovery.Labels...),
+		fixer:        triageCfg.Namespace.RemapAll(fixerRole.Discovery.Labels),
 		fixerMode:    fixerRole.Discovery.LabelMode,
-		worker:       append([]string(nil), workerRole.Discovery.Labels...),
+		worker:       triageCfg.Namespace.RemapAll(workerRole.Discovery.Labels),
 		workerMode:   workerRole.Discovery.LabelMode,
 	}
 	loaded := make([]loadedIssue, 0, len(issues))
@@ -324,7 +383,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 	}
 
-	mergeWatchRetriggers, err := r.applyMergeWatch(ctx, input.ProjectID, input.Repo, project.RepoPath, loaded, projectRoles)
+	mergeWatchRetriggers, err := r.applyMergeWatch(ctx, input.ProjectID, input.Repo, project.RepoPath, loaded, projectRoles, triageCfg.Namespace)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -377,6 +436,60 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	return DiscoveryResult{Ticked: true}, nil
 }
 
+// ReconcileRetiredAutoMerge independently cleans up native auto-merge requests
+// created by the retired Reviewer path.  The marker search deliberately spans
+// all issue states and does not consult Coordinator labels or enablement, so a
+// closed issue or a renamed triage label cannot leave a pending forge action
+// behind when authority changes.
+func (r *Runner) ReconcileRetiredAutoMerge(ctx context.Context, input RetiredAutoMergeInput) error {
+	if r == nil || !r.cancelRetiredAutoMerge || r.github == nil {
+		return nil
+	}
+	if strings.TrimSpace(input.Repo) == "" {
+		return fmt.Errorf("retired auto-merge reconciliation repository is required")
+	}
+	currentLogin, err := r.github.GetCurrentUserLoginForRepo(ctx, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
+	issues, err := r.github.ListMergeWatchIssues(ctx, githubinfra.ListMergeWatchIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: 1000})
+	if err != nil {
+		return fmt.Errorf("list retired merge-watch markers: %w", err)
+	}
+	for _, summary := range issues {
+		comments, err := r.github.ListIssueCommentsContaining(ctx, githubinfra.ViewIssueInput{Repo: input.Repo, IssueNumber: summary.Number, CWD: input.CWD}, []string{mergeWatchCommentMarkerPrefix})
+		if err != nil {
+			return fmt.Errorf("read retired merge-watch marker for issue #%d: %w", summary.Number, err)
+		}
+		marker := findMergeWatchComment(comments, currentLogin)
+		if marker == nil || marker.Marker.PRNumber <= 0 {
+			continue
+		}
+		detail, err := r.github.ViewPullRequestMergeWatch(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: marker.Marker.PRNumber, CWD: input.CWD})
+		if err != nil {
+			return fmt.Errorf("inspect retired merge-watch PR #%d: %w", marker.Marker.PRNumber, err)
+		}
+		if detail.Number != marker.Marker.PRNumber {
+			// A zero or mismatched projection is not evidence that the request is
+			// gone. Preserve the marker for a later authoritative read.
+			continue
+		}
+		owned := detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin))
+		if owned && !strings.EqualFold(strings.TrimSpace(detail.State), "merged") && strings.TrimSpace(detail.MergedAt) == "" {
+			if err := r.github.DisablePullRequestAutoMerge(ctx, githubinfra.DisablePullRequestAutoMergeInput{Repo: input.Repo, PRNumber: marker.Marker.PRNumber, CWD: input.CWD}); err != nil {
+				return fmt.Errorf("disable retired auto-merge for PR #%d: %w", marker.Marker.PRNumber, err)
+			}
+		}
+		// Once migration has observed the PR, the marker has served its provenance
+		// purpose.  Removing it prevents a later tick from treating the same
+		// historical request as live, including when a human disabled auto-merge.
+		if err := r.deleteMergeWatchComment(ctx, input.Repo, input.CWD, marker); err != nil {
+			return fmt.Errorf("delete retired merge-watch marker for issue #%d: %w", summary.Number, err)
+		}
+	}
+	return nil
+}
+
 func (r *Runner) listCoordinatorBacklog(ctx context.Context, projectID, repo, cwd string, triageCfg triage.Config, dispatchCfg dispatch.Config, recent []githubinfra.IssueSummary, limit int) ([]githubinfra.IssueSummary, error) {
 	seen := make(map[int64]struct{}, len(recent))
 	for _, issue := range recent {
@@ -384,10 +497,10 @@ func (r *Runner) listCoordinatorBacklog(ctx context.Context, projectID, repo, cw
 	}
 	issues := make([]githubinfra.IssueSummary, 0, limit)
 	backlogLanes := []backlogLane{
-		{dispatchLabel: dispatch.DispatchPlan, triggerLabels: dispatchCfg.PlannerTriggerLabels},
-		{dispatchLabel: dispatch.DispatchImplement, triggerLabels: dispatchCfg.WorkerTriggerLabels},
+		{dispatchLabel: dispatchCfg.Namespace.DispatchPlan(), triggerLabels: dispatchCfg.PlannerTriggerLabels},
+		{dispatchLabel: dispatchCfg.Namespace.DispatchImplement(), triggerLabels: dispatchCfg.WorkerTriggerLabels},
 	}
-	targets := backlogScanTargets(backlogLanes, r.projectNetworkMode(projectID) == config.ProjectNetworkModeRouted)
+	targets := backlogScanTargets(backlogLanes, r.projectNetworkMode(projectID) == config.ProjectNetworkModeRouted, dispatchCfg.Namespace.DispatchImplement())
 	if len(targets) == 0 {
 		return issues, nil
 	}
@@ -462,13 +575,17 @@ func (r *Runner) backlogHydrationBudget(ctx context.Context, triageCfg triage.Co
 	return min(limit, max(r.config.Scheduler.MaxConcurrentRuns-running, 0)), nil
 }
 
-func backlogScanTargets(lanes []backlogLane, includeWorkerRecovery bool) []backlogTarget {
+func backlogScanTargets(lanes []backlogLane, includeWorkerRecovery bool, workerDispatchLabel string) []backlogTarget {
+	workerLabel := strings.TrimSpace(workerDispatchLabel)
+	if workerLabel == "" {
+		workerLabel = dispatch.DispatchImplement
+	}
 	targets := make([]backlogTarget, 0)
 	for laneIndex, lane := range lanes {
 		for _, triggerLabel := range lane.triggerLabels {
 			if triggerLabel = strings.TrimSpace(triggerLabel); triggerLabel != "" {
 				targets = append(targets, backlogTarget{lane: laneIndex, triggerLabel: triggerLabel})
-				if includeWorkerRecovery && lane.dispatchLabel == dispatch.DispatchImplement {
+				if includeWorkerRecovery && lane.dispatchLabel == workerLabel {
 					targets = append(targets, backlogTarget{lane: laneIndex, triggerLabel: triggerLabel, recovery: true})
 				}
 			}
@@ -663,7 +780,7 @@ func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, iss
 	remainingLabels = removeMatchingLabels(remainingLabels, removeNow)
 	applyNow := removeExactLabels(decision.ApplyLabels, cfg.TriagedLabel)
 	if len(applyNow) > 0 {
-		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: applyNow, CWD: cwd}); err != nil {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: applyNow, LabelNamespace: cfg.Namespace, CWD: cwd}); err != nil {
 			return err
 		}
 	}
@@ -679,7 +796,7 @@ func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, iss
 	}
 	shouldMarkTriaged := decision.MarkTriaged && (!hadTriaged || commentPosted)
 	if shouldMarkTriaged && !hasExactLabel(remainingLabels, cfg.TriagedLabel) {
-		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: []string{cfg.TriagedLabel}, CWD: cwd}); err != nil {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: []string{cfg.TriagedLabel}, LabelNamespace: cfg.Namespace, CWD: cwd}); err != nil {
 			return err
 		}
 	}
@@ -708,15 +825,15 @@ func (r *Runner) applyDispatchAction(ctx context.Context, projectID string, repo
 	}
 	if intent := r.workerAdmissionIntent(issue, action, dispatchCfg); intent.Active {
 		if r.projectNetworkMode(projectID) == config.ProjectNetworkModeRouted {
-			return r.applyRoutedWorkerAdmission(ctx, repo, cwd, issue, action, intent)
+			return r.applyRoutedWorkerAdmission(ctx, repo, cwd, issue, action, intent, dispatchCfg.Namespace)
 		}
-		return r.applyLocalWorkerAdmission(ctx, repo, cwd, issue, action, intent.TriggerLabels)
+		return r.applyLocalWorkerAdmission(ctx, repo, cwd, issue, action, intent.TriggerLabels, dispatchCfg.Namespace)
 	}
-	return r.applyGenericDispatchAction(ctx, repo, cwd, issue, action)
+	return r.applyGenericDispatchAction(ctx, repo, cwd, issue, action, dispatchCfg.Namespace)
 
 }
 
-func (r *Runner) applyGenericDispatchAction(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action) (bool, error) {
+func (r *Runner) applyGenericDispatchAction(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, namespace labels.Namespace) (bool, error) {
 	mutated := false
 	if strings.TrimSpace(action.AssignTo) != "" {
 		if err := r.github.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: repo, IssueNumber: issue.Number, Assignees: []string{action.AssignTo}, CWD: cwd}); err != nil {
@@ -726,7 +843,7 @@ func (r *Runner) applyGenericDispatchAction(ctx context.Context, repo string, cw
 	}
 	labelsToAdd := removeExistingLabels(action.TriggerLabels, issue.Labels)
 	if len(labelsToAdd) > 0 {
-		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToAdd, CWD: cwd}); err != nil {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToAdd, LabelNamespace: namespace, CWD: cwd}); err != nil {
 			return false, err
 		}
 		mutated = true
@@ -753,7 +870,7 @@ func (r *Runner) workerAdmissionIntent(issue triage.Issue, action dispatch.Actio
 	if len(intersectExactLabels(action.TriggerLabels, desired)) > 0 {
 		return workerAdmissionIntent{Active: true, TriggerLabels: desired}
 	}
-	if hasExactLabel(issue.Labels, dispatch.DispatchPlan) {
+	if cfg.Namespace.IsDispatchPlanForLabels(issue.Labels) {
 		return workerAdmissionIntent{}
 	}
 	if len(intersectExactLabels(issue.Labels, desired)) > 0 {
@@ -762,13 +879,13 @@ func (r *Runner) workerAdmissionIntent(issue triage.Issue, action dispatch.Actio
 	return workerAdmissionIntent{}
 }
 
-func (r *Runner) applyLocalWorkerAdmission(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, triggerLabels []string) (bool, error) {
+func (r *Runner) applyLocalWorkerAdmission(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, triggerLabels []string, namespace labels.Namespace) (bool, error) {
 	localAction := action
 	localAction.TriggerLabels = triggerLabels
-	return r.applyGenericDispatchAction(ctx, repo, cwd, issue, localAction)
+	return r.applyGenericDispatchAction(ctx, repo, cwd, issue, localAction, namespace)
 }
 
-func (r *Runner) applyRoutedWorkerAdmission(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, intent workerAdmissionIntent) (bool, error) {
+func (r *Runner) applyRoutedWorkerAdmission(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, intent workerAdmissionIntent, namespace labels.Namespace) (bool, error) {
 	mutated := false
 	if r.network == nil {
 		return false, fmt.Errorf("coordinator network admission is not configured")
@@ -807,7 +924,7 @@ func (r *Runner) applyRoutedWorkerAdmission(ctx context.Context, repo string, cw
 	}
 	labelsToAdd := removeExistingLabels(intent.TriggerLabels, issue.Labels)
 	if len(labelsToAdd) > 0 {
-		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToAdd, CWD: cwd}); err != nil {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToAdd, LabelNamespace: namespace, CWD: cwd}); err != nil {
 			return false, err
 		}
 		mutated = true
@@ -829,7 +946,7 @@ func (r *Runner) applyRoutedWorkerAdmission(ctx context.Context, repo string, cw
 		mutated = true
 	}
 	if len(targetPlan.Add) > 0 {
-		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: targetPlan.Add, CWD: cwd}); err != nil {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: targetPlan.Add, LabelNamespace: namespace, CWD: cwd}); err != nil {
 			return false, err
 		}
 		mutated = true
@@ -1043,7 +1160,8 @@ func (r *Runner) applyDependencyActions(ctx context.Context, repo, cwd string, t
 		if _, ok := deps.retriageIssueNumbers[ref.Number]; !ok {
 			continue
 		}
-		if err := r.removeIssueLabels(ctx, repo, cwd, item.issue.Number, item.issue.Labels, []string{triageCfg.TriagedLabel, "dispatch/*"}); err != nil {
+		patterns := append([]string{triageCfg.TriagedLabel}, triageCfg.Namespace.DispatchLabels()...)
+		if err := r.removeIssueLabels(ctx, repo, cwd, item.issue.Number, item.issue.Labels, patterns); err != nil {
 			return err
 		}
 		if commentBody, ok := deps.cycleCommentByIssue[item.issue.Number]; ok {
@@ -1103,7 +1221,7 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID, repo,
 				}
 			}
 		}
-		ready = append(ready, autonomousDispatchCandidate{issue: item.issue, action: action, order: deps.parentOrderByIssue[item.issue.Number], worker: isWorkerDispatch(item.issue)})
+		ready = append(ready, autonomousDispatchCandidate{issue: item.issue, action: action, order: deps.parentOrderByIssue[item.issue.Number], worker: isWorkerDispatch(item.issue, triageCfg.Namespace)})
 	}
 	sortAutonomousDispatchCandidates(ready)
 	budget, preemptWorkers, err := r.dispatchBudget(ctx, projectID, repo, cwd, loaded, ready, downstreamLabels)
@@ -1309,8 +1427,16 @@ func queuePullRequestKey(repo string, prNumber int64) string {
 	return fmt.Sprintf("%s#%d", repo, prNumber)
 }
 
-func isWorkerDispatch(issue triage.Issue) bool {
-	return labels.Has(issue.Labels, dispatch.DispatchImplement)
+func isWorkerDispatch(issue triage.Issue, namespace labels.Namespace) bool {
+	if strings.TrimSpace(namespace.Prefix) == "" {
+		namespace = labels.DefaultNamespace()
+	}
+	for _, label := range issue.Labels {
+		if namespace.IsConfiguredDispatchImplement(label) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeLogin(login string) string {
@@ -1332,6 +1458,8 @@ func (r *Runner) applyReviewAssignments(ctx context.Context, projectID, repo, cw
 		return nil
 	}
 	trigger := reviewerDiscoveryTriggers(reviewerRole.Discovery)
+	namespace := config.ProjectLabelNamespace(r.config, projectID)
+	trigger.Labels = namespace.RemapAll(trigger.Labels)
 	policy := networkpolicy.ProjectPolicyForProject(*r.config, projectID)
 	routed := networkpolicy.IsRouted(policy)
 	if !reviewerRole.Discovery.Enabled && !routed {
@@ -1366,7 +1494,7 @@ func (r *Runner) applyReviewAssignments(ctx context.Context, projectID, repo, cw
 		}
 		authority := len(detail.ReviewRequests) > 0 || len(detail.ReviewRequestUsers) > 0
 		if routed {
-			authority = authority || routedReviewAssignmentAuthority(projectID, routedMemberships, detail)
+			authority = authority || routedReviewAssignmentAuthority(projectID, routedMemberships, detail, namespace)
 		} else {
 			authority = authority || reviewAssignmentMatchesTrigger(detail, trigger)
 		}
@@ -1374,7 +1502,7 @@ func (r *Runner) applyReviewAssignments(ctx context.Context, projectID, repo, cw
 			continue
 		}
 		if routed {
-			if err := r.applyRoutedReviewAssignment(ctx, projectID, repo, cwd, detail, trigger); err != nil {
+			if err := r.applyRoutedReviewAssignment(ctx, projectID, repo, cwd, detail, trigger, namespace); err != nil {
 				return err
 			}
 			continue
@@ -1421,7 +1549,7 @@ func (r *Runner) applyLocalReviewAssignment(ctx context.Context, repo, cwd strin
 	return r.github.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: repo, PRNumber: detail.Number, Reviewers: []string{candidate.Login}, CWD: cwd})
 }
 
-func (r *Runner) applyRoutedReviewAssignment(ctx context.Context, projectID, repo, cwd string, detail githubinfra.PullRequestDetail, trigger config.ReviewerRoleTriggersConfig) error {
+func (r *Runner) applyRoutedReviewAssignment(ctx context.Context, projectID, repo, cwd string, detail githubinfra.PullRequestDetail, trigger config.ReviewerRoleTriggersConfig, namespace labels.Namespace) error {
 	if r.network == nil {
 		return nil
 	}
@@ -1432,7 +1560,7 @@ func (r *Runner) applyRoutedReviewAssignment(ctx context.Context, projectID, rep
 	if status.Membership.NodeID == "" || status.Lease.HolderNodeID != status.Membership.NodeID {
 		return nil
 	}
-	candidate, ok := chooseReviewerCandidate(projectID, status.Memberships, detail, trigger)
+	candidate, ok := chooseReviewerCandidate(projectID, status.Memberships, detail, trigger, namespace)
 	if !ok {
 		if err := r.recordReviewAssignmentStatus(ctx, repo, detail.Number, "no-eligible-node"); err != nil {
 			return err
@@ -1468,7 +1596,7 @@ func (r *Runner) applyRoutedReviewAssignment(ctx context.Context, projectID, rep
 	if err := r.revalidatePullRequestLease(ctx, repo, detail.Number, status.Lease.FencingToken); err != nil {
 		return err
 	}
-	return r.github.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: detail.Number, Labels: []string{wantLabel}, CWD: cwd})
+	return r.github.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: detail.Number, Labels: []string{wantLabel}, LabelNamespace: namespace, CWD: cwd})
 }
 
 func (r *Runner) revalidatePullRequestLease(ctx context.Context, repo string, prNumber int64, fencingToken int64) error {
@@ -1478,7 +1606,7 @@ func (r *Runner) revalidatePullRequestLease(ctx context.Context, repo string, pr
 	return r.network.RevalidateLease(ctx, protocol.CoordinatorLeaseRevalidateRequest{FencingToken: fencingToken, URL: leaseProbeURL(repo, prNumber)})
 }
 
-func chooseReviewerCandidate(projectID string, memberships []protocol.Membership, detail githubinfra.PullRequestDetail, _ config.ReviewerRoleTriggersConfig) (reviewAssignmentCandidate, bool) {
+func chooseReviewerCandidate(projectID string, memberships []protocol.Membership, detail githubinfra.PullRequestDetail, _ config.ReviewerRoleTriggersConfig, namespace labels.Namespace) (reviewAssignmentCandidate, bool) {
 	requested := requestedReviewerAuthority(detail.ReviewRequests, detail.ReviewRequestUsers)
 	candidates := make([]reviewAssignmentCandidate, 0, len(memberships))
 	for _, member := range memberships {
@@ -1496,7 +1624,7 @@ func chooseReviewerCandidate(projectID string, memberships []protocol.Membership
 		if len(requested) > 0 && !requestedReviewerMatches(requested, candidate) {
 			continue
 		}
-		if !reviewAssignmentEligible(detail, reviewerTriggerFromCapability(projectCapability), candidate, protocol.TargetLabelForNode(candidate.NodeName)) {
+		if !reviewAssignmentEligible(detail, reviewerTriggerFromCapability(projectCapability, namespace), candidate, protocol.TargetLabelForNode(candidate.NodeName)) {
 			continue
 		}
 		candidates = append(candidates, candidate)
@@ -1522,7 +1650,7 @@ func reviewerProjectCapability(capabilities []protocol.ReviewerProjectCapability
 	return protocol.ReviewerProjectCapability{}, false
 }
 
-func routedReviewAssignmentAuthority(projectID string, memberships []protocol.Membership, detail githubinfra.PullRequestDetail) bool {
+func routedReviewAssignmentAuthority(projectID string, memberships []protocol.Membership, detail githubinfra.PullRequestDetail, namespace labels.Namespace) bool {
 	for _, member := range memberships {
 		if member.Capabilities.RoutedProjects <= 0 {
 			continue
@@ -1531,19 +1659,19 @@ func routedReviewAssignmentAuthority(projectID string, memberships []protocol.Me
 		if !ok {
 			continue
 		}
-		if reviewAssignmentMatchesTrigger(detail, reviewerTriggerFromCapability(projectCapability)) {
+		if reviewAssignmentMatchesTrigger(detail, reviewerTriggerFromCapability(projectCapability, namespace)) {
 			return true
 		}
 	}
 	return false
 }
 
-func reviewerTriggerFromCapability(capability protocol.ReviewerProjectCapability) config.ReviewerRoleTriggersConfig {
+func reviewerTriggerFromCapability(capability protocol.ReviewerProjectCapability, namespace labels.Namespace) config.ReviewerRoleTriggersConfig {
 	requireReviewRequest := true
 	if capability.RequireReviewRequest != nil {
 		requireReviewRequest = *capability.RequireReviewRequest
 	}
-	return config.ReviewerRoleTriggersConfig{IncludeDrafts: capability.IncludeDrafts, RequireReviewRequest: requireReviewRequest, EnableSelfReview: capability.EnableSelfReview, Labels: append([]string(nil), capability.Labels...), LabelMode: config.LabelMode(capability.LabelMode)}
+	return config.ReviewerRoleTriggersConfig{IncludeDrafts: capability.IncludeDrafts, RequireReviewRequest: requireReviewRequest, EnableSelfReview: capability.EnableSelfReview, Labels: namespace.RemapAll(capability.Labels), LabelMode: config.LabelMode(capability.LabelMode)}
 }
 
 func reviewAssignmentMatchesTrigger(detail githubinfra.PullRequestDetail, trigger config.ReviewerRoleTriggersConfig) bool {
@@ -1731,7 +1859,7 @@ func dependencyTrackedIssue(issue triage.Issue, triagedLabel string, dispatchCfg
 	if !hasExactLabel(issue.Labels, triagedLabel) {
 		return false
 	}
-	dispatchLabel, ok := issueDispatchLabel(issue.Labels)
+	dispatchLabel, ok := issueDispatchLabelForNamespace(issue.Labels, dispatchCfg.Namespace)
 	if !ok {
 		return false
 	}
@@ -1742,25 +1870,29 @@ func dependencyTrackedIssue(issue triage.Issue, triagedLabel string, dispatchCfg
 	return len(removeExistingLabels(triggerLabels, issue.Labels)) > 0
 }
 
-func issueDispatchLabel(labels []string) (string, bool) {
-	match := ""
-	for _, label := range labels {
-		if !strings.HasPrefix(label, "dispatch/") {
+func issueDispatchLabelForNamespace(issueLabels []string, namespace labels.Namespace) (string, bool) {
+	configured := ""
+	for _, label := range issueLabels {
+		if !namespace.IsConfiguredDispatch(label) {
 			continue
 		}
-		if match != "" {
+		if configured != "" {
 			return "", false
 		}
-		match = label
+		if namespace.IsConfiguredDispatchPlan(label) {
+			configured = namespace.DispatchPlan()
+		} else {
+			configured = namespace.DispatchImplement()
+		}
 	}
-	return match, match != ""
+	return configured, configured != ""
 }
 
 func configuredTriggerLabels(dispatchLabel string, cfg dispatch.Config) []string {
-	switch dispatchLabel {
-	case dispatch.DispatchPlan:
+	switch {
+	case cfg.Namespace.IsConfiguredDispatchPlan(dispatchLabel):
 		return append([]string(nil), cfg.PlannerTriggerLabels...)
-	case dispatch.DispatchImplement:
+	case cfg.Namespace.IsConfiguredDispatchImplement(dispatchLabel):
 		return append([]string(nil), cfg.WorkerTriggerLabels...)
 	default:
 		return nil
@@ -1902,6 +2034,13 @@ func roleConfigToDispatchConfig(roleCfg config.CoordinatorRoleConfig, roles conf
 	}
 }
 
+func (r *Runner) projectLabelNamespace(projectID string, metadataJSON *string) labels.Namespace {
+	if r == nil {
+		return labels.DefaultNamespace()
+	}
+	return config.ProjectLabelNamespaceForMetadata(r.config, projectID, metadataJSON)
+}
+
 func requiredDiscoveryLabels(labels []string, labelMode config.LabelMode) []string {
 	if labelMode == config.LabelModeAll {
 		return append([]string(nil), labels...)
@@ -2036,6 +2175,22 @@ func roleConfigToTriageConfig(roleCfg config.CoordinatorRoleConfig) triage.Confi
 		UnclearLabel:          roleCfg.Triage.Disposition.UnclearLabel,
 		ReTriageOnAuthorReply: roleCfg.Triage.Disposition.ReTriageOnAuthorReply,
 	}
+}
+
+// triageCompletionLabel keeps the historical bare marker for the default
+// namespace while isolating custom-namespace coordinator instances from one
+// another. Unlike dispatch and role-trigger labels, the completion marker is
+// configured as a suffix ("triaged") in the role config, so it needs explicit
+// projection when a project opts into a custom namespace.
+func triageCompletionLabel(label string, namespace labels.Namespace) string {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return ""
+	}
+	if strings.TrimSpace(namespace.Prefix) == "" || strings.EqualFold(strings.TrimSpace(namespace.Prefix), labels.Prefix) {
+		return label
+	}
+	return namespace.Label(label)
 }
 
 func mightNeedCoordinatorAction(issue githubinfra.IssueSummary, cfg triage.Config) bool {

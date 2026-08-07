@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MumuTW/looper/internal/agent"
@@ -27,13 +28,13 @@ import (
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/daemonbinary"
 	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/escalator"
 	"github.com/MumuTW/looper/internal/eventlog"
 	"github.com/MumuTW/looper/internal/fixer"
 	"github.com/MumuTW/looper/internal/gatekeeper"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/shell"
 	"github.com/MumuTW/looper/internal/loops"
-	networkclient "github.com/MumuTW/looper/internal/network/client"
 	"github.com/MumuTW/looper/internal/postmergedigest"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/reviewer/convergence"
@@ -42,6 +43,7 @@ import (
 	"github.com/MumuTW/looper/internal/triager"
 	"github.com/MumuTW/looper/internal/version"
 	"github.com/MumuTW/looper/internal/webhookforward"
+	"github.com/MumuTW/looper/internal/webui"
 	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
@@ -147,10 +149,11 @@ type PullRequestTarget struct {
 // vendor of the loop's last run, so the caller can hand a human the exact resume
 // command.
 type TakeoverResult struct {
-	LoopID       string
-	Vendor       string
-	SessionID    string
-	WorktreePath string
+	LoopID          string
+	Vendor          string
+	ReasoningEffort *config.ReasoningEffort
+	SessionID       string
+	WorktreePath    string
 }
 
 type Handler struct {
@@ -159,6 +162,13 @@ type Handler struct {
 	recoverySummary  func() any
 	webhookForwarder webhookforward.Forwarder
 	bootstrap        *bootstrapCodes
+	// webUICache bounds what the /ui/ poll costs when several tabs are open:
+	// the page handler is rebuilt per request, so the cache has to live here.
+	webUICache *webui.LoadCache
+	// webUICollectorState keeps the Escalator's bounded triage cursor across
+	// request-local page handlers. Its pointer survives ServeHTTP's shallow
+	// Handler copy while its mutex protects concurrent web requests.
+	webUICollectorState *webUICollectorState
 	// discardBeforeGitHook is test-only: invoked after discard preflight recheck
 	// and immediately before git reset/clean so tests can inject a requeue race
 	// that bypasses LockLoopRequeue (defense-in-depth for the pre-git recheck).
@@ -174,6 +184,13 @@ type Handler struct {
 	// loopLogsFollowObserve is test-only instrumentation for enforcing the
 	// stream's query/read budgets without coupling tests to SQLite internals.
 	loopLogsFollowObserve func(loopLogsFollowObservation)
+}
+
+type webUICollectorState struct {
+	mu           sync.Mutex
+	collector    *escalator.Collector
+	repositories *storage.Repositories
+	configKey    string
 }
 
 // effectiveConfig returns the live config when ConfigSnapshot is wired, else
@@ -220,11 +237,13 @@ func NewHandler(context Context) *Handler {
 	bootstrap.now = now
 
 	return &Handler{
-		context:          context,
-		now:              now,
-		recoverySummary:  recoverySummary,
-		webhookForwarder: forwarder,
-		bootstrap:        bootstrap,
+		context:             context,
+		now:                 now,
+		recoverySummary:     recoverySummary,
+		webhookForwarder:    forwarder,
+		bootstrap:           bootstrap,
+		webUICache:          webui.NewLoadCache(webui.RefreshInterval, now),
+		webUICollectorState: &webUICollectorState{},
 	}
 }
 
@@ -308,6 +327,13 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, requestID, typed)
 			return
 		}
+	}
+
+	// The hypermedia UI answers in HTML, so it is dispatched before the JSON
+	// route table — but only after the same authorization every JSON read runs.
+	if isWebUIPath(path) {
+		h.handleWebUIRoute(w, r)
+		return
 	}
 
 	switch path {
@@ -437,6 +463,32 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, requestID, internalServerError(err))
 			return
 		}
+		h.writeSuccess(w, requestID, payload)
+		return
+	case apiBasePath + "/gatekeeper/agreements":
+		payload, err := h.buildGatekeeperAgreementsRouteResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+
+		h.writeSuccess(w, requestID, payload)
+		return
+	case apiBasePath + "/gatekeeper/verdicts":
+		payload, err := h.buildGatekeeperVerdictsRouteResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+
 		h.writeSuccess(w, requestID, payload)
 		return
 	case apiBasePath + "/pull-requests":
@@ -920,7 +972,15 @@ func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 		return nil
 	}
 
-	if r.Header.Get("Authorization") != fmt.Sprintf("Bearer %s", *cfg.Server.LocalToken) {
+	authenticatedToken := r.Header.Get("Authorization")
+	if strings.TrimSpace(authenticatedToken) == "" {
+		if cookie, err := r.Cookie(dashboardSessionCookieName); err == nil {
+			if token, ok := dashboardSessionTokenFromCookie(cookie.Value); ok {
+				authenticatedToken = "Bearer " + token
+			}
+		}
+	}
+	if authenticatedToken != fmt.Sprintf("Bearer %s", *cfg.Server.LocalToken) {
 		return apiError{
 			code:    pkgapi.ErrorCodeUnauthorized,
 			status:  http.StatusUnauthorized,
@@ -959,16 +1019,8 @@ func isLoopbackRemoteAddr(remoteAddr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func normalizePath(path string) string {
-	if path == "" {
-		return "/"
-	}
-
-	if len(path) == 1 {
-		return path
-	}
-
-	return strings.TrimRight(path, "/")
+func normalizePath(requestPath string) string {
+	return webui.NormalizePath(requestPath)
 }
 
 func (h *Handler) writeSuccess(w http.ResponseWriter, requestID string, data any) {
@@ -1046,7 +1098,6 @@ type statusResponse struct {
 	ResourceGuard   any                 `json:"resourceGuard"`
 	Webhook         statusWebhook       `json:"webhook"`
 	Loops           statusLoops         `json:"loops"`
-	Network         any                 `json:"network,omitempty"`
 	Safety          statusSafety        `json:"safety"`
 	Notifications   statusNotifications `json:"notifications"`
 	Tools           statusTools         `json:"tools"`
@@ -1274,7 +1325,6 @@ type configResponse struct {
 	Storage       config.StorageConfig      `json:"storage"`
 	Scheduler     config.SchedulerConfig    `json:"scheduler"`
 	Webhook       config.WebhookConfig      `json:"webhook"`
-	Network       config.NetworkConfig      `json:"network"`
 	Agent         configAgentResponse       `json:"agent"`
 	Logging       config.LoggingConfig      `json:"logging"`
 	Notifications config.NotificationConfig `json:"notifications"`
@@ -1299,6 +1349,7 @@ type configRolesResponse struct {
 	Worker      config.WorkerRoleConfig            `json:"worker"`
 	Coordinator config.CoordinatorRoleConfig       `json:"coordinator"`
 	Gatekeeper  config.GatekeeperRoleConfig        `json:"gatekeeper"`
+	Escalator   config.EscalatorRoleConfig         `json:"escalator"`
 }
 
 type configServerResponse struct {
@@ -1309,14 +1360,15 @@ type configServerResponse struct {
 }
 
 type configAgentResponse struct {
-	Vendor       *config.AgentVendor                  `json:"vendor,omitempty"`
-	Model        *string                              `json:"model,omitempty"`
-	Profiles     map[string]config.AgentBindingConfig `json:"profiles,omitempty"`
-	Params       map[string]any                       `json:"params"`
-	Env          map[string]string                    `json:"env"`
-	EnvKeys      []string                             `json:"envKeys"`
-	Timeouts     config.AgentTimeoutConfig            `json:"timeouts"`
-	NativeResume config.AgentNativeResumeConfig       `json:"nativeResume"`
+	Vendor          *config.AgentVendor                  `json:"vendor,omitempty"`
+	Model           *string                              `json:"model,omitempty"`
+	ReasoningEffort *config.ReasoningEffort              `json:"reasoningEffort,omitempty"`
+	Profiles        map[string]config.AgentBindingConfig `json:"profiles,omitempty"`
+	Params          map[string]any                       `json:"params"`
+	Env             map[string]string                    `json:"env"`
+	EnvKeys         []string                             `json:"envKeys"`
+	Timeouts        config.AgentTimeoutConfig            `json:"timeouts"`
+	NativeResume    config.AgentNativeResumeConfig       `json:"nativeResume"`
 }
 
 type configDaemonResponse struct {
@@ -1353,16 +1405,16 @@ func (h *Handler) buildConfigResponse() configResponse {
 		Storage:   cfg.Storage,
 		Scheduler: cfg.Scheduler,
 		Webhook:   cfg.Webhook,
-		Network:   cfg.Network,
 		Agent: configAgentResponse{
-			Vendor:       cfg.Agent.Vendor,
-			Model:        cfg.Agent.Model,
-			Profiles:     cloneAgentProfiles(cfg.Agent.Profiles),
-			Params:       map[string]any{},
-			Env:          map[string]string{},
-			EnvKeys:      sortedMapKeys(cfg.Agent.Env),
-			Timeouts:     cfg.Agent.Timeouts,
-			NativeResume: cfg.Agent.NativeResume,
+			Vendor:          cfg.Agent.Vendor,
+			Model:           cfg.Agent.Model,
+			ReasoningEffort: cfg.Agent.ReasoningEffort,
+			Profiles:        cloneAgentProfiles(cfg.Agent.Profiles),
+			Params:          map[string]any{},
+			Env:             map[string]string{},
+			EnvKeys:         sortedMapKeys(cfg.Agent.Env),
+			Timeouts:        cfg.Agent.Timeouts,
+			NativeResume:    cfg.Agent.NativeResume,
 		},
 		Logging:       cfg.Logging,
 		Notifications: cfg.Notifications,
@@ -1396,6 +1448,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 			Worker:      cfg.Roles.Worker,
 			Coordinator: cfg.Roles.Coordinator,
 			Gatekeeper:  cfg.Roles.Gatekeeper,
+			Escalator:   cfg.Roles.Escalator,
 		},
 		Providers: append([]config.ProviderConfig{}, cfg.Providers...),
 		Projects:  config.RedactProjectSecrets(cfg.Projects),
@@ -1442,6 +1495,10 @@ func cloneAgentProfiles(profiles map[string]config.AgentBindingConfig) map[strin
 		if binding.Model != nil {
 			model := *binding.Model
 			entry.Model = &model
+		}
+		if binding.ReasoningEffort != nil {
+			effort := *binding.ReasoningEffort
+			entry.ReasoningEffort = &effort
 		}
 		cloned[id] = entry
 	}
@@ -1597,7 +1654,6 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 		ResourceGuard:   h.buildResourceGuardStatusResponse(),
 		Webhook:         summarizeWebhookStatus(h.buildWebhookStatusResponse()),
 		Loops:           loopCounts,
-		Network:         h.buildNetworkStatusResponse(),
 		Safety: statusSafety{
 			AllowAutoCommit:    h.context.Config.Defaults.AllowAutoCommit,
 			AllowAutoPush:      h.context.Config.Defaults.AllowAutoPush,
@@ -1633,9 +1689,6 @@ func (h *Handler) buildWorktreeCleanupStatusResponse() any {
 	}
 }
 
-// buildResourceGuardStatusResponse surfaces the last host reading. A scheduler
-// that is withholding slots must be able to say so: without this, a guarded
-// daemon and an idle one look identical from the outside.
 func (h *Handler) buildResourceGuardStatusResponse() any {
 	if runtimeWithGuard, ok := any(h.context.Runtime).(interface {
 		HostAdmissionStatus() looperdruntime.HostAdmissionStatus
@@ -1646,13 +1699,6 @@ func (h *Handler) buildResourceGuardStatusResponse() any {
 		Enabled: h.context.Config.Daemon.ResourceGuard.Enabled,
 		Admit:   true,
 	}
-}
-
-func (h *Handler) buildNetworkStatusResponse() any {
-	if runtimeWithNetwork, ok := any(h.context.Runtime).(interface{ NetworkStatus() networkclient.Status }); ok {
-		return runtimeWithNetwork.NetworkStatus()
-	}
-	return nil
 }
 
 type storageState struct {
@@ -1891,6 +1937,56 @@ type entityEventsResponse struct {
 	Items      []eventResponse `json:"items"`
 }
 
+type gatekeeperAgreementsResponse struct {
+	Items []gatekeeperAgreementResponse `json:"items"`
+}
+
+type gatekeeperVerdictsResponse struct {
+	Items []gatekeeperVerdictResponse `json:"items"`
+}
+
+// gatekeeperAgreementResponse is a read-only projection of the immutable
+// agreement event. The event ID and verdict event ID keep the causal evidence
+// inspectable without exposing the generic event-log payload contract.
+type gatekeeperAgreementResponse struct {
+	ID              string `json:"id"`
+	ProjectID       string `json:"projectId"`
+	Repo            string `json:"repo"`
+	PRNumber        int64  `json:"prNumber"`
+	VerdictEventID  string `json:"verdictEventId"`
+	VerdictEligible bool   `json:"verdictEligible"`
+	VerdictHeadSHA  string `json:"verdictHeadSha,omitempty"`
+	Outcome         string `json:"outcome"`
+	Agreement       bool   `json:"agreement"`
+	TerminalState   string `json:"terminalState"`
+	TerminalHeadSHA string `json:"terminalHeadSha,omitempty"`
+	TerminalAt      string `json:"terminalAt"`
+	RecordedAt      string `json:"recordedAt"`
+	CreatedAt       string `json:"createdAt"`
+}
+
+// gatekeeperVerdictResponse is a read-only projection of the newest immutable
+// Gate report per project/pull request. The event remains the authority; this
+// typed shape keeps clients from decoding generic payloads or re-evaluating
+// merge eligibility from mutable forge state.
+type gatekeeperVerdictResponse struct {
+	ID                        string              `json:"id"`
+	ProjectID                 string              `json:"projectId"`
+	Repo                      string              `json:"repo"`
+	PRNumber                  int64               `json:"prNumber"`
+	Version                   int                 `json:"version"`
+	Mode                      string              `json:"mode"`
+	Status                    string              `json:"status"`
+	Eligible                  bool                `json:"eligible"`
+	ExpectedHeadSHA           string              `json:"expectedHeadSha,omitempty"`
+	ObservedHeadSHA           string              `json:"observedHeadSha,omitempty"`
+	RequiresFreshRevalidation bool                `json:"requiresFreshRevalidation"`
+	Reasons                   []gatekeeper.Reason `json:"reasons"`
+	Evidence                  gatekeeper.Evidence `json:"evidence"`
+	EvaluatedAt               string              `json:"evaluatedAt"`
+	CreatedAt                 string              `json:"createdAt"`
+}
+
 type eventResponse struct {
 	ID               string  `json:"id"`
 	EventType        string  `json:"eventType"`
@@ -1985,7 +2081,8 @@ type loopResponse struct {
 	LastFailureReason *string `json:"lastFailureReason,omitempty"`
 	// Outcome is the latest run's derived outcome, so a loop view shows what that
 	// run actually accomplished rather than only that it failed.
-	Outcome *fixer.FixerRunOutcome `json:"outcome,omitempty"`
+	Outcome      *fixer.FixerRunOutcome `json:"outcome,omitempty"`
+	Continuation *activeRunContinuation `json:"continuation,omitempty"`
 }
 
 type reviewerConvergenceProjection struct {
@@ -2039,12 +2136,15 @@ type projectResponse struct {
 	BaseBranch string `json:"baseBranch"`
 	Archived   bool   `json:"archived"`
 	// Provider is the resolved provider kind for display.
-	Provider     string                     `json:"provider"`
-	Repo         *string                    `json:"repo"`
-	WorktreeRoot *string                    `json:"worktreeRoot"`
-	Validation   *projectValidationResponse `json:"validation,omitempty"`
-	CreatedAt    string                     `json:"createdAt"`
-	UpdatedAt    string                     `json:"updatedAt"`
+	Provider     string  `json:"provider"`
+	Repo         *string `json:"repo"`
+	WorktreeRoot *string `json:"worktreeRoot"`
+	// GatekeeperTrust is omitted for the default observe level; absence means
+	// observe while non-default levels remain visible to operators.
+	GatekeeperTrust string                     `json:"gatekeeperTrust,omitempty"`
+	Validation      *projectValidationResponse `json:"validation,omitempty"`
+	CreatedAt       string                     `json:"createdAt"`
+	UpdatedAt       string                     `json:"updatedAt"`
 	// Discovery reports post-commit worktree/PR discovery status when the
 	// project record carries it; omitted for records that predate it.
 	Discovery *discoveryResponse `json:"discovery,omitempty"`
@@ -2118,25 +2218,26 @@ type activeRunsQuery struct {
 }
 
 type activeRunView struct {
-	Seq               int64              `json:"seq"`
-	RunID             *string            `json:"runId"`
-	LoopID            string             `json:"loopId"`
-	ProjectID         string             `json:"projectId"`
-	Type              string             `json:"type"`
-	Status            string             `json:"status"`
-	LoopStatus        string             `json:"loopStatus"`
-	DisplayStatus     string             `json:"displayStatus"`
-	Attempts          *int64             `json:"attempts,omitempty"`
-	MaxAttempts       *int64             `json:"maxAttempts,omitempty"`
-	LastFailureKind   *string            `json:"lastFailureKind,omitempty"`
-	LastFailureReason *string            `json:"lastFailureReason,omitempty"`
-	ResumePolicy      *string            `json:"resumePolicy,omitempty"`
-	CurrentStep       *string            `json:"currentStep"`
-	StartedAt         *string            `json:"startedAt"`
-	EndedAt           *string            `json:"endedAt,omitempty"`
-	Target            activeRunTarget    `json:"target"`
-	Agent             *activeRunAgent    `json:"agent"`
-	Worktree          *activeRunWorktree `json:"worktree"`
+	Seq               int64                  `json:"seq"`
+	RunID             *string                `json:"runId"`
+	LoopID            string                 `json:"loopId"`
+	ProjectID         string                 `json:"projectId"`
+	Type              string                 `json:"type"`
+	Status            string                 `json:"status"`
+	LoopStatus        string                 `json:"loopStatus"`
+	DisplayStatus     string                 `json:"displayStatus"`
+	Attempts          *int64                 `json:"attempts,omitempty"`
+	MaxAttempts       *int64                 `json:"maxAttempts,omitempty"`
+	LastFailureKind   *string                `json:"lastFailureKind,omitempty"`
+	LastFailureReason *string                `json:"lastFailureReason,omitempty"`
+	ResumePolicy      *string                `json:"resumePolicy,omitempty"`
+	CurrentStep       *string                `json:"currentStep"`
+	StartedAt         *string                `json:"startedAt"`
+	EndedAt           *string                `json:"endedAt,omitempty"`
+	Target            activeRunTarget        `json:"target"`
+	Agent             *activeRunAgent        `json:"agent"`
+	Worktree          *activeRunWorktree     `json:"worktree"`
+	Continuation      *activeRunContinuation `json:"continuation,omitempty"`
 }
 
 type retryLoopRequest struct {
@@ -2179,6 +2280,31 @@ type activeRunWorktree struct {
 	ID     *string `json:"id"`
 	Path   string  `json:"path"`
 	Branch *string `json:"branch"`
+}
+
+// activeRunContinuation is a redacted, read-only projection of a Worker's
+// persisted timeout-retry evidence. It intentionally omits changed file paths
+// and diff contents: the dashboard needs preservation status, not source data.
+type activeRunContinuation struct {
+	PredecessorRunID       string                 `json:"predecessorRunId,omitempty"`
+	PredecessorExecutionID string                 `json:"predecessorExecutionId,omitempty"`
+	Mode                   string                 `json:"mode,omitempty"`
+	Outcome                string                 `json:"outcome,omitempty"`
+	BeforeTimeout          *activeRunProgressView `json:"beforeTimeout,omitempty"`
+	AfterRestart           *activeRunProgressView `json:"afterRestart,omitempty"`
+}
+
+type activeRunProgressView struct {
+	HeadSHA            string `json:"headSha,omitempty"`
+	WorktreeID         string `json:"worktreeId,omitempty"`
+	Branch             string `json:"branch,omitempty"`
+	ChangedFileCount   int    `json:"changedFileCount"`
+	StagedFileCount    int    `json:"stagedFileCount"`
+	UntrackedFileCount int    `json:"untrackedFileCount"`
+	DiffFingerprint    string `json:"diffFingerprint,omitempty"`
+	TimeoutType        string `json:"timeoutType,omitempty"`
+	LastProgressAt     string `json:"lastProgressAt,omitempty"`
+	CapturedAt         string `json:"capturedAt,omitempty"`
 }
 
 type projectService interface {
@@ -2519,6 +2645,134 @@ func (h *Handler) buildPostMergeDigestResponse(ctx context.Context) (postMergeDi
 	}
 	response.Digest = digest
 	return response, nil
+}
+
+const maxGatekeeperAgreementsLimit int64 = 200
+
+func (h *Handler) buildGatekeeperAgreementsRouteResponse(r *http.Request) (gatekeeperAgreementsResponse, error) {
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Events == nil {
+		return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Events repository is not configured"}
+	}
+	if r.Method != http.MethodGet {
+		return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/gatekeeper/agreements")}
+	}
+
+	limit := int64(100)
+	if limitValue := strings.TrimSpace(r.URL.Query().Get("limit")); limitValue != "" {
+		parsed, err := strconv.ParseInt(limitValue, 10, 64)
+		if err != nil || parsed <= 0 || parsed > maxGatekeeperAgreementsLimit {
+			return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("limit must be a positive integer no greater than %d", maxGatekeeperAgreementsLimit)}
+		}
+		limit = parsed
+	}
+
+	projectID := exactOptionalQueryValue(r.URL.Query().Get("projectId"))
+	events, err := services.Repositories.Events.ListByEventType(r.Context(), gatekeeper.AdviceAgreementEventType, projectID, limit)
+	if err != nil {
+		return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+
+	items := make([]gatekeeperAgreementResponse, 0, len(events))
+	for _, event := range events {
+		var agreement gatekeeper.AdviceAgreement
+		if err := json.Unmarshal([]byte(event.PayloadJSON), &agreement); err != nil {
+			return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("decode advise agreement %s: %v", event.ID, err)}
+		}
+		if strings.TrimSpace(agreement.VerdictEventID) == "" || strings.TrimSpace(agreement.Repo) == "" || agreement.PRNumber <= 0 {
+			return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("advise agreement %s is missing its causal identity", event.ID)}
+		}
+		items = append(items, serializeGatekeeperAgreement(event, agreement))
+	}
+
+	return gatekeeperAgreementsResponse{Items: items}, nil
+}
+
+func serializeGatekeeperAgreement(event storage.EventLogRecord, agreement gatekeeper.AdviceAgreement) gatekeeperAgreementResponse {
+	projectID := agreement.ProjectID
+	if strings.TrimSpace(projectID) == "" && event.ProjectID != nil {
+		projectID = strings.TrimSpace(*event.ProjectID)
+	}
+	return gatekeeperAgreementResponse{
+		ID:              event.ID,
+		ProjectID:       projectID,
+		Repo:            agreement.Repo,
+		PRNumber:        agreement.PRNumber,
+		VerdictEventID:  agreement.VerdictEventID,
+		VerdictEligible: agreement.VerdictEligible,
+		VerdictHeadSHA:  agreement.VerdictHeadSHA,
+		Outcome:         string(agreement.Outcome),
+		Agreement:       agreement.Agreement,
+		TerminalState:   agreement.TerminalState,
+		TerminalHeadSHA: agreement.TerminalHeadSHA,
+		TerminalAt:      agreement.TerminalAt,
+		RecordedAt:      agreement.RecordedAt,
+		CreatedAt:       event.CreatedAt,
+	}
+}
+
+const maxGatekeeperVerdictsLimit int64 = 200
+
+func (h *Handler) buildGatekeeperVerdictsRouteResponse(r *http.Request) (gatekeeperVerdictsResponse, error) {
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Events == nil {
+		return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Events repository is not configured"}
+	}
+	if r.Method != http.MethodGet {
+		return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/gatekeeper/verdicts")}
+	}
+
+	limit := int64(100)
+	if limitValue := strings.TrimSpace(r.URL.Query().Get("limit")); limitValue != "" {
+		parsed, err := strconv.ParseInt(limitValue, 10, 64)
+		if err != nil || parsed <= 0 || parsed > maxGatekeeperVerdictsLimit {
+			return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("limit must be a positive integer no greater than %d", maxGatekeeperVerdictsLimit)}
+		}
+		limit = parsed
+	}
+
+	projectID := exactOptionalQueryValue(r.URL.Query().Get("projectId"))
+	events, err := services.Repositories.Events.ListLatestByEventType(r.Context(), gatekeeper.GateReportEventType, projectID, limit)
+	if err != nil {
+		return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+
+	items := make([]gatekeeperVerdictResponse, 0, len(events))
+	for _, event := range events {
+		var report gatekeeper.Report
+		if err := json.Unmarshal([]byte(event.PayloadJSON), &report); err != nil {
+			return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("decode gatekeeper verdict %s: %v", event.ID, err)}
+		}
+		if strings.TrimSpace(report.ProjectID) == "" && event.ProjectID != nil {
+			report.ProjectID = strings.TrimSpace(*event.ProjectID)
+		}
+		if strings.TrimSpace(report.ProjectID) == "" || strings.TrimSpace(report.Repo) == "" || report.PRNumber <= 0 {
+			return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("gatekeeper verdict %s is missing its causal identity", event.ID)}
+		}
+		items = append(items, serializeGatekeeperVerdict(event, report))
+	}
+
+	return gatekeeperVerdictsResponse{Items: items}, nil
+}
+
+func serializeGatekeeperVerdict(event storage.EventLogRecord, report gatekeeper.Report) gatekeeperVerdictResponse {
+	return gatekeeperVerdictResponse{
+		ID:                        event.ID,
+		ProjectID:                 report.ProjectID,
+		Repo:                      report.Repo,
+		PRNumber:                  report.PRNumber,
+		Version:                   report.Version,
+		Mode:                      report.Mode,
+		Status:                    report.Status,
+		Eligible:                  report.Eligible,
+		ExpectedHeadSHA:           report.ExpectedHeadSHA,
+		ObservedHeadSHA:           report.ObservedHeadSHA,
+		RequiresFreshRevalidation: report.RequiresFreshRevalidation,
+		Reasons:                   append([]gatekeeper.Reason{}, report.Reasons...),
+		Evidence:                  report.Evidence,
+		EvaluatedAt:               report.EvaluatedAt,
+		CreatedAt:                 event.CreatedAt,
+	}
 }
 
 func (h *Handler) buildEntityEventsRouteResponse(r *http.Request, path string) (entityEventsResponse, error) {
@@ -3605,6 +3859,7 @@ func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQ
 		}
 	}
 	view.ResumePolicy = resumePolicyFromRun(latestRun)
+	view.Continuation = buildActiveRunContinuation(latestRun)
 	// Do not override a closed loop's status with manual_intervention: the loop
 	// is no longer actionable even if the latest queue item still has that status.
 	if !isClosedLoopStatus(loop.Status) && (isManualInterventionQueue(latestQueue) || (view.ResumePolicy != nil && *view.ResumePolicy == loops.ResumePolicyManualIntervention)) {
@@ -3982,6 +4237,101 @@ func buildWorktreeSummary(loop storage.LoopRecord, run storage.RunRecord) *activ
 		ID:     firstNonEmptyString(readObjectString(checkpointWorktree, "id"), readStringMap(loopMetadata, "worktreeId")),
 		Path:   *path,
 		Branch: firstNonEmptyString(readObjectString(checkpointWorktree, "branch"), readStringMap(loopMetadata, "branch")),
+	}
+}
+
+func buildActiveRunContinuation(run *storage.RunRecord) *activeRunContinuation {
+	if run == nil || run.CheckpointJSON == nil {
+		return nil
+	}
+	checkpoint := parseJSONObject(run.CheckpointJSON)
+	continuation, _ := readOptionalObject(checkpoint, "continuation")
+	meaningfulContinuation := hasMeaningfulTimeoutContinuation(continuation)
+	// A retry can time out again after inheriting a predecessor continuation.
+	// Its own execution evidence is newer than that inherited comparison, so
+	// expose it first while the operator decides how to recover this attempt.
+	if execution, ok := readOptionalObject(checkpoint, "execution"); ok {
+		executionRunID := derefString(readObjectString(execution, "runId"))
+		sameRun := strings.TrimSpace(run.ID) != "" && executionRunID == run.ID
+		if sameRun || !meaningfulContinuation {
+			if progressError := derefString(readObjectString(execution, "progressSnapshotError")); progressError != "" {
+				return &activeRunContinuation{
+					PredecessorRunID:       executionRunID,
+					PredecessorExecutionID: derefString(readObjectString(execution, "executionId")),
+					Mode:                   "timeout_observed",
+					Outcome:                "observation failed",
+				}
+			}
+			if progressBeforeTimeout, hasProgress := readOptionalObject(execution, "progressBeforeTimeout"); hasProgress {
+				return &activeRunContinuation{
+					PredecessorRunID:       executionRunID,
+					PredecessorExecutionID: derefString(readObjectString(execution, "executionId")),
+					Mode:                   "timeout_observed",
+					BeforeTimeout:          buildActiveRunProgress(progressBeforeTimeout),
+				}
+			}
+		}
+	}
+	if meaningfulContinuation {
+		beforeTimeout, _ := readOptionalObject(continuation, "beforeTimeout")
+		afterRestart, _ := readOptionalObject(continuation, "afterRestart")
+		before := buildActiveRunProgress(beforeTimeout)
+		after := buildActiveRunProgress(afterRestart)
+		return &activeRunContinuation{
+			PredecessorRunID:       derefString(readObjectString(continuation, "predecessorRunId")),
+			PredecessorExecutionID: derefString(readObjectString(continuation, "predecessorExecutionId")),
+			Mode:                   derefString(readObjectString(continuation, "mode")),
+			Outcome:                derefString(readObjectString(continuation, "outcome")),
+			BeforeTimeout:          before,
+			AfterRestart:           after,
+		}
+	}
+	return nil
+}
+
+func hasMeaningfulTimeoutContinuation(value map[string]any) bool {
+	if value == nil {
+		return false
+	}
+	for _, key := range []string{"predecessorRunId", "predecessorExecutionId", "mode", "outcome", "beforeTimeout", "afterRestart"} {
+		if _, ok := value[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func buildActiveRunProgress(value map[string]any) *activeRunProgressView {
+	if value == nil {
+		return nil
+	}
+	return &activeRunProgressView{
+		HeadSHA:            derefString(readObjectString(value, "headSha")),
+		WorktreeID:         derefString(readObjectString(value, "worktreeId")),
+		Branch:             derefString(readObjectString(value, "branch")),
+		ChangedFileCount:   readObjectInt(value, "changedFileCount"),
+		StagedFileCount:    readObjectInt(value, "stagedFileCount"),
+		UntrackedFileCount: readObjectInt(value, "untrackedFileCount"),
+		DiffFingerprint:    derefString(readObjectString(value, "diffFingerprint")),
+		TimeoutType:        derefString(readObjectString(value, "timeoutType")),
+		LastProgressAt:     derefString(readObjectString(value, "lastProgressAt")),
+		CapturedAt:         derefString(readObjectString(value, "capturedAt")),
+	}
+}
+
+func readObjectInt(value map[string]any, key string) int {
+	if value == nil {
+		return 0
+	}
+	switch typed := value[key].(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	default:
+		return 0
 	}
 }
 
@@ -4988,7 +5338,8 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 		if refreshErr != nil {
 			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", refreshErr)}
 		}
-		if domain.IsAutoLaneHeld(loopType, labels) {
+		namespace := config.ProjectLabelNamespaceForMetadata(&h.context.Config, projectID, project.MetadataJSON)
+		if domain.IsAutoLaneHeldForNamespace(loopType, labels, namespace) {
 			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}
 		}
 		return nil
@@ -5010,7 +5361,8 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	if refreshErr != nil {
 		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", refreshErr)}
 	}
-	if !domain.IsAutoLaneHeld(loopType, labels) {
+	namespace := config.ProjectLabelNamespaceForMetadata(&h.context.Config, projectID, project.MetadataJSON)
+	if !domain.IsAutoLaneHeldForNamespace(loopType, labels, namespace) {
 		return nil
 	}
 	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}
@@ -6031,7 +6383,7 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 	// Role runs already filter via ParamsForRoleVendor; takeover must do the same
 	// so a Claude role session is not handed a global Codex wrapper resume line.
 	params := agent.ParamsForRoleVendor(h.context.Config.Agent.Params, h.context.Config.Agent.Vendor, vendor, nil)
-	cmdLine, ok := agent.InteractiveResumeCommandLine(agent.ExecutorConfig{Vendor: vendor, Params: params}, result.WorktreePath, result.SessionID)
+	cmdLine, ok := agent.InteractiveResumeCommandLine(agent.ExecutorConfig{Vendor: vendor, ReasoningEffort: result.ReasoningEffort, Params: params}, result.WorktreePath, result.SessionID)
 	resp.Supported = ok
 	if ok {
 		resp.ResumeCommand = cmdLine
@@ -6601,6 +6953,21 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			if err := h.assertDiscardSharedPRWorktreeClear(ctx, repos, *loop); err != nil {
 				return retryResult{}, err
 			}
+			// The operator's discard request is the authority to stop preserving a
+			// timed-out worker's old edits. Clear only that evidence in the same
+			// transaction that publishes its replacement, so a failed requeue never
+			// converts a preservation checkpoint into an unacknowledged discard.
+			if loop.Type == string(domain.LoopTypeWorker) {
+				latestRun, err := repos.Runs.GetLatestByLoopID(ctx, loop.ID)
+				if err != nil {
+					return retryResult{}, err
+				}
+				if latestRun != nil && latestRun.CheckpointJSON != nil {
+					if err := repos.Runs.ClearTimeoutProgress(ctx, latestRun.ID, nowISO); err != nil {
+						return retryResult{}, err
+					}
+				}
+			}
 		}
 
 		target, targetErr := loopTargetFromRecordCompat(*loop)
@@ -6914,6 +7281,7 @@ func (h *Handler) serializeLoopWithDiagnostics(ctx context.Context, loop storage
 		latestRun = run
 	}
 	decorateLoopDiagnostics(&view, latestQueue, latestRun)
+	view.Continuation = buildActiveRunContinuation(latestRun)
 	return view, nil
 }
 
@@ -7268,8 +7636,18 @@ func assertNoActiveSiblingPRWorktreeLoops(existing []storage.LoopRecord, candida
 // local changes without creating a replacement queue item.
 func (h *Handler) assertLoopRetryPreconditions(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) error {
 	if strings.TrimSpace(loop.ProjectID) != "" {
-		if _, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID); err != nil {
+		project, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID)
+		if err != nil {
 			return err
+		}
+		if project != nil {
+			// A legacy project can remain in SQLite while config validation has
+			// quarantined it from scheduler claims. Explicit retry must enforce the
+			// same coding-role admission or it would publish a queue item no worker
+			// can claim.
+			if err := h.validateCodingProjectRunnable(*project, domain.LoopType(loop.Type)); err != nil {
+				return err
+			}
 		}
 	}
 	if loop.Status == string(domain.LoopStatusStopped) || loop.Status == string(domain.LoopStatusTerminated) || loop.Status == string(domain.LoopStatusCompleted) {
@@ -7791,6 +8169,15 @@ func readObject(value map[string]any, key string) map[string]any {
 	return typed
 }
 
+func readOptionalObject(value map[string]any, key string) (map[string]any, bool) {
+	child, ok := value[key]
+	if !ok {
+		return nil, false
+	}
+	typed, ok := child.(map[string]any)
+	return typed, ok
+}
+
 func readObjectString(value map[string]any, key string) *string {
 	return readStringAny(value[key])
 }
@@ -7919,11 +8306,12 @@ func (f *updateProjectStringField) UnmarshalJSON(raw []byte) error {
 }
 
 type updateProjectRequest struct {
-	Repo         updateProjectStringField        `json:"repo"`
-	Name         updateProjectStringField        `json:"name"`
-	BaseBranch   updateProjectStringField        `json:"baseBranch"`
-	WorktreeRoot updateProjectStringField        `json:"worktreeRoot"`
-	Validation   *config.ProjectValidationConfig `json:"validation"`
+	Repo            updateProjectStringField        `json:"repo"`
+	Name            updateProjectStringField        `json:"name"`
+	BaseBranch      updateProjectStringField        `json:"baseBranch"`
+	WorktreeRoot    updateProjectStringField        `json:"worktreeRoot"`
+	Validation      *config.ProjectValidationConfig `json:"validation"`
+	GatekeeperTrust updateProjectStringField        `json:"gatekeeperTrust"`
 }
 
 func updateProjectField(field updateProjectStringField) projects.UpdateStringField {
@@ -7936,9 +8324,12 @@ func (h *Handler) buildUpdateProjectResponse(r *http.Request, service projectSer
 		return nil, *aerr
 	}
 	updated, err := service.UpdateProject(r.Context(), identifier, projects.UpdateInput{
-		Repo: updateProjectField(body.Repo), Name: updateProjectField(body.Name),
-		BaseBranch: updateProjectField(body.BaseBranch), WorktreeRoot: updateProjectField(body.WorktreeRoot),
-		Validation: body.Validation,
+		Repo:            updateProjectField(body.Repo),
+		Name:            updateProjectField(body.Name),
+		BaseBranch:      updateProjectField(body.BaseBranch),
+		WorktreeRoot:    updateProjectField(body.WorktreeRoot),
+		Validation:      body.Validation,
+		GatekeeperTrust: updateProjectField(body.GatekeeperTrust),
 	})
 	if err != nil {
 		var notFound projects.ProjectNotFoundError
@@ -8067,11 +8458,46 @@ func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultB
 		CreatedAt:    project.CreatedAt,
 		UpdatedAt:    project.UpdatedAt,
 	}
+	if trust := projectGatekeeperTrust(project, cfg); trust != config.GatekeeperTrustObserve {
+		response.GatekeeperTrust = string(trust)
+	}
 	if state := projects.DiscoveryStateFromRecord(project); state.Status != "" {
 		serialized := serializeDiscovery(state)
 		response.Discovery = &serialized
 	}
 	return response
+}
+
+// projectGatekeeperTrust reads the effective catalog policy while allowing a
+// freshly updated API-managed record to be reflected before the caller's
+// handler snapshot is refreshed. Empty trust is the documented observe level.
+func projectGatekeeperTrust(project storage.ProjectRecord, cfg config.Config) config.GatekeeperTrustLevel {
+	trust := config.ProjectRoleConfigs(cfg, project.ID).Gatekeeper.Trust
+	metadata := parseProjectMetadata(project.MetadataJSON)
+	if roles, ok := metadata["roles"].(map[string]any); ok {
+		if gatekeeper, ok := roles["gatekeeper"].(map[string]any); ok {
+			if value, ok := gatekeeper["trust"].(string); ok && strings.TrimSpace(value) != "" {
+				trust = config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(value)))
+			}
+		}
+	}
+	switch normalized := config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(trust)))); normalized {
+	case config.GatekeeperTrustAdvise, config.GatekeeperTrustAuto:
+		return normalized
+	default:
+		return config.GatekeeperTrustObserve
+	}
+}
+
+// exactOptionalQueryValue preserves a configured project ID verbatim for the
+// repository filter. Whitespace-only input is treated as omitted, but valid
+// IDs with intentional surrounding whitespace must not be rewritten before the
+// exact SQLite equality check.
+func exactOptionalQueryValue(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	return value
 }
 
 func serializeProjectValidation(metadata map[string]any, cfg config.Config) *projectValidationResponse {

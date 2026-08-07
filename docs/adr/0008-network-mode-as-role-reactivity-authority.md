@@ -1,5 +1,7 @@
 # Per-project `network.mode = routed` is the Authority for Network target-label reactivity
 
+> Status: withdrawn from the supported product by #84. This ADR is retained as historical design context; Routed configuration and runtime maintenance are unavailable.
+
 ## Context
 
 In a Network, multiple Nodes may subscribe to the same repository. Without exact targeting, every Node's reactive Roles sharing the same GitHub identity could race to claim the same GitHub work. The Network-aware Coordinator solves the production side by adding an exact target label (`looper:target:<node_name>`) after applying GitHub-native coarse authority. The consumption side requires a complementary rule preventing Roles from treating Network target labels as meaningful in local-only projects.

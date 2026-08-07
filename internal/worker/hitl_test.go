@@ -1027,7 +1027,21 @@ func TestMidRunHumanMessageSurvivesAndIsDeliveredNextTurn(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
-	worktreePath := filepath.Join(t.TempDir(), "wt")
+	project, err := fixture.repos.Projects.GetByID(ctx, loop.ProjectID)
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	worktreeRoot, err := workerWorktreeRoot(*project)
+	if err != nil {
+		t.Fatalf("workerWorktreeRoot() error = %v", err)
+	}
+	worktreePath := filepath.Join(worktreeRoot, "wt")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(worktree) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, ".git"), []byte("gitdir: /tmp/test\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(.git) error = %v", err)
+	}
 	agent := &appendingAgentExecutor{repos: fixture.repos, loopID: loop.ID, text: "mid-run arrival", at: "2026-04-11T12:00:30.000Z", ask: `{"question":"Which datastore?","options":["redis","postgres"]}`}
 	runner := New(Options{
 		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{},

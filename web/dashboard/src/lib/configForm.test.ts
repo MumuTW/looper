@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { ApiError, type ConfigData } from "./api";
 import {
-  AGENT_VENDOR_OPTIONS,
+	AGENT_REASONING_EFFORT_OPTIONS,
+	AGENT_VENDOR_OPTIONS,
   agentVendorOptionLabel,
   buildConfigPatch,
   CONFIG_GROUPS,
@@ -25,9 +26,10 @@ function fixture(): ConfigData {
     },
     agent: {
       vendor: "codex",
+      reasoningEffort: "medium",
       envKeys: ["OPENAI_API_KEY"],
       profiles: {
-        fast: { vendor: "codex", model: "gpt-5-mini" },
+        fast: { vendor: "codex", model: "gpt-5-mini", reasoningEffort: "high" },
       },
       nativeResume: { enabled: true },
       timeouts: { plannerIdleTimeoutSeconds: 300 },
@@ -191,6 +193,15 @@ describe("config form contract", () => {
     expect(configSelectOptions("agent.profiles.fast.vendor")).toEqual([
       ...AGENT_VENDOR_OPTIONS,
     ]);
+    expect(configSelectOptions("agent.reasoningEffort")).toEqual([
+      ...AGENT_REASONING_EFFORT_OPTIONS,
+    ]);
+    expect(configSelectOptions("agent.profiles.fast.reasoningEffort")).toEqual([
+      ...AGENT_REASONING_EFFORT_OPTIONS,
+    ]);
+    expect(configSelectOptions(roleAgentPath("worker", "reasoningEffort"))).toEqual([
+      ...AGENT_REASONING_EFFORT_OPTIONS,
+    ]);
   });
 
   it("builds patches for agent profiles and role agent bindings without params", () => {
@@ -217,6 +228,19 @@ describe("config form contract", () => {
       "roles.reviewer.agent.vendor",
     ]);
     expect(JSON.stringify(result.body)).not.toMatch(/params/i);
+  });
+
+  it("keeps reasoning-effort-only profiles until their last leaf is unset", () => {
+    const data = fixture();
+    data.agent.profiles = { effortOnly: { reasoningEffort: "high" } };
+    const result = buildConfigPatch(
+      data,
+      { "agent.profiles.effortOnly.reasoningEffort": "" },
+      [],
+    );
+    expect(result.errors).toEqual({});
+    expect(result.body.set).toEqual({});
+    expect(result.body.unset).toEqual(["agent.profiles.effortOnly"]);
   });
 
   it("labels Devin as experimental in operator-facing selectors", () => {
@@ -442,6 +466,7 @@ describe("config form contract", () => {
 
   it("promotes dual profile leaf unsets to whole-profile removal", () => {
     const data = fixture();
+    delete data.agent.profiles.fast.reasoningEffort;
     const result = buildConfigPatch(
       data,
       {},

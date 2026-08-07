@@ -581,6 +581,10 @@ func TestHandlerLoopDetailAndListSurfaceAttemptsAndFailureReason(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
+	checkpoint := `{"continuation":{"predecessorRunId":"run_timeout","predecessorExecutionId":"agent_timeout","mode":"native_resume","outcome":"preserved","beforeTimeout":{"headSha":"before"},"afterRestart":{"headSha":"before"}}}`
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_loop_diag", LoopID: loopID, Status: "success", CheckpointJSON: &checkpoint, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
 
 	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/569", nil)
 	detailRec := httptest.NewRecorder()
@@ -594,6 +598,9 @@ func TestHandlerLoopDetailAndListSurfaceAttemptsAndFailureReason(t *testing.T) {
 	assertEqual(t, detail["maxAttempts"], float64(-1))
 	assertEqual(t, detail["lastFailureKind"], "retryable_transient")
 	assertEqual(t, detail["lastFailureReason"], lastError)
+	continuation := detail["continuation"].(map[string]any)
+	assertEqual(t, continuation["mode"], "native_resume")
+	assertEqual(t, continuation["outcome"], "preserved")
 
 	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops?status=failed", nil)
 	listRec := httptest.NewRecorder()
@@ -652,6 +659,205 @@ func TestHandlerActiveRunsSurfacesResumePolicyManualIntervention(t *testing.T) {
 	assertEqual(t, item["resumePolicy"], "manual_intervention")
 	// No queue item: reason falls back to the latest run error so `looper ps` can show it.
 	assertEqual(t, item["lastFailureReason"], runError)
+}
+
+func TestHandlerActiveRunsProjectsWorkerTimeoutContinuationWithoutPaths(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_timeout_continuation"
+	loopID := "loop_timeout_continuation"
+	targetID := projectID
+	checkpoint := `{
+		"resumePolicy":"manual_intervention",
+		"continuation":{
+			"predecessorRunId":"run_predecessor",
+			"predecessorExecutionId":"agent_predecessor",
+			"mode":"checkpoint_same_worktree",
+			"outcome":"lost",
+			"beforeTimeout":{"headSha":"before-head","worktreeId":"wt_1","branch":"feature/continue","changedFileCount":3,"stagedFileCount":1,"untrackedFileCount":1,"changedFiles":["private.go"],"diffFingerprint":"before-status","timeoutType":"idle","lastProgressAt":"2026-04-11T11:59:00.000Z"},
+			"afterRestart":{"headSha":"before-head","worktreeId":"wt_1","branch":"feature/continue","changedFileCount":0,"stagedFileCount":0,"untrackedFileCount":0,"diffFingerprint":"clean-status","capturedAt":"2026-04-11T12:00:00.000Z"}
+		}
+	}`
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 48, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_timeout_continuation", LoopID: loopID, Status: "failed", CheckpointJSON: &checkpoint, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	items := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("items len = %d, want 1: %#v", len(items), items)
+	}
+	continuation := items[0].(map[string]any)["continuation"].(map[string]any)
+	assertEqual(t, continuation["predecessorRunId"], "run_predecessor")
+	assertEqual(t, continuation["predecessorExecutionId"], "agent_predecessor")
+	assertEqual(t, continuation["mode"], "checkpoint_same_worktree")
+	assertEqual(t, continuation["outcome"], "lost")
+	before := continuation["beforeTimeout"].(map[string]any)
+	assertEqual(t, before["changedFileCount"], float64(3))
+	assertEqual(t, before["diffFingerprint"], "before-status")
+	if _, ok := before["changedFiles"]; ok {
+		t.Fatalf("beforeTimeout = %#v, must not expose persisted file paths", before)
+	}
+}
+
+func TestBuildActiveRunContinuationUsesTimeoutEvidenceBeforeRetry(t *testing.T) {
+	checkpoint := `{
+		"execution":{
+			"runId":"run_timeout",
+			"executionId":"agent_timed_out",
+			"progressBeforeTimeout":{
+				"headSha":"before-head",
+				"worktreeId":"wt_1",
+				"branch":"feature/continue",
+				"changedFileCount":3,
+				"stagedFileCount":1,
+				"untrackedFileCount":1,
+				"diffFingerprint":"before-status",
+				"timeoutType":"idle"
+			}
+		}
+	}`
+
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_timeout", CheckpointJSON: &checkpoint})
+	if continuation == nil {
+		t.Fatal("buildActiveRunContinuation() = nil, want timeout evidence")
+	}
+	assertEqual(t, continuation.PredecessorExecutionID, "agent_timed_out")
+	assertEqual(t, continuation.Mode, "timeout_observed")
+	if continuation.BeforeTimeout == nil {
+		t.Fatal("BeforeTimeout = nil, want timeout evidence")
+	}
+	assertEqual(t, continuation.BeforeTimeout.HeadSHA, "before-head")
+	assertEqual(t, continuation.BeforeTimeout.ChangedFileCount, 3)
+	assertEqual(t, continuation.BeforeTimeout.DiffFingerprint, "before-status")
+	if continuation.AfterRestart != nil {
+		t.Fatalf("AfterRestart = %#v, want nil", continuation.AfterRestart)
+	}
+}
+
+func TestBuildActiveRunContinuationAcceptsLegacyUncorrelatedTimeoutEvidence(t *testing.T) {
+	checkpoint := `{"execution":{"executionId":"agent_legacy","status":"timeout","progressBeforeTimeout":{"headSha":"legacy-head","changedFileCount":2,"diffFingerprint":"legacy-status"}}}`
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_upgraded", CheckpointJSON: &checkpoint})
+	if continuation == nil || continuation.BeforeTimeout == nil {
+		t.Fatalf("buildActiveRunContinuation() = %#v, want legacy timeout evidence", continuation)
+	}
+	assertEqual(t, continuation.PredecessorExecutionID, "agent_legacy")
+	assertEqual(t, continuation.BeforeTimeout.HeadSHA, "legacy-head")
+}
+
+func TestBuildActiveRunContinuationProjectsOutcomeWithoutSnapshots(t *testing.T) {
+	checkpoint := `{"continuation":{"predecessorRunId":"run_timeout","predecessorExecutionId":"agent_timeout","mode":"checkpoint_same_worktree","outcome":"observation failed"}}`
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_retry", CheckpointJSON: &checkpoint})
+	if continuation == nil {
+		t.Fatal("buildActiveRunContinuation() = nil, want outcome-only continuation")
+	}
+	assertEqual(t, continuation.Outcome, "observation failed")
+	if continuation.BeforeTimeout != nil || continuation.AfterRestart != nil {
+		t.Fatalf("continuation = %#v, want no snapshots for outcome-only evidence", continuation)
+	}
+}
+
+func TestBuildActiveRunContinuationPrefersNewestTimeoutEvidenceAfterRetry(t *testing.T) {
+	checkpoint := `{
+		"continuation":{
+			"predecessorRunId":"run_first_timeout",
+			"predecessorExecutionId":"agent_first_timeout",
+			"mode":"checkpoint_same_worktree",
+			"outcome":"preserved",
+			"beforeTimeout":{"headSha":"first-head","diffFingerprint":"first-timeout"},
+			"afterRestart":{"headSha":"first-head","diffFingerprint":"first-restart"}
+		},
+		"execution":{
+			"runId":"run_second_timeout",
+			"executionId":"agent_second_timeout",
+			"progressBeforeTimeout":{
+				"headSha":"second-head",
+				"worktreeId":"wt_1",
+				"branch":"feature/continue",
+				"changedFileCount":5,
+				"diffFingerprint":"second-timeout",
+				"timeoutType":"wall"
+			}
+		}
+	}`
+
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_second_timeout", CheckpointJSON: &checkpoint})
+	if continuation == nil || continuation.BeforeTimeout == nil {
+		t.Fatalf("buildActiveRunContinuation() = %#v, want newest timeout evidence", continuation)
+	}
+	assertEqual(t, continuation.PredecessorExecutionID, "agent_second_timeout")
+	assertEqual(t, continuation.Mode, "timeout_observed")
+	assertEqual(t, continuation.BeforeTimeout.HeadSHA, "second-head")
+	assertEqual(t, continuation.BeforeTimeout.ChangedFileCount, 5)
+	assertEqual(t, continuation.BeforeTimeout.DiffFingerprint, "second-timeout")
+	if continuation.Outcome != "" || continuation.AfterRestart != nil {
+		t.Fatalf("continuation = %#v, must not report older retry outcome", continuation)
+	}
+}
+
+func TestBuildActiveRunContinuationReportsObservationError(t *testing.T) {
+	checkpoint := `{"execution":{"runId":"run_timeout","executionId":"agent_timeout","status":"timeout","progressSnapshotError":"git status unavailable"}}`
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_timeout", CheckpointJSON: &checkpoint})
+	if continuation == nil {
+		t.Fatal("buildActiveRunContinuation() = nil, want failed-observation projection")
+	}
+	assertEqual(t, continuation.PredecessorRunID, "run_timeout")
+	assertEqual(t, continuation.PredecessorExecutionID, "agent_timeout")
+	assertEqual(t, continuation.Mode, "timeout_observed")
+	assertEqual(t, continuation.Outcome, "observation failed")
+	if continuation.BeforeTimeout != nil || continuation.AfterRestart != nil {
+		t.Fatalf("continuation = %#v, want no partial progress snapshot", continuation)
+	}
+}
+
+func TestBuildActiveRunContinuationPrefersObservationErrorOverPartialSnapshot(t *testing.T) {
+	checkpoint := `{"execution":{"runId":"run_timeout","executionId":"agent_timeout","status":"timeout","progressSnapshotError":"worktree changed after termination","progressBeforeTimeout":{"headSha":"before-head","diffFingerprint":"before-status"}}}`
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_timeout", CheckpointJSON: &checkpoint})
+	if continuation == nil {
+		t.Fatal("buildActiveRunContinuation() = nil, want failed-observation projection")
+	}
+	assertEqual(t, continuation.Outcome, "observation failed")
+	if continuation.BeforeTimeout != nil || continuation.AfterRestart != nil {
+		t.Fatalf("continuation = %#v, want error to suppress partial snapshot", continuation)
+	}
+}
+
+func TestBuildActiveRunContinuationProjectsWorkerRetryOutcome(t *testing.T) {
+	checkpoint := `{"execution":{"status":"completed","runId":"run_retry","executionId":"agent_retry"},"continuation":{"predecessorRunId":"run_timeout","predecessorExecutionId":"agent_timeout","mode":"checkpoint_same_worktree","outcome":"preserved","beforeTimeout":{"headSha":"before-head","diffFingerprint":"before-status"},"afterRestart":{"headSha":"before-head","diffFingerprint":"before-status"}}}`
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_retry", CheckpointJSON: &checkpoint})
+	if continuation == nil || continuation.BeforeTimeout == nil || continuation.AfterRestart == nil {
+		t.Fatalf("buildActiveRunContinuation() = %#v, want persisted retry comparison", continuation)
+	}
+	assertEqual(t, continuation.PredecessorRunID, "run_timeout")
+	assertEqual(t, continuation.PredecessorExecutionID, "agent_timeout")
+	assertEqual(t, continuation.Mode, "checkpoint_same_worktree")
+	assertEqual(t, continuation.Outcome, "preserved")
+}
+
+func TestBuildActiveRunContinuationIgnoresInheritedExecutionForRetryComparison(t *testing.T) {
+	checkpoint := `{"execution":{"runId":"run_timeout","executionId":"agent_timeout","progressBeforeTimeout":{"headSha":"old-head","diffFingerprint":"old-timeout"}},"continuation":{"predecessorRunId":"run_timeout","predecessorExecutionId":"agent_timeout","mode":"checkpoint_same_worktree","outcome":"changed","beforeTimeout":{"headSha":"old-head","diffFingerprint":"old-timeout"},"afterRestart":{"headSha":"new-head","diffFingerprint":"new-timeout"}}}`
+
+	continuation := buildActiveRunContinuation(&storage.RunRecord{ID: "run_retry", CheckpointJSON: &checkpoint})
+	if continuation == nil || continuation.AfterRestart == nil {
+		t.Fatalf("buildActiveRunContinuation() = %#v, want retry comparison", continuation)
+	}
+	assertEqual(t, continuation.PredecessorRunID, "run_timeout")
+	assertEqual(t, continuation.Mode, "checkpoint_same_worktree")
+	assertEqual(t, continuation.Outcome, "changed")
+	assertEqual(t, continuation.AfterRestart.HeadSHA, "new-head")
 }
 
 // Successful completeRun summaries must not populate lastFailureReason when there
@@ -1176,6 +1382,7 @@ func TestHandlerStatusUsesLiveConfigForReviewPublishReadiness(t *testing.T) {
 func TestBuildConfigResponseExposesCanonicalCodingRoles(t *testing.T) {
 	_, cfg := startTestRuntime(t)
 	cfg.Roles.Gatekeeper = config.GatekeeperRoleConfig{Trust: config.GatekeeperTrustAuto, Strategy: config.MergeStrategyRebase}
+	cfg.Roles.Escalator = config.EscalatorRoleConfig{Enabled: true, CadenceSeconds: 600, MaxItems: 42}
 	worker := config.EffectiveCodingRoles(cfg.Roles)[config.CodingRoleWorker]
 	worker.Priority = 7
 	worker.Discovery.Enabled = false
@@ -1192,12 +1399,33 @@ func TestBuildConfigResponseExposesCanonicalCodingRoles(t *testing.T) {
 	if response.Roles.Gatekeeper.Trust != config.GatekeeperTrustAuto || response.Roles.Gatekeeper.Strategy != config.MergeStrategyRebase {
 		t.Fatalf("roles.gatekeeper = %#v, want inspectable auto/rebase authority", response.Roles.Gatekeeper)
 	}
+	if !response.Roles.Escalator.Enabled || response.Roles.Escalator.CadenceSeconds != 600 || response.Roles.Escalator.MaxItems != 42 {
+		t.Fatalf("roles.escalator = %#v, want effective Escalator settings", response.Roles.Escalator)
+	}
 	raw, err := json.Marshal(response.Roles.Reviewer)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(raw), "autoMerge") {
 		t.Fatalf("retired Reviewer auto-merge leaked into config response: %s", raw)
+	}
+}
+
+func TestBuildConfigResponseExposesReasoningEffort(t *testing.T) {
+	_, cfg := startTestRuntime(t)
+	effort := config.ReasoningEffortVeryHigh
+	cfg.Agent.ReasoningEffort = &effort
+	cfg.Agent.Profiles = map[string]config.AgentBindingConfig{
+		"deep": {ReasoningEffort: &effort},
+	}
+
+	response := NewHandler(Context{Config: cfg}).buildConfigResponse()
+	if response.Agent.ReasoningEffort == nil || *response.Agent.ReasoningEffort != effort {
+		t.Fatalf("agent.reasoningEffort = %v, want xhigh", response.Agent.ReasoningEffort)
+	}
+	profile := response.Agent.Profiles["deep"]
+	if profile.ReasoningEffort == nil || *profile.ReasoningEffort != effort {
+		t.Fatalf("agent.profiles.deep.reasoningEffort = %v, want xhigh", profile.ReasoningEffort)
 	}
 }
 
@@ -2227,6 +2455,8 @@ func TestHandlerEventAndPullRequestRoutesMatchFrozenSuccessArtifacts(t *testing.
 	}{
 		{routeID: "events.list", method: http.MethodGet, path: "/api/v1/events?limit=1"},
 		{routeID: "events.entity", method: http.MethodGet, path: "/api/v1/events/loop/loop_1"},
+		{routeID: "gatekeeper.agreements", method: http.MethodGet, path: "/api/v1/gatekeeper/agreements?limit=1"},
+		{routeID: "gatekeeper.verdicts", method: http.MethodGet, path: "/api/v1/gatekeeper/verdicts?limit=1"},
 		{routeID: "pullRequests.list", method: http.MethodGet, path: "/api/v1/pull-requests"},
 		{routeID: "pullRequests.detail", method: http.MethodGet, path: "/api/v1/pull-requests/acme%2Flooper/42"},
 		{routeID: "pullRequests.status", method: http.MethodGet, path: "/api/v1/pull-requests/acme%2Flooper/42/status"},
@@ -2605,6 +2835,54 @@ func TestHandlerProjectsPatchDistinguishesNullFromOmittedFields(t *testing.T) {
 	}
 	if got.Name.Set || got.BaseBranch.Set || got.WorktreeRoot.Set {
 		t.Fatalf("omitted patch fields = %#v, want unset", got)
+	}
+}
+
+func TestHandlerProjectsPatchPromotesGatekeeperTrust(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	metadata := `{"repo":"acme/looper","source":"api","validation":{"optOut":true}}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "project_a", Name: "Project A", RepoPath: "/tmp/project-a", BaseBranch: stringPtr("main"),
+		MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPatch, "/api/v1/projects/project_a", bytes.NewReader([]byte(`{"gatekeeperTrust":"advise"}`))))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, data["id"], "project_a")
+	assertEqual(t, data["gatekeeperTrust"], "advise")
+	stored, err := fixture.runtime.Services().Repositories.Projects.GetByID(context.Background(), "project_a")
+	if err != nil || stored == nil || stored.MetadataJSON == nil {
+		t.Fatalf("Projects.GetByID() = %#v, %v, want promoted project", stored, err)
+	}
+	if !strings.Contains(*stored.MetadataJSON, `"trust":"advise"`) {
+		t.Fatalf("metadata = %s, want advise trust", *stored.MetadataJSON)
+	}
+}
+
+func TestHandlerProjectsPatchMapsGatekeeperPromotionValidation(t *testing.T) {
+	fixture := newTestFixture(t)
+	var got projects.UpdateInput
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, ProjectsService: fakeProjectService{
+		updateProject: func(_ context.Context, _ string, input projects.UpdateInput) (storage.ProjectRecord, error) {
+			got = input
+			return storage.ProjectRecord{ID: "project_a", Name: "Project A", RepoPath: "/tmp/project-a"}, projects.ProjectValidationError{Message: "project is managed by config"}
+		},
+	}})
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPatch, "/api/v1/projects/project_a", bytes.NewReader([]byte(`{"gatekeeperTrust":"auto"}`))))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !got.GatekeeperTrust.Set || got.GatekeeperTrust.Value == nil || *got.GatekeeperTrust.Value != "auto" {
+		t.Fatalf("gatekeeper trust input = %#v, want auto", got.GatekeeperTrust)
 	}
 }
 
@@ -3193,18 +3471,20 @@ func TestTakeoverLoopFiltersCrossVendorResumeParams(t *testing.T) {
 
 	// Same-vendor takeover keeps the global wrapper binary.
 	h.context.TakeoverLoop = func(_ context.Context, loopID, _ string) (TakeoverResult, error) {
+		effort := config.ReasoningEffortHigh
 		return TakeoverResult{
-			LoopID:       loopID,
-			Vendor:       string(config.AgentVendorCodex),
-			SessionID:    "session_codex",
-			WorktreePath: "/tmp/wt-codex",
+			LoopID:          loopID,
+			Vendor:          string(config.AgentVendorCodex),
+			ReasoningEffort: &effort,
+			SessionID:       "session_codex",
+			WorktreePath:    "/tmp/wt-codex",
 		}, nil
 	}
 	resp, err = h.takeoverLoop(context.Background(), "loop_same")
 	if err != nil {
 		t.Fatalf("same-vendor takeoverLoop error = %v", err)
 	}
-	wantSame := "cd /tmp/wt-codex && /opt/codex-wrapper resume session_codex"
+	wantSame := "cd /tmp/wt-codex && /opt/codex-wrapper -c model_reasoning_effort=high resume session_codex"
 	if !resp.Supported || resp.ResumeCommand != wantSame {
 		t.Fatalf("same-vendor resume = %q (supported=%v), want %q", resp.ResumeCommand, resp.Supported, wantSame)
 	}
@@ -8372,6 +8652,15 @@ func seedEventAndPullRequestRouteData(t *testing.T, rt *looperdruntime.Runtime) 
 		CreatedAt:        nowISO,
 	}); err != nil {
 		t.Fatalf("Events.Append(event_1) error = %v", err)
+	}
+
+	if err := rt.Services().Repositories.Events.Append(context.Background(), storage.EventLogRecord{
+		ID: "agreement_1", EventType: gatekeeper.AdviceAgreementEventType,
+		ProjectID: stringPtr("project_1"), EntityType: stringPtr("pull_request"), EntityID: stringPtr("acme/looper#42"),
+		CausationID: stringPtr("event_gate_1"), PayloadJSON: `{"version":1,"verdictEventId":"event_gate_1","projectId":"project_1","repo":"acme/looper","prNumber":42,"verdictEligible":true,"verdictHeadSha":"abc123","outcome":"merged_as_is","agreement":true,"terminalState":"MERGED","terminalHeadSha":"abc123","terminalAt":"2026-04-11T12:00:00.000Z","recordedAt":"2026-04-11T11:59:00.000Z"}`,
+		CreatedAt: "2026-04-11T11:59:00.000Z",
+	}); err != nil {
+		t.Fatalf("Events.Append(agreement_1) error = %v", err)
 	}
 
 	if err := rt.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{

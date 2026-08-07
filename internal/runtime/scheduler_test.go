@@ -17,6 +17,7 @@ import (
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/coordinator"
 	"github.com/MumuTW/looper/internal/fixer"
+	"github.com/MumuTW/looper/internal/gatekeeper"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/planner"
@@ -42,7 +43,7 @@ func allowedQueueTypesFromRunners(input defaultSchedulerTickInput) []string {
 func TestWorkerAgentExecutionAdapterPropagatesParseStatus(t *testing.T) {
 	t.Parallel()
 
-	adapter := workerAgentExecutionAdapter{execution: stubAgentExecution{result: agent.Result{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed", ChangedFiles: []string{"worker.go"}, Commits: []string{"abc123"}}}}
+	adapter := workerAgentExecutionAdapter{execution: stubAgentExecution{result: agent.Result{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed", ChangedFiles: []string{"worker.go"}, Commits: []string{"abc123"}, NativeResumeMode: "native_resume", NativeResumeStatus: "started"}}}
 
 	result, err := adapter.Wait(context.Background())
 	if err != nil {
@@ -51,7 +52,7 @@ func TestWorkerAgentExecutionAdapterPropagatesParseStatus(t *testing.T) {
 	if result.ParseStatus != "parsed" {
 		t.Fatalf("ParseStatus = %q, want parsed", result.ParseStatus)
 	}
-	if result.Status != "completed" || result.Summary != "done" || result.Stdout != "ok" || len(result.ChangedFiles) != 1 || result.ChangedFiles[0] != "worker.go" || len(result.Commits) != 1 || result.Commits[0] != "abc123" {
+	if result.Status != "completed" || result.Summary != "done" || result.Stdout != "ok" || len(result.ChangedFiles) != 1 || result.ChangedFiles[0] != "worker.go" || len(result.Commits) != 1 || result.Commits[0] != "abc123" || result.NativeResumeMode != "native_resume" || result.NativeResumeStatus != "started" {
 		t.Fatalf("result = %#v, want propagated agent result fields", result)
 	}
 }
@@ -266,6 +267,150 @@ func TestRunDefaultSchedulerTickSkipsCoordinatorWhenDisabled(t *testing.T) {
 	}
 	if len(runner.discoverCalls) != 0 {
 		t.Fatalf("coordinator discover calls = %#v, want none when disabled", runner.discoverCalls)
+	}
+	if len(runner.maintenanceCalls) != 1 || runner.maintenanceCalls[0].Repo != "MumuTW/looper" {
+		t.Fatalf("coordinator maintenance calls = %#v, want one migration cleanup despite disabled discovery", runner.maintenanceCalls)
+	}
+}
+
+func TestRunDefaultSchedulerTickReconcilesArchivedProjectFromStoredRepo(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-archived-cleanup.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	baseBranch := "main"
+	metadata := `{"repo":"MumuTW/looper"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "archived", Name: "Archived", RepoPath: filepath.Join(workingDir, "repo"), BaseBranch: &baseBranch, MetadataJSON: &metadata, Archived: true, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	coordinatorRunner := &stubCoordinatorScheduler{}
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{Repos: repos, Now: func() time.Time { return now }, Coordinator: coordinatorRunner}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if len(coordinatorRunner.maintenanceCalls) != 1 || coordinatorRunner.maintenanceCalls[0].ProjectID != "archived" || coordinatorRunner.maintenanceCalls[0].Repo != "MumuTW/looper" {
+		t.Fatalf("maintenance calls = %#v, want archived stored binding", coordinatorRunner.maintenanceCalls)
+	}
+}
+
+func TestRunDefaultSchedulerTickReconcilesProjectMissingFromCatalog(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-missing-cleanup.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinatorRunner := &stubCoordinatorScheduler{}
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{Repos: repos, Now: func() time.Time { return now }, Config: &cfg, Coordinator: coordinatorRunner}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if len(coordinatorRunner.maintenanceCalls) != 1 || coordinatorRunner.maintenanceCalls[0].Repo != "MumuTW/looper" {
+		t.Fatalf("maintenance calls = %#v, want stored binding for missing catalog project", coordinatorRunner.maintenanceCalls)
+	}
+}
+
+func TestRunDefaultSchedulerTickSkipsCompletedRetiredAutoMergeCleanup(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	dbCoordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-cleanup-cadence.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(dbCoordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := coordinator.NewRuntimeState()
+	coordinatorRunner := &stubCoordinatorScheduler{}
+	input := defaultSchedulerTickInput{Repos: repos, Now: func() time.Time { return now }, Config: &cfg, Coordinator: coordinatorRunner, CoordinatorState: state}
+	if err := runDefaultSchedulerTick(context.Background(), input); err != nil {
+		t.Fatalf("first runDefaultSchedulerTick() error = %v", err)
+	}
+	if err := runDefaultSchedulerTick(context.Background(), input); err != nil {
+		t.Fatalf("second runDefaultSchedulerTick() error = %v", err)
+	}
+	if len(coordinatorRunner.maintenanceCalls) != 1 {
+		t.Fatalf("maintenance calls = %#v, want one successful pass for daemon lifetime", coordinatorRunner.maintenanceCalls)
+	}
+}
+
+func TestRunDefaultSchedulerTickUsesDaemonCWDForArchivedCleanup(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	dbCoordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-cleanup-cwd.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(dbCoordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	missingRepoPath := filepath.Join(workingDir, "deleted-checkout")
+	baseBranch := "main"
+	metadata := `{"repo":"MumuTW/looper"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "archived", Name: "Archived", RepoPath: missingRepoPath, BaseBranch: &baseBranch, MetadataJSON: &metadata, Archived: true, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinatorRunner := &stubCoordinatorScheduler{}
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{Repos: repos, Now: func() time.Time { return now }, Config: &cfg, Coordinator: coordinatorRunner}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if len(coordinatorRunner.maintenanceCalls) != 1 {
+		t.Fatalf("maintenance calls = %#v, want one archived cleanup", coordinatorRunner.maintenanceCalls)
+	}
+	if got := coordinatorRunner.maintenanceCalls[0].CWD; got != workingDir || got == missingRepoPath {
+		t.Fatalf("maintenance CWD = %q, want valid daemon working directory %q", got, workingDir)
+	}
+}
+
+func TestCatalogWebhookGatekeeperWaitsForRetiredCleanup(t *testing.T) {
+	t.Parallel()
+	state := coordinator.NewRuntimeState()
+	runner := &fakeGatekeeperScheduler{}
+	adapter := catalogWebhookGatekeeper{
+		snapshot: func() gatekeeperScheduler { return runner },
+		maintenanceCleanupReady: func(projectID, repo string) bool {
+			return state.RetiredAutoMergeCleanupReady(projectID, repo)
+		},
+	}
+	input := gatekeeper.EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"}
+	if _, err := adapter.EvaluatePullRequest(context.Background(), input); err == nil || !strings.Contains(err.Error(), "retired auto-merge cleanup") {
+		t.Fatalf("EvaluatePullRequest() error = %v, want cleanup barrier", err)
+	}
+	state.SetRetiredAutoMergeCleanupReady(input.ProjectID, input.Repo, true)
+	if _, err := adapter.EvaluatePullRequest(context.Background(), input); err != nil {
+		t.Fatalf("EvaluatePullRequest() after cleanup error = %v", err)
+	}
+}
+
+func TestRunDefaultSchedulerTickBlocksGatekeeperAfterCleanupFailure(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-cleanup-barrier.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Name: "Looper", Repo: "MumuTW/looper", RepoPath: filepath.Join(workingDir, "repo")}}
+	cleanupErr := errors.New("legacy auto-merge cleanup unavailable")
+	coordinatorRunner := &stubCoordinatorScheduler{maintenanceErr: cleanupErr}
+	gatekeeperRunner := &fakeGatekeeperScheduler{}
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{Repos: repos, Now: func() time.Time { return now }, Config: &cfg, Coordinator: coordinatorRunner, Gatekeeper: gatekeeperRunner}); err == nil || !strings.Contains(err.Error(), cleanupErr.Error()) {
+		t.Fatalf("runDefaultSchedulerTick() error = %v, want cleanup error", err)
+	}
+	if gatekeeperRunner.discoveryInput.Repo != "" {
+		t.Fatalf("Gatekeeper discovery input = %#v, want cleanup barrier", gatekeeperRunner.discoveryInput)
 	}
 }
 
@@ -1511,9 +1656,11 @@ type stubPlannerScheduler struct {
 }
 
 type stubCoordinatorScheduler struct {
-	mu            sync.Mutex
-	discoverCalls []coordinator.DiscoveryInput
-	discoverErr   error
+	mu               sync.Mutex
+	discoverCalls    []coordinator.DiscoveryInput
+	maintenanceCalls []coordinator.RetiredAutoMergeInput
+	discoverErr      error
+	maintenanceErr   error
 }
 
 type immediateSchedulerRunner struct{}
@@ -1760,6 +1907,14 @@ func (s *stubCoordinatorScheduler) DiscoverIssues(_ context.Context, input coord
 	s.discoverCalls = append(s.discoverCalls, input)
 	s.mu.Unlock()
 	return coordinator.DiscoveryResult{Ticked: true}, s.discoverErr
+}
+
+func (s *stubCoordinatorScheduler) ReconcileRetiredAutoMerge(_ context.Context, input coordinator.RetiredAutoMergeInput) error {
+	s.mu.Lock()
+	s.maintenanceCalls = append(s.maintenanceCalls, input)
+	err := s.maintenanceErr
+	s.mu.Unlock()
+	return err
 }
 
 type stubReviewerScheduler struct {

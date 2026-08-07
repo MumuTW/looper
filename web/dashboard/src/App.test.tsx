@@ -200,6 +200,56 @@ describe("triage confirmation status", () => {
       }
       if (path === "/api/v1/runs/active") return response({ items: [] });
       if (path === "/api/v1/projects") return response({ items: [] });
+      if (path.startsWith("/api/v1/gatekeeper/agreements")) {
+        return response({
+          items: [
+            {
+              id: "agreement_1",
+              projectId: "project_1",
+              repo: "acme/looper",
+              prNumber: 42,
+              verdictEventId: "verdict_1",
+              verdictEligible: true,
+              outcome: "merged_as_is",
+              agreement: true,
+              terminalState: "MERGED",
+              terminalAt: "2026-07-30T12:00:00Z",
+              recordedAt: "2026-07-30T12:00:00Z",
+              createdAt: "2026-07-30T12:00:00Z",
+            },
+          ],
+        });
+      }
+      if (path.startsWith("/api/v1/gatekeeper/verdicts")) {
+        return response({
+          items: [
+            {
+              id: "verdict_1",
+              projectId: "project_1",
+              repo: "acme/gate",
+              prNumber: 99,
+              version: 2,
+              mode: "advise",
+              status: "blocked",
+              eligible: false,
+              observedHeadSha: "head-42",
+              requiresFreshRevalidation: true,
+              reasons: [{ code: "hold", subject: "looper:hold" }],
+              evidence: {
+                draft: false,
+                requiredChecks: [],
+                checks: [],
+                requiredApprovingReviewCount: 1,
+                unresolvedReviewThreadIds: [],
+                holdLabels: ["looper:hold"],
+                projectPolicyPermitsTarget: true,
+              },
+              evaluatedAt: "2026-07-30T12:00:00Z",
+              createdAt: "2026-07-30T12:00:00Z",
+            },
+          ],
+        });
+      }
       if (path.startsWith("/api/v1/loops")) return response({ items: [] });
       return bootstrapRouteAbsent();
     });
@@ -209,7 +259,7 @@ describe("triage confirmation status", () => {
 
     expect(await screen.findByText("Awaiting human confirmation")).toBeTruthy();
     expect(screen.getByText("2")).toBeTruthy();
-    expect(screen.getByText(/acme\/looper#42/)).toBeTruthy();
+    expect(screen.getAllByText(/acme\/looper#42/)).toHaveLength(2);
     expect(screen.getByText(/acme\/looper#43/)).toBeTruthy();
     expect(screen.getByText(/waiting 1h/)).toBeTruthy();
     expect(screen.getByText(/waiting 15m/)).toBeTruthy();
@@ -217,5 +267,10 @@ describe("triage confirmation status", () => {
     expect(screen.getByText("/plan triage-confirm-a1")).toBeTruthy();
     expect(screen.getByText("/plan triage-confirm-b2")).toBeTruthy();
     expect(screen.getAllByRole("button", { name: /copy/i })).toHaveLength(2);
+    expect(await screen.findByText("merged_as_is")).toBeTruthy();
+    expect(await screen.findByText(/blocked/)).toBeTruthy();
+    expect(screen.getByText("acme/gate#99")).toBeTruthy();
+    expect(screen.getByText("hold (looper:hold)")).toBeTruthy();
+    expect(screen.getAllByText(/acme\/looper#42/)).toHaveLength(2);
   });
 });

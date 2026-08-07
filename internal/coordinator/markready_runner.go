@@ -64,7 +64,7 @@ func (r *Runner) markReadyCandidates(ctx context.Context, repo, cwd string, role
 // on top of a pipeline that works without it, so a forge hiccup leaves the
 // draft alone and the next tick tries again rather than aborting discovery and
 // stalling triage and dispatch behind an optional lane.
-func (r *Runner) applyMarkReady(ctx context.Context, repo, cwd string, issue loadedIssue, currentLogin string, candidates map[int64]struct{}, triagedLabel string) {
+func (r *Runner) applyMarkReady(ctx context.Context, repo, cwd string, issue loadedIssue, currentLogin string, candidates map[int64]struct{}, triagedLabel string, namespace labels.Namespace) {
 	if len(candidates) == 0 {
 		return
 	}
@@ -76,7 +76,7 @@ func (r *Runner) applyMarkReady(ctx context.Context, repo, cwd string, issue loa
 		r.logMarkReadySkip(repo, issue.detail.Number, 0, "revalidate issue", err)
 		return
 	}
-	if !strings.EqualFold(strings.TrimSpace(freshIssue.State), "open") || !issueHasCoordinatorTracking(freshIssue.Labels, triagedLabel) {
+	if !strings.EqualFold(strings.TrimSpace(freshIssue.State), "open") || !issueHasCoordinatorTracking(freshIssue.Labels, triagedLabel, namespace) {
 		return
 	}
 	issue.detail = freshIssue
@@ -84,17 +84,17 @@ func (r *Runner) applyMarkReady(ctx context.Context, repo, cwd string, issue loa
 		if _, ok := candidates[prNumber]; !ok {
 			continue
 		}
-		r.applyMarkReadyForPullRequest(ctx, repo, cwd, issue.detail.Number, prNumber, currentLogin, triagedLabel)
+		r.applyMarkReadyForPullRequest(ctx, repo, cwd, issue.detail.Number, prNumber, currentLogin, triagedLabel, namespace)
 	}
 }
 
-func (r *Runner) applyMarkReadyForPullRequest(ctx context.Context, repo, cwd string, issueNumber, prNumber int64, currentLogin, triagedLabel string) {
+func (r *Runner) applyMarkReadyForPullRequest(ctx context.Context, repo, cwd string, issueNumber, prNumber int64, currentLogin, triagedLabel string, namespace labels.Namespace) {
 	detail, err := r.github.ViewPullRequestMergeWatch(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		r.logMarkReadySkip(repo, issueNumber, prNumber, "read pull request", err)
 		return
 	}
-	snapshot := markReadySnapshot(repo, issueNumber, prNumber, detail, currentLogin)
+	snapshot := markReadySnapshot(repo, issueNumber, prNumber, detail, currentLogin, namespace)
 	// First pass over the guards that need nothing but the Pull Request
 	// itself. A draft that already fails one of those is left alone without
 	// spending the timeline, check-run, branch-protection, and commit reads
@@ -152,7 +152,7 @@ func (r *Runner) applyMarkReadyForPullRequest(ctx context.Context, repo, cwd str
 		r.logMarkReadySkip(repo, issueNumber, prNumber, "revalidate pull request", err)
 		return
 	}
-	confirming := markReadySnapshot(repo, issueNumber, prNumber, confirmDetail, currentLogin)
+	confirming := markReadySnapshot(repo, issueNumber, prNumber, confirmDetail, currentLogin, namespace)
 	if !strings.EqualFold(strings.TrimSpace(detail.HeadSHA), strings.TrimSpace(confirmDetail.HeadSHA)) {
 		if decision := mergewatch.ConfirmMarkReady(snapshot, confirming); !decision.MarkReady {
 			r.logMarkReadyBlocked(repo, issueNumber, prNumber, decision.Blocker)
@@ -198,7 +198,7 @@ func (r *Runner) applyMarkReadyForPullRequest(ctx context.Context, repo, cwd str
 		r.logMarkReadySkip(repo, issueNumber, prNumber, "revalidate issue before mutation", err)
 		return
 	}
-	if (finalIssue.Number != 0 && finalIssue.Number != issueNumber) || !strings.EqualFold(strings.TrimSpace(finalIssue.State), "open") || !issueHasCoordinatorTracking(finalIssue.Labels, triagedLabel) {
+	if (finalIssue.Number != 0 && finalIssue.Number != issueNumber) || !strings.EqualFold(strings.TrimSpace(finalIssue.State), "open") || !issueHasCoordinatorTracking(finalIssue.Labels, triagedLabel, namespace) {
 		return
 	}
 	if err := r.github.MarkPullRequestReady(ctx, githubinfra.MarkPullRequestReadyInput{Repo: repo, PRNumber: prNumber, CWD: cwd}); err != nil {
@@ -210,7 +210,7 @@ func (r *Runner) applyMarkReadyForPullRequest(ctx context.Context, repo, cwd str
 	}
 }
 
-func markReadySnapshot(repo string, issueNumber, prNumber int64, detail githubinfra.PullRequestDetail, currentLogin string) mergewatch.MarkReadySnapshot {
+func markReadySnapshot(repo string, issueNumber, prNumber int64, detail githubinfra.PullRequestDetail, currentLogin string, namespace labels.Namespace) mergewatch.MarkReadySnapshot {
 	daemon := strings.ToLower(strings.TrimSpace(currentLogin))
 	return mergewatch.MarkReadySnapshot{
 		Repo:             repo,
@@ -220,9 +220,9 @@ func markReadySnapshot(repo string, issueNumber, prNumber int64, detail githubin
 		BaseRefName:      detail.BaseRefName,
 		Draft:            detail.IsDraft,
 		Open:             strings.EqualFold(strings.TrimSpace(detail.State), "open") && detail.MergedAt == "",
-		InScope:          labels.AnyLooperOwned(detail.Labels) && prLinksIssue(repo, issueNumber, detail.Body),
+		InScope:          namespace.AnyOwned(detail.Labels) && prLinksIssue(repo, issueNumber, detail.Body),
 		AuthoredByDaemon: daemon != "" && strings.ToLower(strings.TrimSpace(detail.Author)) == daemon,
-		Held:             labels.Has(detail.Labels, labels.HoldGlobal) || labels.Has(detail.Labels, labels.DoNotMerge),
+		Held:             labels.Has(detail.Labels, namespace.HoldGlobal()) || labels.Has(detail.Labels, labels.DoNotMerge),
 		Mergeable:        detail.Mergeable,
 		MergeableState:   detail.MergeableState.Raw(),
 	}

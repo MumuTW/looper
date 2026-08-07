@@ -360,10 +360,6 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		mergeWebhookConfig(&config.Webhook, *partial.Webhook)
 	}
 
-	if partial.Network != nil {
-		mergeNetworkConfig(&config.Network, *partial.Network)
-	}
-
 	if partial.Agent != nil {
 		mergeAgentConfig(&config.Agent, *partial.Agent)
 	}
@@ -602,24 +598,6 @@ func mergeWebhookConfig(config *WebhookConfig, partial PartialWebhookConfig) {
 	}
 }
 
-func mergeNetworkConfig(config *NetworkConfig, partial PartialNetworkConfig) {
-	if partial.Enrolled != nil {
-		config.Enrolled = *partial.Enrolled
-	}
-	if partial.LoopernetBaseURL != nil {
-		config.LoopernetBaseURL = *partial.LoopernetBaseURL
-	}
-	if partial.NodeName != nil {
-		config.NodeName = *partial.NodeName
-	}
-	if partial.GitHubLogin != nil {
-		config.GitHubLogin = *partial.GitHubLogin
-	}
-	if partial.GitHubUserID != nil {
-		config.GitHubUserID = *partial.GitHubUserID
-	}
-}
-
 func mergeAgentConfig(config *AgentConfig, partial PartialAgentConfig) {
 	if partial.Vendor != nil {
 		vendor := *partial.Vendor
@@ -628,6 +606,9 @@ func mergeAgentConfig(config *AgentConfig, partial PartialAgentConfig) {
 
 	if partial.Model != nil {
 		config.Model = stringPtr(*partial.Model)
+	}
+	if partial.ReasoningEffort != nil {
+		config.ReasoningEffort = normalizeReasoningEffortPtr(partial.ReasoningEffort)
 	}
 
 	if partial.Profiles != nil {
@@ -668,6 +649,9 @@ func mergeAgentProfiles(base map[string]AgentBindingConfig, override map[string]
 		if binding.Model != nil {
 			existing.Model = stringPtr(*binding.Model)
 		}
+		if binding.ReasoningEffort != nil {
+			existing.ReasoningEffort = normalizeReasoningEffortPtr(binding.ReasoningEffort)
+		}
 		merged[id] = existing
 	}
 	if len(merged) == 0 {
@@ -684,6 +668,10 @@ func cloneAgentBindingConfig(binding AgentBindingConfig) AgentBindingConfig {
 	}
 	if binding.Model != nil {
 		cloned.Model = stringPtr(*binding.Model)
+	}
+	if binding.ReasoningEffort != nil {
+		effort := *binding.ReasoningEffort
+		cloned.ReasoningEffort = &effort
 	}
 	return cloned
 }
@@ -705,6 +693,9 @@ func mergeRoleAgentConfig(config **RoleAgentConfig, partial *RoleAgentConfig) {
 	if partial.Model != nil {
 		(*config).Model = stringPtr(*partial.Model)
 	}
+	if partial.ReasoningEffort != nil {
+		(*config).ReasoningEffort = normalizeReasoningEffortPtr(partial.ReasoningEffort)
+	}
 	if isEmptyRoleAgentConfig(*config) {
 		*config = nil
 	}
@@ -718,7 +709,7 @@ func isEmptyRoleAgentConfig(agent *RoleAgentConfig) bool {
 		return true
 	}
 	profileEmpty := agent.Profile == nil || strings.TrimSpace(*agent.Profile) == ""
-	return profileEmpty && agent.Vendor == nil && agent.Model == nil
+	return profileEmpty && agent.Vendor == nil && agent.Model == nil && agent.ReasoningEffort == nil
 }
 
 // canonicalizePartialRoleAgentBindings nils empty agent objects on coding roles
@@ -752,14 +743,35 @@ func cloneRoleAgentConfig(agent *RoleAgentConfig) *RoleAgentConfig {
 		return nil
 	}
 	cloned := &RoleAgentConfig{
-		Profile: cloneStringPtr(agent.Profile),
-		Model:   cloneStringPtr(agent.Model),
+		Profile:         cloneStringPtr(agent.Profile),
+		Model:           cloneStringPtr(agent.Model),
+		ReasoningEffort: cloneReasoningEffortPtr(agent.ReasoningEffort),
 	}
 	if agent.Vendor != nil {
 		vendor := *agent.Vendor
 		cloned.Vendor = &vendor
 	}
 	return cloned
+}
+
+func cloneReasoningEffortPtr(effort *ReasoningEffort) *ReasoningEffort {
+	if effort == nil {
+		return nil
+	}
+	cloned := *effort
+	return &cloned
+}
+
+func normalizeReasoningEffortPtr(effort *ReasoningEffort) *ReasoningEffort {
+	if effort == nil {
+		return nil
+	}
+	if canonical, ok := ParseReasoningEffort(string(*effort)); ok {
+		return &canonical
+	}
+	// Preserve invalid values so validation can report the authored path rather
+	// than silently dropping a configuration error during normalization.
+	return cloneReasoningEffortPtr(effort)
 }
 
 func mergeAgentTimeoutConfig(config *AgentTimeoutConfig, partial PartialAgentTimeoutConfig) {
@@ -1032,6 +1044,9 @@ func mergeWorktreeCleanupConfig(config *WorktreeCleanupConfig, partial PartialWo
 	if partial.DryRun != nil {
 		config.DryRun = *partial.DryRun
 	}
+	if partial.MaxDiskSweepPerTick != nil {
+		config.MaxDiskSweepPerTick = *partial.MaxDiskSweepPerTick
+	}
 }
 
 func mergePackageConfig(config *PackageConfig, partial PartialPackageConfig) {
@@ -1284,9 +1299,56 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 		if partial.Gatekeeper.Trust != nil {
 			config.Gatekeeper.Trust = GatekeeperTrustLevel(strings.TrimSpace(string(*partial.Gatekeeper.Trust)))
 		}
-		if partial.Gatekeeper.Strategy != nil {
-			config.Gatekeeper.Strategy = MergeStrategy(strings.TrimSpace(string(*partial.Gatekeeper.Strategy)))
+		if partial.Gatekeeper.DiffBudget != nil {
+			budget := config.Gatekeeper.DiffBudget
+			if budget == nil {
+				budget = &GatekeeperDiffBudget{}
+			} else {
+				cloned := *budget
+				budget = &cloned
+			}
+			if partial.Gatekeeper.DiffBudget.MaxChangedFiles != nil {
+				budget.MaxChangedFiles = *partial.Gatekeeper.DiffBudget.MaxChangedFiles
+			}
+			if partial.Gatekeeper.DiffBudget.MaxDeletions != nil {
+				budget.MaxDeletions = *partial.Gatekeeper.DiffBudget.MaxDeletions
+			}
+			config.Gatekeeper.DiffBudget = budget
 		}
+		if partial.Gatekeeper.Strategy != nil {
+			strategy := MergeStrategy(strings.TrimSpace(string(*partial.Gatekeeper.Strategy)))
+			if strategy == "" {
+				strategy = MergeStrategySquash
+			}
+			config.Gatekeeper.Strategy = strategy
+		}
+		if partial.Gatekeeper.RequiredReviewChangedLines != nil {
+			config.Gatekeeper.RequiredReviewChangedLines = *partial.Gatekeeper.RequiredReviewChangedLines
+		}
+	}
+	if partial.Escalator != nil {
+		mergeEscalatorRoleConfig(&config.Escalator, *partial.Escalator)
+	}
+}
+
+func mergeEscalatorRoleConfig(config *EscalatorRoleConfig, partial PartialEscalatorRoleConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.CadenceSeconds != nil {
+		config.CadenceSeconds = *partial.CadenceSeconds
+	}
+	if partial.RetryAttemptThreshold != nil {
+		config.RetryAttemptThreshold = *partial.RetryAttemptThreshold
+	}
+	if partial.UnroutedAfterSeconds != nil {
+		config.UnroutedAfterSeconds = *partial.UnroutedAfterSeconds
+	}
+	if partial.StaleHeadAfterSeconds != nil {
+		config.StaleHeadAfterSeconds = *partial.StaleHeadAfterSeconds
+	}
+	if partial.MaxItems != nil {
+		config.MaxItems = *partial.MaxItems
 	}
 }
 
@@ -1740,10 +1802,6 @@ func cloneStrings(values []string) []string {
 
 func clonePartialConfig(partial PartialConfig) PartialConfig {
 	cloned := partial
-	if partial.Network != nil {
-		network := *partial.Network
-		cloned.Network = &network
-	}
 	if partial.Agent != nil {
 		cloned.Agent = clonePartialAgentConfig(partial.Agent)
 	}
@@ -1806,31 +1864,24 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 	cloned := make([]PartialProjectRefConfig, len(projects))
 	for index, project := range projects {
 		cloned[index] = PartialProjectRefConfig{
-			ID:              project.ID,
-			Name:            project.Name,
-			PersonalProject: cloneBoolPtr(project.PersonalProject),
-			Provider:        cloneStringPtr(project.Provider),
-			Repo:            cloneStringPtr(project.Repo),
-			RepoPath:        project.RepoPath,
-			Path:            project.Path,
-			BaseBranch:      cloneStringPtr(project.BaseBranch),
-			WorktreeRoot:    cloneStringPtr(project.WorktreeRoot),
-			Network:         clonePartialProjectNetworkConfig(project.Network),
-			Webhook:         clonePartialProjectWebhookConfig(project.Webhook),
-			Validation:      clonePartialProjectValidationConfig(project.Validation),
-			Instructions:    cloneStringMap(project.Instructions),
-			Roles:           clonePartialRoleConfigs(project.Roles),
+			ID:                   project.ID,
+			Name:                 project.Name,
+			PersonalProject:      cloneBoolPtr(project.PersonalProject),
+			Provider:             cloneStringPtr(project.Provider),
+			Repo:                 cloneStringPtr(project.Repo),
+			RepoPath:             project.RepoPath,
+			Path:                 project.Path,
+			LabelNamespace:       cloneStringPtr(project.LabelNamespace),
+			ClassificationLabels: cloneBoolPtr(project.ClassificationLabels),
+			BaseBranch:           cloneStringPtr(project.BaseBranch),
+			WorktreeRoot:         cloneStringPtr(project.WorktreeRoot),
+			Webhook:              clonePartialProjectWebhookConfig(project.Webhook),
+			Validation:           clonePartialProjectValidationConfig(project.Validation),
+			Instructions:         cloneStringMap(project.Instructions),
+			Roles:                clonePartialRoleConfigs(project.Roles),
 		}
 	}
 	return cloned
-}
-
-func clonePartialProjectNetworkConfig(config *PartialProjectNetworkConfig) *PartialProjectNetworkConfig {
-	if config == nil {
-		return nil
-	}
-	cloned := *config
-	return &cloned
 }
 
 func clonePartialProjectWebhookConfig(config *PartialProjectWebhookConfig) *PartialProjectWebhookConfig {
@@ -1925,9 +1976,6 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 		if project.Repo != nil {
 			cloned[index].Repo = strings.TrimSpace(*project.Repo)
 		}
-		if project.Network != nil && project.Network.Mode != nil {
-			cloned[index].Network.Mode = *project.Network.Mode
-		}
 		if project.Webhook != nil && project.Webhook.Mode != nil {
 			cloned[index].Webhook.Mode = *project.Webhook.Mode
 		}
@@ -1939,12 +1987,26 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 		if project.WorktreeRoot != nil {
 			cloned[index].WorktreeRoot = stringPtr(*project.WorktreeRoot)
 		}
+		if project.LabelNamespace != nil && strings.TrimSpace(*project.LabelNamespace) != "" {
+			cloned[index].LabelNamespace = strings.ToLower(strings.TrimSpace(*project.LabelNamespace))
+		}
+		if project.ClassificationLabels != nil {
+			cloned[index].ClassificationLabels = *project.ClassificationLabels
+		}
 	}
 
 	return cloned
 }
 
 func cloneProviderKindPtr(value *ProviderKind) *ProviderKind {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneBoolPtr(value *bool) *bool {
 	if value == nil {
 		return nil
 	}
@@ -2029,6 +2091,7 @@ func clonePartialAgentConfig(agent *PartialAgentConfig) *PartialAgentConfig {
 		cloned.Vendor = &vendor
 	}
 	cloned.Model = cloneStringPtr(agent.Model)
+	cloned.ReasoningEffort = cloneReasoningEffortPtr(agent.ReasoningEffort)
 	cloned.Profiles = cloneAgentProfiles(agent.Profiles)
 	if agent.Params != nil {
 		cloned.Params = mergeAnyMap(nil, agent.Params)
@@ -2172,9 +2235,14 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			trust := *configs.Gatekeeper.Trust
 			gatekeeper.Trust = &trust
 		}
+		gatekeeper.DiffBudget = clonePartialGatekeeperDiffBudget(configs.Gatekeeper.DiffBudget)
 		if configs.Gatekeeper.Strategy != nil {
 			strategy := *configs.Gatekeeper.Strategy
 			gatekeeper.Strategy = &strategy
+		}
+		if configs.Gatekeeper.RequiredReviewChangedLines != nil {
+			threshold := *configs.Gatekeeper.RequiredReviewChangedLines
+			gatekeeper.RequiredReviewChangedLines = &threshold
 		}
 		cloned.Gatekeeper = &gatekeeper
 	}
@@ -2416,14 +2484,6 @@ func cloneStringMap(values map[string]string) map[string]string {
 		cloned[key] = value
 	}
 	return cloned
-}
-
-func cloneBoolPtr(value *bool) *bool {
-	if value == nil {
-		return nil
-	}
-	cloned := *value
-	return &cloned
 }
 
 func firstNonEmpty(values ...string) string {

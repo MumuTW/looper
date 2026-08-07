@@ -3,11 +3,11 @@ name: Issue Intake
 # Projects "awaiting triage" visibility onto issues. Both transitions key on
 # durable GitHub events only — never on model output:
 #   add:    issue opened/reopened
-#   remove: issue closed, or looper takes authority (a looper:* or dispatch/*
+#   remove: issue closed, or looper takes authority (a looper:* label)
 #           label lands, e.g. looper:worker-ready on dispatch)
 # The durable authority for triage state remains the Triager's Triage Report
 # (CONTEXT.md); semantic projection beyond this belongs to the Triager (#122).
-# No workflow may write looper:* or dispatch/* labels.
+# No workflow may write looper:* or bare dispatch/* labels.
 on:
   issues:
     types: [opened, reopened, closed, labeled]
@@ -31,6 +31,5 @@ jobs:
         if: >-
           github.event.action == 'closed' ||
           (github.event.action == 'labeled' &&
-            (startsWith(github.event.label.name, 'looper:') ||
-             startsWith(github.event.label.name, 'dispatch/')))
+            startsWith(github.event.label.name, 'looper:'))
         run: gh issue edit "$NUMBER" --remove-label "needs-triage"

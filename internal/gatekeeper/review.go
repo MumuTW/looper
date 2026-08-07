@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/MumuTW/looper/internal/storage"
 )
@@ -73,6 +74,66 @@ func latestCodexReviewForHead(ctx context.Context, repos *storage.Repositories, 
 	}
 	evidence.CurrentHeadValid = evidence.ReviewedHeadSHA != "" && strings.EqualFold(evidence.ReviewedHeadSHA, evidence.RequiredHeadSHA)
 	return evidence, nil
+}
+
+// reviewerReviewEvidenceAppearedSince reports whether a new, verified Reviewer
+// event for the current head was appended after a cached Gatekeeper report was
+// evaluated. It is intentionally separate from latestCodexReviewForHead: the
+// latter answers the current projection, while discovery needs an event-time
+// edge so a below-threshold success is invalidated exactly once when a later
+// blocking review arrives.
+func reviewerReviewEvidenceAppearedSince(ctx context.Context, repos *storage.Repositories, projectID, repo string, prNumber int64, requiredHeadSHA, since, previousRecordedAt string) (bool, error) {
+	if repos == nil || repos.Events == nil {
+		return false, fmt.Errorf("events repository is not configured")
+	}
+	events, err := repos.Events.ListByEntityAndEventTypes(ctx, "pull_request", fmt.Sprintf("%s#%d", repo, prNumber), []string{reviewerReviewPostedEventType})
+	if err != nil {
+		return false, fmt.Errorf("list Reviewer review events: %w", err)
+	}
+	var sinceTime time.Time
+	if parsed, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(since)); parseErr == nil {
+		sinceTime = parsed
+	}
+	for _, event := range events {
+		if event.EventType != reviewerReviewPostedEventType || !reviewEventBelongsToProject(event, projectID) || !reviewEventActorIsReviewer(event) {
+			continue
+		}
+		var payload reviewerReviewPostedPayload
+		if err := json.Unmarshal([]byte(event.PayloadJSON), &payload); err != nil || !payload.MarkerVerified {
+			continue
+		}
+		if strings.TrimSpace(payload.HeadSHA) == "" || !strings.EqualFold(strings.TrimSpace(payload.HeadSHA), strings.TrimSpace(requiredHeadSHA)) {
+			continue
+		}
+		if sinceTime.IsZero() {
+			if strings.TrimSpace(event.CreatedAt) > strings.TrimSpace(since) {
+				return true, nil
+			}
+			continue
+		}
+		eventTime, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(event.CreatedAt))
+		if parseErr != nil {
+			continue
+		}
+		if eventTime.After(sinceTime) {
+			return true, nil
+		}
+		// Event-log timestamps are millisecond precision while a report can
+		// preserve a nanosecond-precision clock value. An event created at the
+		// same instant as the report must still invalidate the cache. Once a
+		// report has projected that event into CodexReview.RecordedAt, the equal
+		// timestamp is known evidence and must not trigger every later tick.
+		if eventTime.Equal(sinceTime) {
+			if strings.TrimSpace(previousRecordedAt) == "" {
+				return true, nil
+			}
+			previousTime, previousErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(previousRecordedAt))
+			if previousErr != nil || !eventTime.Equal(previousTime) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 func reviewEventBelongsToProject(event storage.EventLogRecord, projectID string) bool {

@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/loops"
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/storage"
@@ -65,7 +67,8 @@ func newTakeoverFixture(t *testing.T) *takeoverFixture {
 		t.Fatalf("Queue.Upsert(reviewer) error = %v", err)
 	}
 
-	run := storage.RunRecord{ID: "run_1", LoopID: held.ID, Status: "running", StartedAt: takeoverNowISO, LastHeartbeatAt: stringRef(takeoverNowISO), CreatedAt: takeoverNowISO, UpdatedAt: takeoverNowISO}
+	snapshot := `{"vendor":"codex","reasoningEffort":"high"}`
+	run := storage.RunRecord{ID: "run_1", LoopID: held.ID, Status: "running", AgentSnapshotJSON: &snapshot, StartedAt: takeoverNowISO, LastHeartbeatAt: stringRef(takeoverNowISO), CreatedAt: takeoverNowISO, UpdatedAt: takeoverNowISO}
 	if err := repos.Runs.Upsert(ctx, run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -87,6 +90,100 @@ func newTakeoverFixture(t *testing.T) *takeoverFixture {
 			Loops: &loops.Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }},
 		},
 		now: now, loopID: held.ID,
+	}
+}
+
+func TestTakeoverLoopReturnsPersistedReasoningEffort(t *testing.T) {
+	ctx := context.Background()
+	f := newTakeoverFixture(t)
+	result, err := takeoverLoop(ctx, f.services, f.loopID, "Taken over by test", func() time.Time { return f.now }, func(int, syscall.Signal) error { return nil }, nil)
+	if err != nil {
+		t.Fatalf("takeoverLoop() error = %v", err)
+	}
+	if result.ReasoningEffort == nil || *result.ReasoningEffort != config.ReasoningEffortHigh {
+		t.Fatalf("ReasoningEffort = %v, want high from persisted run snapshot", result.ReasoningEffort)
+	}
+}
+
+func TestTakeoverLoopSurvivesMalformedReasoningSnapshot(t *testing.T) {
+	ctx := context.Background()
+	f := newTakeoverFixture(t)
+	malformed := `{"vendor":"codex","reasoningEffort":`
+	// Run snapshots are insert-only in production; mutate the fixture row
+	// directly to exercise recovery from a legacy/corrupt persisted payload.
+	if _, err := f.services.Coordinator.DB().ExecContext(ctx, "UPDATE runs SET agent_snapshot_json = ? WHERE id = ?", malformed, "run_1"); err != nil {
+		t.Fatalf("malformed snapshot fixture update error = %v", err)
+	}
+
+	result, err := takeoverLoop(ctx, f.services, f.loopID, "Taken over by test", func() time.Time { return f.now }, func(int, syscall.Signal) error { return nil }, nil)
+	if err != nil {
+		t.Fatalf("takeoverLoop() error = %v, want malformed optional snapshot to degrade gracefully", err)
+	}
+	if result.ReasoningEffort != nil {
+		t.Fatalf("ReasoningEffort = %v, want omitted for malformed snapshot", result.ReasoningEffort)
+	}
+}
+
+func TestTakeoverLoopReleasesLocksWhenRunLookupFails(t *testing.T) {
+	ctx := context.Background()
+	f := newTakeoverFixture(t)
+	// Keep the loop and execution rows readable, but make the correlated run
+	// lookup fail after takeover has acquired both guards.
+	if _, err := f.services.Coordinator.DB().ExecContext(ctx, "ALTER TABLE runs RENAME TO runs_missing"); err != nil {
+		t.Fatalf("rename runs table error = %v", err)
+	}
+
+	_, err := takeoverLoop(ctx, f.services, f.loopID, "Taken over by test", func() time.Time { return f.now }, func(int, syscall.Signal) error { return nil }, nil)
+	if err == nil || !strings.Contains(err.Error(), "load agent run before takeover") {
+		t.Fatalf("takeoverLoop() error = %v, want correlated run lookup failure", err)
+	}
+
+	assertGuardAvailable := func(name string, acquire func() func()) {
+		t.Helper()
+		done := make(chan struct{})
+		go func() {
+			release := acquire()
+			release()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatalf("%s remained held after takeover lookup failure", name)
+		}
+	}
+	assertGuardAvailable("loop requeue lock", func() func() {
+		return looperdruntime.LockLoopRequeue(f.loopID)
+	})
+	assertGuardAvailable("target lock", func() func() {
+		return loops.LockLoopTarget(loops.LoopTargetGuardKey("project_1", "fixer", "pull_request", "pull_request:acme/looper:41"))
+	})
+}
+
+func TestTakeoverLoopCorrelatesReasoningEffortWithSelectedExecutionRun(t *testing.T) {
+	ctx := context.Background()
+	f := newTakeoverFixture(t)
+
+	// A retry can create a newer run after the agent execution row was
+	// recorded. The takeover response must keep the selected execution's
+	// snapshot instead of pairing that execution with the newer run.
+	newerSnapshot := `{"vendor":"codex","reasoningEffort":"low"}`
+	if err := f.repos.Runs.Upsert(ctx, storage.RunRecord{
+		ID: "run_newer", LoopID: f.loopID, Status: "failed", AgentSnapshotJSON: &newerSnapshot,
+		StartedAt: "2026-04-21T12:00:01.000Z", CreatedAt: "2026-04-21T12:00:01.000Z", UpdatedAt: "2026-04-21T12:00:01.000Z",
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(newer) error = %v", err)
+	}
+
+	result, err := takeoverLoop(ctx, f.services, f.loopID, "Taken over by test", func() time.Time { return f.now }, func(int, syscall.Signal) error { return nil }, nil)
+	if err != nil {
+		t.Fatalf("takeoverLoop() error = %v", err)
+	}
+	if result.SessionID != "session_human" {
+		t.Fatalf("SessionID = %q, want selected execution session", result.SessionID)
+	}
+	if result.ReasoningEffort == nil || *result.ReasoningEffort != config.ReasoningEffortHigh {
+		t.Fatalf("ReasoningEffort = %v, want high from the selected execution's run", result.ReasoningEffort)
 	}
 }
 

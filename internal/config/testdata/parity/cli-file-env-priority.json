@@ -105,12 +105,6 @@
         "mode": "gh-forward",
         "publicBaseUrl": ""
       },
-      "network": {
-        "enrolled": false,
-        "githubLogin": "",
-        "loopernetBaseUrl": "",
-        "nodeName": ""
-      },
       "agent": {
         "vendor": "opencode",
         "params": {
@@ -193,7 +187,8 @@
           "retentionDays": 7,
           "maxPerTick": 10,
           "includeOrphans": true,
-          "dryRun": false
+          "dryRun": false,
+          "maxDiskSweepPerTick": 2000
         },
         "resourceGuard": {
           "enabled": true,
@@ -266,6 +261,7 @@
           }
         },
         "gatekeeper": {
+          "requiredReviewChangedLines": 200,
           "strategy": "squash"
         },
         "deployer": {
@@ -384,9 +380,6 @@
         {
           "id": "demo",
           "name": "Demo",
-          "network": {
-            "mode": "off"
-          },
           "repoPath": "__TMP__/repo",
           "webhook": {}
         }

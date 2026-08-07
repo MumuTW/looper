@@ -1,5 +1,7 @@
 package config
 
+import "strings"
+
 type AgentVendor string
 
 const (
@@ -11,6 +13,37 @@ const (
 	AgentVendorDevinExperimental AgentVendor = "devin-experimental"
 	AgentVendorHermes            AgentVendor = "hermes"
 )
+
+// ReasoningEffort is the typed effort level passed to vendor model invocation.
+// "none" explicitly disables reasoning effort (strip any inherited value).
+type ReasoningEffort string
+
+const (
+	ReasoningEffortLow      ReasoningEffort = "low"
+	ReasoningEffortMedium   ReasoningEffort = "medium"
+	ReasoningEffortHigh     ReasoningEffort = "high"
+	ReasoningEffortVeryHigh ReasoningEffort = "xhigh"
+	ReasoningEffortNone     ReasoningEffort = "none"
+)
+
+// ValidReasoningEfforts returns the recognized effort levels for validation.
+func ValidReasoningEfforts() []ReasoningEffort {
+	return []ReasoningEffort{
+		ReasoningEffortLow,
+		ReasoningEffortMedium,
+		ReasoningEffortHigh,
+		ReasoningEffortVeryHigh,
+		ReasoningEffortNone,
+	}
+}
+
+func ParseReasoningEffort(raw string) (ReasoningEffort, bool) {
+	switch ReasoningEffort(strings.ToLower(strings.TrimSpace(raw))) {
+	case ReasoningEffortLow, ReasoningEffortMedium, ReasoningEffortHigh, ReasoningEffortVeryHigh, ReasoningEffortNone:
+		return ReasoningEffort(strings.ToLower(strings.TrimSpace(raw))), true
+	}
+	return "", false
+}
 
 var supportedAgentVendors = []AgentVendor{
 	AgentVendorClaudeCode,
@@ -248,25 +281,28 @@ type ProviderConfig struct {
 
 // AgentBindingConfig is vendor+model only (profiles).
 type AgentBindingConfig struct {
-	Vendor *AgentVendor `json:"vendor,omitempty"`
-	Model  *string      `json:"model,omitempty"` // nil=inherit; non-nil empty=suppress model
+	Vendor          *AgentVendor     `json:"vendor,omitempty"`
+	Model           *string          `json:"model,omitempty"` // nil=inherit; non-nil empty=suppress model
+	ReasoningEffort *ReasoningEffort `json:"reasoningEffort,omitempty"`
 }
 
 // RoleAgentConfig is optional per-role overlay (planner/worker/reviewer/fixer only).
 type RoleAgentConfig struct {
-	Profile *string      `json:"profile,omitempty"`
-	Vendor  *AgentVendor `json:"vendor,omitempty"`
-	Model   *string      `json:"model,omitempty"`
+	Profile         *string          `json:"profile,omitempty"`
+	Vendor          *AgentVendor     `json:"vendor,omitempty"`
+	Model           *string          `json:"model,omitempty"`
+	ReasoningEffort *ReasoningEffort `json:"reasoningEffort,omitempty"`
 }
 
 type AgentConfig struct {
-	Vendor       *AgentVendor                  `json:"vendor,omitempty"`
-	Model        *string                       `json:"model,omitempty"`
-	Profiles     map[string]AgentBindingConfig `json:"profiles,omitempty"`
-	Params       map[string]any                `json:"params"`
-	Env          map[string]string             `json:"env"`
-	Timeouts     AgentTimeoutConfig            `json:"timeouts"`
-	NativeResume AgentNativeResumeConfig       `json:"nativeResume"`
+	Vendor          *AgentVendor                  `json:"vendor,omitempty"`
+	Model           *string                       `json:"model,omitempty"`
+	Profiles        map[string]AgentBindingConfig `json:"profiles,omitempty"`
+	Params          map[string]any                `json:"params"`
+	Env             map[string]string             `json:"env"`
+	Timeouts        AgentTimeoutConfig            `json:"timeouts"`
+	NativeResume    AgentNativeResumeConfig       `json:"nativeResume"`
+	ReasoningEffort *ReasoningEffort              `json:"reasoningEffort,omitempty"`
 }
 
 type AgentNativeResumeConfig struct {
@@ -413,6 +449,13 @@ type WorktreeCleanupConfig struct {
 	MaxPerTick     int    `json:"maxPerTick"`
 	IncludeOrphans bool   `json:"includeOrphans"`
 	DryRun         bool   `json:"dryRun"`
+	// MaxDiskSweepPerTick budgets removals of directories under a worktree
+	// root that the worktrees table never claimed. It is separate from
+	// MaxPerTick because the two passes cost different things: a record
+	// cleanup runs git commands per candidate, while a sweep removal is one
+	// RemoveAll. Sharing one budget would let unbounded debris starve the
+	// record pass that owns every worktree looper actually manages.
+	MaxDiskSweepPerTick int `json:"maxDiskSweepPerTick"`
 }
 
 type PackageConfig struct {
@@ -844,9 +887,39 @@ const (
 // GatekeeperRoleConfig configures the agent-free Merge Gatekeeper.
 type GatekeeperRoleConfig struct {
 	// Trust is the merge authority level. Empty defaults to observe.
-	Trust GatekeeperTrustLevel `json:"trust,omitempty"`
+	Trust      GatekeeperTrustLevel  `json:"trust,omitempty"`
+	DiffBudget *GatekeeperDiffBudget `json:"diffBudget,omitempty"`
+	// RequiredReviewChangedLines is the smallest additions+deletions total that
+	// triggers a review-capacity gate. The normalized default is 200; an explicit
+	// zero disables the threshold.
+	RequiredReviewChangedLines int `json:"requiredReviewChangedLines,omitempty"`
 	// Strategy is used only at auto. Empty input normalizes to squash.
 	Strategy MergeStrategy `json:"strategy"`
+}
+
+// GatekeeperDiffBudget is a boolean change-size gate. A zero bound is
+// unlimited; non-zero bounds are enforced independently. The two bounds are
+// independent: configuring only maxDeletions leaves changedFiles unlimited, so a
+// very large addition concentrated in a few files can still pass.
+//
+// Remaining blind spots reviewers should weigh before relying on this gate:
+//
+//   - Only changed-file count and deletion count are bounded. There is no
+//     maxAdditions or total-line bound, so a massive purely-additive diff passes
+//     whenever maxDeletions is the only configured bound.
+//   - Counts are whole-PR totals from GitHub, computed against the current merge
+//     base. There is no per-file or per-path budget, so one very large file
+//     passes whenever the file count is under limit, and generated or vendored
+//     files are not excluded.
+//   - The gate is boolean per bound, not a score. It reports observed counts and
+//     configured limits as evidence; it does not model review effort or risk.
+//
+// What it still does not catch is the price of a cheap, deterministic,
+// provider-authoritative guard; a heuristic or inferred diff layer would be less
+// authoritative and is deliberately not built here.
+type GatekeeperDiffBudget struct {
+	MaxChangedFiles int `json:"maxChangedFiles"`
+	MaxDeletions    int `json:"maxDeletions"`
 }
 
 // AuditorRoleConfig configures the opt-in Post-merge Auditor. It remains
@@ -863,17 +936,21 @@ type ProjectRefConfig struct {
 	// PersonalProject opts this repository into self-authored issue admission.
 	// It is never inferred from repository ownership: shared/contributing
 	// repositories remain unchanged unless an operator explicitly enables it.
-	PersonalProject bool                     `json:"personalProject,omitempty"`
-	Provider        string                   `json:"provider,omitempty"`
-	Repo            string                   `json:"repo,omitempty"`
-	RepoPath        string                   `json:"repoPath"`
-	Path            string                   `json:"path,omitempty"`
-	BaseBranch      *string                  `json:"baseBranch,omitempty"`
-	WorktreeRoot    *string                  `json:"worktreeRoot,omitempty"`
-	Network         ProjectNetworkConfig     `json:"network,omitempty"`
-	Webhook         ProjectWebhookConfig     `json:"webhook,omitempty"`
-	Validation      *ProjectValidationConfig `json:"validation,omitempty"`
-	Roles           *PartialRoleConfigs      `json:"roles,omitempty"`
+	PersonalProject      bool    `json:"personalProject,omitempty"`
+	Provider             string  `json:"provider,omitempty"`
+	Repo                 string  `json:"repo,omitempty"`
+	RepoPath             string  `json:"repoPath"`
+	Path                 string  `json:"path,omitempty"`
+	LabelNamespace       string  `json:"labelNamespace,omitempty"`
+	ClassificationLabels bool    `json:"classificationLabels,omitempty"`
+	BaseBranch           *string `json:"baseBranch,omitempty"`
+	WorktreeRoot         *string `json:"worktreeRoot,omitempty"`
+	// Network is retained only for dormant routed internals. There is no
+	// supported enrollment producer, so it is not a public config/API field.
+	Network    ProjectNetworkConfig     `json:"-"`
+	Webhook    ProjectWebhookConfig     `json:"webhook,omitempty"`
+	Validation *ProjectValidationConfig `json:"validation,omitempty"`
+	Roles      *PartialRoleConfigs      `json:"roles,omitempty"`
 }
 
 type ProjectWebhookConfig struct {
@@ -881,24 +958,21 @@ type ProjectWebhookConfig struct {
 }
 
 type PartialProjectRefConfig struct {
-	ID              string                          `json:"id"`
-	Name            string                          `json:"name"`
-	PersonalProject *bool                           `json:"personalProject,omitempty"`
-	Provider        *string                         `json:"provider,omitempty"`
-	Repo            *string                         `json:"repo,omitempty"`
-	RepoPath        string                          `json:"repoPath"`
-	Path            string                          `json:"path,omitempty"`
-	BaseBranch      *string                         `json:"baseBranch,omitempty"`
-	WorktreeRoot    *string                         `json:"worktreeRoot,omitempty"`
-	Network         *PartialProjectNetworkConfig    `json:"network,omitempty"`
-	Webhook         *PartialProjectWebhookConfig    `json:"webhook,omitempty"`
-	Validation      *PartialProjectValidationConfig `json:"validation,omitempty"`
-	Instructions    map[string]string               `json:"instructions,omitempty"`
-	Roles           *PartialRoleConfigs             `json:"roles,omitempty"`
-}
-
-type PartialProjectNetworkConfig struct {
-	Mode *NetworkMode `json:"mode,omitempty"`
+	ID                   string                          `json:"id"`
+	Name                 string                          `json:"name"`
+	PersonalProject      *bool                           `json:"personalProject,omitempty"`
+	Provider             *string                         `json:"provider,omitempty"`
+	Repo                 *string                         `json:"repo,omitempty"`
+	RepoPath             string                          `json:"repoPath"`
+	Path                 string                          `json:"path,omitempty"`
+	LabelNamespace       *string                         `json:"labelNamespace,omitempty"`
+	ClassificationLabels *bool                           `json:"classificationLabels,omitempty"`
+	BaseBranch           *string                         `json:"baseBranch,omitempty"`
+	WorktreeRoot         *string                         `json:"worktreeRoot,omitempty"`
+	Webhook              *PartialProjectWebhookConfig    `json:"webhook,omitempty"`
+	Validation           *PartialProjectValidationConfig `json:"validation,omitempty"`
+	Instructions         map[string]string               `json:"instructions,omitempty"`
+	Roles                *PartialRoleConfigs             `json:"roles,omitempty"`
 }
 
 type PartialProjectWebhookConfig struct {
@@ -919,11 +993,12 @@ type PartialProviderConfig struct {
 }
 
 type Config struct {
-	Server        ServerConfig       `json:"server"`
-	Storage       StorageConfig      `json:"storage"`
-	Scheduler     SchedulerConfig    `json:"scheduler"`
-	Webhook       WebhookConfig      `json:"webhook"`
-	Network       NetworkConfig      `json:"network"`
+	Server    ServerConfig    `json:"server"`
+	Storage   StorageConfig   `json:"storage"`
+	Scheduler SchedulerConfig `json:"scheduler"`
+	Webhook   WebhookConfig   `json:"webhook"`
+	// Network is internal-only while Routed mode is withdrawn.
+	Network       NetworkConfig      `json:"-"`
 	Agent         AgentConfig        `json:"agent"`
 	Logging       LoggingConfig      `json:"logging"`
 	Notifications NotificationConfig `json:"notifications"`
@@ -1038,13 +1113,14 @@ type PartialWebhookConfig struct {
 }
 
 type PartialAgentConfig struct {
-	Vendor       *AgentVendor                    `json:"vendor,omitempty"`
-	Model        *string                         `json:"model,omitempty"`
-	Profiles     map[string]AgentBindingConfig   `json:"profiles,omitempty"`
-	Params       map[string]any                  `json:"params,omitempty"`
-	Env          map[string]string               `json:"env,omitempty"`
-	Timeouts     *PartialAgentTimeoutConfig      `json:"timeouts,omitempty"`
-	NativeResume *PartialAgentNativeResumeConfig `json:"nativeResume,omitempty"`
+	Vendor          *AgentVendor                    `json:"vendor,omitempty"`
+	Model           *string                         `json:"model,omitempty"`
+	Profiles        map[string]AgentBindingConfig   `json:"profiles,omitempty"`
+	Params          map[string]any                  `json:"params,omitempty"`
+	Env             map[string]string               `json:"env,omitempty"`
+	Timeouts        *PartialAgentTimeoutConfig      `json:"timeouts,omitempty"`
+	NativeResume    *PartialAgentNativeResumeConfig `json:"nativeResume,omitempty"`
+	ReasoningEffort *ReasoningEffort                `json:"reasoningEffort,omitempty"`
 }
 
 type PartialAgentNativeResumeConfig struct {
@@ -1148,6 +1224,8 @@ type PartialWorktreeCleanupConfig struct {
 	MaxPerTick     *int    `json:"maxPerTick,omitempty"`
 	IncludeOrphans *bool   `json:"includeOrphans,omitempty"`
 	DryRun         *bool   `json:"dryRun,omitempty"`
+
+	MaxDiskSweepPerTick *int `json:"maxDiskSweepPerTick,omitempty"`
 }
 
 type PartialPackageConfig struct {
@@ -1157,14 +1235,6 @@ type PartialPackageConfig struct {
 	DeprecatedAutoUpgradeEnabled *bool `json:"autoUpgradeEnabled,omitempty"`
 	AutoMigrateOnStartup         *bool `json:"autoMigrateOnStartup,omitempty"`
 	RequireBackupBeforeMigrate   *bool `json:"requireBackupBeforeMigrate,omitempty"`
-}
-
-type PartialNetworkConfig struct {
-	Enrolled         *bool   `json:"enrolled,omitempty"`
-	LoopernetBaseURL *string `json:"loopernetBaseUrl,omitempty"`
-	NodeName         *string `json:"nodeName,omitempty"`
-	GitHubLogin      *string `json:"githubLogin,omitempty"`
-	GitHubUserID     *int64  `json:"githubUserId,omitempty"`
 }
 
 type PartialDefaultsConfig struct {
@@ -1494,8 +1564,24 @@ type PartialDeployerRoleConfig struct {
 }
 
 type PartialGatekeeperRoleConfig struct {
-	Trust    *GatekeeperTrustLevel `json:"trust,omitempty"`
-	Strategy *MergeStrategy        `json:"strategy,omitempty"`
+	Trust                      *GatekeeperTrustLevel        `json:"trust,omitempty"`
+	DiffBudget                 *PartialGatekeeperDiffBudget `json:"diffBudget,omitempty"`
+	RequiredReviewChangedLines *int                         `json:"requiredReviewChangedLines,omitempty"`
+	Strategy                   *MergeStrategy               `json:"strategy,omitempty"`
+}
+
+type PartialGatekeeperDiffBudget struct {
+	MaxChangedFiles *int `json:"maxChangedFiles,omitempty"`
+	MaxDeletions    *int `json:"maxDeletions,omitempty"`
+}
+
+type PartialEscalatorRoleConfig struct {
+	Enabled               *bool  `json:"enabled,omitempty"`
+	CadenceSeconds        *int   `json:"cadenceSeconds,omitempty"`
+	RetryAttemptThreshold *int64 `json:"retryAttemptThreshold,omitempty"`
+	UnroutedAfterSeconds  *int   `json:"unroutedAfterSeconds,omitempty"`
+	StaleHeadAfterSeconds *int   `json:"staleHeadAfterSeconds,omitempty"`
+	MaxItems              *int   `json:"maxItems,omitempty"`
 }
 
 type PartialAuditorRoleConfig struct {
@@ -1529,7 +1615,6 @@ type PartialConfig struct {
 	Storage        *PartialStorageConfig      `json:"storage,omitempty"`
 	Scheduler      *PartialSchedulerConfig    `json:"scheduler,omitempty"`
 	Webhook        *PartialWebhookConfig      `json:"webhook,omitempty"`
-	Network        *PartialNetworkConfig      `json:"network,omitempty"`
 	Agent          *PartialAgentConfig        `json:"agent,omitempty"`
 	Logging        *PartialLoggingConfig      `json:"logging,omitempty"`
 	Notifications  *PartialNotificationConfig `json:"notifications,omitempty"`

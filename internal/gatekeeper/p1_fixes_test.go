@@ -3,6 +3,7 @@ package gatekeeper
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,11 +87,11 @@ func TestAutoGatekeeperDoesNotCacheReportAfterStatusPublishFailure(t *testing.T)
 	runner := fixture.autoRunner()
 
 	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
-	if err != nil {
-		t.Fatalf("first DiscoverPullRequests() error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "publish confirming eligible status") {
+		t.Fatalf("first DiscoverPullRequests() error = %v, want retryable confirming-status failure", err)
 	}
-	if first.Evaluated != 1 {
-		t.Fatalf("first discovery = %#v, want one evaluated pull request", first)
+	if first.Evaluated != 0 {
+		t.Fatalf("first discovery = %#v, want no completed evaluation after confirming-status failure", first)
 	}
 
 	fixture.github.statusErr = nil
@@ -212,20 +213,22 @@ func TestDiscoverPullRequestsPublishesKnownHeadsOnAbort(t *testing.T) {
 		switch views {
 		case 1:
 			f.detail = githubinfra.PullRequestDetail{
-				Number: 41, State: "OPEN", HeadSHA: "head-a", BaseRefName: "main",
-				ReviewDecision: "APPROVED", Labels: []string{labels.HoldGlobal},
+				Number: 41, State: "OPEN", HeadSHA: "head-a", BaseRefName: "main", BaseSHA: "base-1",
+				ReviewDecision: "APPROVED", Labels: []string{labels.HoldGlobal}, AdditionsKnown: true, DeletionsKnown: true,
 			}
-			f.mergeable = githubinfra.PullRequestDetail{Number: 41, HeadSHA: "head-a", Mergeable: &mergeable, MergeableState: "clean"}
+			f.mergeable = githubinfra.PullRequestDetail{Number: 41, HeadSHA: "head-a", BaseSHA: "base-1", Mergeable: &mergeable, MergeableState: "clean", AdditionsKnown: true, DeletionsKnown: true}
 			f.finalHeadSHA = "head-a"
+			f.finalBaseSHA = "base-1"
 		default:
 			if fixture.closeDB != nil {
 				_ = fixture.closeDB()
 			}
 			f.detail = githubinfra.PullRequestDetail{
-				Number: 42, State: "OPEN", HeadSHA: "head-b", BaseRefName: "main", ReviewDecision: "APPROVED",
+				Number: 42, State: "OPEN", HeadSHA: "head-b", BaseRefName: "main", BaseSHA: "base-1", ReviewDecision: "APPROVED", AdditionsKnown: true, DeletionsKnown: true,
 			}
-			f.mergeable = githubinfra.PullRequestDetail{Number: 42, HeadSHA: "head-b", Mergeable: &mergeable, MergeableState: "clean"}
+			f.mergeable = githubinfra.PullRequestDetail{Number: 42, HeadSHA: "head-b", BaseSHA: "base-1", Mergeable: &mergeable, MergeableState: "clean", AdditionsKnown: true, DeletionsKnown: true}
 			f.finalHeadSHA = "head-b"
+			f.finalBaseSHA = "base-1"
 		}
 	}
 
@@ -265,8 +268,8 @@ func TestDiscoverPullRequestsSkipsUnchangedCommitStatusPublication(t *testing.T)
 	if err != nil {
 		t.Fatalf("second DiscoverPullRequests() error = %v", err)
 	}
-	if second.Skipped != 1 || len(fixture.github.statusCalls) != 1 {
-		t.Fatalf("second discovery = %#v status calls = %d, want skip without another status write", second, len(fixture.github.statusCalls))
+	if second.Evaluated != 1 || second.Skipped != 0 || len(fixture.github.statusCalls) != 1 {
+		t.Fatalf("second discovery = %#v status calls = %d, want auto re-evaluation without another status write", second, len(fixture.github.statusCalls))
 	}
 }
 

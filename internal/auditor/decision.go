@@ -24,7 +24,12 @@ func Decide(confirmation ConfirmationResult, attribution Attribution) Decision {
 	case ConfirmationSuspectedFlake:
 		return Decision{Action: ActionRecordFlake, Reason: string(confirmation.Outcome)}
 	case ConfirmationConfirmed:
-		if attribution.Confidence == ConfidenceHigh && attribution.Candidate != nil {
+		// A candidate projected from a merge outcome with authoritative file
+		// evidence must also carry the merge commit that a future revert would
+		// target. Synthetic unit candidates without that provenance remain
+		// usable for the pure decision contract; the runtime never treats them
+		// as action authority.
+		if attribution.Confidence == ConfidenceHigh && attribution.Candidate != nil && (attribution.Candidate.MergeCommitSHA != "" || !attribution.Candidate.TouchedFilesAvailable) {
 			return Decision{Action: ActionProposeRevert, Candidate: attribution.Candidate, Reason: attribution.Reason}
 		}
 		return Decision{Action: ActionEscalate, Reason: attribution.Reason}

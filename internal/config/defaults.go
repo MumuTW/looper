@@ -193,6 +193,15 @@ func DefaultConfig(cwd string) (Config, error) {
 				// skipped it regardless of age.
 				IncludeOrphans: true,
 				DryRun:         false,
+				// Removals are one RemoveAll each, so the budget is sized to
+				// drain a real backlog rather than to pace git commands. The
+				// backlog this has to survive is bursty, not steady: a single
+				// day of agents re-running a test suite that resolves the real
+				// worktree root can mint five figures of debris, and a budget
+				// in the tens or hundreds would never catch up at a 24h
+				// interval. It stays a cap, not a target — status reports what
+				// the budget left behind.
+				MaxDiskSweepPerTick: 2000,
 			},
 			ResourceGuard: ResourceGuardConfig{
 				Enabled: true,
@@ -246,6 +255,10 @@ func DefaultConfig(cwd string) (Config, error) {
 				},
 			},
 			Auditor: AuditorRoleConfig{Enabled: false, WindowMinutes: 60},
+			Gatekeeper: GatekeeperRoleConfig{
+				RequiredReviewChangedLines: 200,
+				Strategy:                   MergeStrategySquash,
+			},
 			Coordinator: CoordinatorRoleConfig{
 				Enabled:      false,
 				PollInterval: "5m",
@@ -357,7 +370,14 @@ func DefaultConfig(cwd string) (Config, error) {
 					RequireAssigneeCurrentUser: true,
 				},
 			},
-			Gatekeeper: GatekeeperRoleConfig{Strategy: MergeStrategySquash},
+			Escalator: EscalatorRoleConfig{
+				Enabled:               false,
+				CadenceSeconds:        3600,
+				RetryAttemptThreshold: 2,
+				UnroutedAfterSeconds:  3600,
+				StaleHeadAfterSeconds: 86400,
+				MaxItems:              500,
+			},
 		},
 		Projects: []ProjectRefConfig{},
 	}, nil

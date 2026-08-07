@@ -60,6 +60,47 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 	}
 }
 
+func TestLoadFileNormalizesReasoningEffortAcrossGlobalProfileAndRole(t *testing.T) {
+	loaded := loadConfigFixture(t, "config.toml", `
+[agent]
+vendor = "codex"
+reasoningEffort = " High "
+
+[agent.profiles.performance]
+reasoningEffort = " XHIGH "
+
+[roles.coding.reviewer.agent]
+profile = "performance"
+
+[roles.coding.fixer.agent]
+reasoningEffort = " LoW "
+`, nil, nil)
+
+	assertResolvedEffort := func(role string, want ReasoningEffort) {
+		t.Helper()
+		resolved, ok := ResolveAgent(loaded.Config, "", role)
+		if !ok || resolved.ReasoningEffort == nil || *resolved.ReasoningEffort != want {
+			got := ReasoningEffort("")
+			if resolved.ReasoningEffort != nil {
+				got = *resolved.ReasoningEffort
+			}
+			t.Fatalf("ResolveAgent(%q) effort = %q, ok=%v; want %q", role, got, ok, want)
+		}
+	}
+	assertResolvedEffort(CodingRolePlanner, ReasoningEffortHigh)
+	assertResolvedEffort(CodingRoleReviewer, ReasoningEffortVeryHigh)
+	assertResolvedEffort(CodingRoleFixer, ReasoningEffortLow)
+	if loaded.Config.Agent.ReasoningEffort == nil || *loaded.Config.Agent.ReasoningEffort != ReasoningEffortHigh {
+		t.Fatalf("global normalized effort = %v, want %q", loaded.Config.Agent.ReasoningEffort, ReasoningEffortHigh)
+	}
+	if got := loaded.Config.Agent.Profiles["performance"].ReasoningEffort; got == nil || *got != ReasoningEffortVeryHigh {
+		t.Fatalf("profile normalized effort = %v, want %q", got, ReasoningEffortVeryHigh)
+	}
+	if got := loaded.Config.Roles.Coding["fixer"].Agent.ReasoningEffort; got == nil || *got != ReasoningEffortLow {
+		t.Fatalf("role normalized effort = %v, want %q", got, ReasoningEffortLow)
+	}
+}
+
 func TestLoadFileAcceptsIgnoredDeprecatedPackageAutoUpgradeEnabledAcrossFormats(t *testing.T) {
 	tests := []struct {
 		name string
@@ -230,49 +271,29 @@ func TestReadConfigFileMatchesTopLevelKeysCaseInsensitively(t *testing.T) {
 	}
 }
 
-func TestLoadFileDecodesTopLevelNetworkSectionForRoutedProjects(t *testing.T) {
-	cwd := t.TempDir()
-	configPath := filepath.Join(cwd, "config.json")
-	contents := `{
-		"network": {
-			"enrolled": true,
-			"loopernetBaseUrl": "https://loopernet.example.test",
-			"nodeName": "worker-1",
-			"githubLogin": "mrcfps",
-			"githubUserId": 23410977
-		},
-		"projects": [
-			{
-				"id": "sandbox",
-				"name": "sandbox",
-				"repoPath": "/tmp/sandbox",
-				"network": {"mode": "routed"},
-				"roles": {
-					"planner": {"autoDiscovery": false},
-					"fixer": {"autoDiscovery": false}
-				}
+func TestLoadFileRejectsWithdrawnNetworkConfiguration(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name     string
+		fileName string
+		contents string
+		wantPath string
+	}{
+		{name: "global enrollment json", fileName: "config.json", contents: `{"network":{"enrolled":true}}`, wantPath: "network"},
+		{name: "global enrollment toml", fileName: "config.toml", contents: "[network]\nenrolled = true\n", wantPath: "network"},
+		{name: "project routed mode yaml", fileName: "config.yaml", contents: "projects:\n  - id: sandbox\n    name: sandbox\n    repoPath: /tmp/sandbox\n    network:\n      mode: routed\n", wantPath: "projects[0].network"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cwd := t.TempDir()
+			configPath := filepath.Join(cwd, test.fileName)
+			if err := os.WriteFile(configPath, []byte(test.contents), 0o644); err != nil {
+				t.Fatalf("os.WriteFile() error = %v", err)
 			}
-		]
-	}`
-	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
-		t.Fatalf("os.WriteFile() error = %v", err)
-	}
-
-	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
-	if err != nil {
-		t.Fatalf("LoadFile() error = %v", err)
-	}
-	if !loaded.Config.Network.Enrolled {
-		t.Fatal("LoadFile().Config.Network.Enrolled = false, want true")
-	}
-	if got := loaded.Config.Network.LoopernetBaseURL; got != "https://loopernet.example.test" {
-		t.Fatalf("LoadFile().Config.Network.LoopernetBaseURL = %q, want %q", got, "https://loopernet.example.test")
-	}
-	if got := loaded.Config.Network.NodeName; got != "worker-1" {
-		t.Fatalf("LoadFile().Config.Network.NodeName = %q, want %q", got, "worker-1")
-	}
-	if loaded.Partial.Network == nil || loaded.Partial.Network.GitHubLogin == nil || *loaded.Partial.Network.GitHubLogin != "mrcfps" {
-		t.Fatalf("LoadFile().Partial.Network = %#v, want githubLogin mrcfps", loaded.Partial.Network)
+			_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+			if err == nil || !strings.Contains(err.Error(), test.wantPath) || !strings.Contains(err.Error(), "no safe credential producer") {
+				t.Fatalf("LoadFile() error = %v, want explicit withdrawn Network error at %s", err, test.wantPath)
+			}
+		})
 	}
 }
 
@@ -3329,6 +3350,23 @@ func TestValidateWorktreeCleanupConfig(t *testing.T) {
 	assertValidationIssue(t, validationErr, "daemon.worktreeCleanup.interval", "must be a positive duration")
 	assertValidationIssue(t, validationErr, "daemon.worktreeCleanup.retentionDays", "must be an integer >= 0")
 	assertValidationIssue(t, validationErr, "daemon.worktreeCleanup.maxPerTick", "must be a positive integer")
+}
+
+func TestValidateWorktreeCleanupConfigRejectsRetentionOverflow(t *testing.T) {
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Daemon.WorktreeCleanup.RetentionDays = 106752
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil {
+		t.Fatal("ValidateWithOptions() error = nil, want retention overflow validation")
+	}
+	validationErr, ok := err.(*ConfigValidationError)
+	if !ok {
+		t.Fatalf("ValidateWithOptions() error = %T, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "daemon.worktreeCleanup.retentionDays", "must not exceed 106751 days")
 }
 
 // NaN and Inf defeat the strict range comparisons in validateResourceGuardConfig

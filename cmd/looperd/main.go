@@ -461,21 +461,31 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	// looper-fix-<project>-pr-N). Empty target key is a no-op.
 	unlockLoop := looperdruntime.LockLoopRequeue(loopID)
 	var unlockTarget func() = func() {}
+	var releaseOnce sync.Once
+	releaseLocks := func() {
+		releaseOnce.Do(func() {
+			unlockTarget()
+			unlockLoop()
+		})
+	}
+	// Keep one cleanup path for every abortable read below. The locks must be
+	// released before the post-Hold halt drain, but the deferred cleanup covers
+	// future returns added before that explicit release as well.
+	defer releaseLocks()
 	if services.Repositories != nil && services.Repositories.Loops != nil {
 		loop, err := services.Repositories.Loops.GetByID(ctx, loopID)
 		if err != nil {
 			// Fail closed: a transient storage error must not proceed without
 			// the shared PR fence while sibling cleanup can still delete the
 			// checkout.
-			unlockLoop()
 			return result, fmt.Errorf("load loop before takeover target fence: %w", err)
 		}
 		if loop == nil {
-			unlockLoop()
 			return result, fmt.Errorf("loop not found before takeover target fence: %s", loopID)
 		}
 		unlockTarget = loops.LockLoopTarget(loops.LoopTargetGuardKeyFromRecord(*loop))
 	}
+	var selectedExecution *storage.AgentExecutionRecord
 	if services.Repositories != nil && services.Repositories.AgentExecutions != nil {
 		execution, err := services.Repositories.AgentExecutions.GetLatestByLoopID(ctx, loopID)
 		if err != nil {
@@ -484,11 +494,10 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 			// needs to resume the exact session. Abort before any lifecycle
 			// mutation; a genuinely absent execution (nil, no error) still
 			// takes over with empty ownership fields.
-			unlockTarget()
-			unlockLoop()
 			return result, fmt.Errorf("load latest agent execution before takeover: %w", err)
 		}
 		if execution != nil {
+			selectedExecution = execution
 			result.Vendor = execution.Vendor
 			if execution.NativeSessionID != nil {
 				result.SessionID = strings.TrimSpace(*execution.NativeSessionID)
@@ -498,19 +507,45 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 			}
 		}
 	}
+	if services.Repositories != nil && services.Repositories.Runs != nil {
+		var run *storage.RunRecord
+		var err error
+		switch {
+		case selectedExecution != nil && selectedExecution.RunID != nil && strings.TrimSpace(*selectedExecution.RunID) != "":
+			// The execution owns the session/worktree identity. Correlate its
+			// reasoning snapshot by RunID so a newer run inserted between these
+			// reads cannot be paired with the older execution.
+			run, err = services.Repositories.Runs.GetByID(ctx, strings.TrimSpace(*selectedExecution.RunID))
+		case selectedExecution == nil:
+			// A loop can be taken over without an execution (for example while
+			// paused). In that case the latest run is the only available identity.
+			run, err = services.Repositories.Runs.GetLatestByLoopID(ctx, loopID)
+		}
+		if err != nil {
+			return result, fmt.Errorf("load agent run before takeover: %w", err)
+		}
+		if run != nil && run.AgentSnapshotJSON != nil && strings.TrimSpace(*run.AgentSnapshotJSON) != "" {
+			snapshot, err := config.ParseAgentSnapshot(*run.AgentSnapshotJSON)
+			if err != nil {
+				// Snapshot effort is optional handback metadata. A malformed
+				// snapshot must not strand an operator with a live session: the
+				// captured execution identity is still sufficient to park the loop.
+				result.ReasoningEffort = nil
+			} else {
+				result.ReasoningEffort = snapshot.ReasoningEffort
+			}
+		}
+	}
 	// Establish the durable takeover fence before cancelling an agent. A stopped
 	// queue item with only a paused loop was claimable by a concurrent discovery
 	// tick; Hold commits human_takeover and cancellation together.
 	preflight, err := loadHaltPreflight(ctx, services, loopID)
 	if err != nil {
-		unlockTarget()
-		unlockLoop()
 		return result, err
 	}
 	reasonCopy := reason
 	_, holdErr := services.Loops.Hold(ctx, loopID, &reasonCopy)
-	unlockTarget()
-	unlockLoop()
+	releaseLocks()
 	if holdErr != nil {
 		return result, holdErr
 	}

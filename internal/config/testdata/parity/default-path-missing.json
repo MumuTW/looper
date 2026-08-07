@@ -45,12 +45,6 @@
         "mode": "gh-forward",
         "publicBaseUrl": ""
       },
-      "network": {
-        "enrolled": false,
-        "githubLogin": "",
-        "loopernetBaseUrl": "",
-        "nodeName": ""
-      },
       "agent": {
         "params": {},
         "env": {},
@@ -126,7 +120,8 @@
           "retentionDays": 7,
           "maxPerTick": 10,
           "includeOrphans": true,
-          "dryRun": false
+          "dryRun": false,
+          "maxDiskSweepPerTick": 2000
         },
         "resourceGuard": {
           "enabled": true,
@@ -207,6 +202,7 @@
           }
         },
         "gatekeeper": {
+          "requiredReviewChangedLines": 200,
           "strategy": "squash"
         },
         "deployer": {

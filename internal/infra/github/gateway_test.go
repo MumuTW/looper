@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -706,7 +707,7 @@ func TestListPullRequestCheckRunsIncludesStatusContexts(t *testing.T) {
 			if args != "api repos/acme/looper/commits/abc123/check-runs?filter=latest&per_page=100 -H Accept: application/vnd.github+json" {
 				t.Fatalf("unexpected gh args: %q", args)
 			}
-			return shell.Result{Stdout: `{"total_count":1,"check_runs":[{"name":"unit","status":"completed","conclusion":"success","app":{"id":15368},"check_suite":{"id":7654}}]}`}, nil
+			return shell.Result{Stdout: `{"total_count":1,"check_runs":[{"id":99,"name":"unit","status":"completed","conclusion":"success","started_at":"2026-07-31T12:00:00Z","completed_at":"2026-07-31T12:01:00Z","app":{"id":15368},"check_suite":{"id":7654}}]}`}, nil
 		case 2:
 			if args != "api repos/acme/looper/commits/abc123/status?per_page=100 -H Accept: application/vnd.github+json" {
 				t.Fatalf("unexpected gh args: %q", args)
@@ -726,14 +727,140 @@ func TestListPullRequestCheckRunsIncludesStatusContexts(t *testing.T) {
 	if len(runs.CheckRuns) != 1 || runs.CheckRuns[0].Name != "unit" {
 		t.Fatalf("CheckRuns = %#v, want decoded check run", runs.CheckRuns)
 	}
-	if runs.CheckRuns[0].AppID != 15368 || runs.CheckRuns[0].CheckSuiteID != 7654 {
+	if runs.CheckRuns[0].ID != 99 || runs.CheckRuns[0].AppID != 15368 || runs.CheckRuns[0].CheckSuiteID != 7654 {
 		t.Fatalf("CheckRuns[0] = %#v, want app and check-suite identities", runs.CheckRuns[0])
+	}
+	if runs.CheckRuns[0].StartedAt != "2026-07-31T12:00:00Z" || runs.CheckRuns[0].CompletedAt != "2026-07-31T12:01:00Z" {
+		t.Fatalf("CheckRuns[0] = %#v, want run timestamps", runs.CheckRuns[0])
 	}
 	if len(runs.Statuses) != 2 || runs.Statuses[0].Context != "legacy-ci" || runs.Statuses[1].Context != "lint" {
 		t.Fatalf("Statuses = %#v, want deduped status contexts in API order", runs.Statuses)
 	}
 	if runs.StatusesTotalCount != 2 {
 		t.Fatalf("StatusesTotalCount = %d, want 2", runs.StatusesTotalCount)
+	}
+}
+
+func TestListAttributionPathsUsesPaginatedGitHubEvidence(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	call := 0
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		call++
+		switch got := strings.Join(options.Args, " "); call {
+		case 1:
+			if want := "api --paginate --slurp repos/acme/looper/check-runs/99/annotations?per_page=100 -H Accept: application/vnd.github+json --hostname ghes.example"; got != want {
+				t.Fatalf("annotation args = %q, want %q", got, want)
+			}
+			return shell.Result{Stdout: `[[{"path":"internal/runtime/a.go","annotation_level":"failure"},{"path":"internal/runtime/a.go","annotation_level":"warning"}]]`}, nil
+		case 2:
+			if want := "api --paginate --slurp repos/acme/looper/pulls/42/files?per_page=100 -H Accept: application/vnd.github+json --hostname ghes.example"; got != want {
+				t.Fatalf("files args = %q, want %q", got, want)
+			}
+			return shell.Result{Stdout: `[[{"filename":"z.go"},{"filename":"a.go"},{"filename":"a.go"}]]`}, nil
+		default:
+			t.Fatalf("unexpected extra call %q", got)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	annotations, err := gateway.ListCheckRunAnnotations(context.Background(), CheckRunAnnotationsInput{Repo: "ghes.example/acme/looper", CheckRunID: 99})
+	if err != nil || len(annotations) != 2 || annotations[0].Path != "internal/runtime/a.go" {
+		t.Fatalf("ListCheckRunAnnotations() = %#v, %v", annotations, err)
+	}
+	if annotations[0].Level != "failure" || annotations[1].Level != "warning" {
+		t.Fatalf("annotation levels = %#v, want REST annotation_level values", annotations)
+	}
+	files, err := gateway.ListPullRequestFiles(context.Background(), ViewPullRequestInput{Repo: "ghes.example/acme/looper", PRNumber: 42})
+	if err != nil || len(files) != 2 || files[0] != "a.go" || files[1] != "z.go" {
+		t.Fatalf("ListPullRequestFiles() = %#v, %v", files, err)
+	}
+}
+
+func TestPullRequestDetailReadsNativeClosingIssueAndMergeCommit(t *testing.T) {
+	detail := pullRequestDetailFromViewRow(map[string]any{
+		"number":      float64(42),
+		"mergeCommit": map[string]any{"oid": "merge-commit-1"},
+		"closingIssuesReferences": []any{map[string]any{
+			"number": float64(118), "url": "https://example.test/acme/looper/issues/118",
+			"repository": map[string]any{"name": "looper", "owner": map[string]any{"login": "acme"}},
+		}},
+	}, nil, nil)
+	if detail.MergeCommitSHA != "merge-commit-1" || len(detail.ClosingIssues) != 1 || detail.ClosingIssues[0].Number != 118 || detail.ClosingIssues[0].Repo != "example.test/acme/looper" {
+		t.Fatalf("pullRequestDetailFromViewRow() = %#v, want native merge and closing-issue identity", detail)
+	}
+}
+
+func TestViewPullRequestForGatekeeperRetriesWithoutOptionalClosingIssues(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	call := 0
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		call++
+		args := strings.Join(options.Args, " ")
+		if call == 1 {
+			if !strings.Contains(args, "closingIssuesReferences") {
+				t.Fatalf("first gatekeeper view args = %q, want optional provenance field", args)
+			}
+			return shell.Result{}, errors.New("unknown field closingIssuesReferences")
+		}
+		if strings.Contains(args, "closingIssuesReferences") {
+			t.Fatalf("fallback gatekeeper view args = %q, want optional provenance field omitted", args)
+		}
+		return shell.Result{Stdout: `{"number":42,"state":"OPEN","headRefOid":"head-1"}`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	detail, err := gateway.ViewPullRequestForGatekeeper(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil || detail.Number != 42 || detail.HeadSHA != "head-1" || call != 2 {
+		t.Fatalf("ViewPullRequestForGatekeeper() = %#v, %v; calls=%d, want fallback success", detail, err, call)
+	}
+}
+
+func TestViewPullRequestForGatekeeperDoesNotRetryProviderFailures(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	call := 0
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		call++
+		if !strings.Contains(strings.Join(options.Args, " "), "closingIssuesReferences") {
+			t.Fatalf("gatekeeper view args = %q, want optional field on the only attempt", strings.Join(options.Args, " "))
+		}
+		return shell.Result{}, errors.New("rate limit exceeded")
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	_, err := gateway.ViewPullRequestForGatekeeper(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err == nil || call != 1 {
+		t.Fatalf("ViewPullRequestForGatekeeper() error=%v calls=%d, want one provider attempt", err, call)
+	}
+}
+
+func TestIssueReferenceUsesLowerCamelJSON(t *testing.T) {
+	raw, err := json.Marshal(IssueReference{Number: 118, Repo: "acme/looper", URL: "https://github.com/acme/looper/issues/118"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(raw); got != `{"number":118,"repo":"acme/looper","url":"https://github.com/acme/looper/issues/118"}` {
+		t.Fatalf("IssueReference JSON = %s", got)
+	}
+}
+
+func TestViewPullRequestMergeWatchReadsDefaultBranchMergeCommit(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if got, want := strings.Join(options.Args, " "), "api repos/acme/looper/pulls/42 -H Accept: application/vnd.github+json"; got != want {
+			t.Fatalf("gh args = %q, want %q", got, want)
+		}
+		return shell.Result{Stdout: `{"number":42,"state":"closed","merged_at":"2026-07-31T12:01:00Z","merge_commit_sha":"merge-commit-1"}`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	detail, err := gateway.ViewPullRequestMergeWatch(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil || detail.MergeCommitSHA != "merge-commit-1" || detail.MergedAt == "" {
+		t.Fatalf("ViewPullRequestMergeWatch() = %#v, %v", detail, err)
 	}
 }
 
@@ -837,6 +964,7 @@ func TestIsTransientErrorTreatsShellCommandNetworkFailuresAsRetryable(t *testing
 		{name: "graphql transient", err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stdout: `{"errors":[{"message":"GraphQL: Something went wrong while executing your query."}]}`}}},
 		{name: "bare http 504", err: fmt.Errorf("HTTP 504")},
 		{name: "generic rate limit", err: fmt.Errorf("rate limit exceeded")},
+		{name: "supervisor timeout", err: &shell.CommandExecutionError{Message: "Command timed out", Category: shell.FailureSupervisorTimeout}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -2840,9 +2968,9 @@ func TestGatewayMergePullRequest(t *testing.T) {
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
 		switch args {
-		case "api repos/acme/looper/rules/branches/main":
-			return shell.Result{Stdout: "[]"}, nil
-		case "pr merge 42 --repo acme/looper --squash --match-head-commit abc123":
+		case "api --paginate --slurp repos/acme/looper/rules/branches/main":
+			return shell.Result{Stdout: "[[]]"}, nil
+		case "api repos/acme/looper/pulls/42/merge --method PUT -f merge_method=squash -f sha=abc123":
 			return shell.Result{}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)
@@ -2860,10 +2988,10 @@ func TestGatewayMergePullRequestRejectsMergeQueueBranch(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "api repos/acme/looper/rules/branches/main" {
+		if args != "api --paginate --slurp repos/acme/looper/rules/branches/main" {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
-		return shell.Result{Stdout: `[{"type":"merge_queue"}]`}, nil
+		return shell.Result{Stdout: `[[{"type":"branch_protection"}],[{"type":"merge_queue"}]]`}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
 	err := gateway.MergePullRequest(context.Background(), PullRequestMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.MergeStrategySquash, HeadSHA: "abc123", BaseBranch: "main"})
@@ -2889,19 +3017,35 @@ func TestGatewayMergePullRequestRequiresHeadSHA(t *testing.T) {
 	}
 }
 
-func TestGatewayMarkPullRequestReady(t *testing.T) {
+func TestGatewayMergePullRequestRejectsInvalidStrategy(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh args: %v", options.Args)
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	err := gateway.MergePullRequest(context.Background(), PullRequestMergeInput{
+		Repo: "acme/looper", PRNumber: 42, Strategy: config.MergeStrategy("octopus"), HeadSHA: "abc123", BaseBranch: "main",
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid merge strategy") {
+		t.Fatalf("MergePullRequest() error = %v, want invalid strategy error", err)
+	}
+}
+
+func TestGatewayDisablePullRequestAutoMerge(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "pr ready 42 --repo acme/looper" {
+		if args != "pr merge 42 --repo acme/looper --disable-auto" {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
 		return shell.Result{}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	if err := gateway.MarkPullRequestReady(context.Background(), MarkPullRequestReadyInput{Repo: "acme/looper", PRNumber: 42}); err != nil {
-		t.Fatalf("MarkPullRequestReady() error = %v", err)
+	if err := gateway.DisablePullRequestAutoMerge(context.Background(), DisablePullRequestAutoMergeInput{Repo: "acme/looper", PRNumber: 42}); err != nil {
+		t.Fatalf("DisablePullRequestAutoMerge() error = %v", err)
 	}
 }
 
@@ -3049,6 +3193,26 @@ func TestGatewaySetCommitStatusRejectsInvalidInput(t *testing.T) {
 		t.Fatal("SetCommitStatus() error = nil, want invalid state error")
 	}
 }
+
+func TestGatewayListMergedPullRequests(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if args := strings.Join(options.Args, " "); args != "pr list --repo acme/looper --state merged --limit 100 --json number,url,state,mergedAt,headRefOid,additions,deletions" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `[{"number":42,"url":"https://example.test/pull/42","state":"MERGED","mergedAt":"2026-07-30T12:00:00Z","headRefOid":"abc123","additions":120,"deletions":30}]`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	prs, err := gateway.ListMergedPullRequests(context.Background(), ListMergedPullRequestsInput{Repo: "acme/looper", Limit: 100})
+	if err != nil {
+		t.Fatalf("ListMergedPullRequests() error = %v", err)
+	}
+	if len(prs) != 1 || prs[0].Number != 42 || prs[0].MergedAt != "2026-07-30T12:00:00Z" || prs[0].HeadSHA != "abc123" || prs[0].Additions != 120 || prs[0].Deletions != 30 || !prs[0].AdditionsKnown || !prs[0].DeletionsKnown {
+		t.Fatalf("ListMergedPullRequests() = %#v", prs)
+	}
+}
+
 func TestGatewayCloseIssueRejectsUnknownStateReason(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -3131,6 +3295,46 @@ func TestListOpenIssuesPassesSourceSearchToGH(t *testing.T) {
 		Repo: "acme/looper", Search: "updated:>=2026-07-30T11:55:00Z sort:updated-desc",
 	}); err != nil {
 		t.Fatalf("ListOpenIssues() error = %v", err)
+	}
+}
+
+func TestListMergeWatchIssuesSearchesAllIssueStates(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		want := "issue list --repo acme/looper --state all --search looper:coordinator:merge-watch in:comments --limit 1000 --json number"
+		if args != want {
+			t.Fatalf("gh args = %q, want all-state marker search", args)
+		}
+		return shell.Result{Stdout: `[{"number":7}]`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	issues, err := gateway.ListMergeWatchIssues(context.Background(), ListMergeWatchIssuesInput{Repo: "acme/looper", Limit: 1000})
+	if err != nil {
+		t.Fatalf("ListMergeWatchIssues() error = %v", err)
+	}
+	if len(issues) != 1 || issues[0].Number != 7 {
+		t.Fatalf("issues = %#v, want marker-bearing issue number", issues)
+	}
+}
+
+func TestListMergeWatchIssuesPreservesEnterpriseRepo(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		want := "issue list --repo code.example.test/acme/looper --state all --search looper:coordinator:merge-watch in:comments --limit 1000 --json number"
+		if args != want {
+			t.Fatalf("gh args = %q, want host-qualified issue repository", args)
+		}
+		return shell.Result{Stdout: `[]`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if _, err := gateway.ListMergeWatchIssues(context.Background(), ListMergeWatchIssuesInput{Repo: "code.example.test/acme/looper", Limit: 1000}); err != nil {
+		t.Fatalf("ListMergeWatchIssues() error = %v", err)
 	}
 }
 

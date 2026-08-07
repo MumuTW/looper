@@ -33,6 +33,12 @@ func IsTransientError(err error) bool {
 	}
 	var commandErr *shell.CommandExecutionError
 	if errors.As(err, &commandErr) {
+		// A supervised gh timeout is indeterminate: GitHub may have accepted
+		// the request before the local process was killed. Treat it as
+		// retryable instead of recording a definitive forge refusal.
+		if commandErr.Category == shell.FailureSupervisorTimeout {
+			return true
+		}
 		message := strings.Join([]string{commandErr.Message, commandErr.Result.Stdout, commandErr.Result.Stderr}, "\n")
 		return (looksLikeGitHubFailure(message) && isTransientGitHubMessage(message)) || isExplicitTransientGitHubStatus(message)
 	}

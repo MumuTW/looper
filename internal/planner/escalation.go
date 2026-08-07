@@ -115,16 +115,16 @@ func (r *Runner) runAssessSuitabilityStep(ctx context.Context, input stepInput) 
 		return checkpoint, fmt.Errorf("remove stale planner assessment output: %w", err)
 	}
 	executionID := eventlog.NewEventID("agent")
-	vendor, model, _, useSnapshot, err := r.identityFromRun(input.Run)
+	vendor, model, _, reasoningEffort, useSnapshot, err := r.identityFromRun(input.Run)
 	if err != nil {
 		return checkpoint, err
 	}
-	useSnap, snapVendor, snapModel := agentRunSnapshotFields(vendor, model, useSnapshot)
+	useSnap, snapVendor, snapModel, snapReasoningEffort := agentRunSnapshotFields(vendor, model, reasoningEffort, useSnapshot)
 	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
 		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 		Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 		Metadata:       map[string]any{"loopType": "planner", "phase": "suitability-assessment", "repo": issue.Repo, "issueNumber": issue.IssueNumber},
-		IdempotencyKey: fmt.Sprintf("planner-assessment:%s", input.Loop.ID), UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+		IdempotencyKey: fmt.Sprintf("planner-assessment:%s", input.Loop.ID), UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
 	})
 	if err != nil {
 		return checkpoint, err
