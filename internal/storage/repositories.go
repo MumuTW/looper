@@ -4288,6 +4288,32 @@ func (r *WorktreesRepository) ListActive(ctx context.Context) ([]WorktreeRecord,
 	return scanWorktrees(rows)
 }
 
+// ListAllPaths returns every worktree path this table has ever claimed,
+// including cleaned and retired rows. The disk sweeper needs the full set, not
+// the active one: a cleaned row whose directory still exists is a failed
+// removal that the record-driven pass owns, and treating it as unregistered
+// debris would delete it out from under that pass's provenance.
+func (r *WorktreesRepository) ListAllPaths(ctx context.Context) ([]string, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT worktree_path FROM worktrees`)
+	if err != nil {
+		return nil, fmt.Errorf("list worktree paths: %w", err)
+	}
+	defer rows.Close()
+
+	paths := make([]string, 0)
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, fmt.Errorf("scan worktree path: %w", err)
+		}
+		paths = append(paths, path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list worktree paths: %w", err)
+	}
+	return paths, nil
+}
+
 func (r *WorktreesRepository) TouchCleanupAttempt(ctx context.Context, id, updatedAt string) error {
 	_, err := r.q.ExecContext(ctx, `
 		UPDATE worktrees

@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -27,6 +29,31 @@ type WorktreeCleanupStatus struct {
 	Skipped         int     `json:"skipped"`
 	Failed          int     `json:"failed"`
 	LastError       string  `json:"lastError,omitempty"`
+	// DiskSweep reports the unregistered-directory pass separately from the
+	// record-driven counters above. Folding them together would hide the one
+	// number an operator needs when a worktree root has a backlog: how much
+	// debris is left that no worktrees row describes.
+	DiskSweep WorktreeDiskSweepStatus `json:"diskSweep"`
+}
+
+// WorktreeDiskSweepStatus counts the most recent unregistered-directory pass.
+// Containers are counted separately from checkouts because they answer
+// different questions: containersUnreachable is repo paths looper no longer
+// manages, unregistered is checkouts inside a root it still does.
+type WorktreeDiskSweepStatus struct {
+	Scanned               int    `json:"scanned"`
+	Unregistered          int    `json:"unregistered"`
+	WouldRemove           int    `json:"wouldRemove"`
+	Removed               int    `json:"removed"`
+	Skipped               int    `json:"skipped"`
+	Failed                int    `json:"failed"`
+	ContainersScanned     int    `json:"containersScanned"`
+	ContainersUnreachable int    `json:"containersUnreachable"`
+	ContainersWouldRemove int    `json:"containersWouldRemove"`
+	ContainersRemoved     int    `json:"containersRemoved"`
+	ContainersSkipped     int    `json:"containersSkipped"`
+	ContainersFailed      int    `json:"containersFailed"`
+	LastError             string `json:"lastError,omitempty"`
 }
 
 func (r *Runtime) WorktreeCleanupStatus() WorktreeCleanupStatus {
@@ -309,6 +336,16 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 		}
 	}
 
+	// The record pass above can only see worktrees the table claims. Sweep the
+	// roots themselves for directories it never had a row for. Ordering is
+	// deliberate: the record pass runs first so a path it cleans this tick is
+	// already gone (or already row-tracked) when the sweep enumerates.
+	summary.DiskSweep = r.runWorktreeDiskSweep(ctx, repos, gitGateway, cfg)
+	summary.Failed += summary.DiskSweep.Failed
+	if summary.LastError == "" {
+		summary.LastError = summary.DiskSweep.LastError
+	}
+
 	summary.LastCompletedAt = stringPtr(formatJavaScriptISOString(r.now().UTC()))
 	if summary.Failed > 0 {
 		summary.LastStatus = "failed"
@@ -336,11 +373,336 @@ func worktreeCleanupCompletedPayload(summary WorktreeCleanupStatus, skipReasons 
 		"failed":      summary.Failed,
 		"lastError":   summary.LastError,
 		"completedAt": derefString(summary.LastCompletedAt),
+		// Durable, not just in the in-memory status: a backlog the budget
+		// left behind is the number that explains why disk use did not drop.
+		"diskSweep": map[string]any{
+			"scanned":               summary.DiskSweep.Scanned,
+			"unregistered":          summary.DiskSweep.Unregistered,
+			"wouldRemove":           summary.DiskSweep.WouldRemove,
+			"removed":               summary.DiskSweep.Removed,
+			"skipped":               summary.DiskSweep.Skipped,
+			"failed":                summary.DiskSweep.Failed,
+			"containersScanned":     summary.DiskSweep.ContainersScanned,
+			"containersUnreachable": summary.DiskSweep.ContainersUnreachable,
+			"containersWouldRemove": summary.DiskSweep.ContainersWouldRemove,
+			"containersRemoved":     summary.DiskSweep.ContainersRemoved,
+			"containersSkipped":     summary.DiskSweep.ContainersSkipped,
+			"containersFailed":      summary.DiskSweep.ContainersFailed,
+		},
 	}
 	if len(skipReasons) > 0 {
 		payload["skipReasons"] = skipReasons
 	}
 	return payload
+}
+
+// runWorktreeDiskSweep removes directories under a project's worktree root
+// that no worktrees row claims. It is gated by the same admission claim as
+// candidate cleanup: the sweep deletes directories, so it must not run after
+// shutdown or degradation has closed admission.
+func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repositories, gitGateway worktreeCleanupGit, cfg config.Config) WorktreeDiskSweepStatus {
+	status := WorktreeDiskSweepStatus{}
+	budget := cfg.Daemon.WorktreeCleanup.MaxDiskSweepPerTick
+	if budget <= 0 {
+		return status
+	}
+	if err := r.AllowClaim(); err != nil {
+		status.LastError = err.Error()
+		return status
+	}
+	// Roots come from the project records, not config.Projects, so the sweep
+	// sees exactly the roots cleanupWorktreeCandidate resolves. An archived
+	// project is excluded on purpose: RetireByProject deliberately leaves its
+	// checkouts on disk, and sweeping them would delete the work a handoff
+	// chose to preserve.
+	projects, err := repos.Projects.List(ctx)
+	if err != nil {
+		status.Failed = 1
+		status.LastError = err.Error()
+		return status
+	}
+	roots := make([]worktreecleanup.DiskSweepRoot, 0, len(projects))
+	allRoots := make([]worktreecleanup.DiskSweepRoot, 0, len(projects))
+	rootIndexes := make(map[string]int, len(projects))
+	repoPathsByRoot := make(map[string][]string, len(projects))
+	managedRepoPaths := make([]string, 0, len(projects))
+	for _, project := range projects {
+		managedRepoPaths = appendUniqueWorktreeRepoPath(managedRepoPaths, project.RepoPath)
+	}
+	// Container names cover archived projects too. Archiving retires records
+	// but deliberately leaves checkouts on disk, so an archived project's
+	// container is still reachable state, not debris.
+	liveContainers := make([]string, 0, 2*len(projects))
+	liveProjectPaths := make([]string, 0, len(projects))
+	sharedRoot, sharedRootErr := worktreeSharedRoot()
+	sharedRootFailureCounted := false
+	for _, project := range projects {
+		liveContainers = append(liveContainers, config.ToRepoWorktreeDirectoryName(project.RepoPath))
+		root, rootErr := worktreeCleanupRoot(project)
+		if rootErr != nil {
+			status.Failed++
+			status.LastError = rootErr.Error()
+			continue
+		}
+		allRoots = append(allRoots, worktreecleanup.DiskSweepRoot{
+			ProjectID:    project.ID,
+			RepoPath:     project.RepoPath,
+			WorktreeRoot: root,
+		})
+		if rootErr := validateDiskSweepRoot(root, managedRepoPaths, sharedRoot, sharedRootErr); rootErr != nil {
+			status.Failed++
+			status.LastError = rootErr.Error()
+			if sharedRootErr != nil {
+				sharedRootFailureCounted = true
+			}
+			continue
+		}
+		rootKey := worktreesafety.NormalizePath(root)
+		repoPathsByRoot[rootKey] = appendUniqueWorktreeRepoPath(repoPathsByRoot[rootKey], project.RepoPath)
+		if index, ok := rootIndexes[rootKey]; ok {
+			roots[index].RepoPaths = append([]string(nil), repoPathsByRoot[rootKey]...)
+		}
+		// A project may carry an explicit worktreeRoot that does not follow the
+		// repo-hash layout. If it still lives under the shared root, its own
+		// first segment is the container to protect — the hash name alone would
+		// not cover it, and the sweep would read the directory as unreachable.
+		if sharedRootErr == nil {
+			if name, ok := containerNameUnder(sharedRoot, root); ok {
+				liveContainers = append(liveContainers, name)
+			}
+		}
+		liveProjectPaths = append(liveProjectPaths, root)
+		if project.Archived {
+			continue
+		}
+		if _, ok := rootIndexes[rootKey]; ok {
+			continue
+		}
+		repoPaths := append([]string(nil), repoPathsByRoot[rootKey]...)
+		if len(repoPaths) == 0 {
+			continue
+		}
+		roots = append(roots, worktreecleanup.DiskSweepRoot{
+			ProjectID:    project.ID,
+			RepoPath:     repoPaths[0],
+			RepoPaths:    repoPaths,
+			WorktreeRoot: root,
+		})
+		rootIndexes[rootKey] = len(roots) - 1
+	}
+	if sharedRootErr == nil {
+		sharedRootErr = validateSharedDiskSweepRoot(sharedRoot, managedRepoPaths, allRoots)
+		if sharedRootErr != nil {
+			status.Failed++
+			status.LastError = sharedRootErr.Error()
+			sharedRootFailureCounted = true
+			// A shared-root alias can overlap a configured project root even when
+			// the per-root pass accepted its lexical spelling. Do not run either
+			// destructive tier until the shared identity is safe.
+			roots = nil
+		}
+	}
+	if sharedRootErr != nil && !sharedRootFailureCounted {
+		status.Failed++
+		status.LastError = sharedRootErr.Error()
+	}
+	roots, overlapErrs := rejectOverlappingDiskSweepRoots(roots, allRoots)
+	if len(overlapErrs) > 0 {
+		status.Failed += len(overlapErrs)
+		status.LastError = overlapErrs[len(overlapErrs)-1].Error()
+	}
+	registered, err := repos.Worktrees.ListAllPaths(ctx)
+	if err != nil {
+		status.Failed++
+		if status.LastError == "" {
+			status.LastError = err.Error()
+		}
+		return status
+	}
+
+	retentionCutoff, retentionErr := worktreeRetentionCutoff(r.now().UTC(), cfg.Daemon.WorktreeCleanup.RetentionDays)
+	if retentionErr != nil {
+		status.Failed++
+		status.LastError = retentionErr.Error()
+		return status
+	}
+
+	r.mu.Lock()
+	rootStart := r.worktreeCleanupSweepCursor
+	r.worktreeCleanupSweepCursor++
+	r.mu.Unlock()
+	containersFirst := true
+	if budget == 1 && len(roots) > 0 {
+		containersFirst = rootStart%2 == 0
+	}
+	containerBudget := budget
+	if len(roots) > 0 && budget > 1 {
+		containerBudget-- // reserve one slot for the per-root tier
+	}
+	rootBudget := budget
+
+	runContainers := func(available int) int {
+		if sharedRootErr != nil {
+			status.ContainersFailed++
+			status.LastError = sharedRootErr.Error()
+			return 0
+		}
+		containers, containerErr := worktreecleanup.RunContainerSweep(ctx, worktreecleanup.ContainerSweepOptions{
+			SharedRoot:         sharedRoot,
+			LiveContainerNames: liveContainers,
+			LiveProjectPaths:   liveProjectPaths,
+			RegisteredPaths:    registered,
+			IsRegisteredPath: func(ctx context.Context, path string) (bool, error) {
+				record, err := repos.Worktrees.GetByPath(ctx, path)
+				return record != nil, err
+			},
+			IsLiveProjectPath: func(ctx context.Context, path string) (bool, error) {
+				currentProjects, err := repos.Projects.List(ctx)
+				if err != nil {
+					return false, err
+				}
+				for _, project := range currentProjects {
+					projectRoot, err := worktreeCleanupRoot(project)
+					if err != nil {
+						return false, err
+					}
+					projectIdentity := worktreesafety.NormalizePath(projectRoot)
+					candidateIdentity := worktreesafety.NormalizePath(path)
+					if projectIdentity == candidateIdentity || pathContains(candidateIdentity, projectIdentity) {
+						return true, nil
+					}
+				}
+				return false, nil
+			},
+			IsLiveContainerPath: func(ctx context.Context, path string) (bool, error) {
+				currentProjects, err := repos.Projects.List(ctx)
+				if err != nil {
+					return false, err
+				}
+				candidate := worktreesafety.NormalizePath(path)
+				for _, project := range currentProjects {
+					containerNames := []string{config.ToRepoWorktreeDirectoryName(project.RepoPath)}
+					root, rootErr := worktreeCleanupRoot(project)
+					if rootErr != nil {
+						return false, rootErr
+					}
+					if name, ok := containerNameUnder(sharedRoot, root); ok {
+						containerNames = append(containerNames, name)
+					}
+					for _, name := range containerNames {
+						if candidate == worktreesafety.NormalizePath(filepath.Join(sharedRoot, name)) {
+							return true, nil
+						}
+					}
+				}
+				return false, nil
+			},
+			Git:             gitGateway,
+			Budget:          available,
+			RetentionCutoff: retentionCutoff,
+			DryRun:          cfg.Daemon.WorktreeCleanup.DryRun,
+		})
+		status.ContainersScanned = containers.Summary.Scanned
+		status.ContainersUnreachable = containers.Summary.Unregistered
+		orphanProjectsRemoved := 0
+		orphanProjectsWouldRemove := 0
+		for _, candidate := range containers.Candidates {
+			if candidate.Reason == "orphaned_project" {
+				orphanProjectsWouldRemove++
+				if !cfg.Daemon.WorktreeCleanup.DryRun {
+					orphanProjectsRemoved++
+				}
+			}
+		}
+		status.ContainersRemoved = containers.Summary.Removed - orphanProjectsRemoved
+		status.ContainersWouldRemove = containers.Summary.WouldRemove - orphanProjectsWouldRemove
+		status.ContainersSkipped = containers.Summary.Skipped
+		status.ContainersFailed = containers.Summary.Errors
+		status.Removed += orphanProjectsRemoved
+		status.WouldRemove += orphanProjectsWouldRemove
+		status.Skipped += containers.Summary.Skipped
+		status.Failed += containers.Summary.Errors
+		if containerErr != nil {
+			status.ContainersFailed++
+			status.Failed++
+			status.LastError = containerErr.Error()
+		}
+		for _, candidate := range containers.Candidates {
+			if candidate.Error != "" {
+				status.LastError = candidate.Error
+			}
+		}
+		if cfg.Daemon.WorktreeCleanup.DryRun {
+			return containers.Summary.WouldRemove
+		}
+		return containers.Summary.Removed
+	}
+
+	if containersFirst {
+		used := runContainers(containerBudget)
+		if used < rootBudget {
+			rootBudget -= used
+		} else {
+			rootBudget = 0
+		}
+	}
+	if len(roots) > 0 {
+		plan, planErr := worktreecleanup.RunDiskSweep(ctx, worktreecleanup.DiskSweepOptions{
+			Roots:           roots,
+			RegisteredPaths: registered,
+			Git:             gitGateway,
+			Budget:          rootBudget,
+			RootStartIndex:  rootStart,
+			RetentionCutoff: retentionCutoff,
+			DryRun:          cfg.Daemon.WorktreeCleanup.DryRun,
+			GitTrackedPaths: func(ctx context.Context, repoPath string) ([]string, error) {
+				entries, err := gitGateway.ListWorktrees(ctx, repoPath)
+				if err != nil {
+					return nil, err
+				}
+				paths := make([]string, 0, len(entries))
+				for _, entry := range entries {
+					paths = append(paths, entry.Path)
+				}
+				return paths, nil
+			},
+			IsRegisteredPath: func(ctx context.Context, path string) (bool, error) {
+				record, err := repos.Worktrees.GetByPath(ctx, path)
+				return record != nil, err
+			},
+		})
+		status.Scanned += plan.Summary.Scanned
+		status.Unregistered += plan.Summary.Unregistered
+		status.WouldRemove += plan.Summary.WouldRemove
+		status.Removed += plan.Summary.Removed
+		status.Skipped += plan.Summary.Skipped
+		status.Failed += plan.Summary.Errors
+		if planErr != nil {
+			status.Failed++
+			status.LastError = planErr.Error()
+			return status
+		}
+		for _, candidate := range plan.Candidates {
+			if candidate.Error != "" {
+				status.LastError = candidate.Error
+			}
+		}
+		if !containersFirst {
+			used := plan.Summary.Removed
+			if cfg.Daemon.WorktreeCleanup.DryRun {
+				used = plan.Summary.WouldRemove
+			}
+			if used < containerBudget {
+				containerBudget -= used
+			} else {
+				containerBudget = 0
+			}
+		}
+	}
+	if !containersFirst {
+		runContainers(containerBudget)
+	}
+	return status
 }
 
 type worktreeCleanupCandidateResult struct {
@@ -589,6 +951,148 @@ func worktreeCleanupRoot(project storage.ProjectRecord) (string, error) {
 	return config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
 }
 
+// worktreeSharedRoot is the parent every per-repo container sits under. It is
+// derived the same way project roots are, so LOOPER_HOME keeps a test binary's
+// sweep inside its own throwaway home.
+func worktreeSharedRoot() (string, error) {
+	return config.DefaultWorktreeRoot()
+}
+
+func worktreeRetentionCutoff(now time.Time, retentionDays int) (time.Time, error) {
+	if retentionDays < 0 {
+		return time.Time{}, fmt.Errorf("worktree retention days must be non-negative")
+	}
+	if retentionDays > 106751 {
+		return time.Time{}, fmt.Errorf("worktree retention days %d overflows time.Duration", retentionDays)
+	}
+	return now.Add(-time.Duration(retentionDays) * 24 * time.Hour), nil
+}
+
+func validateDiskSweepRoot(root string, managedRepoPaths []string, sharedRoot string, sharedRootErr error) error {
+	if sharedRootErr != nil {
+		return fmt.Errorf("shared worktree root unavailable: %w", sharedRootErr)
+	}
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return fmt.Errorf("worktree sweep root is empty")
+	}
+	rootIdentity := worktreesafety.NormalizePath(root)
+	for _, managedRepoPath := range managedRepoPaths {
+		managedRepoPath = strings.TrimSpace(managedRepoPath)
+		if managedRepoPath == "" {
+			continue
+		}
+		if rootIdentity == worktreesafety.NormalizePath(managedRepoPath) || pathContains(rootIdentity, managedRepoPath) {
+			return fmt.Errorf("worktree sweep root %q is a broad ancestor of repository %q", root, managedRepoPath)
+		}
+	}
+	if rootIdentity == filepath.Dir(rootIdentity) || rootIdentity == string(filepath.Separator) || rootIdentity == worktreesafety.NormalizePath(os.TempDir()) {
+		return fmt.Errorf("worktree sweep root %q is not dedicated", root)
+	}
+	if home, err := os.UserHomeDir(); err == nil && rootIdentity == worktreesafety.NormalizePath(home) {
+		return fmt.Errorf("worktree sweep root %q is not dedicated", root)
+	}
+	if sharedRootErr == nil {
+		sharedRoot = strings.TrimSpace(sharedRoot)
+		if rootIdentity == worktreesafety.NormalizePath(sharedRoot) {
+			return fmt.Errorf("worktree sweep root %q is the shared root", root)
+		}
+	}
+	return nil
+}
+
+func validateSharedDiskSweepRoot(sharedRoot string, managedRepoPaths []string, configuredRoots []worktreecleanup.DiskSweepRoot) error {
+	sharedRoot = strings.TrimSpace(sharedRoot)
+	if sharedRoot == "" {
+		return fmt.Errorf("shared worktree root is empty")
+	}
+	identity := worktreesafety.NormalizePath(sharedRoot)
+	if identity == filepath.Dir(identity) || identity == string(filepath.Separator) || identity == worktreesafety.NormalizePath(os.TempDir()) {
+		return fmt.Errorf("shared worktree root %q is not dedicated", sharedRoot)
+	}
+	if home, err := os.UserHomeDir(); err == nil && identity == worktreesafety.NormalizePath(home) {
+		return fmt.Errorf("shared worktree root %q is not dedicated", sharedRoot)
+	}
+	for _, managedRepoPath := range managedRepoPaths {
+		managedRepoPath = strings.TrimSpace(managedRepoPath)
+		if managedRepoPath == "" {
+			continue
+		}
+		managedIdentity := worktreesafety.NormalizePath(managedRepoPath)
+		if identity == managedIdentity || pathContains(identity, managedIdentity) || pathContains(managedIdentity, identity) {
+			return fmt.Errorf("shared worktree root %q overlaps managed repository %q", sharedRoot, managedRepoPath)
+		}
+	}
+	for _, configuredRoot := range configuredRoots {
+		rootIdentity := worktreesafety.NormalizePath(configuredRoot.WorktreeRoot)
+		if identity == rootIdentity || pathContains(rootIdentity, identity) {
+			return fmt.Errorf("shared worktree root %q overlaps configured worktree root %q", sharedRoot, configuredRoot.WorktreeRoot)
+		}
+	}
+	return nil
+}
+
+func pathContains(parent, child string) bool {
+	rel, err := filepath.Rel(worktreesafety.NormalizePath(parent), worktreesafety.NormalizePath(child))
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return false
+	}
+	return true
+}
+
+func rejectOverlappingDiskSweepRoots(roots []worktreecleanup.DiskSweepRoot, protected ...[]worktreecleanup.DiskSweepRoot) ([]worktreecleanup.DiskSweepRoot, []error) {
+	invalid := make(map[int]bool)
+	errs := []error{}
+	scope := roots
+	if len(protected) > 0 {
+		scope = protected[0]
+	}
+	seenPairs := make(map[string]bool)
+	for i := 0; i < len(roots); i++ {
+		for _, other := range scope {
+			if worktreesafety.NormalizePath(roots[i].WorktreeRoot) == worktreesafety.NormalizePath(other.WorktreeRoot) {
+				continue
+			}
+			if !pathContains(roots[i].WorktreeRoot, other.WorktreeRoot) && !pathContains(other.WorktreeRoot, roots[i].WorktreeRoot) {
+				continue
+			}
+			invalid[i] = true
+			left, right := worktreesafety.NormalizePath(roots[i].WorktreeRoot), worktreesafety.NormalizePath(other.WorktreeRoot)
+			if left > right {
+				left, right = right, left
+			}
+			pair := left + "\x00" + right
+			if !seenPairs[pair] {
+				seenPairs[pair] = true
+				errs = append(errs, fmt.Errorf("overlapping worktree sweep roots %q and %q", roots[i].WorktreeRoot, other.WorktreeRoot))
+			}
+		}
+	}
+	if len(invalid) == 0 {
+		return roots, nil
+	}
+	filtered := make([]worktreecleanup.DiskSweepRoot, 0, len(roots)-len(invalid))
+	for index, root := range roots {
+		if !invalid[index] {
+			filtered = append(filtered, root)
+		}
+	}
+	return filtered, errs
+}
+
+// containerNameUnder returns the first path segment of root beneath sharedRoot.
+func containerNameUnder(sharedRoot, root string) (string, bool) {
+	rel, err := filepath.Rel(worktreesafety.NormalizePath(sharedRoot), worktreesafety.NormalizePath(root))
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) == 0 || parts[0] == "" {
+		return "", false
+	}
+	return parts[0], true
+}
+
 func worktreeInList(items []gitinfra.WorktreeListEntry, path string) bool {
 	for _, item := range items {
 		if normalizeRuntimePath(item.Path) == normalizeRuntimePath(path) {
@@ -600,6 +1104,20 @@ func worktreeInList(items []gitinfra.WorktreeListEntry, path string) bool {
 
 func normalizeRuntimePath(path string) string {
 	return strings.TrimRight(strings.TrimSpace(path), string(os.PathSeparator))
+}
+
+func appendUniqueWorktreeRepoPath(paths []string, path string) []string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return paths
+	}
+	identity := worktreesafety.NormalizePath(trimmed)
+	for _, existing := range paths {
+		if worktreesafety.NormalizePath(existing) == identity {
+			return paths
+		}
+	}
+	return append(paths, trimmed)
 }
 
 func worktreeCleanupCandidateActive(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord) (bool, error) {

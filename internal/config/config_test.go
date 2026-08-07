@@ -3374,6 +3374,23 @@ func TestValidateWorktreeCleanupConfig(t *testing.T) {
 	assertValidationIssue(t, validationErr, "daemon.worktreeCleanup.maxPerTick", "must be a positive integer")
 }
 
+func TestValidateWorktreeCleanupConfigRejectsRetentionOverflow(t *testing.T) {
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Daemon.WorktreeCleanup.RetentionDays = 106752
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil {
+		t.Fatal("ValidateWithOptions() error = nil, want retention overflow validation")
+	}
+	validationErr, ok := err.(*ConfigValidationError)
+	if !ok {
+		t.Fatalf("ValidateWithOptions() error = %T, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "daemon.worktreeCleanup.retentionDays", "must not exceed 106751 days")
+}
+
 // NaN and Inf defeat the strict range comparisons in validateResourceGuardConfig
 // (NaN < 0 and NaN >= 100 are both false), so without an explicit finite check
 // they would be accepted, silently skip the guard, and break JSON projections.

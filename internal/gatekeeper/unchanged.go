@@ -30,18 +30,19 @@ const maxSkipAge = 30 * time.Minute
 // pull requests whose gate is waiting on a check are never skipped (see
 // reportAwaitsCheckState).
 //
-// BaseSHA is included only when the diff budget is enabled. It does not move on
+// BaseSHA is included when either the diff budget or review-capacity policy is
+// enabled. It does not move on
 // an ordinary push, but when the base branch is force-pushed or otherwise
 // rewritten GitHub recomputes changedFiles and deletions against a different
 // merge base without moving the head or any other list-page field. Omitting it
 // then would let a stale diff-budget verdict be reused for up to maxSkipAge
-// after the observed counts crossed a configured limit. With both bounds at
-// their default of zero the gate is unlimited, so a base advance changes
-// nothing Gatekeeper enforces; including BaseSHA unconditionally would make
+// after the observed counts crossed a configured limit. When neither policy
+// depends on merge-base-derived counts, a base advance changes nothing
+// Gatekeeper enforces; including BaseSHA unconditionally would make
 // every base-branch commit invalidate the cached report for every open pull
 // request, paying for a full re-evaluation (and its forge round trips) to
 // recompute a verdict that cannot have changed.
-func sourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled bool) string {
+func sourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled bool, reviewPolicyEnabled ...bool) string {
 	labels := append([]string(nil), pullRequest.Labels...)
 	sort.Strings(labels)
 	fields := []string{
@@ -54,8 +55,12 @@ func sourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled
 		fmt.Sprintf("%t", pullRequest.HasConflicts),
 		strings.Join(labels, ","),
 	}
-	if budgetEnabled {
+	reviewPolicy := len(reviewPolicyEnabled) > 0 && reviewPolicyEnabled[0]
+	if budgetEnabled || reviewPolicy {
 		fields = append(fields, pullRequest.BaseSHA)
+	}
+	if reviewPolicy {
+		fields = append(fields, fmt.Sprintf("%d", pullRequest.Additions), fmt.Sprintf("%d", pullRequest.Deletions))
 	}
 	return strings.Join(fields, "\x1f")
 }
@@ -93,6 +98,23 @@ var checkReasonCodes = map[ReasonCode]struct{}{
 // alone would miss that case and checking the reason alone would miss a
 // provider-blocked report. Both signals are authoritative.
 func reportAwaitsCurrentHeadReview(report Report) bool {
+	// A provider-blocked report replaces its reasons, but retains the invalid
+	// review projection. It must remain retryable until evidence arrives. New
+	// below-threshold reports are eligible and therefore do not take this path.
+	if report.Evidence.CodexReview != nil && !report.Evidence.CodexReview.CurrentHeadValid && !report.Eligible {
+		return true
+	}
+	if !report.Evidence.ReviewRequiredByPolicy {
+		// Reports written before the threshold field existed are still recognized
+		// through their explicit review-missing reason. New below-threshold
+		// reports deliberately do not poll for a review that policy waived.
+		for _, reason := range report.Reasons {
+			if reason.Code == ReasonCodexReviewMissing || reason.Code == ReasonCodexReviewRequired {
+				return true
+			}
+		}
+		return false
+	}
 	if report.Evidence.CodexReview != nil && !report.Evidence.CodexReview.CurrentHeadValid {
 		return true
 	}
@@ -172,12 +194,13 @@ func latestGateReports(ctx context.Context, repos *storage.Repositories, project
 // enough — and re-evaluated only when it advances, instead of re-polling the
 // forge on every tick while a PR awaits human or reviewer progress.
 //
-// reviewEvidenceAppeared is the result of a cheap local event-log check made by
-// the caller for reports awaiting a current-head review. When the review event
-// has not appeared, the PR is skipped because re-evaluating would reach the same
-// conclusion without the event and would pay forge round trips every tick; when
-// it has appeared, the PR is re-evaluated so the new evidence is observed.
-func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now time.Time, currentConvergenceRevision string, reviewEvidenceAppeared bool) (Report, bool) {
+// reviewEvidenceRefreshRequired is the result of a cheap local event-log check
+// made by the caller for reports awaiting a current-head review. When no new
+// evidence is observed, the PR is skipped because re-evaluating would reach the
+// same conclusion without the event and would pay forge round trips every tick;
+// when evidence appears — or the lookup fails — it is re-evaluated so a stale
+// success is never reused while the evidence source is uncertain.
+func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now time.Time, currentConvergenceRevision string, reviewEvidenceRefreshRequired bool) (Report, bool) {
 	if !hasPrevious || strings.TrimSpace(previous.SourceFingerprint) == "" {
 		return Report{}, false
 	}
@@ -197,7 +220,7 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now ti
 			return Report{}, false
 		}
 	}
-	if reportAwaitsCurrentHeadReview(previous) && reviewEvidenceAppeared {
+	if reviewEvidenceRefreshRequired {
 		return Report{}, false
 	}
 	evaluatedAt, err := time.Parse(time.RFC3339Nano, previous.EvaluatedAt)

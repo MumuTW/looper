@@ -226,6 +226,7 @@ type Runtime struct {
 	worktreeCleanupRunning      bool
 	worktreeCleanupInitialDelay time.Duration
 	worktreeCleanupStatus       WorktreeCleanupStatus
+	worktreeCleanupSweepCursor  int
 	hostAdmission               *hostAdmissionGate
 	projectDiscovery            *projectDiscoveryRunner
 	resumeProjectDiscoveries    func(context.Context, *projects.Service) error

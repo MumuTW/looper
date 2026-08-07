@@ -3,9 +3,11 @@ package eventlog
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/MumuTW/looper/internal/storage"
@@ -64,6 +66,16 @@ func NewEventID(prefix string) string {
 		return fmt.Sprintf("%s_%d", prefix, time.Now().UTC().UnixNano())
 	}
 	return prefix + "_" + hex.EncodeToString(raw)
+}
+
+// StableReviewEvidenceID returns the deterministic event ID shared by the
+// Reviewer and Gatekeeper writers for one review-capacity observation. Keeping
+// the identity algorithm at the event-log boundary makes retries and
+// cross-writer reconciliation idempotent even when either writer is changed.
+func StableReviewEvidenceID(eventType, repo string, prNumber int64, headSHA, reviewID, reason string) string {
+	identity := fmt.Sprintf("%s\x00%s\x00%d\x00%s\x00%s\x00%s", eventType, strings.TrimSpace(repo), prNumber, strings.TrimSpace(headSHA), strings.TrimSpace(reviewID), strings.TrimSpace(reason))
+	digest := sha256.Sum256([]byte(identity))
+	return fmt.Sprintf("%s:%x", eventType, digest[:])
 }
 
 func Append(ctx context.Context, repositories *storage.Repositories, input AppendInput) error {

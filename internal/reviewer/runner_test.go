@@ -9580,6 +9580,33 @@ func testReviewerLoopConfig() config.ReviewerLoopConfig {
 	return config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 60, MinPublishIntervalSeconds: 300, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: false, StopOnReadyLabel: true, StopOnIdenticalOutput: true}
 }
 
+func TestReviewCapacityRefusalRequiresStructuredRateLimitResult(t *testing.T) {
+	t.Parallel()
+	refusal, ok := reviewCapacityRefusal(AgentResult{Stdout: `__LOOPER_RESULT__={"type":"rate_limit","message":"review quota exhausted"}`})
+	if !ok || refusal.reason != "rate_limit" || refusal.message != "review quota exhausted" {
+		t.Fatalf("reviewCapacityRefusal() = %#v, %t", refusal, ok)
+	}
+	if _, ok := reviewCapacityRefusal(AgentResult{Summary: "rate limit exceeded"}); ok {
+		t.Fatal("prose rate-limit message must not become durable refusal evidence")
+	}
+}
+
+func TestAppendReviewEvidencePersistsPullRequestEntity(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	runner := New(Options{Repos: fixture.repos, Now: fixture.now})
+	input := stepInput{Project: storage.ProjectRecord{ID: "project_1"}, Repo: "acme/looper", PRNumber: 42}
+	if err := runner.appendReviewEvidence(context.Background(), input, "pr.review.refused", map[string]any{"headSha": "abc123", "reason": "rate_limit"}); err != nil {
+		t.Fatalf("appendReviewEvidence() error = %v", err)
+	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if len(events) != 1 || events[0].EventType != "pr.review.refused" || !strings.Contains(events[0].PayloadJSON, `"reason":"rate_limit"`) {
+		t.Fatalf("events = %#v, want durable rate-limit refusal", events)
+	}
+}
+
 func (f *runnerFixture) advance(delta time.Duration) { f.current = f.current.Add(delta) }
 
 func (f *runnerFixture) nowISO() string {

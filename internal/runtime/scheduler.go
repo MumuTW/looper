@@ -793,7 +793,7 @@ func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input revie
 	if err != nil {
 		return reviewer.ReviewMarkerResult{}, err
 	}
-	return reviewer.ReviewMarkerResult{Found: marker.Found, Outcome: marker.Outcome, Event: reviewer.ReviewEvent(marker.Event), AuthorLogin: marker.AuthorLogin, Body: marker.Body, InlineCommentBodies: append([]string(nil), marker.InlineCommentBodies...)}, nil
+	return reviewer.ReviewMarkerResult{Found: marker.Found, Outcome: marker.Outcome, Event: reviewer.ReviewEvent(marker.Event), AuthorLogin: marker.AuthorLogin, ReviewID: marker.ReviewID, Body: marker.Body, InlineCommentBodies: append([]string(nil), marker.InlineCommentBodies...)}, nil
 }
 
 func (a reviewerGitHubAdapter) CreateIssueComment(ctx context.Context, input reviewer.IssueCommentInput) (reviewer.IssueCommentResult, error) {
@@ -2180,6 +2180,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			},
 			DiffBudgetForProject: func(projectID string) config.GatekeeperDiffBudget {
 				return gatekeeperDiffBudgetForProject(cfg, projectID)
+			},
+			RequiredReviewChangedLinesForProject: func(projectID string) int {
+				return gatekeeperRequiredReviewChangedLinesForProject(cfg, projectID)
 			},
 			LogWarn: func(msg string, fields map[string]any) {
 				if logger != nil {

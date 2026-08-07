@@ -474,6 +474,13 @@ type WorktreeCleanupConfig struct {
 	MaxPerTick     int    `json:"maxPerTick"`
 	IncludeOrphans bool   `json:"includeOrphans"`
 	DryRun         bool   `json:"dryRun"`
+	// MaxDiskSweepPerTick budgets removals of directories under a worktree
+	// root that the worktrees table never claimed. It is separate from
+	// MaxPerTick because the two passes cost different things: a record
+	// cleanup runs git commands per candidate, while a sweep removal is one
+	// RemoveAll. Sharing one budget would let unbounded debris starve the
+	// record pass that owns every worktree looper actually manages.
+	MaxDiskSweepPerTick int `json:"maxDiskSweepPerTick"`
 }
 
 type PackageConfig struct {
@@ -906,6 +913,10 @@ type GatekeeperRoleConfig struct {
 	// Trust is the merge authority level. Empty defaults to observe.
 	Trust      GatekeeperTrustLevel  `json:"trust,omitempty"`
 	DiffBudget *GatekeeperDiffBudget `json:"diffBudget,omitempty"`
+	// RequiredReviewChangedLines is the smallest additions+deletions total that
+	// triggers a review-capacity gate. The normalized default is 200; an explicit
+	// zero disables the threshold.
+	RequiredReviewChangedLines int `json:"requiredReviewChangedLines,omitempty"`
 }
 
 // GatekeeperDiffBudget is a boolean change-size gate. A zero bound is
@@ -1247,6 +1258,8 @@ type PartialWorktreeCleanupConfig struct {
 	MaxPerTick     *int    `json:"maxPerTick,omitempty"`
 	IncludeOrphans *bool   `json:"includeOrphans,omitempty"`
 	DryRun         *bool   `json:"dryRun,omitempty"`
+
+	MaxDiskSweepPerTick *int `json:"maxDiskSweepPerTick,omitempty"`
 }
 
 type PartialPackageConfig struct {
@@ -1585,8 +1598,9 @@ type PartialDeployerRoleConfig struct {
 }
 
 type PartialGatekeeperRoleConfig struct {
-	Trust      *GatekeeperTrustLevel        `json:"trust,omitempty"`
-	DiffBudget *PartialGatekeeperDiffBudget `json:"diffBudget,omitempty"`
+	Trust                      *GatekeeperTrustLevel        `json:"trust,omitempty"`
+	DiffBudget                 *PartialGatekeeperDiffBudget `json:"diffBudget,omitempty"`
+	RequiredReviewChangedLines *int                         `json:"requiredReviewChangedLines,omitempty"`
 }
 
 type PartialGatekeeperDiffBudget struct {

@@ -1082,6 +1082,9 @@ func mergeWorktreeCleanupConfig(config *WorktreeCleanupConfig, partial PartialWo
 	if partial.DryRun != nil {
 		config.DryRun = *partial.DryRun
 	}
+	if partial.MaxDiskSweepPerTick != nil {
+		config.MaxDiskSweepPerTick = *partial.MaxDiskSweepPerTick
+	}
 }
 
 func mergePackageConfig(config *PackageConfig, partial PartialPackageConfig) {
@@ -1349,6 +1352,9 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 				budget.MaxDeletions = *partial.Gatekeeper.DiffBudget.MaxDeletions
 			}
 			config.Gatekeeper.DiffBudget = budget
+		}
+		if partial.Gatekeeper.RequiredReviewChangedLines != nil {
+			config.Gatekeeper.RequiredReviewChangedLines = *partial.Gatekeeper.RequiredReviewChangedLines
 		}
 	}
 	if partial.Escalator != nil {
@@ -2275,6 +2281,10 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 		}
 		if configs.Gatekeeper.DiffBudget != nil {
 			gatekeeper.DiffBudget = clonePartialGatekeeperDiffBudget(configs.Gatekeeper.DiffBudget)
+		}
+		if configs.Gatekeeper.RequiredReviewChangedLines != nil {
+			threshold := *configs.Gatekeeper.RequiredReviewChangedLines
+			gatekeeper.RequiredReviewChangedLines = &threshold
 		}
 		cloned.Gatekeeper = &gatekeeper
 	}
