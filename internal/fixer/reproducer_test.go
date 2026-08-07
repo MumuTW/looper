@@ -294,6 +294,17 @@ func TestFixerReproductionDefersMalformedManifestDuringRetry(t *testing.T) {
 	}
 }
 
+func TestFixerReproductionDefersManifestWhileAgentWaitIsPending(t *testing.T) {
+	root, _ := writeFixerReproductionFixture(t)
+	checkpoint := fixerCheckpoint{ReproductionAbsent: true, PendingAgentExecutionID: "agent_live_1"}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("captureFixerReproduction() = %v, want manifest deferred for retry", err)
+	}
+	if checkpoint.Reproduction != nil || !checkpoint.ReproductionAbsent {
+		t.Fatalf("checkpoint after retry capture = %#v, want untrusted manifest deferred", checkpoint)
+	}
+}
+
 func TestRewindCheckpointForPrepareRetryPreservesOnlyUnfinishedRepair(t *testing.T) {
 	t.Parallel()
 

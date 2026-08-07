@@ -46,6 +46,24 @@ func seedTerminalCleanupRun(t *testing.T, fixture *runnerFixture, runID, worktre
 	return checkpoint
 }
 
+func seedSiblingWorkerCheckpoint(t *testing.T, fixture *runnerFixture, loopID, runID, worktreePath, checkoutMode string) {
+	t.Helper()
+	nowISO := fixture.nowISO()
+	checkpointJSON := runpipe.MustMarshalJSON(map[string]any{
+		"worktree": map[string]string{
+			"path":         worktreePath,
+			"checkoutMode": checkoutMode,
+		},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: runID, LoopID: loopID, Status: "running",
+		CurrentStep: runpipe.StringPtr("execute"), CheckpointJSON: &checkpointJSON,
+		StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(worker sibling) error = %v", err)
+	}
+}
+
 func storedCleanupTimestamps(t *testing.T, fixture *runnerFixture, runID string) (attempted, cleaned string) {
 	t.Helper()
 	run, err := fixture.repos.Runs.GetByID(context.Background(), runID)
@@ -162,6 +180,7 @@ func TestTerminalCleanupDoesNotSkipSiblingWorkerTakeover(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Loops.Upsert(sibling) error = %v", err)
 	}
+	seedSiblingWorkerCheckpoint(t, fixture, "loop_worker_takeover", "run_worker_takeover", filepath.Join(t.TempDir(), "worker-branch"), "branch")
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
 		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
@@ -172,6 +191,41 @@ func TestTerminalCleanupDoesNotSkipSiblingWorkerTakeover(t *testing.T) {
 	}
 	if checkpoint.Outcome != nil && len(checkpoint.Outcome.SecondaryIssues) != 0 {
 		t.Fatalf("Outcome = %#v, want no sibling-ownership skip", checkpoint.Outcome)
+	}
+}
+
+func TestTerminalCleanupSkipsDetachedSiblingWorkerTakeover(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	worktreePath := filepath.Join(t.TempDir(), "wt-worker-detached")
+	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_worker_detached", worktreePath)
+
+	// A legacy/retargeted PR Worker can own the same detached checkout. Its
+	// persisted checkpoint, not its loop type, is the ownership evidence.
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	target := "pr:acme/looper:42"
+	if err := fixture.repos.Loops.UpsertChangingHumanHold(context.Background(), storage.LoopRecord{
+		ID: "loop_worker_detached_takeover", Seq: 99, ProjectID: "project_1", Type: "worker",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+		Status: "human_takeover", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(sibling) error = %v", err)
+	}
+	seedSiblingWorkerCheckpoint(t, fixture, "loop_worker_detached_takeover", "run_worker_detached_takeover", worktreePath, "detached")
+
+	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
+	}, "run_cleanup_worker_detached", &checkpoint)
+
+	if len(git.cleanupCalls) != 0 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 0 while detached Worker owns the worktree", len(git.cleanupCalls))
+	}
+	if checkpoint.Outcome == nil || len(checkpoint.Outcome.SecondaryIssues) != 1 || !strings.Contains(checkpoint.Outcome.SecondaryIssues[0].Message, "sibling Worker") {
+		t.Fatalf("Outcome = %#v, want detached Worker ownership skip", checkpoint.Outcome)
 	}
 }
 

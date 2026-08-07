@@ -1151,7 +1151,17 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 }
 
 func fixerRetryHasUnfinishedRepair(checkpoint *fixerCheckpoint) bool {
-	if checkpoint == nil || checkpoint.Repair == nil {
+	if checkpoint == nil {
+		return false
+	}
+	// PendingAgentExecutionID is persisted after Start and before Wait. A
+	// Wait error therefore leaves Repair nil even though the agent may already
+	// have written a manifest; that manifest must remain untrusted but
+	// deferrable while the replacement agent owns the retry.
+	if strings.TrimSpace(checkpoint.PendingAgentExecutionID) != "" {
+		return true
+	}
+	if checkpoint.Repair == nil {
 		return false
 	}
 	status := strings.TrimSpace(checkpoint.Repair.Status)
@@ -7395,7 +7405,7 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 		// project+PR owns the detached path even when this Fixer loop is
 		// terminal. Re-check under the PR target lock so takeover cannot
 		// commit human_takeover between the lookup and CleanupWorktree.
-		if skip, reason := r.siblingHumanTakeoverOwnsWorktree(ctx, *loop); skip {
+		if skip, reason := r.siblingHumanTakeoverOwnsWorktree(ctx, *loop, checkpoint.Worktree.Path); skip {
 			cause := errors.New(reason)
 			r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.cleanup_skipped", projectID: project.ID, loopID: loop.ID, runID: runID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"path": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "reason": cause.Error()}})
 			r.recordCleanupSecondaryIssue(ctx, runID, checkpoint, cause)
@@ -7438,7 +7448,7 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 
 // siblingHumanTakeoverOwnsWorktree reports whether another loop for the same
 // project+PR is in human_takeover and therefore owns the shared managed checkout.
-func (r *Runner) siblingHumanTakeoverOwnsWorktree(ctx context.Context, loop storage.LoopRecord) (bool, string) {
+func (r *Runner) siblingHumanTakeoverOwnsWorktree(ctx context.Context, loop storage.LoopRecord, worktreePath string) (bool, string) {
 	if r.repos == nil || r.repos.Loops == nil {
 		return false, ""
 	}
@@ -7462,20 +7472,63 @@ func (r *Runner) siblingHumanTakeoverOwnsWorktree(ctx context.Context, loop stor
 		if sibling.ProjectID != loop.ProjectID {
 			continue
 		}
-		// PR-target Workers use the branch checkout path
-		// (looper-fix-<project>-pr-N), while Fixer and Reviewer use the
-		// detached path (looper-fix-<project>-pr-N-detached). A Worker
-		// takeover therefore cannot own the path this terminal Fixer is
-		// cleaning; treating its status as ownership would strand the
-		// detached checkout until some unrelated retry happens.
-		if sibling.Type == string(domain.LoopTypeWorker) {
+		if sibling.Status != string(domain.LoopStatusHumanTakeover) {
 			continue
 		}
-		if sibling.Status == string(domain.LoopStatusHumanTakeover) {
-			return true, fmt.Sprintf("sibling loop %s is human_takeover for the same PR worktree", sibling.ID)
+		if sibling.Type == string(domain.LoopTypeWorker) {
+			owns, err := r.siblingWorkerOwnsWorktree(ctx, sibling, worktreePath)
+			if err != nil {
+				// A missing or legacy checkpoint cannot prove that this Worker
+				// uses the separate branch checkout. Retain the worktree rather
+				// than risk deleting an interactive detached checkout.
+				return true, "sibling Worker worktree ownership is unavailable: " + err.Error()
+			}
+			if owns {
+				return true, fmt.Sprintf("sibling Worker loop %s owns the same detached PR worktree", sibling.ID)
+			}
+			continue
 		}
+		return true, fmt.Sprintf("sibling loop %s is human_takeover for the same PR worktree", sibling.ID)
 	}
 	return false, ""
+}
+
+// siblingWorkerOwnsWorktree identifies the checkout recorded by a PR-target
+// Worker takeover. Worker loop type alone is not enough: Workers can resume
+// legacy detached checkpoints that share the Fixer/Reviewer path, while newer
+// Workers normally use a separate branch checkout.
+func (r *Runner) siblingWorkerOwnsWorktree(ctx context.Context, sibling storage.LoopRecord, worktreePath string) (bool, error) {
+	if r.repos == nil || r.repos.Runs == nil {
+		return false, errors.New("runs repository is unavailable")
+	}
+	run, err := r.repos.Runs.GetLatestByLoopID(ctx, sibling.ID)
+	if err != nil {
+		return false, err
+	}
+	if run == nil || run.CheckpointJSON == nil || strings.TrimSpace(*run.CheckpointJSON) == "" {
+		// Legacy Worker loops have no durable checkout identity. Retain the
+		// path conservatively because it may be the old shared detached path.
+		return true, nil
+	}
+	var checkpoint struct {
+		Worktree *struct {
+			Path         string `json:"path,omitempty"`
+			CheckoutMode string `json:"checkoutMode,omitempty"`
+		} `json:"worktree,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(*run.CheckpointJSON), &checkpoint); err != nil {
+		return false, fmt.Errorf("decode checkpoint: %w", err)
+	}
+	if checkpoint.Worktree == nil || strings.TrimSpace(checkpoint.Worktree.Path) == "" {
+		// A checkpoint without a path is also legacy/ambiguous. Fail closed
+		// for cleanup rather than infer branch-mode ownership from loop type.
+		return true, nil
+	}
+	if filepath.Clean(checkpoint.Worktree.Path) != filepath.Clean(worktreePath) {
+		return false, nil
+	}
+	mode := strings.TrimSpace(checkpoint.Worktree.CheckoutMode)
+	return mode == "" || strings.EqualFold(mode, "detached"), nil
 }
 
 // recordCleanupSecondaryIssue records a refused removal on the run's outcome.

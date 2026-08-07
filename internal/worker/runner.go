@@ -2639,6 +2639,15 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if r.onAgentExecutionStarted != nil {
 			_ = r.onAgentExecutionStarted(ctx, AgentExecutionStartedInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Subtitle: work.Title, Body: "Worker started", DedupeKey: fmt.Sprintf("runtime.agent.started:worker:%s", input.Run.ID)})
 		}
+		// Persist the live execution boundary before waiting. The agent can write
+		// a reproduction manifest before Wait returns; without this marker a
+		// Wait error makes the retry look like a pre-execution run and the
+		// retained manifest is rejected instead of being left for the replacement
+		// agent to finish or remove.
+		checkpoint.Execution = &checkpointExecution{RunID: input.Run.ID, ExecutionID: executionID, Status: "running"}
+		if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		}
 		result, err := execution.Wait(ctx)
 		progressMu.Lock()
 		defer progressMu.Unlock()
