@@ -136,6 +136,22 @@ export type StatusData = {
     daemonMode?: string;
     startedAt?: string;
     admissionState?: string;
+    agentHealth?: {
+      state?: string;
+      partial?: boolean;
+      failures?: number;
+      total?: number;
+      openUntil?: string;
+      trips?: number;
+      providers?: Array<{
+        provider?: string;
+        state?: string;
+        failures?: number;
+        total?: number;
+        openUntil?: string;
+        trips?: number;
+      }>;
+    };
     triage?: {
       awaitingConfirmation?: {
         count?: number;

@@ -122,7 +122,7 @@ func TestCatalogSchedulerStartsUsingVendorPublishedAfterDaemonStartup(t *testing
 		nil,
 		nil,
 		nil,
-		nil,
+		schedulerProviderGate{},
 	)
 	if handlers.webhook != nil {
 		t.Cleanup(handlers.webhook.Close)
@@ -311,7 +311,7 @@ func TestCatalogSchedulerPreservesCoordinatorThrottleAcrossConfigSnapshots(t *te
 		nil,
 		nil,
 		nil,
-		nil,
+		schedulerProviderGate{},
 	)
 	if handlers.webhook != nil {
 		t.Cleanup(handlers.webhook.Close)

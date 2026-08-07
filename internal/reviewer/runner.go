@@ -363,6 +363,13 @@ type AgentRunInput struct {
 	SnapshotVendor          string
 	SnapshotModel           *string
 	SnapshotReasoningEffort *config.ReasoningEffort
+	// CompletionContract selects the daemon-owned stdout contract used for
+	// agent-health success accounting. Thread-resolution classifiers emit raw
+	// JSON without the generic completion marker; review runs use the reviewer
+	// marker contract aligned with clean/non_blocking/blocking outcomes.
+	CompletionContract         agent.CompletionContract
+	CompletionValidator        func(string) bool
+	CompletionOutcomeValidator func() bool
 }
 
 type AgentResult struct {
@@ -1401,7 +1408,13 @@ func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.
 
 func (r *Runner) finalizeClaimSetupFailure(ctx context.Context, queueItem storage.QueueItemRecord, cause error) error {
 	failure := r.classifyFailureForProject(derefString(queueItem.ProjectID), cause)
-	failedQueue, err := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
+	var failedQueue *storage.QueueItemRecord
+	var err error
+	if errors.Is(cause, agent.ErrProviderBrownout) {
+		failedQueue, err = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.Kind, failure.Message)
+	} else {
+		failedQueue, err = r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
+	}
 	if err != nil {
 		return err
 	}
@@ -1585,7 +1598,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			} else {
 				r.logError("reviewer run failed", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": derefString(run.CurrentStep), "elapsedSeconds": stepElapsedSeconds, "failureKind": string(failure.Kind), "summary": failure.Message})
 			}
-			failedQueue, queueErr := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
+			var failedQueue *storage.QueueItemRecord
+			var queueErr error
+			if errors.Is(err, agent.ErrProviderBrownout) {
+				failedQueue, queueErr = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.Kind, failure.Message)
+			} else {
+				failedQueue, queueErr = r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
+			}
 			if queueErr != nil {
 				return runpipe.ProcessResult{}, queueErr
 			}
@@ -2458,6 +2477,8 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 		Metadata:       map[string]any{"loopType": "reviewer", "phase": "thread_resolution", "repo": input.Repo, "prNumber": input.PRNumber},
 		IdempotencyKey: idempotencyKey,
 		UseSnapshot:    useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
+		CompletionContract:  agent.CompletionContractRawJSONEnvelope,
+		CompletionValidator: validateReviewThreadResolutionOutput,
 	})
 	if err != nil {
 		return nil, err
@@ -2478,15 +2499,28 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
 		return nil, &runpipe.LoopError{Message: message, Kind: runpipe.FailureRetryableTransient}
 	}
-	parsed, err := resolution.ParseOutput(result.Stdout)
+	decisions, err := parseReviewerThreadResolutionOutput(result.Stdout)
 	if err == nil {
-		return parsed.Decisions, nil
+		return decisions, nil
 	}
 	if message := transientProviderMessageFromAgentResult(result); message != "" {
 		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
 		return nil, &runpipe.LoopError{Message: message, Kind: runpipe.FailureRetryableTransient}
 	}
 	return nil, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureNonRetryable}
+}
+
+func parseReviewerThreadResolutionOutput(stdout string) ([]threadResolutionAgentDecision, error) {
+	parsed, err := resolution.ParseOutput(agent.FinalMessage(stdout))
+	if err != nil {
+		return nil, err
+	}
+	return parsed.Decisions, nil
+}
+
+func validateReviewThreadResolutionOutput(stdout string) bool {
+	_, err := resolution.ParseOutput(stdout)
+	return err == nil
 }
 
 type reviewerHeadChangeMonitor struct {
@@ -2644,6 +2678,11 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		Prompt: prompt, NativeResumePrompt: nativeResumePrompt, WorkingDirectory: worktree.Path,
 		Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey,
 		UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
+		CompletionContract: agent.CompletionContractReviewerPublication,
+		CompletionOutcomeValidator: func() bool {
+			found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{}))
+			return err == nil && found.Found
+		},
 	})
 	if err != nil {
 		return checkpoint, err
@@ -4673,6 +4712,29 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 	return updated, nil
 }
 
+// requeueClaimedItemWithoutAttempt returns a claim refused by provider
+// brownout to queued without charging an attempt: no agent run reached the
+// executor after the durable claim.
+func (r *Runner) requeueClaimedItemWithoutAttempt(ctx context.Context, queueItem storage.QueueItemRecord, kind runpipe.QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
+	nowISO := r.nowISO()
+	delay := backoffDelay(r.retryBaseDelay, cappedRetryDelayAttempt(queueItem.Attempts+1, queueItem.MaxAttempts), r.retryMaxDelayForProject(derefString(queueItem.ProjectID)))
+	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(delay))
+	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: queueItem.Attempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		return nil, err
+	}
+	return r.repos.Queue.GetByID(ctx, queueItem.ID)
+}
+
+func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
+	if attempts <= 0 {
+		return 1
+	}
+	if maxAttempts > 0 && attempts > maxAttempts {
+		return maxAttempts
+	}
+	return attempts
+}
+
 func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, error) {
 	return runpipe.UpdateLoop(ctx, r.repos, r.now, loop, runpipe.UpdateLoopOptions{GuardMetadata: true}, mutate)
 }
@@ -6610,6 +6672,13 @@ func derefString(value *string) string {
 		return ""
 	}
 	return *value
+}
+
+func optionalString(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
 }
 
 func derefInt64(value *int64) int64 {

@@ -13,6 +13,8 @@ import (
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/daemonbinary"
+	"github.com/MumuTW/looper/internal/eventlog"
+	"github.com/MumuTW/looper/internal/loops/brownout"
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/triager"
 	"github.com/MumuTW/looper/internal/version"
@@ -51,6 +53,71 @@ type statusService struct {
 	// quarantine orphan debt). Empty when none apply.
 	DegradedReasons []string     `json:"degradedReasons,omitempty"`
 	Binary          statusBinary `json:"binary"`
+	// AgentHealth is present only while the agent-health gate is holding work
+	// back, so a healthy daemon's status stays unchanged.
+	AgentHealth *statusAgentHealth `json:"agentHealth,omitempty"`
+}
+
+// statusAgentHealth reports why work production is suspended and when it will
+// be retried, so an operator seeing an idle daemon can tell "waiting out a bad
+// provider" from "stuck".
+type statusAgentHealth struct {
+	State     string                      `json:"state"`
+	Partial   bool                        `json:"partial,omitempty"`
+	Failures  int                         `json:"failures"`
+	Total     int                         `json:"total"`
+	OpenUntil *string                     `json:"openUntil,omitempty"`
+	Trips     int                         `json:"trips"`
+	Providers []statusAgentProviderHealth `json:"providers,omitempty"`
+}
+
+type statusAgentProviderHealth struct {
+	Provider  string  `json:"provider"`
+	State     string  `json:"state"`
+	Failures  int     `json:"failures"`
+	Total     int     `json:"total"`
+	OpenUntil *string `json:"openUntil,omitempty"`
+	Trips     int     `json:"trips"`
+}
+
+// agentHealthStatus projects the agent-health gate for status surfaces. A
+// runtime that does not expose it reports closed: an embedder without the gate
+// is not browned out, it simply never opens one.
+func (h *Handler) agentHealthStatus() *statusAgentHealth {
+	runtimeValue := h.context.Runtime
+	if runtimeValue == nil {
+		return nil
+	}
+	typed, ok := any(runtimeValue).(interface {
+		AgentHealth() brownout.Summary
+	})
+	if !ok {
+		return nil
+	}
+	summary := typed.AgentHealth()
+	// Only report a gate that is actually holding work back. A closed aggregate
+	// can still be partial when one provider is open and a healthy sibling keeps
+	// AllowAny admitted, so retain that provider-scoped evidence.
+	if summary.State == brownout.StateClosed && !summary.Partial && len(summary.Providers) == 0 {
+		return nil
+	}
+	view := &statusAgentHealth{State: string(summary.State), Partial: summary.Partial, Failures: summary.Failures, Total: summary.Total, Trips: summary.Trips}
+	if summary.OpenUntil != nil {
+		openUntil := eventlog.FormatJavaScriptISOString(summary.OpenUntil.UTC())
+		view.OpenUntil = &openUntil
+	}
+	if len(summary.Providers) > 0 {
+		view.Providers = make([]statusAgentProviderHealth, 0, len(summary.Providers))
+		for _, provider := range summary.Providers {
+			item := statusAgentProviderHealth{Provider: provider.Provider, State: string(provider.State), Failures: provider.Failures, Total: provider.Total, Trips: provider.Trips}
+			if provider.OpenUntil != nil {
+				openUntil := eventlog.FormatJavaScriptISOString(provider.OpenUntil.UTC())
+				item.OpenUntil = &openUntil
+			}
+			view.Providers = append(view.Providers, item)
+		}
+	}
+	return view
 }
 
 type statusTriage struct {
@@ -277,6 +344,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 				SupportedTargets: []string{"darwin-arm64", "linux-amd64"},
 				Identity:         binaryIdentity,
 			},
+			AgentHealth: h.agentHealthStatus(),
 		},
 		Storage: statusStorage{
 			Mode:              h.context.Config.Storage.Mode,

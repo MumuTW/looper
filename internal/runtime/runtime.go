@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MumuTW/looper/internal/agent"
 	"github.com/MumuTW/looper/internal/bootstrap"
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/domain"
@@ -25,6 +26,7 @@ import (
 	"github.com/MumuTW/looper/internal/infra/notify"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/brownout"
 	"github.com/MumuTW/looper/internal/processidentity"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/storage"
@@ -192,15 +194,25 @@ type Runtime struct {
 	shutdownTimeout        time.Duration
 	deferRecovery          bool
 
-	mu                          sync.RWMutex
-	startedAt                   *time.Time
-	recovery                    RecoverySummary
-	stopped                     bool
-	services                    Services
-	startErr                    error
-	startOnce                   sync.Once
-	shutdownOnce                sync.Once
-	shutdownCh                  chan struct{}
+	mu                    sync.RWMutex
+	startedAt             *time.Time
+	recovery              RecoverySummary
+	stopped               bool
+	services              Services
+	startErr              error
+	startOnce             sync.Once
+	shutdownOnce          sync.Once
+	shutdownCh            chan struct{}
+	notificationCtx       context.Context
+	notificationCancel    context.CancelFunc
+	notificationWG        sync.WaitGroup
+	notificationsStopping bool
+	// brownoutIncidentID scopes notification dedupe keys to this daemon
+	// lifetime. Breaker trip counters restart at zero after a process restart,
+	// so a provider.open.1 key must not collide with the previous daemon's
+	// incident.
+	brownoutIncidentID          string
+	brownoutNotificationTails   map[string]chan struct{}
 	schedulerStop               chan struct{}
 	schedulerDone               chan struct{}
 	schedulerWake               chan struct{}
@@ -235,6 +247,11 @@ type Runtime struct {
 	// this flag is not a mutation/claim gate.
 	ownershipAcquired bool
 	admission         *Admission
+	// agentHealth suspends work production while looper's own agent runs are
+	// failing. It is deliberately not part of Admission: admission states are
+	// operator/lifecycle transitions that never recover on their own, and this
+	// one must. Breakers are partitioned by effective provider identity.
+	agentHealth *agentHealthRegistry
 	// daemonBinary answers whether the executable file this daemon was launched
 	// from still holds the image it is running (#154).
 	daemonBinary *daemonBinaryWatcher
@@ -306,6 +323,7 @@ func New(options Options) *Runtime {
 	if reloadInterval <= 0 {
 		reloadInterval = time.Second
 	}
+	notificationCtx, notificationCancel := context.WithCancel(context.Background())
 	rt := &Runtime{
 		config:                      options.Config,
 		configPath:                  strings.TrimSpace(options.ConfigPath),
@@ -334,15 +352,30 @@ func New(options Options) *Runtime {
 		deferRecovery:               options.DeferRecovery,
 		recovery:                    createEmptyRecoverySummary(),
 		shutdownCh:                  make(chan struct{}),
+		notificationCtx:             notificationCtx,
+		notificationCancel:          notificationCancel,
+		brownoutIncidentID:          newDaemonID(),
+		brownoutNotificationTails:   make(map[string]chan struct{}),
 		activeExecutions:            NewActiveExecutionRegistry(),
 		projectCatalog:              projectCatalog,
 		webhook:                     newWebhookRuntime(options.Config, options.Logger, now),
 		admission:                   NewAdmission(),
 		daemonBinary:                newDaemonBinaryWatcher(options.Logger),
 	}
+	rt.agentHealth = newAgentHealthRegistry(agentBrownoutConfig(options.Config), options.Config, now, rt.onAgentBrownoutTransition, func(message string) {
+		if rt.logger != nil {
+			rt.logger.Warn(message, map[string]any{"authority": "agent.Outcome.Vendor"})
+		}
+	})
+	// Every terminal agent outcome feeds the health gate. This is the only
+	// input it has: looper does not read provider status pages or parse their
+	// rate-limit messages, it counts its own results.
+	rt.activeExecutions.SetOnAgentOutcome(func(outcome agent.Outcome) {
+		rt.agentHealth.Record(outcome.Vendor, outcome.StartedAt, outcome.Succeeded, outcome.BrownoutProbe, outcome.BrownoutStickySnapshot, outcome.BrownoutProbeGeneration)
+	})
 	// Project daemon Admission onto agent spawn leases so cmd.Start is refused
 	// while starting/stopping/degraded (#576 + #575).
-	rt.activeExecutions.SetAllowSpawn(rt.AllowClaim)
+	rt.activeExecutions.SetAllowSpawn(rt.allowAgentSpawn)
 	// Hard agent_executions observation failures close admission until process
 	// restart (#578 / ADR-0015 R5). Prefer split-brain stop over silent continue.
 	rt.activeExecutions.SetOnHardPersistFailure(func(err error) {
@@ -430,6 +463,11 @@ func (r *Runtime) Stop(reason string) {
 		// Runtime.Stop matches the daemon path: scheduler, deferred recovery,
 		// and in-flight webhook discovery are canceled before any waits.
 		r.BeginShutdown(reason)
+		// Brownout notifications are best-effort side effects. Stop accepting
+		// new ones and cancel/drain the bounded in-flight deliveries before
+		// repositories are closed, so an async notification cannot write into
+		// a coordinator that shutdown has already released.
+		r.stopAgentBrownoutNotifications()
 
 		r.stopConfigReloadLoop()
 		r.stopDeferredReviewerRecovery()
@@ -678,12 +716,328 @@ func (r *Runtime) AllowMutations() error {
 }
 
 // AllowClaim is the scheduler work-producing projection of admission
-// (full tick + durable claims).
+// (full tick + durable claims), plus the agent-health gate.
+//
+// The health gate belongs here rather than at the claim pump because discovery
+// is what re-enqueues work: gating claims alone leaves discovery free to create
+// fresh queue items for loops that were just paused, which is how a tripped
+// per-loop breaker ended up producing new runs every few seconds (#533).
 func (r *Runtime) AllowClaim() error {
+	if err := r.AllowLifecycleWork(); err != nil {
+		return err
+	}
+	return r.agentHealth.AllowAny()
+}
+
+// AllowClaimForVendor is the scheduler admission projection for a queue lane
+// whose effective agent provider is already known. A healthy sibling provider
+// must not authorize durable claims for a provider whose breaker is open.
+func (r *Runtime) AllowClaimForVendor(vendor string) error {
+	if err := r.AllowLifecycleWork(); err != nil {
+		return err
+	}
+	return r.agentHealth.Allow(vendor)
+}
+
+// AllowSnapshotClaimForVendor performs a non-reserving health check for a
+// sticky retry using the provider stored in its durable run snapshot, including
+// a vendor removed from live config. The spawn lease owns probe reservation.
+func (r *Runtime) AllowSnapshotClaimForVendor(vendor string) error {
+	if err := r.AllowLifecycleWork(); err != nil {
+		return err
+	}
+	return r.agentHealth.AllowSnapshot(vendor)
+}
+
+// ClaimCapacityForVendor is the scheduler's observational half-open batch
+// limit. It does not reserve a probe; common spawn admission remains the
+// authority that reserves and transfers probe capacity to an execution.
+func (r *Runtime) ClaimCapacityForVendor(vendor string, snapshot bool) int {
+	if r == nil || r.agentHealth == nil {
+		return -1
+	}
+	return r.agentHealth.ClaimCapacity(vendor, snapshot)
+}
+
+func (r *Runtime) allowAgentSpawn(meta *agent.SpawnMeta) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	// Operation leases already run inside the scheduler's lifecycle admission
+	// section. Re-entering Admission here would deadlock that critical section;
+	// provider health is only meaningful for the execution spawn metadata.
+	if meta == nil {
+		return nil
+	}
+	if err := r.admission.AllowClaim(); err != nil {
+		return err
+	}
+	var probe bool
+	var generation uint64
+	var err error
+	if meta.BrownoutStickySnapshot {
+		probe, generation, err = r.agentHealth.AllowSnapshotAdmissionWithGeneration(meta.Vendor)
+	} else {
+		probe, generation, err = r.agentHealth.AllowAdmissionWithGeneration(meta.Vendor)
+	}
+	if err != nil && errors.Is(err, brownout.ErrOpen) {
+		return errors.Join(agent.ErrProviderBrownout, err)
+	}
+	meta.BrownoutProbe = probe
+	meta.BrownoutProbeGeneration = generation
+	if err == nil && probe {
+		vendor := meta.Vendor
+		meta.BrownoutProbeRelease = func() { r.agentHealth.ReleaseAdmission(vendor, generation) }
+	}
+	return err
+}
+
+// AllowLifecycleWork is claim admission without the agent-health gate, for work
+// that consumes no agent call. Worktree cleanup is the case that matters: a
+// provider outage is exactly when worktree debt accumulates, because every
+// attempt prepares a worktree before failing at the agent step, so suspending
+// cleanup for the whole backoff would preserve the disk growth the gate is
+// meant to stop. It stays on AllowClaim's admission authority rather than
+// AllowMutations so cleanup keeps the #580 invariant of not running while
+// starting, degraded, or stopping.
+func (r *Runtime) AllowLifecycleWork() error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionStopping
 	}
 	return r.admission.AllowClaim()
+}
+
+// WithAllowLifecycleWork holds lifecycle admission across a cleanup mutation
+// without consulting provider health. Cleanup consumes no agent call and must
+// continue during a provider brownout, while the admission mutex still keeps
+// shutdown/degraded transitions from interleaving with its durable writes.
+func (r *Runtime) WithAllowLifecycleWork(fn func()) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	return r.admission.WithAllowWork(fn)
+}
+
+// AgentHealth reports the agent-health gate's posture for status endpoints.
+func (r *Runtime) AgentHealth() brownout.Summary {
+	if r == nil {
+		return brownout.Summary{State: brownout.StateClosed}
+	}
+	return r.agentHealth.Snapshot()
+}
+
+func agentBrownoutConfig(cfg config.Config) brownout.Config {
+	settings := cfg.Scheduler.AgentBrownout
+	return brownout.Config{
+		Enabled:        settings.Enabled,
+		Window:         time.Duration(settings.WindowSeconds) * time.Second,
+		MinFailures:    settings.MinFailures,
+		FailureRatio:   settings.FailureRatio,
+		Cooldown:       time.Duration(settings.CooldownSeconds) * time.Second,
+		MaxCooldown:    time.Duration(settings.MaxCooldownSeconds) * time.Second,
+		ProbeSuccesses: settings.ProbeSuccesses,
+	}
+}
+
+// onAgentBrownoutTransition logs every state change and notifies the operator
+// when work stops and when it resumes. Notifying is the point: the incident this
+// gate exists for ran for hours, and the only thing the operator could observe
+// was disk and fan noise.
+func (r *Runtime) onAgentBrownoutTransition(vendor string, transition brownout.Transition) {
+	if r == nil {
+		return
+	}
+	fields := map[string]any{
+		"vendor":   vendor,
+		"from":     string(transition.From),
+		"to":       string(transition.To),
+		"reason":   transition.Reason,
+		"failures": transition.Failures,
+		"total":    transition.Total,
+	}
+	if transition.Cooldown > 0 {
+		fields["cooldownSeconds"] = int(transition.Cooldown.Seconds())
+	}
+	if r.logger != nil {
+		if transition.To == brownout.StateOpen {
+			r.logger.Warn("agent brownout opened: work production suspended", fields)
+		} else {
+			r.logger.Info("agent brownout state changed", fields)
+		}
+	}
+	// half_open is a probe, not news. Telling the operator about it would make
+	// every outage a stream of notifications instead of two.
+	provider := strings.TrimSpace(vendor)
+	if provider == "" {
+		provider = "agent provider"
+	}
+	switch transition.To {
+	case brownout.StateOpen:
+		r.notifyAgentBrownout("failure", fmt.Sprintf("Looper Paused: %s Agents Keep Failing", provider),
+			fmt.Sprintf("%d of %d recent agent runs failed", transition.Failures, transition.Total),
+			fmt.Sprintf("Looper stopped starting new %s work because its own %s agent runs keep failing. It will retry by itself in %s. Other healthy providers may continue; queued %s work resumes when recovery probes succeed.", provider, provider, transition.Cooldown.Round(time.Second), provider),
+			brownoutTransitionDedupeSuffix(vendor+".open", transition.Trips))
+	case brownout.StateClosed:
+		title, subtitle, body, dedupeSuffix := agentBrownoutResumeMessage(provider, transition.Reason)
+		r.notifyAgentBrownout("action_required", title, subtitle, body, brownoutTransitionDedupeSuffix(vendor+dedupeSuffix, transition.Trips))
+	}
+}
+
+func brownoutTransitionDedupeSuffix(vendorSuffix string, trips int) string {
+	if trips <= 0 {
+		return vendorSuffix
+	}
+	return fmt.Sprintf("%s.%d", vendorSuffix, trips)
+}
+
+// agentBrownoutResumeMessage keeps operator overrides distinct from breaker
+// recovery. The transition reason is the brownout state machine's authority;
+// an operator disabling the policy is not evidence that a provider probe ran.
+func agentBrownoutResumeMessage(provider, reason string) (title, subtitle, body, dedupeSuffix string) {
+	if reason == "disabled_override" {
+		return fmt.Sprintf("Looper Resumed: %s (override)", provider),
+			fmt.Sprintf("%s brownout disabled by operator override", provider),
+			fmt.Sprintf("The %s agent brownout override was disabled by the operator. Looper resumed starting %s work; no recovery probe was observed.", provider, provider),
+			".disabled_override"
+	}
+	return fmt.Sprintf("Looper Resumed: %s", provider), fmt.Sprintf("a %s probe agent run succeeded", provider),
+		fmt.Sprintf("%s agent runs are working again. Looper has resumed starting %s work.", provider, provider), ".closed"
+}
+
+func (r *Runtime) notifyAgentBrownout(level, title, subtitle, body, dedupeSuffix string) {
+	// The transition callback runs on an agent terminal path while the provider
+	// gate is held. Keep that path to lifecycle bookkeeping only; all gateway,
+	// config, payload, and repository work belongs in the bounded goroutine.
+	r.mu.Lock()
+	if r.notificationsStopping || r.stopped || r.notificationCtx == nil {
+		r.mu.Unlock()
+		return
+	}
+	if strings.TrimSpace(r.brownoutIncidentID) == "" {
+		// Tests and narrowly constructed runtimes may bypass New. Preserve the
+		// same per-runtime scope in that case without falling back to a shared key.
+		r.brownoutIncidentID = newDaemonID()
+	}
+	brownoutIncidentID := r.brownoutIncidentID
+	r.notificationWG.Add(1)
+	notificationCtx := r.notificationCtx
+	providerKey := brownoutNotificationProviderKey(dedupeSuffix)
+	var previous chan struct{}
+	if r.brownoutNotificationTails == nil {
+		r.brownoutNotificationTails = make(map[string]chan struct{})
+	}
+	previous = r.brownoutNotificationTails[providerKey]
+	done := make(chan struct{})
+	r.brownoutNotificationTails[providerKey] = done
+	r.mu.Unlock()
+	go func() {
+		defer r.notificationWG.Done()
+		defer func() {
+			r.mu.Lock()
+			if r.brownoutNotificationTails[providerKey] == done {
+				delete(r.brownoutNotificationTails, providerKey)
+			}
+			r.mu.Unlock()
+		}()
+		// Close before removing the tail. A transition arriving in the small
+		// cleanup window must either wait for this notification or observe its
+		// completed channel, never start a second delivery concurrently.
+		defer close(done)
+		if previous != nil {
+			select {
+			case <-previous:
+			case <-notificationCtx.Done():
+				return
+			}
+		}
+		r.mu.RLock()
+		gateways := r.notificationGateways
+		services := r.services
+		r.mu.RUnlock()
+		if gateways == nil || services.Repositories == nil {
+			return
+		}
+		cfg := r.Config()
+		if !cfg.Scheduler.AgentBrownout.Notify {
+			return
+		}
+		payload := notify.SystemNotificationPayload{
+			Level:      level,
+			Title:      title,
+			Subtitle:   subtitle,
+			Body:       body,
+			EntityType: "agent_brownout",
+			EntityID:   "looperd-agent-brownout",
+			DedupeKey:  brownoutNotificationDedupeKey(brownoutIncidentID, dedupeSuffix),
+		}
+		ctx, cancel := context.WithTimeout(notificationCtx, agentBrownoutNotificationTimeout)
+		defer cancel()
+		gateways.New(notify.Options{
+			Config:        cfg.Notifications,
+			OsascriptPath: derefString(cfg.Tools.OsascriptPath),
+			LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
+			Repositories:  services.Repositories,
+			Now:           r.now,
+		}).Notify(ctx, payload)
+	}()
+}
+
+func brownoutNotificationDedupeKey(incidentID, dedupeSuffix string) string {
+	incidentID = strings.TrimSpace(incidentID)
+	if incidentID == "" {
+		incidentID = "unknown"
+	}
+	return fmt.Sprintf("runtime.agentBrownout.%s.%s", incidentID, dedupeSuffix)
+}
+
+func brownoutNotificationProviderKey(dedupeSuffix string) string {
+	for _, suffix := range []string{".open", ".closed", ".disabled_override"} {
+		if strings.HasSuffix(dedupeSuffix, suffix) {
+			return strings.TrimSuffix(dedupeSuffix, suffix)
+		}
+		marker := suffix + "."
+		if index := strings.LastIndex(dedupeSuffix, marker); index >= 0 {
+			trip := dedupeSuffix[index+len(marker):]
+			if trip != "" && allASCIIDigits(trip) {
+				return dedupeSuffix[:index]
+			}
+		}
+	}
+	return dedupeSuffix
+}
+
+func allASCIIDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// agentBrownoutNotificationTimeout bounds one best-effort transition alert. It
+// exceeds the osascript transport's own 35s timeout so a slow-but-working local
+// notifier still delivers; shutdown does not pay for it, because Stop cancels
+// the notification context before waiting on the drain.
+const agentBrownoutNotificationTimeout = 45 * time.Second
+
+func (r *Runtime) stopAgentBrownoutNotifications() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if !r.notificationsStopping {
+		r.notificationsStopping = true
+		if r.notificationCancel != nil {
+			r.notificationCancel()
+			r.notificationCancel = nil
+		}
+	}
+	r.mu.Unlock()
+	r.notificationWG.Wait()
 }
 
 // WithAllowClaim runs fn only while claim admission is open, holding the
@@ -693,7 +1047,85 @@ func (r *Runtime) WithAllowClaim(fn func()) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionStopping
 	}
+	if err := r.AllowLifecycleWork(); err != nil {
+		return err
+	}
+	// Webhook acceptance spends agent budget downstream, so it sees the health
+	// gate too. Checked before the critical section rather than under
+	// admission.mu: the two locks protect different things, and nesting them
+	// would order agent-outcome recording behind admission. The residual window
+	// is one accept already in flight when the gate opens, which enqueues an
+	// item the scheduler then refuses to claim — a delay, not a spend.
+	if err := r.agentHealth.AllowAny(); err != nil {
+		return err
+	}
 	return r.admission.WithAllowWork(fn)
+}
+
+// WithAllowAgentClaim holds lifecycle admission and the provider-health gate
+// across a work-producing critical section. The callback must not spawn an
+// agent or consult provider health: agentHealthRegistry.WithAny holds the
+// non-reentrant gateMu for the whole callback, and recursive admission would
+// deadlock. Cleanup deliberately uses WithAllowLifecycleWork because it does
+// not consume an agent provider call.
+func (r *Runtime) WithAllowAgentClaim(fn func()) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	var brownoutErr error
+	if err := r.admission.WithAllowWork(func() {
+		brownoutErr = r.agentHealth.WithAny(fn)
+	}); err != nil {
+		return err
+	}
+	return brownoutErr
+}
+
+// WithAllowAgentClaimForVendor holds lifecycle admission and one provider's
+// health gate across a durable claim. The callback must not spawn an agent or
+// consult provider health; the provider gate is non-reentrant.
+func (r *Runtime) WithAllowAgentClaimForVendor(vendor string, fn func()) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	var brownoutErr error
+	if err := r.admission.WithAllowWork(func() {
+		brownoutErr = r.agentHealth.With(vendor, fn)
+	}); err != nil {
+		return err
+	}
+	return brownoutErr
+}
+
+// WithAllowSnapshotAgentClaimForVendor holds lifecycle admission and the
+// sticky snapshot provider breaker across a durable retry claim.
+func (r *Runtime) WithAllowSnapshotAgentClaimForVendor(vendor string, fn func()) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	var brownoutErr error
+	if err := r.admission.WithAllowWork(func() {
+		brownoutErr = r.agentHealth.WithSnapshot(vendor, fn)
+	}); err != nil {
+		return err
+	}
+	return brownoutErr
+}
+
+// WithAllowAgentClaimLanes holds lifecycle admission and every provider gate
+// represented by an atomic multi-lane queue claim. The callback must not spawn
+// an agent or consult provider health; the shared health gate is non-reentrant.
+func (r *Runtime) WithAllowAgentClaimLanes(lanes []storage.QueueClaimLane, fn func()) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	var brownoutErr error
+	if err := r.admission.WithAllowWork(func() {
+		brownoutErr = r.agentHealth.WithLanes(lanes, fn)
+	}); err != nil {
+		return err
+	}
+	return brownoutErr
 }
 
 // MarkDegraded sticks admission until process restart and cancels work-producing
@@ -1076,7 +1508,13 @@ func (r *Runtime) start(ctx context.Context) error {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
-		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim, r.hostAdmission)
+		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowAgentClaim, schedulerProviderGate{
+			lifecycle:     r.AllowLifecycleWork,
+			lifecycleWith: r.WithAllowLifecycleWork,
+			allow:         r.AllowClaimForVendor, with: r.WithAllowAgentClaimForVendor, capacity: r.ClaimCapacityForVendor, withLanes: r.WithAllowAgentClaimLanes,
+			snapshotAllow: r.AllowSnapshotClaimForVendor, snapshotWith: r.WithAllowSnapshotAgentClaimForVendor,
+			refreshSticky: r.refreshAgentHealthStickyReferences,
+		})
 		if !r.customSchedulerTick {
 			r.defaultSchedulerTick = handlers.tick
 			if !r.customWebhookForwarder {
@@ -1392,6 +1830,57 @@ func (r *Runtime) publishCatalogConsumers(next config.Config) {
 	if webhook != nil {
 		webhook.updateConfig(next)
 	}
+	// Reconfiguring the health gate must not clear an open one: an operator
+	// editing config during an outage would otherwise release the cooldown and
+	// resume the exact hammering the gate is there to stop. Read durable/live
+	// sticky references under the same provider gate as this config publication
+	// so a spawn cannot enter the gap between the two operations.
+	if err := r.refreshAgentHealthStickyReferencesAndConfig(next); err != nil && r.logger != nil {
+		r.logger.Warn("agent health sticky-vendor reference refresh deferred", map[string]any{"error": err.Error()})
+	}
+}
+
+// refreshAgentHealthStickyReferences supplies the health registry with the
+// durable/live authorities that justify retaining a removed vendor breaker.
+// A config reload is the point where a provider leaves the active set; using
+// the current queue snapshot and spawn leases at that boundary avoids keeping
+// an outage row forever after its work has moved to another provider.
+func (r *Runtime) refreshAgentHealthStickyReferences() {
+	if r == nil || r.agentHealth == nil {
+		return
+	}
+	if err := r.agentHealth.RefreshStickyVendorReferences(r.collectAgentHealthStickyReferences); err != nil && r.logger != nil {
+		r.logger.Warn("agent health sticky-vendor reference refresh deferred", map[string]any{"error": err.Error()})
+	}
+}
+
+func (r *Runtime) refreshAgentHealthStickyReferencesAndConfig(next config.Config) error {
+	if r == nil || r.agentHealth == nil {
+		return nil
+	}
+	return r.agentHealth.RefreshStickyVendorReferencesAndConfig(r.collectAgentHealthStickyReferences, agentBrownoutConfig(next), next)
+}
+
+func (r *Runtime) collectAgentHealthStickyReferences() ([]string, error) {
+	if r == nil {
+		return nil, nil
+	}
+	r.mu.RLock()
+	repos := r.services.Repositories
+	active := r.activeExecutions
+	r.mu.RUnlock()
+	refs := make([]string, 0)
+	if active != nil {
+		refs = append(refs, active.AgentVendors()...)
+	}
+	if repos != nil && repos.Queue != nil {
+		queueVendors, err := repos.Queue.ListActiveSnapshotVendors(context.Background(), []string{"planner", "reviewer", "fixer", "worker"})
+		if err != nil {
+			return nil, err
+		}
+		refs = append(refs, queueVendors...)
+	}
+	return refs, nil
 }
 
 // afterProjectsPublished deliberately runs outside configBoundary. Webhook
@@ -1734,8 +2223,11 @@ func (r *Runtime) executeDefaultSchedulerTick(ctx context.Context, services Serv
 }
 
 func (r *Runtime) executeSchedulerClaimPass(ctx context.Context) {
-	// Claim is a projection of admission — refuse before any durable claim.
-	if err := r.AllowClaim(); err != nil {
+	// The outer pump only gates lifecycle admission. Provider-specific queue
+	// lanes (and the common spawn boundary) own agent-health admission; using
+	// AllowClaim here would prevent agent-free snapshots and healthy sticky
+	// retries from reaching that partitioned logic during a full brownout.
+	if err := r.AllowLifecycleWork(); err != nil {
 		return
 	}
 	r.mu.RLock()

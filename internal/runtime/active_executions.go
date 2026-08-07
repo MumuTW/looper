@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"errors"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +27,9 @@ type ownedExecution struct {
 	// execution entry is published by BindHandle, so handle is non-nil; pending
 	// spawn windows stay in pending until they have a containment handle.
 	handle *processcontainment.Handle
+	// lease carries the brownout probe reservation that must be marked observed
+	// before the lease releases after a terminal outcome.
+	lease *spawnLease
 }
 
 // nonAgentTracked is one Supervisor-owned non-agent containment handle
@@ -99,12 +104,16 @@ type ActiveExecutionRegistry struct {
 	// allowSpawn, when set, projects daemon Admission.AllowClaim so spawns
 	// refuse while starting/stopping/degraded. Nil means registry-local only
 	// (tests that do not wire Runtime admission).
-	allowSpawn func() error
+	allowSpawn func(*agent.SpawnMeta) error
 
 	// onHardPersistFailure maps hard agent_executions write failures into the
 	// single sticky admission degraded state (ADR-0015 R5 / #578). Also used
 	// for queue finalize persistence failures that retain operation ownership.
 	onHardPersistFailure func(error)
+	// onAgentOutcome receives every terminal agent execution the agent itself
+	// produced, so the daemon can gate work production on its own success rate
+	// without recognizing any provider's error format.
+	onAgentOutcome func(agent.Outcome)
 
 	// killTimeout bounds handle.Kill during stop. Zero uses defaultKillTimeout.
 	killTimeout time.Duration
@@ -134,6 +143,50 @@ func (r *ActiveExecutionRegistry) DrainSnapshot() DrainSnapshot {
 	return DrainSnapshot{LiveExecutions: len(r.executions), PendingSpawns: len(r.pending), BoundOperations: len(r.boundOps), PendingOperations: len(r.pendingOps)}
 }
 
+// AgentVendors returns providers held by pending spawn leases or live
+// executions. Runtime config publication uses this as one half of the
+// sticky-breaker retention authority; the other half comes from queued run
+// snapshots in storage.
+func (r *ActiveExecutionRegistry) AgentVendors() []string {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	seen := make(map[string]struct{})
+	add := func(vendor string) {
+		if vendor = strings.TrimSpace(vendor); vendor != "" {
+			seen[vendor] = struct{}{}
+		}
+	}
+	for _, lease := range r.pending {
+		if lease != nil {
+			add(lease.meta.Vendor)
+		}
+	}
+	for _, lease := range r.active {
+		if lease != nil {
+			add(lease.meta.Vendor)
+		}
+	}
+	for _, lease := range r.pendingOps {
+		if lease != nil {
+			add(lease.Vendor())
+		}
+	}
+	for _, lease := range r.boundOps {
+		if lease != nil {
+			add(lease.Vendor())
+		}
+	}
+	vendors := make([]string, 0, len(seen))
+	for vendor := range seen {
+		vendors = append(vendors, vendor)
+	}
+	sort.Strings(vendors)
+	return vendors
+}
+
 func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
 	return &ActiveExecutionRegistry{
 		executions:       make(map[string]*ownedExecution),
@@ -149,7 +202,7 @@ func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
 }
 
 // SetAllowSpawn wires the daemon Admission projection for spawn decisions.
-func (r *ActiveExecutionRegistry) SetAllowSpawn(fn func() error) {
+func (r *ActiveExecutionRegistry) SetAllowSpawn(fn func(*agent.SpawnMeta) error) {
 	if r == nil {
 		return
 	}
@@ -184,6 +237,38 @@ func (r *ActiveExecutionRegistry) ReportHardPersistFailure(err error) {
 	}
 }
 
+// SetOnAgentOutcome wires the daemon's agent-health observer. It is set once by
+// the runtime and read by every executor snapshot, so the observation survives
+// the config reloads that rebuild scheduler handlers — a health signal that
+// reset whenever config changed would never accumulate enough evidence to act.
+func (r *ActiveExecutionRegistry) SetOnAgentOutcome(fn func(agent.Outcome)) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.onAgentOutcome = fn
+	r.mu.Unlock()
+}
+
+// ReportAgentOutcome forwards one terminal agent outcome to the observer.
+func (r *ActiveExecutionRegistry) ReportAgentOutcome(outcome agent.Outcome) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	fn := r.onAgentOutcome
+	if fn != nil && outcome.BrownoutProbe {
+		key := activeExecutionKey(outcome.LoopID, outcome.RunID, outcome.ExecutionID)
+		if entry := r.executions[key]; entry != nil && entry.lease != nil {
+			entry.lease.markBrownoutObserved()
+		}
+	}
+	r.mu.Unlock()
+	if fn != nil {
+		fn(outcome)
+	}
+}
+
 // spawnLease implements agent.SpawnLease.
 type spawnLease struct {
 	registry *ActiveExecutionRegistry
@@ -192,10 +277,12 @@ type spawnLease struct {
 	ctx      context.Context
 	cancel   context.CancelCauseFunc
 
-	mu       sync.Mutex
-	released bool
-	handle   *processcontainment.Handle
-	softKill agent.SoftKillFunc
+	mu               sync.Mutex
+	released         bool
+	handle           *processcontainment.Handle
+	softKill         agent.SoftKillFunc
+	brownoutProbe    bool
+	brownoutObserved bool
 
 	// spawnDone is closed when the lease leaves pending (BindHandle or Release).
 	// BeginLoopStop/BeginShutdown wait on it so stop cannot return while a
@@ -233,6 +320,31 @@ func (l *spawnLease) Context() context.Context {
 		return context.Background()
 	}
 	return l.ctx
+}
+
+func (l *spawnLease) BrownoutProbe() bool {
+	if l == nil {
+		return false
+	}
+	return l.brownoutProbe
+}
+
+func (l *spawnLease) BrownoutProbeGeneration() uint64 {
+	if l == nil {
+		return 0
+	}
+	return l.meta.BrownoutProbeGeneration
+}
+
+func (l *spawnLease) markBrownoutObserved() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	if l.brownoutProbe {
+		l.brownoutObserved = true
+	}
+	l.mu.Unlock()
 }
 
 func (l *spawnLease) BindHandle(handle *processcontainment.Handle, softKill agent.SoftKillFunc) error {
@@ -281,6 +393,7 @@ func (l *spawnLease) BindHandle(handle *processcontainment.Handle, softKill agen
 		executionID: l.meta.ExecutionID,
 		handle:      handle,
 		softKill:    softKill,
+		lease:       l,
 	}
 	l.mu.Lock()
 	l.handle = handle
@@ -401,6 +514,7 @@ func (l *spawnLease) RebindHandle(handle *processcontainment.Handle, softKill ag
 			loopID:      l.meta.LoopID,
 			runID:       l.meta.RunID,
 			executionID: l.meta.ExecutionID,
+			lease:       l,
 		}
 		r.executions[key] = entry
 	}
@@ -476,8 +590,15 @@ func (l *spawnLease) Release() {
 		return
 	}
 	l.released = true
+	probeRelease := l.meta.BrownoutProbeRelease
+	if !l.brownoutProbe || l.brownoutObserved {
+		probeRelease = nil
+	}
 	l.mu.Unlock()
 	l.cancel(nil)
+	if probeRelease != nil {
+		probeRelease()
+	}
 	r := l.registry
 	if r == nil {
 		l.closeSpawnDone()
@@ -518,16 +639,27 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 	closed := r.admissionClosed
 	stopping := meta.LoopID != "" && r.stoppingLoops[meta.LoopID] != nil
 	r.mu.Unlock()
+	releaseBrownoutProbe := func() {
+		if meta.BrownoutProbeRelease == nil {
+			return
+		}
+		release := meta.BrownoutProbeRelease
+		meta.BrownoutProbeRelease = nil
+		release()
+	}
 
 	if allow != nil {
-		if err := allow(); err != nil {
+		if err := allow(&meta); err != nil {
+			releaseBrownoutProbe()
 			return nil, errors.Join(agent.ErrSpawnAdmissionClosed, err)
 		}
 	}
 	if closed {
+		releaseBrownoutProbe()
 		return nil, agent.ErrSpawnAdmissionClosed
 	}
 	if stopping {
+		releaseBrownoutProbe()
 		return nil, agent.ErrSpawnLoopStopping
 	}
 
@@ -535,22 +667,25 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 	// Re-check under lock after allowSpawn (which may have raced with shutdown).
 	if r.admissionClosed {
 		r.mu.Unlock()
+		releaseBrownoutProbe()
 		return nil, agent.ErrSpawnAdmissionClosed
 	}
 	if meta.LoopID != "" && r.stoppingLoops[meta.LoopID] != nil {
 		r.mu.Unlock()
+		releaseBrownoutProbe()
 		return nil, agent.ErrSpawnLoopStopping
 	}
 	r.nextLeaseID++
 	id := r.nextLeaseID
 	leaseCtx, cancel := context.WithCancelCause(ctx)
 	lease := &spawnLease{
-		registry:  r,
-		id:        id,
-		meta:      meta,
-		ctx:       leaseCtx,
-		cancel:    cancel,
-		spawnDone: make(chan struct{}),
+		registry:      r,
+		id:            id,
+		meta:          meta,
+		ctx:           leaseCtx,
+		cancel:        cancel,
+		spawnDone:     make(chan struct{}),
+		brownoutProbe: meta.BrownoutProbe,
 	}
 	r.pending[id] = lease
 	r.mu.Unlock()

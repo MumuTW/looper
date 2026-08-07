@@ -185,9 +185,9 @@ func (r *Runtime) stopWorktreeCleanupLoop() {
 func (r *Runtime) executeWorktreeCleanupPass(ctx context.Context) {
 	// Cleanup deletes managed worktrees and touches durable records — treat it
 	// as a mutation surface under the same admission Authority as claims
-	// (#580). Loop starts before MarkReady; without this gate a first pass can
+	// (#580), minus the agent-health gate, which cleanup does not spend. Loop starts before MarkReady; without this gate a first pass can
 	// run while starting, or continue while degraded/stopping.
-	if err := r.AllowClaim(); err != nil {
+	if err := r.AllowLifecycleWork(); err != nil {
 		return
 	}
 	r.mu.Lock()
@@ -230,13 +230,13 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 		LastStartedAt: stringPtr(startedAt),
 		LastStatus:    "running",
 	}
-	// Gate the start event with a point-in-time AllowClaim, then append outside
-	// admission.mu. Holding WithAllowClaim across the SQLite write stalls
+	// Gate the start event with a point-in-time AllowLifecycleWork, then append outside
+	// admission.mu. Holding WithAllowLifecycleWork across the SQLite write stalls
 	// MarkDegraded/BeginShutdown (they need that mutex to cancel producers), so
 	// the cancellation that would unblock a busy ExecContext cannot run.
 	// Already-closed admission still omits durable events; a concurrent close
 	// during the write is accepted for telemetry rather than deadlocking drain.
-	if err := r.AllowClaim(); err != nil {
+	if err := r.AllowLifecycleWork(); err != nil {
 		summary.LastError = err.Error()
 		summary.LastCompletedAt = stringPtr(formatJavaScriptISOString(r.now().UTC()))
 		summary.LastStatus = "completed"
@@ -261,9 +261,9 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 		summary.LastError = err.Error()
 		summary.LastCompletedAt = stringPtr(formatJavaScriptISOString(r.now().UTC()))
 		// MarkDegraded cancels the cleanup context during Plan; that surfaces as
-		// a Plan error after admission is already closed. Hold WithAllowClaim so
+		// a Plan error after admission is already closed. Hold WithAllowLifecycleWork so
 		// terminal failed/completed events cannot append after closure.
-		_ = r.WithAllowClaim(func() {
+		_ = r.WithAllowLifecycleWork(func() {
 			_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.failed", nil, map[string]any{"message": err.Error()})
 			_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.completed", nil, map[string]any{"status": summary.LastStatus, "failed": summary.Failed, "lastError": summary.LastError})
 		})
@@ -275,7 +275,7 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 	// Recheck after planning: MarkDegraded can close admission while Plan runs,
 	// and a pass that already started must not continue into candidate mutations
 	// or emit durable cleanup events while closed.
-	if err := r.AllowClaim(); err != nil {
+	if err := r.AllowLifecycleWork(); err != nil {
 		summary.LastError = err.Error()
 		summary.LastCompletedAt = stringPtr(formatJavaScriptISOString(r.now().UTC()))
 		summary.LastStatus = "completed"
@@ -300,14 +300,14 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 			} else {
 				summary.LastStatus = "completed"
 			}
-			_ = r.WithAllowClaim(func() {
+			_ = r.WithAllowLifecycleWork(func() {
 				_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.completed", nil, worktreeCleanupCompletedPayload(summary, skipReasons))
 			})
 			return summary
 		}
 		// Recheck before each candidate so degradation mid-pass cancels remaining
 		// worktree/record mutations instead of finishing the planned batch.
-		if err := r.AllowClaim(); err != nil {
+		if err := r.AllowLifecycleWork(); err != nil {
 			summary.LastError = err.Error()
 			// Admission closed mid-pass: stop candidate work and do not append
 			// further durable cleanup events (including completed) after close.
@@ -354,7 +354,7 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 	}
 	// Terminal completed is a durable cleanup mutation: hold admission so a
 	// concurrent MarkDegraded/cancel cannot append after closure.
-	_ = r.WithAllowClaim(func() {
+	_ = r.WithAllowLifecycleWork(func() {
 		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.completed", nil, worktreeCleanupCompletedPayload(summary, skipReasons))
 	})
 	return summary
@@ -713,7 +713,7 @@ type worktreeCleanupCandidateResult struct {
 func (r *Runtime) cleanupWorktreeCandidate(ctx context.Context, repos *storage.Repositories, gitGateway worktreeCleanupGit, cfg config.Config, candidate storage.WorktreeRecord) worktreeCleanupCandidateResult {
 	// Per-candidate gate: admission can close after the pass/loop recheck and
 	// before this candidate mutates records or deletes a checkout.
-	if err := r.AllowClaim(); err != nil {
+	if err := r.AllowLifecycleWork(); err != nil {
 		return worktreeCleanupCandidateResult{status: "skipped", message: err.Error()}
 	}
 	current, err := repos.Worktrees.GetByID(ctx, candidate.ID)
@@ -790,7 +790,7 @@ func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Rep
 	// R7 atomicity with admission closure: point-in-time AllowClaim + ctx.Err
 	// leave a window before cmd.Start where MarkDegraded can close admission and
 	// cancel, yet git worktree remove can still Start (cancellation is not a
-	// reservation synchronized with process start). AdmitStart holds WithAllowClaim
+	// reservation synchronized with process start). AdmitStart holds WithAllowLifecycleWork
 	// only across Start; retry waits and Wait/Drain stay outside so cancel can run.
 	if cleanErr := gitGateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{
 		ProjectID:         candidate.ProjectID,
@@ -809,7 +809,7 @@ func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Rep
 		return r.recordWorktreeCleanupFailure(ctx, repos, candidate, cleanErr)
 	}
 	var result worktreeCleanupCandidateResult
-	if err := r.WithAllowClaim(func() {
+	if err := r.WithAllowLifecycleWork(func() {
 		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.cleaned", &candidate, map[string]any{"reason": reason})
 		result = worktreeCleanupCandidateResult{status: "cleaned"}
 	}); err != nil {
@@ -827,7 +827,7 @@ func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Rep
 func (r *Runtime) admitWorktreeCleanupStart(ctx context.Context) func(start func() error) error {
 	return func(start func() error) error {
 		var startErr error
-		if err := r.WithAllowClaim(func() {
+		if err := r.WithAllowLifecycleWork(func() {
 			if err := ctx.Err(); err != nil {
 				startErr = err
 				return
@@ -858,11 +858,11 @@ func isWorktreeCleanupStartRefused(err error) bool {
 
 // recordWorktreeCleanupSkip holds admission across the worktrees touch and skip
 // event so degradation after eligibility checks cannot commit durable cleanup
-// mutations after close. Callers that already hold WithAllowClaim must use
+// mutations after close. Callers that already hold WithAllowLifecycleWork must use
 // writeWorktreeCleanupSkip instead.
 func (r *Runtime) recordWorktreeCleanupSkip(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord, reason string) worktreeCleanupCandidateResult {
 	var result worktreeCleanupCandidateResult
-	if err := r.WithAllowClaim(func() {
+	if err := r.WithAllowLifecycleWork(func() {
 		result = r.writeWorktreeCleanupSkip(ctx, repos, candidate, reason)
 	}); err != nil {
 		return worktreeCleanupCandidateResult{status: "skipped", message: err.Error()}
@@ -882,10 +882,10 @@ func (r *Runtime) writeWorktreeCleanupSkip(ctx context.Context, repos *storage.R
 
 // recordWorktreeCleanupFailure holds admission across the worktrees touch and
 // failure event (same write-boundary contract as recordWorktreeCleanupSkip).
-// Callers already inside WithAllowClaim must use writeWorktreeCleanupFailure.
+// Callers already inside WithAllowLifecycleWork must use writeWorktreeCleanupFailure.
 func (r *Runtime) recordWorktreeCleanupFailure(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord, cause error) worktreeCleanupCandidateResult {
 	var result worktreeCleanupCandidateResult
-	if err := r.WithAllowClaim(func() {
+	if err := r.WithAllowLifecycleWork(func() {
 		result = r.writeWorktreeCleanupFailure(ctx, repos, candidate, cause)
 	}); err != nil {
 		return worktreeCleanupCandidateResult{status: "skipped", message: err.Error()}

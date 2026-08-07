@@ -135,6 +135,171 @@ type ExecutorOptions struct {
 	// output, so a transport can surface live progress. Vendor-agnostic: it works
 	// off the subprocess's stdout tail, whatever agent (codex/opencode/claude) runs.
 	OnProgress func(context.Context, ProgressUpdate)
+	// OnOutcome, when set, is called once per execution that reached a terminal
+	// state the agent itself produced. It is the daemon's provider-agnostic view
+	// of "did the agent work", and exists so a health gate can be built without
+	// any component having to recognize a specific provider's rate-limit or
+	// outage message. Executions looper killed are not reported: shutting an
+	// agent down is looper's decision, not evidence about the provider.
+	OnOutcome func(Outcome)
+}
+
+// Outcome is one terminal agent execution, reduced to whether it worked.
+type Outcome struct {
+	ProjectID   string
+	LoopID      string
+	RunID       string
+	ExecutionID string
+	// Vendor is the effective provider identity for this execution. Runtime
+	// health is partitioned by this value so one provider outage does not pause
+	// independent providers.
+	Vendor string
+	// BrownoutProbe is true only when the spawn was admitted during half-open.
+	BrownoutProbe bool
+	// BrownoutProbeGeneration identifies the half-open round for this outcome.
+	BrownoutProbeGeneration uint64
+	// BrownoutStickySnapshot is true when this outcome belongs to a retry using
+	// a persisted vendor snapshot rather than the current live role config.
+	BrownoutStickySnapshot bool
+	// Status is the executor's terminal status ("completed", "failed",
+	// "timeout").
+	Status string
+	// Succeeded is true only for a clean completion. A timeout counts as a
+	// failure here: an agent that hangs and one that is refused both mean work
+	// is not getting done, and both are worth backing off from.
+	Succeeded bool
+	// StartedAt is when this execution was admitted. A health gate needs it to
+	// tell a probe it admitted from a long-running execution that predates it.
+	StartedAt time.Time
+}
+
+// declaresRetryableBlock reports whether a parsed completion marker says the
+// agent was blocked by something a retry might clear. The role runners turn
+// that into a failed, replayable run, so health accounting must agree: a
+// provider that answers "blocked: retryable_transient, rate limited" would
+// otherwise be recorded as a success on every attempt while the runner keeps
+// retrying — diluting the very ratio meant to notice it.
+//
+// manual_intervention is deliberately excluded. That is looper or the repo
+// needing a human, not the provider failing, and backing off from the provider
+// would not help.
+func declaresRetryableBlock(completionPayload string) bool {
+	payload := strings.TrimSpace(completionPayload)
+	if payload == "" {
+		return false
+	}
+	var parsed struct {
+		Outcome     string `json:"outcome"`
+		FailureKind string `json:"failure_kind"`
+	}
+	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(parsed.Outcome), "blocked") {
+		return false
+	}
+	return !strings.EqualFold(strings.TrimSpace(parsed.FailureKind), "manual_intervention")
+}
+
+func validRawJSONObject(stdout string) bool {
+	message := strings.TrimSpace(FinalMessage(stdout))
+	if message == "" {
+		return false
+	}
+	var object map[string]any
+	return json.Unmarshal([]byte(message), &object) == nil && object != nil
+}
+
+// validRawJSONObjectEnvelope matches callers whose parser extracts the first
+// JSON object from otherwise harmless surrounding prose (for example reviewer
+// thread reconciliation). The caller still owns semantic schema validation;
+// this only keeps health accounting aligned with its accepted transport shape.
+func validRawJSONObjectEnvelope(stdout string) bool {
+	message := strings.TrimSpace(FinalMessage(stdout))
+	start := strings.Index(message, "{")
+	end := strings.LastIndex(message, "}")
+	if start < 0 || end < start {
+		return false
+	}
+	var object map[string]any
+	return json.Unmarshal([]byte(message[start:end+1]), &object) == nil && object != nil
+}
+
+// validMarkerOutcome rejects a marker that advertises an outcome outside the
+// shared completion contract. Generic workers still use the summary-only
+// marker, so an absent outcome remains valid; once an agent supplies the key,
+// only completed or blocked is recognized. This keeps health accounting aligned
+// with fixerRepairTaskOutcome instead of treating an unknown role result as a
+// provider success.
+func validMarkerOutcome(payload string) bool {
+	var raw map[string]json.RawMessage
+	if strings.TrimSpace(payload) == "" || json.Unmarshal([]byte(payload), &raw) != nil {
+		return false
+	}
+	encoded, ok := raw["outcome"]
+	if !ok {
+		return true
+	}
+	var outcome string
+	if json.Unmarshal(encoded, &outcome) != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "completed", "blocked":
+		return true
+	default:
+		return false
+	}
+}
+
+// validFixerMarkerOutcome is the stricter marker contract used by the fixer.
+// Unlike generic coding roles, the fixer runner requires an explicit outcome
+// before it may advance to validation or publish; a summary-only marker is not
+// evidence that repair completed.
+func validFixerMarkerOutcome(payload string) bool {
+	var raw map[string]json.RawMessage
+	if strings.TrimSpace(payload) == "" || json.Unmarshal([]byte(payload), &raw) != nil {
+		return false
+	}
+	encoded, ok := raw["outcome"]
+	if !ok {
+		return false
+	}
+	var outcome string
+	if json.Unmarshal(encoded, &outcome) != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "completed", "blocked":
+		return true
+	default:
+		return false
+	}
+}
+
+// validReviewerMarkerOutcome aligns health accounting with the reviewer
+// runner's reviewCompletionOutcome contract. A reviewer may finish cleanly or
+// publish actionable feedback as blocking, non_blocking, or legacy actionable;
+// an absent outcome preserves the summary-only marker used by clean no-op runs.
+func validReviewerMarkerOutcome(payload string) bool {
+	var raw map[string]json.RawMessage
+	if strings.TrimSpace(payload) == "" || json.Unmarshal([]byte(payload), &raw) != nil {
+		return false
+	}
+	encoded, ok := raw["outcome"]
+	if !ok {
+		return true
+	}
+	var outcome string
+	if json.Unmarshal(encoded, &outcome) != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "clean", "non_blocking", "blocking", "actionable":
+		return true
+	default:
+		return false
+	}
 }
 
 // ProgressUpdate is a throttled snapshot of a running agent's activity: the last
@@ -198,7 +363,44 @@ type RunInput struct {
 	// SnapshotReasoningEffort is used only when UseSnapshot is true. nil means
 	// no reasoning-effort override.
 	SnapshotReasoningEffort *config.ReasoningEffort
+	// CompletionContract selects the output contract that determines health
+	// success. Coding agents use the marker contract; reviewer runs use the
+	// reviewer outcome marker; coordinator and triager classifiers use raw JSON;
+	// file-backed callers provide a semantic validator.
+	CompletionContract CompletionContract
+	// CompletionValidator is the daemon-owned caller validator for contracts
+	// whose authority is not the executor's generic syntax check (for example a
+	// planner assessment file or a coordinator decision schema). For stdout
+	// contracts it receives FinalMessage(stdout); file-backed callers may ignore
+	// the argument. It is evaluated only at terminal outcome reporting.
+	CompletionValidator func(string) bool
+	// CompletionOutcomeValidator is a caller-owned durable publication check.
+	// Reviewer runs use it only when the process status or stdout marker is
+	// incomplete; a verified remote review marker can therefore count as a
+	// successful provider outcome even when the agent exited non-zero.
+	CompletionOutcomeValidator func() bool
+	// BrownoutProbe is populated by the common spawn admission lease.
+	BrownoutProbe bool
+	// BrownoutProbeGeneration is copied from the common spawn admission lease.
+	BrownoutProbeGeneration uint64
 }
+
+type CompletionContract string
+
+const (
+	CompletionContractMarker              CompletionContract = "marker"
+	CompletionContractRawJSON             CompletionContract = "raw_json"
+	CompletionContractRawJSONEnvelope     CompletionContract = "raw_json_envelope"
+	CompletionContractReviewerMarker      CompletionContract = "reviewer_marker"
+	CompletionContractReviewerPublication CompletionContract = "reviewer_publication"
+	CompletionContractWorkerHITL          CompletionContract = "worker_hitl"
+	CompletionContractFixerMarker         CompletionContract = "fixer_marker"
+	// CompletionContractPlannerMarker matches Planner's optional completion
+	// marker. Planner can advance from a successful agent result without a
+	// marker, while a present marker is still validated by the Planner caller.
+	CompletionContractPlannerMarker CompletionContract = "planner_marker"
+	CompletionContractFile          CompletionContract = "file"
+)
 
 // TimeoutObservation identifies the timeout that is about to terminate an
 // agent process. LastProgressAt is the executor's own observed activity time.
@@ -256,6 +458,7 @@ type ConfiguredExecutor struct {
 	owner                SpawnOwner
 	onHardPersistFailure func(error)
 	onProgress           func(context.Context, ProgressUpdate)
+	onOutcome            func(Outcome)
 }
 
 func New(options ExecutorOptions) *ConfiguredExecutor {
@@ -272,6 +475,7 @@ func New(options ExecutorOptions) *ConfiguredExecutor {
 		owner:                options.Owner,
 		onHardPersistFailure: options.OnHardPersistFailure,
 		onProgress:           options.OnProgress,
+		onOutcome:            options.OnOutcome,
 	}
 }
 
@@ -497,8 +701,6 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	if executionID == "" {
 		executionID = eventlog.NewEventID("agentexec")
 	}
-	startedAt := e.now().UTC()
-	startedAtISO := eventlog.FormatJavaScriptISOString(startedAt)
 	cfg := e.effectiveConfig(input)
 	if input.Assessment {
 		if err := validateAssessmentExecution(cfg, input); err != nil {
@@ -528,14 +730,27 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	var lease SpawnLease
 	if e.owner != nil {
 		lease, err = e.owner.AdmitSpawn(ctx, SpawnMeta{
-			LoopID:      input.LoopID,
-			RunID:       input.RunID,
-			ExecutionID: executionID,
+			LoopID:                 input.LoopID,
+			RunID:                  input.RunID,
+			ExecutionID:            executionID,
+			Vendor:                 string(cfg.Vendor),
+			BrownoutStickySnapshot: input.UseSnapshot && strings.TrimSpace(input.SnapshotVendor) != "",
 		})
 		if err != nil {
 			return nil, err
 		}
+		if probeLease, ok := lease.(interface{ BrownoutProbe() bool }); ok {
+			input.BrownoutProbe = probeLease.BrownoutProbe()
+		}
+		if probeLease, ok := lease.(interface{ BrownoutProbeGeneration() uint64 }); ok {
+			input.BrownoutProbeGeneration = probeLease.BrownoutProbeGeneration()
+		}
 	}
+	// The health admission timestamp must be captured after AdmitSpawn returns:
+	// a half-open breaker may transition during that call, and a timestamp from
+	// before it would make a genuine probe look like a stale execution.
+	startedAt := e.now().UTC()
+	startedAtISO := eventlog.FormatJavaScriptISOString(startedAt)
 	releaseLease := func() {
 		if lease != nil {
 			lease.Release()
@@ -1212,6 +1427,7 @@ func (x *execution) run(ctx context.Context) {
 		}, endedAtISO)
 	}
 
+	x.reportOutcome(status, result.ParseStatus, result.CompletionPayload, result.Stdout)
 	x.doneCh <- execOutcome{result: result, err: persistErr}
 }
 
@@ -1229,6 +1445,78 @@ func (x *execution) finalizeNativeResumeStatus(status, errorMessage, stderr stri
 	x.nativeResumeError = firstNonEmpty(x.nativeResumeError, errorMessage, strings.TrimSpace(stderr))
 }
 
+// reportOutcome feeds the daemon's agent-health gate. "killed" is excluded on
+// purpose: it means looper stopped the agent (operator stop, shutdown drain),
+// which says nothing about whether the provider is answering.
+func (x *execution) reportOutcome(status, parseStatus, completionPayload, stdout string) {
+	if x.executor == nil || x.executor.onOutcome == nil || status == "killed" {
+		return
+	}
+	succeeded := status == "completed"
+	if x.input.CompletionContract == CompletionContractFile {
+		succeeded = succeeded && x.input.CompletionValidator != nil && x.input.CompletionValidator("")
+	} else if x.input.CompletionContract == CompletionContractRawJSON {
+		succeeded = succeeded && validRawJSONObject(stdout)
+		if succeeded && x.input.CompletionValidator != nil {
+			succeeded = x.input.CompletionValidator(FinalMessage(stdout))
+		}
+	} else if x.input.CompletionContract == CompletionContractRawJSONEnvelope {
+		succeeded = succeeded && validRawJSONObjectEnvelope(stdout)
+		if succeeded && x.input.CompletionValidator != nil {
+			succeeded = x.input.CompletionValidator(FinalMessage(stdout))
+		}
+	} else if x.input.CompletionContract == CompletionContractReviewerMarker {
+		succeeded = succeeded && parseStatus == "parsed" && validReviewerMarkerOutcome(completionPayload)
+	} else if x.input.CompletionContract == CompletionContractReviewerPublication {
+		succeeded = succeeded && parseStatus == "parsed" && validReviewerMarkerOutcome(completionPayload)
+		if !succeeded && x.input.CompletionOutcomeValidator != nil {
+			succeeded = x.input.CompletionOutcomeValidator()
+		}
+	} else if x.input.CompletionContract == CompletionContractWorkerHITL {
+		succeeded = succeeded && parseStatus == "parsed" && validMarkerOutcome(completionPayload)
+		if !succeeded && status == "completed" && x.input.CompletionOutcomeValidator != nil {
+			succeeded = x.input.CompletionOutcomeValidator()
+		}
+	} else if x.input.CompletionContract == CompletionContractFixerMarker {
+		succeeded = succeeded && parseStatus == "parsed" && validFixerMarkerOutcome(completionPayload)
+	} else if x.input.CompletionContract == CompletionContractPlannerMarker {
+		// Planner's runner treats the marker as optional. A malformed marker is
+		// still a failed completion, while a caller validator owns the optional
+		// workGraph schema when a marker is present (or receives an empty payload
+		// when the marker is absent).
+		succeeded = succeeded && (parseStatus == "missing" || (parseStatus == "parsed" && validMarkerOutcome(completionPayload)))
+		if succeeded && x.input.CompletionValidator != nil {
+			succeeded = x.input.CompletionValidator(completionPayload)
+		}
+	} else {
+		succeeded = succeeded && parseStatus == "parsed" && validMarkerOutcome(completionPayload)
+	}
+	// Planner's runner treats a valid blocked marker as a completed Planner
+	// step (it may still advance the checkpoint); do not apply the generic
+	// retryable-block classification to that caller-owned contract. Other role
+	// runners replay retryable blocks, so those remain provider-health failures.
+	healthSucceeded := succeeded
+	if x.input.CompletionContract != CompletionContractPlannerMarker {
+		healthSucceeded = healthSucceeded && !declaresRetryableBlock(completionPayload)
+	}
+	x.executor.onOutcome(Outcome{
+		ProjectID:               x.input.ProjectID,
+		LoopID:                  x.input.LoopID,
+		RunID:                   x.input.RunID,
+		ExecutionID:             x.executionID,
+		Vendor:                  string(x.executor.effectiveConfig(x.input).Vendor),
+		BrownoutProbe:           x.input.BrownoutProbe,
+		BrownoutProbeGeneration: x.input.BrownoutProbeGeneration,
+		BrownoutStickySnapshot:  x.input.UseSnapshot && strings.TrimSpace(x.input.SnapshotVendor) != "",
+		Status:                  status,
+		// A zero exit code is not a valid agent completion by itself. The selected
+		// structured output contract is the executor's completion authority;
+		// missing or malformed output must feed the health gate as a failure so
+		// brownout backs off from agents that exit cleanly without doing the work.
+		Succeeded: healthSucceeded,
+		StartedAt: x.startedAt,
+	})
+}
 func (x *execution) observeBeforeTimeout(timeoutType string) string {
 	callback := x.input.OnBeforeTimeout
 	if callback == nil {

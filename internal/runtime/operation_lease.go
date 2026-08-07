@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +30,10 @@ var ErrOperationFinalizeFailed = errors.New("queue operation durable finalize fa
 type OperationMeta struct {
 	// ClaimedBy is the durable claimed_by value (e.g. "scheduler").
 	ClaimedBy string
+	// Vendor is the effective provider for the claim. It is retained while a
+	// claim is pending/bound so a config reload cannot discard its breaker state
+	// before the queue snapshot or spawn lease becomes visible.
+	Vendor string
 }
 
 // OperationPermit is the explicit token proving BindClaim succeeded. The queue
@@ -66,6 +71,11 @@ type OperationLease interface {
 	Release()
 	// Owns reports whether this lease currently owns queueItemID (bound, not released).
 	Owns(queueItemID string) bool
+	// SetVendor fills the effective provider once an atomic multi-lane claim has
+	// resolved its winner. It is safe before or after BindClaim.
+	SetVendor(vendor string)
+	// Vendor returns the provider retained by this lease.
+	Vendor() string
 }
 
 // operationLease implements OperationLease under ActiveExecutionRegistry.
@@ -119,6 +129,24 @@ func (l *operationLease) Owns(queueItemID string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return !l.released && l.bound && l.queueItemID == queueItemID
+}
+
+func (l *operationLease) SetVendor(vendor string) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	l.meta.Vendor = strings.TrimSpace(vendor)
+	l.mu.Unlock()
+}
+
+func (l *operationLease) Vendor() string {
+	if l == nil {
+		return ""
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.TrimSpace(l.meta.Vendor)
 }
 
 func (l *operationLease) BindClaim(item storage.QueueItemRecord) (OperationPermit, error) {
@@ -244,9 +272,13 @@ func (r *ActiveExecutionRegistry) AdmitOperation(ctx context.Context, meta Opera
 	closed := r.admissionClosed
 	r.mu.Unlock()
 
-	// Project the same admission Authority as spawns/claims (starting/stopping/degraded).
+	// The scheduler's outer WithAllowAgentClaim already holds the lifecycle and
+	// provider gates across this operation lease. Do not call AllowClaim through
+	// allowAgentSpawn(nil) here: that would re-enter the non-reentrant admission
+	// mutex and deadlock. The registry's local admissionClosed check below still
+	// closes a lease that races with shutdown.
 	if allow != nil {
-		if err := allow(); err != nil {
+		if err := allow(nil); err != nil {
 			return nil, errors.Join(ErrOperationAdmissionClosed, err)
 		}
 	}

@@ -54,6 +54,7 @@ const (
 	defaultAgentTimeout = time.Hour
 	defaultClaimTTL     = 10 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
+	maxRetryDelay       = 300 * time.Second
 	defaultRetryMax     = 3
 	defaultIssueLimit   = 30
 	// Keep in lockstep with internal/infra/git.WorktreeFingerprintVersion; this
@@ -387,10 +388,12 @@ type AgentRunInput struct {
 	OnBeforeTimeout          func(context.Context, agent.TimeoutObservation) error
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
-	UseSnapshot             bool
-	SnapshotVendor          string
-	SnapshotModel           *string
-	SnapshotReasoningEffort *config.ReasoningEffort
+	UseSnapshot                bool
+	SnapshotVendor             string
+	SnapshotModel              *string
+	SnapshotReasoningEffort    *config.ReasoningEffort
+	CompletionContract         agent.CompletionContract
+	CompletionOutcomeValidator func() bool
 }
 
 type AgentResult struct {
@@ -1552,7 +1555,13 @@ func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.
 
 func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord, err error) (*runpipe.ProcessResult, error) {
 	failure := r.classifyFailure(err)
-	failedQueue, failErr := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
+	var failedQueue *storage.QueueItemRecord
+	var failErr error
+	if errors.Is(err, agent.ErrProviderBrownout) {
+		failedQueue, failErr = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.Kind, failure.Message)
+	} else {
+		failedQueue, failErr = r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
+	}
 	if failErr != nil {
 		return nil, failErr
 	}
@@ -1787,7 +1796,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if _, err := r.completeRun(ctx, run, "failed", failure.Message, failure.Message, latest); err != nil {
 				return runpipe.ProcessResult{}, err
 			}
-			failedQueue, err := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
+			var failedQueue *storage.QueueItemRecord
+			if errors.Is(err, agent.ErrProviderBrownout) {
+				failedQueue, err = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.Kind, failure.Message)
+			} else {
+				failedQueue, err = r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
+			}
 			if err != nil {
 				return runpipe.ProcessResult{}, err
 			}
@@ -2509,6 +2523,10 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			RestrictToolNetwork: len(validationCommands) > 0,
 			OnBeforeTimeout:     onBeforeTimeout,
 			UseSnapshot:         useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
+			CompletionContract: agent.CompletionContractWorkerHITL,
+			CompletionOutcomeValidator: func() bool {
+				return r.hitlEnabled && validAskSentinelForHealth(worktree.Path)
+			},
 		})
 		if err != nil {
 			return checkpoint, err
@@ -4339,6 +4357,49 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 		return nil, err
 	}
 	return r.repos.Queue.GetByID(ctx, queueItem.ID)
+}
+
+// requeueClaimedItemWithoutAttempt returns a claim refused by provider
+// brownout to queued without charging an attempt: no agent run reached the
+// executor after the durable claim.
+func (r *Runner) requeueClaimedItemWithoutAttempt(ctx context.Context, queueItem storage.QueueItemRecord, kind runpipe.QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
+	nowISO := r.nowISO()
+	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, cappedRetryDelayAttempt(queueItem.Attempts+1, queueItem.MaxAttempts))))
+	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: queueItem.Attempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		return nil, err
+	}
+	return r.repos.Queue.GetByID(ctx, queueItem.ID)
+}
+
+func backoffDelay(base time.Duration, attempts int64) time.Duration {
+	delay := base
+	for i := int64(1); i < attempts; i++ {
+		if delay >= maxRetryDelay || delay > maxRetryDelay/2 {
+			return maxRetryDelay
+		}
+		delay *= 2
+	}
+	if delay > maxRetryDelay {
+		return maxRetryDelay
+	}
+	return delay
+}
+
+func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
+	if attempts <= 0 {
+		return 1
+	}
+	if maxAttempts > 0 && attempts > maxAttempts {
+		return maxAttempts
+	}
+	return attempts
+}
+
+func optionalString(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
 }
 
 func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, error) {

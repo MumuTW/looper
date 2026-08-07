@@ -25,8 +25,16 @@ var hotEditablePaths = map[string]struct{}{
 	"agent.timeouts.fixerIdleTimeoutSeconds":    {},
 	"agent.timeouts.fixerMaxRuntimeSeconds":     {},
 
-	"scheduler.maxConcurrentRuns":       {},
-	"scheduler.slowLaneWarnThresholdMs": {},
+	"scheduler.maxConcurrentRuns":                {},
+	"scheduler.slowLaneWarnThresholdMs":          {},
+	"scheduler.agentBrownout.enabled":            {},
+	"scheduler.agentBrownout.windowSeconds":      {},
+	"scheduler.agentBrownout.minFailures":        {},
+	"scheduler.agentBrownout.failureRatio":       {},
+	"scheduler.agentBrownout.cooldownSeconds":    {},
+	"scheduler.agentBrownout.maxCooldownSeconds": {},
+	"scheduler.agentBrownout.probeSuccesses":     {},
+	"scheduler.agentBrownout.notify":             {},
 
 	// The cleanup loop rereads these each iteration and a reload wakes it, so
 	// none of them replace a process-owned resource. Only the leaves are hot;

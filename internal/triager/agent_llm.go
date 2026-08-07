@@ -28,11 +28,13 @@ func (l agentLLM) Complete(ctx context.Context, req Request) (string, error) {
 		return "", fmt.Errorf("triager working directory is required")
 	}
 	execution, err := l.executor.Start(ctx, agent.RunInput{
-		ExecutionID:      eventlog.NewEventID("triager"),
-		Prompt:           req.Prompt,
-		WorkingDirectory: req.WorkingDirectory,
-		Timeout:          l.timeout,
-		HeartbeatTimeout: l.idleTimeout,
+		ExecutionID:         eventlog.NewEventID("triager"),
+		Prompt:              req.Prompt,
+		WorkingDirectory:    req.WorkingDirectory,
+		CompletionContract:  agent.CompletionContractRawJSON,
+		CompletionValidator: ValidateDecisionOutput,
+		Timeout:             l.timeout,
+		HeartbeatTimeout:    l.idleTimeout,
 	})
 	if err != nil {
 		return "", err

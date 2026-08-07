@@ -1102,10 +1102,30 @@ type daemonStatusResponse struct {
 }
 
 type statusServiceView struct {
-	DegradedReasons []string           `json:"degradedReasons"`
-	Recovery        statusRecoveryView `json:"recovery"`
-	Triage          statusTriageView   `json:"triage"`
-	Binary          statusBinaryView   `json:"binary"`
+	DegradedReasons []string               `json:"degradedReasons"`
+	Recovery        statusRecoveryView     `json:"recovery"`
+	Triage          statusTriageView       `json:"triage"`
+	Binary          statusBinaryView       `json:"binary"`
+	AgentHealth     *statusAgentHealthView `json:"agentHealth"`
+}
+
+type statusAgentHealthView struct {
+	State     string                          `json:"state"`
+	Partial   bool                            `json:"partial"`
+	Failures  int                             `json:"failures"`
+	Total     int                             `json:"total"`
+	OpenUntil *string                         `json:"openUntil"`
+	Trips     int                             `json:"trips"`
+	Providers []statusAgentProviderHealthView `json:"providers"`
+}
+
+type statusAgentProviderHealthView struct {
+	Provider  string  `json:"provider"`
+	State     string  `json:"state"`
+	Failures  int     `json:"failures"`
+	Total     int     `json:"total"`
+	OpenUntil *string `json:"openUntil"`
+	Trips     int     `json:"trips"`
 }
 
 type statusTriageView struct {
@@ -1242,6 +1262,11 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 			_, _ = fmt.Fprintf(stdout, "  - %s\n", awaitingConfirmationLine(source))
 		}
 	}
+	// An idle daemon that is waiting out a bad provider looks exactly like a
+	// stuck one. Say which it is, and when it will try again.
+	if health := status.Service.AgentHealth; health != nil {
+		_, _ = fmt.Fprintf(stdout, "agents:   %s\n", agentHealthLine(*health))
+	}
 	if len(status.Service.DegradedReasons) > 0 {
 		_, _ = fmt.Fprintf(stdout, "degraded: %s\n", strings.Join(status.Service.DegradedReasons, ", "))
 	}
@@ -1260,6 +1285,51 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 			detail = "host pressure"
 		}
 		_, _ = fmt.Fprintf(stdout, "resources: scheduler held (%s)\n", singleLine(detail))
+	}
+}
+
+func agentHealthLine(health statusAgentHealthView) string {
+	// A non-closed retained provider row is a sticky-only pause only when the
+	// active-provider aggregate is closed. If every active provider is open or
+	// probing, preserve the aggregate state below so status does not downgrade a
+	// global outage to a misleading partial outage.
+	stickyProviderPaused := false
+	if health.State == "closed" {
+		for _, provider := range health.Providers {
+			if provider.State != "closed" {
+				stickyProviderPaused = true
+				break
+			}
+		}
+	}
+	if health.Partial || stickyProviderPaused {
+		if len(health.Providers) == 0 {
+			return "partially paused: one or more agent providers are unavailable"
+		}
+		parts := make([]string, 0, len(health.Providers))
+		for _, provider := range health.Providers {
+			line := fmt.Sprintf("%s=%s", provider.Provider, provider.State)
+			if provider.State == "open" && provider.OpenUntil != nil && strings.TrimSpace(*provider.OpenUntil) != "" {
+				line += fmt.Sprintf(" (retrying at %s)", strings.TrimSpace(*provider.OpenUntil))
+			}
+			parts = append(parts, line)
+		}
+		return "partially paused: " + strings.Join(parts, ", ")
+	}
+	switch health.State {
+	case "open":
+		line := fmt.Sprintf("work paused: %d of %d recent agent runs failed", health.Failures, health.Total)
+		if health.OpenUntil != nil && strings.TrimSpace(*health.OpenUntil) != "" {
+			line += fmt.Sprintf("; retrying at %s", strings.TrimSpace(*health.OpenUntil))
+		}
+		if health.Trips > 1 {
+			line += fmt.Sprintf(" (%d trips)", health.Trips)
+		}
+		return line
+	case "half_open":
+		return "probing: recovery checks must succeed before work resumes"
+	default:
+		return health.State
 	}
 }
 

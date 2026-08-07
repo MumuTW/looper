@@ -18,6 +18,7 @@ import (
 	"github.com/MumuTW/looper/internal/coordinator"
 	"github.com/MumuTW/looper/internal/fixer"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/loops/brownout"
 	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/planner"
 	"github.com/MumuTW/looper/internal/projects"
@@ -37,6 +38,20 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 func allowedQueueTypesFromRunners(input defaultSchedulerTickInput) []string {
 	unrestricted, stickySnapshotOnly := claimTypeSetsFromInput(input)
 	return append(unrestricted, stickySnapshotOnly...)
+}
+
+func TestSchedulerSeparatesLifecycleAndClaimAdmission(t *testing.T) {
+	t.Parallel()
+	input := defaultSchedulerTickInput{
+		AllowLifecycleWork: func() error { return nil },
+		AllowClaim:         func() error { return brownout.ErrOpen },
+	}
+	if err := admissionRefuseWork(input); err != nil {
+		t.Fatalf("lifecycle admission = %v, want allowed during provider brownout", err)
+	}
+	if err := admissionRefuseClaim(input); !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("claim admission = %v, want brownout.ErrOpen", err)
+	}
 }
 
 func TestWorkerAgentExecutionAdapterPropagatesParseStatus(t *testing.T) {
@@ -801,6 +816,599 @@ func TestClaimAndRunScheduledQueueItemsSkipsUnconfiguredRoles(t *testing.T) {
 	}
 	if reviewerItem == nil || reviewerItem.Status != "queued" {
 		t.Fatalf("reviewer item = %#v, want still queued", reviewerItem)
+	}
+}
+
+func TestClaimAndRunScheduledQueueItemsGatesEachProviderLane(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-provider-lanes.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	cfg.Agent.Vendor = &codex
+	cfg.Roles.Reviewer.Agent = &config.RoleAgentConfig{Vendor: &claude}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "provider_lanes", Validation: &config.ProjectValidationConfig{OptOut: true}}}
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "provider_lanes", Name: "Provider lanes", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	workerLoopID := "loop_worker_codex"
+	reviewerLoopID := "loop_reviewer_claude"
+	for _, loop := range []storage.LoopRecord{
+		{ID: workerLoopID, Seq: 1, ProjectID: "provider_lanes", Type: "worker", TargetType: "project", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: reviewerLoopID, Seq: 2, ProjectID: "provider_lanes", Type: "reviewer", TargetType: "pull_request", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := repos.Loops.Upsert(context.Background(), loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+	projectID := "provider_lanes"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	for _, item := range []storage.QueueItemRecord{
+		{ID: "worker_codex", ProjectID: &projectID, LoopID: &workerLoopID, Type: "worker", TargetType: "project", TargetID: "project:provider_lanes", DedupeKey: "d_worker_codex", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "reviewer_claude", ProjectID: &projectID, LoopID: &reviewerLoopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "d_reviewer_claude", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	var allowVendors []string
+	var withVendors []string
+	allowVendor := func(vendor string) error {
+		allowVendors = append(allowVendors, vendor)
+		if vendor == string(codex) {
+			return fmt.Errorf("%w: codex provider is open", brownout.ErrOpen)
+		}
+		return nil
+	}
+	withVendor := func(vendor string, fn func()) error {
+		withVendors = append(withVendors, vendor)
+		fn()
+		return nil
+	}
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 2, defaultSchedulerTickInput{
+		Repos:                   repos,
+		Now:                     func() time.Time { return now },
+		Config:                  &cfg,
+		Worker:                  &stubWorkerScheduler{},
+		Reviewer:                &stubReviewerScheduler{},
+		AllowClaimForVendor:     allowVendor,
+		WithAllowClaimForVendor: withVendor,
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != "reviewer_claude" {
+		t.Fatalf("claimed = %#v, want only Claude reviewer work", claimed)
+	}
+	seenCodex := false
+	for _, vendor := range allowVendors {
+		if vendor == string(codex) {
+			seenCodex = true
+		}
+	}
+	if len(allowVendors) == 0 || allowVendors[0] != string(claude) || !seenCodex {
+		t.Fatalf("provider admission calls = %#v, want Claude first and Codex lane checked", allowVendors)
+	}
+	if len(withVendors) == 0 {
+		t.Fatal("provider critical sections = empty, want Claude claim section")
+	}
+	for _, vendor := range withVendors {
+		if vendor != string(claude) {
+			t.Fatalf("provider critical sections = %#v, want only Claude", withVendors)
+		}
+	}
+	workerItem, err := repos.Queue.GetByID(context.Background(), "worker_codex")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(worker_codex) error = %v", err)
+	}
+	if workerItem == nil || workerItem.Status != "queued" {
+		t.Fatalf("worker item = %#v, want queued while Codex is open", workerItem)
+	}
+}
+
+func TestClaimAndRunScheduledQueueItemsCapsHalfOpenProviderBatch(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-half-open-capacity.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	cfg.Agent.Vendor = &codex
+	cfg.Roles.Reviewer.Agent = &config.RoleAgentConfig{Vendor: &claude}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Validation: &config.ProjectValidationConfig{OptOut: true}}}
+
+	workerOne := schedulerTestQueueItem("half_open_worker_1", "worker", nowISO)
+	workerTwo := schedulerTestQueueItem("half_open_worker_2", "worker", nowISO)
+	reviewer := schedulerTestQueueItem("half_open_reviewer", "reviewer", nowISO)
+	reviewer.Priority = storage.QueuePriorityReviewer
+	for seq, item := range []storage.QueueItemRecord{workerOne, workerTwo, reviewer} {
+		loopID := "loop_" + item.ID
+		item.LoopID = &loopID
+		if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: int64(seq + 1), ProjectID: "looper", Type: item.Type, TargetType: item.TargetType, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loopID, err)
+		}
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	allowVendor := func(string) error { return nil }
+	withVendor := func(_ string, fn func()) error { fn(); return nil }
+	atomicLaneCalls := 0
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 3, defaultSchedulerTickInput{
+		Repos: repos, Config: &cfg, Now: func() time.Time { return now }, AsyncRunner: immediateSchedulerRunner{},
+		Worker: &stubWorkerScheduler{}, Reviewer: &stubReviewerScheduler{},
+		AllowClaimForVendor: allowVendor, WithAllowClaimForVendor: withVendor,
+		WithAllowClaimLanes: func(_ []storage.QueueClaimLane, fn func()) error {
+			atomicLaneCalls++
+			fn()
+			return nil
+		},
+		// The Codex lane is half-open with one remaining probe; the Claude lane
+		// is closed/unlimited. Capacity is observational, while spawn admission
+		// remains responsible for reserving the actual probe.
+		ClaimCapacityForVendor: func(vendor string, snapshot bool) int {
+			if snapshot {
+				return -1
+			}
+			if vendor == string(codex) {
+				return 1
+			}
+			return -1
+		},
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if atomicLaneCalls == 0 {
+		t.Fatal("atomic lane admission was not used while a provider was half-open")
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("claimed = %#v, want one Codex item plus the Claude reviewer", claimed)
+	}
+	claimedIDs := map[string]bool{}
+	for _, item := range claimed {
+		claimedIDs[item.ID] = true
+	}
+	if !claimedIDs[reviewer.ID] || (claimedIDs[workerOne.ID] == claimedIDs[workerTwo.ID]) {
+		t.Fatalf("claimed = %#v, want reviewer and exactly one half-open provider item", claimed)
+	}
+	for _, id := range []string{workerOne.ID, workerTwo.ID} {
+		item, err := repos.Queue.GetByID(context.Background(), id)
+		if err != nil {
+			t.Fatalf("Queue.GetByID(%s) error = %v", id, err)
+		}
+		if item == nil {
+			t.Fatalf("Queue.GetByID(%s) = nil", id)
+		}
+		if !claimedIDs[id] && item.Status != "queued" {
+			t.Fatalf("queue item %s = %#v, want one claimed and one queued", id, item)
+		}
+	}
+}
+
+func TestClaimAndRunScheduledQueueItemsSharesHalfOpenBudgetAcrossStickyAndLiveLanes(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-half-open-shared-budget.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	cfg.Agent.Vendor = &codex
+	cfg.Roles.Reviewer.Agent = &config.RoleAgentConfig{Vendor: &codex}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Validation: &config.ProjectValidationConfig{OptOut: true}}}
+
+	live := schedulerTestQueueItem("shared_budget_live", "worker", nowISO)
+	stickyLoopID := "shared_budget_sticky_loop"
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: stickyLoopID, Seq: 1, ProjectID: "looper", Type: "reviewer", TargetType: "pull_request", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	snapshot := `{"vendor":"codex","model":"frozen-reviewer"}`
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "shared_budget_sticky_run", LoopID: stickyLoopID, Status: "failed", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, AgentSnapshotJSON: &snapshot}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	sticky := schedulerTestQueueItem("shared_budget_sticky", "reviewer", nowISO)
+	sticky.LoopID = &stickyLoopID
+	sticky.Attempts = storage.QueueLongTermRetryAttemptThreshold
+	sticky.MaxAttempts = -1
+	stickyErrorKind := "retryable_transient"
+	sticky.LastErrorKind = &stickyErrorKind
+	for _, item := range []storage.QueueItemRecord{live, sticky} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	atomicLaneCalls := 0
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 2, defaultSchedulerTickInput{
+		Repos: repos, Config: &cfg, Now: func() time.Time { return now }, AsyncRunner: immediateSchedulerRunner{},
+		Worker: &stubWorkerScheduler{}, Reviewer: &stubReviewerScheduler{},
+		WithAllowClaimLanes: func(_ []storage.QueueClaimLane, fn func()) error {
+			atomicLaneCalls++
+			fn()
+			return nil
+		},
+		ClaimCapacityForVendor: func(vendor string, _ bool) int {
+			if vendor == string(codex) {
+				return 1
+			}
+			return -1
+		},
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if atomicLaneCalls == 0 {
+		t.Fatal("atomic lane admission was not used for the shared-budget claim")
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed = %#v, want one item for the shared Codex probe budget", claimed)
+	}
+	for _, id := range []string{live.ID, sticky.ID} {
+		item, err := repos.Queue.GetByID(context.Background(), id)
+		if err != nil {
+			t.Fatalf("Queue.GetByID(%s) error = %v", id, err)
+		}
+		if item == nil {
+			t.Fatalf("Queue.GetByID(%s) = nil", id)
+		}
+		claimedThis := item.Status != "queued"
+		if claimedThis != (claimed[0].ID == id) {
+			t.Fatalf("queue item %s = %#v, claimed = %#v; want exactly one row claimed", id, item, claimed)
+		}
+	}
+}
+
+func TestClaimAndRunScheduledQueueItemsSelectsGlobalHighestPriorityAcrossProviderLanes(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-provider-priority.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	cfg.Agent.Vendor = &codex
+	cfg.Roles.Reviewer.Agent = &config.RoleAgentConfig{Vendor: &claude}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Validation: &config.ProjectValidationConfig{OptOut: true}}}
+
+	workerOne := schedulerTestQueueItem("worker_low_1", "worker", nowISO)
+	workerTwo := schedulerTestQueueItem("worker_low_2", "worker", nowISO)
+	workerOne.Priority = storage.QueuePriorityWorker
+	workerTwo.Priority = storage.QueuePriorityWorker
+	reviewer := schedulerTestQueueItem("reviewer_high", "reviewer", nowISO)
+	reviewer.Priority = storage.QueuePriorityReviewer
+	for _, item := range []storage.QueueItemRecord{workerOne, workerTwo, reviewer} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	atomicLaneCalls := 0
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 1, defaultSchedulerTickInput{
+		Repos: repos, Config: &cfg, Now: func() time.Time { return now }, AsyncRunner: immediateSchedulerRunner{},
+		Planner: &stubPlannerScheduler{}, Reviewer: &stubReviewerScheduler{}, Worker: &stubWorkerScheduler{},
+		// A normal daemon also carries an agent-free Snapshotter lifecycle lane;
+		// that lane must not disable atomic provider selection for coding work.
+		Snapshotter: stubSnapshotScheduler{},
+		WithAllowClaimLanes: func(_ []storage.QueueClaimLane, fn func()) error {
+			atomicLaneCalls++
+			fn()
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != reviewer.ID {
+		t.Fatalf("claimed = %#v, want the higher-priority reviewer before either worker", claimed)
+	}
+	if atomicLaneCalls == 0 {
+		t.Fatal("atomic lane admission was not used for the provider-priority claim")
+	}
+}
+
+func TestClaimAndRunScheduledQueueItemsRotatesProviderLaneAcrossPasses(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-provider-cursor.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	cfg.Agent.Vendor = &codex
+	cfg.Roles.Reviewer.Agent = &config.RoleAgentConfig{Vendor: &claude}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Validation: &config.ProjectValidationConfig{OptOut: true}}}
+	worker := schedulerTestQueueItem("worker_cursor", "worker", nowISO)
+	reviewer := schedulerTestQueueItem("reviewer_cursor", "reviewer", nowISO)
+	// Equal priorities exercise the persistent lane cursor's fairness tie-break
+	// without weakening the global priority ordering tested above.
+	reviewer.Priority = worker.Priority
+	for _, item := range []storage.QueueItemRecord{worker, reviewer} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+	cursor := &schedulerClaimLaneCursor{}
+	base := defaultSchedulerTickInput{
+		Repos: repos, Config: &cfg, Now: func() time.Time { return now }, AsyncRunner: immediateSchedulerRunner{},
+		ClaimLaneCursor: cursor, Planner: &stubPlannerScheduler{}, Reviewer: &stubReviewerScheduler{}, Worker: &stubWorkerScheduler{},
+	}
+	first, err := claimAndRunScheduledQueueItems(context.Background(), 1, base)
+	if err != nil {
+		t.Fatalf("first claim pass error = %v", err)
+	}
+	if len(first) != 1 || first[0].ID != worker.ID {
+		t.Fatalf("first claim pass = %#v, want Codex worker before cursor rotates", first)
+	}
+	second, err := claimAndRunScheduledQueueItems(context.Background(), 1, base)
+	if err != nil {
+		t.Fatalf("second claim pass error = %v", err)
+	}
+	if len(second) != 1 || second[0].ID != reviewer.ID {
+		t.Fatalf("second claim pass = %#v, want Claude reviewer after cursor rotates", second)
+	}
+}
+
+func TestExecuteClaimPhaseAllowsAgentFreeSnapshotDuringProviderBrownout(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-snapshot-brownout.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	projectID := "looper"
+	repo := "MumuTW/looper"
+	prNumber := int64(109)
+	item := storage.QueueItemRecord{
+		ID: "snapshot_brownout", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request",
+		TargetID: "MumuTW/looper#109", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:brownout",
+		Priority: storage.QueuePrioritySnapshot, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	vendor := config.AgentVendorCodex
+	cfg.Agent.Vendor = &vendor
+	cfg.Projects = []config.ProjectRefConfig{{ID: projectID, Validation: &config.ProjectValidationConfig{OptOut: true}}}
+
+	lifecycleChecks := 0
+	lifecycleSections := 0
+	stickyRefreshes := 0
+	aggregateCalls := 0
+	claimedCount, _, err := executeClaimPhase(context.Background(), "claim_pump", defaultSchedulerTickInput{
+		Repos: repos, Config: &cfg, Now: func() time.Time { return now }, MaxConcurrentRuns: 1,
+		AsyncRunner: immediateSchedulerRunner{},
+		Snapshotter: stubSnapshotScheduler{},
+		AllowClaim: func() error {
+			aggregateCalls++
+			return brownout.ErrOpen
+		},
+		WithAllowClaim: func(func()) error {
+			aggregateCalls++
+			return brownout.ErrOpen
+		},
+		AllowLifecycleWork: func() error {
+			lifecycleChecks++
+			return nil
+		},
+		WithAllowLifecycleWork: func(fn func()) error {
+			lifecycleSections++
+			fn()
+			return nil
+		},
+		RefreshAgentHealthStickyReferences: func() { stickyRefreshes++ },
+	}, nil, true)
+	if err != nil {
+		t.Fatalf("executeClaimPhase() error = %v", err)
+	}
+	if claimedCount != 1 {
+		t.Fatalf("claimed count = %d, want the agent-free snapshot item", claimedCount)
+	}
+	if lifecycleChecks == 0 || lifecycleSections == 0 {
+		t.Fatalf("lifecycle admission checks/sections = %d/%d, want both", lifecycleChecks, lifecycleSections)
+	}
+	if stickyRefreshes == 0 {
+		t.Fatal("sticky-vendor references were not refreshed after the claim pass")
+	}
+	if aggregateCalls != 0 {
+		t.Fatalf("aggregate claim gate calls = %d, want none for agent-free snapshot", aggregateCalls)
+	}
+	updated, err := repos.Queue.GetByID(context.Background(), item.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if updated == nil || updated.Status != "completed" {
+		t.Fatalf("snapshot queue item = %#v, want completed", updated)
+	}
+}
+
+func TestClaimLanesFallThroughToLifecycleAfterEmptyProviderUnion(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-empty-provider.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	projectID := "looper"
+	repo := "MumuTW/looper"
+	prNumber := int64(110)
+	item := storage.QueueItemRecord{
+		ID: "snapshot-after-empty-provider", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request",
+		TargetID: "MumuTW/looper#110", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:empty-provider",
+		Priority: storage.QueuePrioritySnapshot, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	vendor := config.AgentVendorCodex
+	cfg.Agent.Vendor = &vendor
+	cfg.Projects = []config.ProjectRefConfig{{ID: projectID, Validation: &config.ProjectValidationConfig{OptOut: true}}}
+
+	lifecycleSections := 0
+	providerSections := 0
+	claimedCount, _, err := executeClaimPhase(context.Background(), "claim_pump", defaultSchedulerTickInput{
+		Repos: repos, Config: &cfg, Now: func() time.Time { return now }, MaxConcurrentRuns: 1,
+		AsyncRunner: immediateSchedulerRunner{}, Snapshotter: stubSnapshotScheduler{}, Worker: &stubWorkerScheduler{},
+		AllowLifecycleWork: func() error { return nil },
+		WithAllowLifecycleWork: func(fn func()) error {
+			lifecycleSections++
+			fn()
+			return nil
+		},
+		WithAllowClaimLanes: func(_ []storage.QueueClaimLane, fn func()) error {
+			providerSections++
+			fn()
+			return nil
+		},
+		ClaimCapacityForVendor: func(string, bool) int {
+			// Coding lanes have no half-open probe budget; the lifecycle
+			// snapshot must still be admitted independently.
+			return 0
+		},
+	}, nil, true)
+	if err != nil {
+		t.Fatalf("executeClaimPhase() error = %v", err)
+	}
+	if claimedCount != 1 {
+		t.Fatalf("claimed count = %d, want lifecycle snapshot after empty provider union", claimedCount)
+	}
+	if lifecycleSections == 0 {
+		t.Fatalf("lifecycle sections = %d, want lifecycle admission after coding lanes were exhausted", lifecycleSections)
+	}
+	updated, err := repos.Queue.GetByID(context.Background(), item.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if updated == nil || updated.Status != "completed" {
+		t.Fatalf("snapshot queue item = %#v, want completed", updated)
+	}
+}
+
+func TestClaimAndRunScheduledQueueItemsRoutesStickyRetryBySnapshotVendor(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-sticky-provider.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	cfg.Agent.Vendor = &codex
+	cfg.Roles.Reviewer.Agent = &config.RoleAgentConfig{Vendor: &claude}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "sticky_provider", Validation: &config.ProjectValidationConfig{OptOut: true}}}
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "sticky_provider", Name: "Sticky provider", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loopID := "loop_sticky_provider"
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "sticky_provider", Type: "reviewer", TargetType: "pull_request", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	snapshot := `{"vendor":"codex","model":"frozen-reviewer"}`
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_sticky_provider", LoopID: loopID, Status: "failed", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, AgentSnapshotJSON: &snapshot}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "sticky_provider_item", LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:1", DedupeKey: "sticky-provider", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	var ordinaryVendors []string
+	var snapshotVendors []string
+	allowOrdinary := func(vendor string) error {
+		ordinaryVendors = append(ordinaryVendors, vendor)
+		return fmt.Errorf("%w: live provider is open", brownout.ErrOpen)
+	}
+	allowSnapshot := func(vendor string) error {
+		snapshotVendors = append(snapshotVendors, vendor)
+		return nil
+	}
+	withSnapshot := func(vendor string, fn func()) error {
+		snapshotVendors = append(snapshotVendors, vendor)
+		fn()
+		return nil
+	}
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 1, defaultSchedulerTickInput{
+		Repos:                           repos,
+		Now:                             func() time.Time { return now },
+		Config:                          &cfg,
+		Reviewer:                        &stubReviewerScheduler{},
+		AllowClaimForVendor:             allowOrdinary,
+		AllowSnapshotClaimForVendor:     allowSnapshot,
+		WithAllowSnapshotClaimForVendor: withSnapshot,
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != "sticky_provider_item" {
+		t.Fatalf("claimed = %#v, want sticky retry", claimed)
+	}
+	if len(ordinaryVendors) != 1 || ordinaryVendors[0] != string(claude) {
+		t.Fatalf("ordinary provider admissions = %#v, want only current Claude lane", ordinaryVendors)
+	}
+	if len(snapshotVendors) != 2 || snapshotVendors[0] != string(codex) || snapshotVendors[1] != string(codex) {
+		t.Fatalf("snapshot provider admissions = %#v, want Codex point and critical gates", snapshotVendors)
 	}
 }
 

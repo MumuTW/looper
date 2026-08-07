@@ -26,6 +26,7 @@ import (
 	"github.com/MumuTW/looper/internal/gatekeeper"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/loops/brownout"
 	"github.com/MumuTW/looper/internal/projects"
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/storage"
@@ -7689,6 +7690,42 @@ func TestServerServesStatusEndpoint(t *testing.T) {
 	}
 }
 
+func TestStatusExposesPartialProviderBrownout(t *testing.T) {
+	fixture := newTestFixture(t)
+	openUntil := fixture.now.Add(10 * time.Minute)
+	runtime := healthRuntimeState{
+		fixedRuntimeState: fixedRuntimeState{services: fixture.runtime.Services()},
+		health: brownout.Summary{
+			State:   brownout.StateClosed,
+			Partial: true,
+			Providers: []brownout.ProviderSummary{
+				{Provider: "claude", State: brownout.StateClosed},
+				{Provider: "codex", State: brownout.StateOpen, Failures: 3, Total: 3, OpenUntil: &openUntil, Trips: 1},
+			},
+		},
+	}
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtime})
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	service := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)["service"].(map[string]any)
+	health, ok := service["agentHealth"].(map[string]any)
+	if !ok {
+		t.Fatalf("agentHealth = %#v, want partial provider health", service["agentHealth"])
+	}
+	assertEqual(t, health["state"], "closed")
+	assertEqual(t, health["partial"], true)
+	providers, ok := health["providers"].([]any)
+	if !ok || len(providers) != 2 {
+		t.Fatalf("agentHealth.providers = %#v, want two provider summaries", health["providers"])
+	}
+	if providers[1].(map[string]any)["provider"] != "codex" || providers[1].(map[string]any)["state"] != "open" {
+		t.Fatalf("provider summaries = %#v, want sorted codex open entry", providers)
+	}
+}
+
 func TestActiveRunsIncludesRunningLoopWithoutRun(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
@@ -9177,6 +9214,15 @@ var _ bootstrap.Logger = noopLogger{}
 type fixedRuntimeState struct {
 	services                 looperdruntime.Services
 	refreshWebhookForwarders func() error
+}
+
+type healthRuntimeState struct {
+	fixedRuntimeState
+	health brownout.Summary
+}
+
+func (s healthRuntimeState) AgentHealth() brownout.Summary {
+	return s.health
 }
 
 type errorInjectingQuerier struct {

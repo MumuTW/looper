@@ -74,7 +74,7 @@ func TestCleanWorktreeCandidateRefusesWhenAdmissionClosed(t *testing.T) {
 }
 
 // Contract (#592 review): Plan failure terminal events (failed/completed) are
-// held under WithAllowClaim so a closed admission cannot append them after
+// held under WithAllowLifecycleWork so a closed admission cannot append them after
 // MarkDegraded cancels the cleanup context mid-Plan.
 func TestWorktreeCleanupPassGatesPlanFailureTerminalEvents(t *testing.T) {
 	t.Parallel()

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/MumuTW/looper/internal/config"
+	coordinatorrole "github.com/MumuTW/looper/internal/coordinator"
 	"github.com/MumuTW/looper/internal/gatekeeper"
 	"github.com/MumuTW/looper/internal/triager"
 )
@@ -140,6 +141,100 @@ func TestDiscoveryLanesOrderFromCanonicalRegistryPriority(t *testing.T) {
 		}
 	}
 	t.Fatal("worker discovery lane missing")
+}
+
+func TestCodingDiscoveryLanesResolveProviderForProjectAdmission(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	cfg.Agent.Vendor = &codex
+	cfg.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &claude}
+
+	byName := make(map[string]discoveryLane)
+	for _, lane := range discoveryLanes(defaultSchedulerTickInput{Config: &cfg}) {
+		byName[lane.Name] = lane
+	}
+	if got := byName[config.CodingRolePlanner].Provider("project"); got != string(codex) {
+		t.Fatalf("planner provider = %q, want %q", got, codex)
+	}
+	if got := byName[config.CodingRoleWorker].Provider("project"); got != string(claude) {
+		t.Fatalf("worker provider = %q, want %q", got, claude)
+	}
+}
+
+func TestInternalDiscoveryLanesResolveAgentProviders(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	cfg.Agent.Vendor = &codex
+	cfg.Roles.Planner.Agent = &config.RoleAgentConfig{Vendor: &claude}
+
+	lanes := discoveryLanes(defaultSchedulerTickInput{Config: &cfg})
+	byName := make(map[string]discoveryLane, len(lanes))
+	for _, lane := range lanes {
+		byName[lane.Name] = lane
+	}
+	if byName["triager"].Provider != nil {
+		t.Fatal("triager lane should not gate enrollment and state processing")
+	}
+	if byName["coordinator"].Provider != nil {
+		t.Fatal("coordinator lane should not gate the entire maintenance pass")
+	}
+}
+
+func TestCoordinatorLanePassesProviderAdmissionToTriageOnly(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	cfg.Agent.Vendor = &codex
+	var (
+		admittedProvider string
+		admissionCalls   int
+		triageCalls      int
+	)
+	lane := coordinatorLane(defaultSchedulerTickInput{
+		Config:      &cfg,
+		Coordinator: coordinatorLaneProbe{triageCalls: &triageCalls},
+		AllowClaimForVendor: func(provider string) error {
+			admittedProvider = provider
+			admissionCalls++
+			return nil
+		},
+	})
+	if lane.Provider != nil {
+		t.Fatal("coordinator lane unexpectedly has an outer provider gate")
+	}
+	if _, err := lane.Discover(context.Background(), "project", "acme/looper", nil); err != nil {
+		t.Fatalf("Discover() error = %v", err)
+	}
+	if admittedProvider != string(codex) || admissionCalls != 1 || triageCalls != 1 {
+		t.Fatalf("provider=%q admissionCalls=%d triageCalls=%d, want %q, 1, 1", admittedProvider, admissionCalls, triageCalls, codex)
+	}
+}
+
+type coordinatorLaneProbe struct {
+	triageCalls *int
+}
+
+func (p coordinatorLaneProbe) DiscoverIssues(_ context.Context, input coordinatorrole.DiscoveryInput) (coordinatorrole.DiscoveryResult, error) {
+	if input.TriageAdmission == nil {
+		return coordinatorrole.DiscoveryResult{}, nil
+	}
+	return coordinatorrole.DiscoveryResult{}, input.TriageAdmission(func() error {
+		(*p.triageCalls)++
+		return nil
+	})
 }
 
 type budgetTriager struct {

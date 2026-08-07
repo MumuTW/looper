@@ -18,7 +18,17 @@ export type ConfigGroup = {
 const SCHEDULER_PATHS = new Set([
   "scheduler.maxConcurrentRuns",
   "scheduler.slowLaneWarnThresholdMs",
+	"scheduler.agentBrownout.enabled",
+	"scheduler.agentBrownout.windowSeconds",
+	"scheduler.agentBrownout.minFailures",
+	"scheduler.agentBrownout.failureRatio",
+	"scheduler.agentBrownout.cooldownSeconds",
+	"scheduler.agentBrownout.maxCooldownSeconds",
+	"scheduler.agentBrownout.probeSuccesses",
+	"scheduler.agentBrownout.notify",
 ]);
+
+const DECIMAL_NUMBER_PATHS = new Set(["scheduler.agentBrownout.failureRatio"]);
 
 const agentPath = (path: string) =>
   path === "agent.vendor" ||
@@ -137,7 +147,7 @@ export const CONFIG_GROUPS: ConfigGroup[] = [
   {
     id: "scheduler",
     title: "Scheduler",
-    description: "Concurrency and slow-lane diagnostics.",
+    description: "Concurrency, slow-lane diagnostics, and agent brownout protection.",
     accepts: (path) => SCHEDULER_PATHS.has(path),
   },
   {
@@ -414,16 +424,19 @@ export function draftFromValue(kind: ConfigFieldKind, value: unknown): ConfigDra
 }
 
 function parseDraft(
+  path: string,
   kind: ConfigFieldKind,
   draft: ConfigDraft,
 ): { value?: ConfigValue; error?: string } {
   if (kind === "boolean") return { value: draft === true };
   const raw = String(draft);
   if (kind === "number") {
-    if (!raw.trim()) return { error: "Enter a whole number." };
+    if (!raw.trim()) {
+      return { error: DECIMAL_NUMBER_PATHS.has(path) ? "Enter a number." : "Enter a whole number." };
+    }
     const value = Number(raw);
-    if (!Number.isFinite(value) || !Number.isInteger(value)) {
-      return { error: "Enter a whole number." };
+    if (!Number.isFinite(value) || (!DECIMAL_NUMBER_PATHS.has(path) && !Number.isInteger(value))) {
+      return { error: DECIMAL_NUMBER_PATHS.has(path) ? "Enter a number." : "Enter a whole number." };
     }
     return { value };
   }
@@ -563,7 +576,7 @@ export function buildConfigPatch(
   for (const [path, draft] of Object.entries(drafts)) {
     if (unset.has(path)) continue;
     const kind = configFieldKind(path, getConfigValue(data, path));
-    const parsed = parseDraft(kind, draft);
+    const parsed = parseDraft(path, kind, draft);
     if (parsed.error) {
       errors[path] = parsed.error;
       continue;

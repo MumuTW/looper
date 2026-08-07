@@ -571,7 +571,47 @@ func validateSchedulerConfig(scheduler SchedulerConfig, issues *[]ValidationIssu
 	if scheduler.DiscoveryCacheTTLSeconds < 0 {
 		*issues = append(*issues, ValidationIssue{Path: "scheduler.discoveryCacheTtlSeconds", Message: "must be an integer >= 0"})
 	}
+	validateAgentBrownoutConfig(scheduler.AgentBrownout, issues)
 }
+
+// validateAgentBrownoutConfig rejects settings that would make the gate either
+// never trip or never recover. A disabled gate is not validated: an operator
+// turning it off should not have to keep its numbers coherent.
+func validateAgentBrownoutConfig(brownout AgentBrownoutConfig, issues *[]ValidationIssue) {
+	if !brownout.Enabled {
+		return
+	}
+	if brownout.WindowSeconds < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.windowSeconds", Message: "must be a positive integer"})
+	} else if int64(brownout.WindowSeconds) > maxAgentBrownoutDurationSeconds {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.windowSeconds", Message: "must not exceed time.Duration maximum in seconds"})
+	}
+	if brownout.MinFailures < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.minFailures", Message: "must be a positive integer"})
+	}
+	if math.IsNaN(brownout.FailureRatio) || math.IsInf(brownout.FailureRatio, 0) || brownout.FailureRatio <= 0 || brownout.FailureRatio > 1 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.failureRatio", Message: "must be a number in (0, 1]"})
+	}
+	if brownout.CooldownSeconds < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.cooldownSeconds", Message: "must be a positive integer"})
+	} else if int64(brownout.CooldownSeconds) > maxAgentBrownoutDurationSeconds {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.cooldownSeconds", Message: "must not exceed time.Duration maximum in seconds"})
+	}
+	// A max below the base would silently shorten the operator's chosen safe
+	// interval on the second trip, which is the opposite of backing off.
+	if brownout.MaxCooldownSeconds < brownout.CooldownSeconds {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.maxCooldownSeconds", Message: "must be an integer >= scheduler.agentBrownout.cooldownSeconds"})
+	} else if int64(brownout.MaxCooldownSeconds) > maxAgentBrownoutDurationSeconds {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.maxCooldownSeconds", Message: "must not exceed time.Duration maximum in seconds"})
+	}
+	if brownout.ProbeSuccesses < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.probeSuccesses", Message: "must be a positive integer"})
+	}
+}
+
+// time.Duration stores nanoseconds in a signed 64-bit integer. Keep seconds
+// within that representable range before runtime converts the config values.
+const maxAgentBrownoutDurationSeconds = int64((1<<63 - 1) / int64(time.Second))
 
 func validateWebhookConfig(config Config, issues *[]ValidationIssue) {
 	if config.Webhook.FallbackPollIntervalSeconds < 60 {

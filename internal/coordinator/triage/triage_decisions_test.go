@@ -107,6 +107,29 @@ func TestBuildPromptCustomNamespaceUsesNamespacedDispatchSchema(t *testing.T) {
 	}
 }
 
+func TestValidateOutputRequiresSemanticFields(t *testing.T) {
+	t.Parallel()
+	if !ValidateOutput(`{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["looper:dispatch:plan"]}}`) {
+		t.Fatal("ValidateOutput() = false, want true for a complete classifier result")
+	}
+	if ValidateOutput(`{}`) {
+		t.Fatal("ValidateOutput() = true, want false for schema-invalid JSON")
+	}
+}
+
+func TestValidateOutputForConfigUsesProjectNamespace(t *testing.T) {
+	t.Parallel()
+	cfg := testConfig()
+	cfg.Namespace = labels.NewNamespace("team.looper:")
+	raw := `{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["team.looper:dispatch:plan"]}}`
+	if !ValidateOutputForConfig(raw, cfg) {
+		t.Fatal("ValidateOutputForConfig() = false, want true for a custom-namespaced decision")
+	}
+	if ValidateOutput(raw) {
+		t.Fatal("ValidateOutput() = true, want false when the custom namespace is not supplied")
+	}
+}
+
 func testConfig() Config {
 	return Config{TriagedLabel: "triaged", MaxIssueAgeDays: 7, MaxPerTick: 5, OutOfScopeLabel: "wontfix", UnclearLabel: "needs-info", ReTriageOnAuthorReply: true}
 }

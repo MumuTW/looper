@@ -1145,3 +1145,75 @@ func TestStatusOmitsBinaryLineWhenUnchanged(t *testing.T) {
 		t.Fatalf("status output = %q, want nothing for an unchanged binary", got)
 	}
 }
+
+func TestStatusReportsRecoveryProbeWithoutClaimingOneRunIsEnough(t *testing.T) {
+	var stdout bytes.Buffer
+	writeStatusOpsLines(&stdout, daemonStatusResponse{Service: statusServiceView{
+		AgentHealth: &statusAgentHealthView{State: "half_open"},
+	}})
+	got := stdout.String()
+	if !strings.Contains(got, "probing: recovery checks must succeed before work resumes") {
+		t.Fatalf("status output = %q, want recovery-check wording", got)
+	}
+	if strings.Contains(got, "one agent run") {
+		t.Fatalf("status output = %q, must not claim one run is sufficient", got)
+	}
+}
+
+func TestStatusReportsPartialProviderBrownout(t *testing.T) {
+	var stdout bytes.Buffer
+	retryAt := "2026-08-01T22:10:00.000Z"
+	writeStatusOpsLines(&stdout, daemonStatusResponse{Service: statusServiceView{
+		AgentHealth: &statusAgentHealthView{
+			State:   "closed",
+			Partial: true,
+			Providers: []statusAgentProviderHealthView{
+				{Provider: "claude", State: "closed"},
+				{Provider: "codex", State: "open", OpenUntil: &retryAt},
+			},
+		},
+	}})
+	got := stdout.String()
+	if !strings.Contains(got, "agents:   partially paused: claude=closed, codex=open (retrying at 2026-08-01T22:10:00.000Z)") {
+		t.Fatalf("status output = %q, want provider-scoped partial brownout line", got)
+	}
+}
+
+func TestStatusReportsStickyOnlyProviderBrownout(t *testing.T) {
+	var stdout bytes.Buffer
+	retryAt := "2026-08-01T22:20:00.000Z"
+	writeStatusOpsLines(&stdout, daemonStatusResponse{Service: statusServiceView{
+		AgentHealth: &statusAgentHealthView{
+			State:     "closed",
+			Providers: []statusAgentProviderHealthView{{Provider: "codex", State: "open", OpenUntil: &retryAt}},
+		},
+	}})
+	got := stdout.String()
+	if !strings.Contains(got, "agents:   partially paused: codex=open (retrying at 2026-08-01T22:20:00.000Z)") {
+		t.Fatalf("status output = %q, want sticky-provider pause line", got)
+	}
+}
+
+func TestStatusPreservesGlobalBrownoutStateWithProviderRows(t *testing.T) {
+	var stdout bytes.Buffer
+	retryAt := "2026-08-01T22:30:00.000Z"
+	writeStatusOpsLines(&stdout, daemonStatusResponse{Service: statusServiceView{
+		AgentHealth: &statusAgentHealthView{
+			State:     "open",
+			Failures:  5,
+			Total:     5,
+			OpenUntil: &retryAt,
+			Providers: []statusAgentProviderHealthView{
+				{Provider: "claude", State: "open", OpenUntil: &retryAt},
+				{Provider: "codex", State: "half_open"},
+			},
+		},
+	}})
+	got := stdout.String()
+	if !strings.Contains(got, "agents:   work paused: 5 of 5 recent agent runs failed; retrying at 2026-08-01T22:30:00.000Z") {
+		t.Fatalf("status output = %q, want global pause line", got)
+	}
+	if strings.Contains(got, "partially paused") {
+		t.Fatalf("status output = %q, must not downgrade a global outage to partial", got)
+	}
+}
