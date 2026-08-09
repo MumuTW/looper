@@ -3,6 +3,7 @@ package loops
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
@@ -57,7 +58,7 @@ func TestReactivateQueueCreatesFirstReviewerQueueAndRejectsSiblingConflict(t *te
 	otherID := "loop_conflict"
 	repo := "acme/looper"
 	pr := int64(42)
-	targetID := "pull_request:acme/looper:42"
+	targetID := "pr:acme/looper:42"
 	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: otherID, Seq: 2, ProjectID: loop.ProjectID, Type: string(domain.LoopTypeReviewer), TargetType: string(domain.LoopTargetTypePullRequest), TargetID: &targetID, Repo: &repo, PRNumber: &pr, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert(conflict) error = %v", err)
 	}
@@ -66,6 +67,24 @@ func TestReactivateQueueCreatesFirstReviewerQueueAndRejectsSiblingConflict(t *te
 		return err
 	}); err == nil {
 		t.Fatal("ReactivateQueue() error = nil, want active sibling conflict")
+	}
+}
+
+func TestReactivateQueueRejectsUnsupportedTypeBeforeRunningTransition(t *testing.T) {
+	t.Parallel()
+	ctx, db, repos, loop, nowISO := reactivationFixture(t)
+	loop.Type = "future-loop"
+	if err := repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if _, err := storage.WithTransactionValue(ctx, db, nil, func(tx *sql.Tx) (QueueReactivationResult, error) {
+		return ReactivateQueue(ctx, storage.NewRepositories(tx), QueueReactivationInput{Loop: loop, NowISO: nowISO, MaxAttempts: 3})
+	}); !errors.Is(err, ErrInvalidQueueTarget) {
+		t.Fatalf("ReactivateQueue() error = %v, want ErrInvalidQueueTarget", err)
+	}
+	stored, err := repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || stored == nil || stored.Status != "paused" {
+		t.Fatalf("stored loop = %#v, err=%v; want original paused status", stored, err)
 	}
 }
 

@@ -24,7 +24,7 @@ func TestGatekeeperProtectedPathsNormalizeAndClone(t *testing.T) {
 
 func TestGatekeeperProtectedPathsValidation(t *testing.T) {
 	issues := []ValidationIssue{}
-	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"", " ../secret", "/absolute/*", "[bad"}}, "roles.gatekeeper", &issues)
+	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"", " ../secret", "/absolute/*", "[bad"}}, "roles.gatekeeper", false, &issues)
 	want := []string{"roles.gatekeeper.protectedPaths[0]", "roles.gatekeeper.protectedPaths[1]", "roles.gatekeeper.protectedPaths[2]", "roles.gatekeeper.protectedPaths[3]"}
 	for _, path := range want {
 		found := false
@@ -42,7 +42,7 @@ func TestGatekeeperProtectedPathsValidation(t *testing.T) {
 
 func TestGatekeeperProtectedPathsRejectNoOpPatterns(t *testing.T) {
 	issues := []ValidationIssue{}
-	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"./", ".", "foo/.."}}, "roles.gatekeeper", &issues)
+	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"./", ".", "foo/.."}}, "roles.gatekeeper", false, &issues)
 	for _, index := range []int{0, 1, 2} {
 		want := fmt.Sprintf("roles.gatekeeper.protectedPaths[%d]", index)
 		found := false
@@ -60,7 +60,7 @@ func TestGatekeeperProtectedPathsRejectNoOpPatterns(t *testing.T) {
 
 func TestGatekeeperProtectedPathsRejectDotSegments(t *testing.T) {
 	issues := []ValidationIssue{}
-	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"foo/../bar", "a/./b", "x/.."}}, "roles.gatekeeper", &issues)
+	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"foo/../bar", "a/./b", "x/.."}}, "roles.gatekeeper", false, &issues)
 	for _, index := range []int{0, 1, 2} {
 		want := fmt.Sprintf("roles.gatekeeper.protectedPaths[%d]", index)
 		found := false
@@ -78,7 +78,7 @@ func TestGatekeeperProtectedPathsRejectDotSegments(t *testing.T) {
 
 func TestGatekeeperProtectedPathsRejectEmptySegments(t *testing.T) {
 	issues := []ValidationIssue{}
-	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"internal/migrations/", "internal//generated/**"}}, "roles.gatekeeper", &issues)
+	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"internal/migrations/", "internal//generated/**"}}, "roles.gatekeeper", false, &issues)
 	if len(issues) != 2 {
 		t.Fatalf("issues = %#v, want one issue per empty-segment pattern", issues)
 	}

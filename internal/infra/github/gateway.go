@@ -3,6 +3,9 @@ package github
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +26,7 @@ import (
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/outboundguard"
 	"github.com/MumuTW/looper/internal/storage"
+	"gopkg.in/yaml.v3"
 )
 
 const javaScriptISOStringLayout = "2006-01-02T15:04:05.000Z"
@@ -185,16 +189,14 @@ type PullRequestDetail struct {
 	Checks             []map[string]any
 	DiffStats          *PullRequestDiffStats `json:"diffStats,omitempty"`
 	ChangedFiles       []string
-	// ChangedFilesCount is the provider's total changed-file count for the pull
-	// request, independent of any paginated file-list ceiling. Gatekeeper uses
-	// it to detect when the REST file-list endpoint omitted files past its cap.
-	ChangedFilesCount int
-	Mergeable         *bool
-	MergeableState    MergeabilityState
-	MergedAt          string
-	MergeCommitSHA    string
-	ClosingIssues     []IssueReference
-	AutoMerge         *PullRequestAutoMerge
+	ChangedFilesCount  int
+	Mergeable          *bool
+	MergeableState     MergeabilityState
+	MergedAt           string
+	MergeCommitSHA     string
+	ClosingIssues      []IssueReference
+	MergedBy           string
+	AutoMerge          *PullRequestAutoMerge
 }
 
 // PullRequestDiffStats is the provider-observed change size for a pull request.
@@ -517,19 +519,6 @@ type DisablePullRequestAutoMergeInput struct {
 	CWD      string
 }
 
-// PullRequestMergeInput is the input for an immediate merge. It is deliberately
-// separate from the retired native auto-merge request: Gatekeeper owns the
-// decision and crosses the forge boundary only after its confirming pass.
-type PullRequestMergeInput struct {
-	Repo       string
-	PRNumber   int64
-	Strategy   config.MergeStrategy
-	HeadSHA    string
-	BaseSHA    string
-	BaseBranch string
-	CWD        string
-}
-
 type MarkPullRequestReadyInput struct {
 	Repo     string
 	PRNumber int64
@@ -680,6 +669,43 @@ type PullRequestLabelsInput struct {
 	Labels         []string
 	LabelNamespace labels.Namespace
 	CWD            string
+}
+
+// ValidateMergifyRoutingInput identifies the repository configuration whose
+// queue contract Gatekeeper relies on when it publishes the auto-merge label.
+type ValidateMergifyRoutingInput struct {
+	Repo        string
+	BaseRefName string
+	CWD         string
+}
+
+// MergifyRoutingContractFingerprint returns a stable digest of the repository's
+// queue contract. Gatekeeper includes it in its discovery fingerprint so a
+// default-branch edit invalidates an otherwise unchanged auto route.
+func (g *Gateway) MergifyRoutingContractFingerprint(ctx context.Context, input ValidateMergifyRoutingInput) (string, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/contents/.mergify.yml", repo), "--jq", ".content", "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return "", fmt.Errorf("read .mergify.yml: %w", err)
+	}
+	encoded := strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\r', '\n':
+			return -1
+		default:
+			return r
+		}
+	}, result.Stdout)
+	content, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("decode .mergify.yml: %w", err)
+	}
+	digest := sha256.Sum256(content)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 type PullRequestReviewersInput struct {
@@ -2215,6 +2241,7 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		Author:         extractAuthor(row["user"]),
 		MergedAt:       firstNonEmpty(asString(row["merged_at"]), asString(row["mergedAt"])),
 		MergeCommitSHA: firstNonEmpty(asString(row["merge_commit_sha"]), nestedString(row, "mergeCommit", "oid")),
+		MergedBy:       extractAuthor(row["merged_by"]),
 		Labels:         extractLabelNames(row["labels"]),
 		HeadRefName:    nestedString(row, "head", "ref"),
 		BaseRefName:    nestedString(row, "base", "ref"),
@@ -2487,84 +2514,48 @@ func (g *Gateway) DisablePullRequestAutoMerge(ctx context.Context, input Disable
 	return err
 }
 
-// MergePullRequest merges now, refusing if the head has moved.
-//
-// --match-head-commit is what closes the gap between deciding a pull request is
-// eligible and acting on it: the forge rejects the merge if anything was pushed
-// in between, so the decision cannot be applied to a different commit than the
-// one it was made about.
-//
-// This deliberately does not pass --auto. Auto-merge hands the decision to
-// GitHub to apply later, by which time the evaluation behind it is stale — the
-// opposite of the guarantee an immediate merge makes.
-//
-// Only the head is bound here: GitHub's merge API accepts no parameter that
-// atomically pins the base. A diff-budget verdict depends on the
-// merge base, so when the base branch advances between the confirming pass's
-// final revalidation read and this call, the merge can still proceed against a
-// new base whose recomputed diff exceeds the budget. The confirming pass narrows
-// that window to the calls between the final read and the merge, but it cannot
-// close it; this is a documented blind spot of the diff-budget gate, not a
-// property this command can enforce.
-func (g *Gateway) MergePullRequest(ctx context.Context, input PullRequestMergeInput) error {
-	strategy := strings.TrimSpace(string(input.Strategy))
-	if strategy == "" {
-		return fmt.Errorf("merge strategy is required")
-	}
-	switch config.MergeStrategy(strategy) {
-	case config.MergeStrategySquash, config.MergeStrategyMerge, config.MergeStrategyRebase:
-	default:
-		return fmt.Errorf("invalid merge strategy %q", strategy)
-	}
-	headSHA := strings.TrimSpace(input.HeadSHA)
-	if headSHA == "" {
-		return fmt.Errorf("merge head SHA is required")
-	}
-	baseBranch := strings.TrimSpace(input.BaseBranch)
-	if baseBranch == "" {
-		return fmt.Errorf("merge base branch is required")
-	}
-	if expectedBase := strings.TrimSpace(input.BaseSHA); expectedBase != "" {
-		actualBase, err := g.GetPullRequestBaseSHA(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
-		if err != nil {
-			return fmt.Errorf("revalidate merge base SHA: %w", err)
-		}
-		if actualBase != expectedBase {
-			return fmt.Errorf("pull request base SHA moved: expected %s, got %s", expectedBase, actualBase)
-		}
-	}
-	hostname, repo := splitRepoHostname(input.Repo)
-	rulesArgs := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/rules/branches/%s", repo, url.PathEscape(baseBranch))}
-	if hostname != "" {
-		rulesArgs = append(rulesArgs, "--hostname", hostname)
-	}
-	rulesResult, err := g.runGh(ctx, input.CWD, "", rulesArgs...)
+func (g *Gateway) GetPullRequestHeadSHA(ctx context.Context, input ViewPullRequestInput) (string, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "headRefOid")
 	if err != nil {
-		return fmt.Errorf("inspect base branch rules before merge: %w", err)
+		return "", err
 	}
-	rules, err := decodeJSONArrayOrPages(rulesResult.Stdout)
+	row, err := decodeJSONObject(result.Stdout)
 	if err != nil {
-		return fmt.Errorf("decode base branch rules before merge: %w", err)
+		return "", err
 	}
-	for _, rule := range rules {
-		if strings.EqualFold(asString(rule["type"]), "merge_queue") {
-			return fmt.Errorf("base branch %q requires a merge queue; Gatekeeper only performs immediate merges", baseBranch)
-		}
-	}
-	// Use the REST merge endpoint rather than `gh pr merge`: the CLI can turn a
-	// queue-required branch into a deferred auto-merge request when a ruleset
-	// changes after the preflight. The API mutation is an immediate merge
-	// attempt, and the head SHA is part of the same forge request.
-	mergeArgs := []string{"api", fmt.Sprintf("repos/%s/pulls/%d/merge", repo, input.PRNumber), "--method", "PUT", "-f", "merge_method=" + strategy, "-f", "sha=" + headSHA}
-	if hostname != "" {
-		mergeArgs = append(mergeArgs, "--hostname", hostname)
-	}
-	_, err = g.runGh(ctx, input.CWD, "", mergeArgs...)
-	return err
+	return asString(row["headRefOid"]), nil
 }
 
-// SetCommitStatus publishes a status for exactly one commit. A later push has a
-// different SHA and therefore cannot inherit this decision.
+func (g *Gateway) GetPullRequestBaseSHA(ctx context.Context, input ViewPullRequestInput) (string, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "baseRefOid")
+	if err != nil {
+		return "", err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return "", err
+	}
+	return asString(row["baseRefOid"]), nil
+}
+
+// GetPullRequestHeadAndBaseSHA is the final revalidation read for gates whose
+// verdict depends on the merge base, not only on the head. A base branch can
+// advance between the merge-watch read and this observation without moving the
+// head, so revalidating the head alone cannot detect that a diff-budget verdict
+// was computed against a stale base. It costs the same `gh pr view` call as
+// GetPullRequestHeadSHA with one additional JSON field.
+func (g *Gateway) GetPullRequestHeadAndBaseSHA(ctx context.Context, input ViewPullRequestInput) (string, string, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "headRefOid,baseRefOid")
+	if err != nil {
+		return "", "", err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return "", "", err
+	}
+	return asString(row["headRefOid"]), asString(row["baseRefOid"]), nil
+}
+
 func (g *Gateway) SetCommitStatus(ctx context.Context, input CommitStatusInput) error {
 	sha := strings.TrimSpace(input.SHA)
 	contextName := strings.TrimSpace(input.Context)
@@ -2672,63 +2663,131 @@ func (g *Gateway) ListPullRequestDraftEvents(ctx context.Context, input PullRequ
 	if err != nil {
 		return nil, err
 	}
-	out := make([]PullRequestDraftEvent, 0, 4)
+	out := make([]PullRequestDraftEvent, 0, len(rows))
 	for _, row := range rows {
-		event := strings.ToLower(strings.TrimSpace(asString(row["event"])))
-		if event != DraftEventConvertToDraft && event != DraftEventReadyForReview {
+		event := asString(row["event"])
+		if event != "convert_to_draft" && event != "ready_for_review" {
 			continue
 		}
-		out = append(out, PullRequestDraftEvent{
-			Event:     event,
-			Actor:     extractAuthor(row["actor"]),
-			CreatedAt: firstNonEmpty(asString(row["created_at"]), asString(row["createdAt"])),
-		})
+		actor := strings.TrimSpace(extractAuthor(row["actor"]))
+		createdAt := strings.TrimSpace(asString(row["created_at"]))
+		out = append(out, PullRequestDraftEvent{Event: event, Actor: actor, CreatedAt: createdAt})
 	}
 	return out, nil
 }
 
-func (g *Gateway) GetPullRequestHeadSHA(ctx context.Context, input ViewPullRequestInput) (string, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "headRefOid")
-	if err != nil {
-		return "", err
+// ValidateMergifyRouting checks the repository-owned Mergify contract before
+// Gatekeeper publishes an auto-merge label. The repository file is the
+// authority for how that label is consumed; Gatekeeper must fail closed when
+// the file is absent or does not contain the vetoes that protect manual queue
+// entries as well as the automatic route.
+func (g *Gateway) ValidateMergifyRouting(ctx context.Context, input ValidateMergifyRoutingInput) error {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/contents/.mergify.yml", repo), "--jq", ".content", "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
 	}
-	row, err := decodeJSONObject(result.Stdout)
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
-		return "", err
+		return fmt.Errorf("read .mergify.yml: %w", err)
 	}
-	return asString(row["headRefOid"]), nil
+	encoded := strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\r', '\n':
+			return -1
+		default:
+			return r
+		}
+	}, result.Stdout)
+	content, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return fmt.Errorf("decode .mergify.yml: %w", err)
+	}
+	var contract struct {
+		QueueRules []struct {
+			QueueConditions []string `yaml:"queue_conditions"`
+		} `yaml:"queue_rules"`
+		// merge_protections is the list of protection rules that activates
+		// auto_merge_conditions. Mergify does not honor auto_merge_conditions
+		// unless at least one merge_protections entry exists, so the validator
+		// must require it rather than accept an inactive contract.
+		MergeProtections []struct {
+			Name string `yaml:"name"`
+		} `yaml:"merge_protections"`
+		MergeProtectionsSettings struct {
+			AutoMergeConditions []string `yaml:"auto_merge_conditions"`
+		} `yaml:"merge_protections_settings"`
+	}
+	if err := yaml.Unmarshal(content, &contract); err != nil {
+		return fmt.Errorf("parse .mergify.yml: %w", err)
+	}
+	if len(contract.QueueRules) == 0 {
+		return fmt.Errorf(".mergify.yml has no queue_rules")
+	}
+	baseRefName := strings.TrimSpace(input.BaseRefName)
+	if baseRefName == "" {
+		return fmt.Errorf("Mergify routing validation requires the evaluated base branch")
+	}
+	baseRuleApplicable := false
+	for index, rule := range contract.QueueRules {
+		for _, condition := range []string{"label != " + labels.NeedsHumanReview, "label != " + labels.DoNotMerge} {
+			if !hasMergifyCondition(rule.QueueConditions, condition) {
+				return fmt.Errorf(".mergify.yml queue_rules[%d] queue_conditions missing %q", index, condition)
+			}
+		}
+		if queueRuleAppliesToBase(rule.QueueConditions, baseRefName) {
+			baseRuleApplicable = true
+		}
+	}
+	if !baseRuleApplicable {
+		return fmt.Errorf(".mergify.yml has no queue rule applicable to base branch %q", baseRefName)
+	}
+	if len(contract.MergeProtections) == 0 {
+		return fmt.Errorf(".mergify.yml has no merge_protections; auto_merge_conditions require at least one active merge-protection rule")
+	}
+	if !hasMergifyCondition(contract.MergeProtectionsSettings.AutoMergeConditions, "label = "+labels.AutoMerge) {
+		return fmt.Errorf(".mergify.yml has no auto-merge label contract")
+	}
+	if !hasMergifyCondition(contract.MergeProtectionsSettings.AutoMergeConditions, `check-success = "Looper Gatekeeper"`) {
+		return fmt.Errorf(`.mergify.yml has no current-head Gatekeeper status contract`)
+	}
+	return nil
 }
 
-// GetPullRequestHeadAndBaseSHA is the final revalidation read for gates whose
-// verdict depends on the merge base, not only on the head. A base branch can
-// advance between the merge-watch read and this observation without moving the
-// head, so revalidating the head alone cannot detect that a diff-budget verdict
-// was computed against a stale base. It costs the same `gh pr view` call as
-// GetPullRequestHeadSHA with one additional JSON field.
-func (g *Gateway) GetPullRequestHeadAndBaseSHA(ctx context.Context, input ViewPullRequestInput) (string, string, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "headRefOid,baseRefOid")
-	if err != nil {
-		return "", "", err
+func queueRuleAppliesToBase(conditions []string, baseRefName string) bool {
+	baseRefName = strings.TrimSpace(baseRefName)
+	if baseRefName == "" {
+		return true
 	}
-	row, err := decodeJSONObject(result.Stdout)
-	if err != nil {
-		return "", "", err
+	for _, condition := range conditions {
+		fields := strings.Fields(condition)
+		if len(fields) != 3 || fields[0] != "base" {
+			continue
+		}
+		value := strings.Trim(strings.TrimSpace(fields[2]), "\"'")
+		switch fields[1] {
+		case "=":
+			if value != baseRefName {
+				return false
+			}
+		case "!=":
+			if value == baseRefName {
+				return false
+			}
+		}
 	}
-	return asString(row["headRefOid"]), asString(row["baseRefOid"]), nil
+	return true
 }
 
-func (g *Gateway) GetPullRequestBaseSHA(ctx context.Context, input ViewPullRequestInput) (string, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "baseRefOid")
-	if err != nil {
-		return "", err
+func hasMergifyCondition(conditions []string, expected string) bool {
+	want := strings.Join(strings.Fields(expected), " ")
+	for _, condition := range conditions {
+		if strings.Join(strings.Fields(condition), " ") == want {
+			return true
+		}
 	}
-	row, err := decodeJSONObject(result.Stdout)
-	if err != nil {
-		return "", err
-	}
-	return asString(row["baseRefOid"]), nil
+	return false
 }
-
 func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewThreadInput) error {
 	hostname, _ := splitRepoHostname(input.Repo)
 	thread, err := g.getReviewThread(ctx, input.ThreadID, input.CWD, hostname)

@@ -3,6 +3,7 @@ package gatekeeper
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,31 +20,62 @@ func openPullRequestFixture() githubinfra.PullRequestSummary {
 	}
 }
 
-func TestDiscoverPullRequestsReevaluatesEveryAutoTrustTick(t *testing.T) {
+func TestSourceFingerprintIncludesExactDiffBudgetBounds(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
-	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	pullRequest := openPullRequestFixture()
 	runner := New(Options{
-		Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now },
-		PolicyPermitsTarget: func(string, string, string) bool { return fixture.policyPermits },
+		Repos: fixture.repos, GitHub: fixture.github,
+		PolicyPermitsTarget: func(string, string, string) bool { return true },
 		TrustForProject:     func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+		DiffBudgetForProject: func(string) config.GatekeeperDiffBudget {
+			return config.GatekeeperDiffBudget{MaxChangedFiles: 20, MaxDeletions: 100}
+		},
 	})
-	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
-	if err != nil {
-		t.Fatalf("first discovery error = %v", err)
+	first := runner.sourceFingerprintForProjectWithContract(pullRequest, "project_1", "acme/looper", "")
+	runner.diffBudgetForProject = func(string) config.GatekeeperDiffBudget {
+		return config.GatekeeperDiffBudget{MaxChangedFiles: 4, MaxDeletions: 100}
 	}
-	if first.Evaluated != 1 || first.Skipped != 0 {
-		t.Fatalf("first tick = %d evaluated / %d skipped", first.Evaluated, first.Skipped)
+	second := runner.sourceFingerprintForProjectWithContract(pullRequest, "project_1", "acme/looper", "")
+	if first == second {
+		t.Fatalf("fingerprint unchanged after tightening diff budget: %q", first)
 	}
-	callsAfterFirst := fixture.github.perPullRequestCalls
-	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
-	if err != nil {
-		t.Fatalf("second discovery error = %v", err)
+}
+
+func TestSourceFingerprintIncludesReviewCapacityPolicy(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	pullRequest := openPullRequestFixture()
+	threshold := 200
+	runner := New(Options{
+		Repos: fixture.repos, GitHub: fixture.github,
+		PolicyPermitsTarget:                  func(string, string, string) bool { return true },
+		TrustForProject:                      func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+		RequiredReviewChangedLinesForProject: func(string) int { return threshold },
+	})
+	first := runner.sourceFingerprintForProjectWithContract(pullRequest, "project_1", "acme/looper", "")
+	threshold = 300
+	second := runner.sourceFingerprintForProjectWithContract(pullRequest, "project_1", "acme/looper", "")
+	if first == second {
+		t.Fatalf("fingerprint unchanged after tightening review-capacity threshold: %q", first)
 	}
-	if second.Evaluated != 1 || second.Skipped != 0 {
-		t.Fatalf("second tick = %d evaluated / %d skipped, want 1 / 0", second.Evaluated, second.Skipped)
+	if !strings.Contains(first, "\x1f200\x1f") {
+		t.Fatalf("fingerprint = %q, want effective review threshold", first)
 	}
-	if fixture.github.perPullRequestCalls <= callsAfterFirst {
-		t.Fatal("auto trust reused the observe cache instead of re-evaluating")
+}
+
+func TestMergifyContractFingerprintUsesProviderQualifiedRepository(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	github := &fingerprintGatekeeperGitHub{fakeGatekeeperGitHub: fixture.github}
+	runner := New(Options{
+		Repos: fixture.repos, GitHub: github, Now: func() time.Time { return fixture.now },
+		TrustForProject:    func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+		RepositoryIdentity: func(string) string { return "ghe.example.test/acme/looper" },
+	})
+
+	if got := runner.mergifyContractFingerprint(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); got != "contract-digest" {
+		t.Fatalf("mergifyContractFingerprint() = %q, want contract-digest", got)
+	}
+	if github.fingerprintRepo != "ghe.example.test/acme/looper" {
+		t.Fatalf("fingerprint repository = %q, want provider-qualified target", github.fingerprintRepo)
 	}
 }
 
@@ -88,9 +120,8 @@ func TestDiscoverPullRequestsSkipsUnchangedPullRequests(t *testing.T) {
 	}
 }
 
-// A small auto-trust change may legitimately pass without a clean review, but a
-// later verified Reviewer event must still invalidate that cached success so a
-// newly blocking review is observed instead of being hidden until maxSkipAge.
+// A small auto-trust change may legitimately pass without a clean review. The
+// established route can be reused until a later Reviewer event invalidates it.
 func TestDiscoverPullRequestsReevaluatesSmallAutoChangeAfterReviewEvent(t *testing.T) {
 	fixture := newGatekeeperFixtureWithoutReview(t)
 	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
@@ -109,8 +140,8 @@ func TestDiscoverPullRequestsReevaluatesSmallAutoChangeAfterReviewEvent(t *testi
 	if err != nil {
 		t.Fatalf("second DiscoverPullRequests() error = %v", err)
 	}
-	if second.Evaluated != 1 || second.Skipped != 0 {
-		t.Fatalf("second discovery = %#v, want auto trust to re-evaluate every tick", second)
+	if second.Evaluated != 0 || second.Skipped != 1 {
+		t.Fatalf("second discovery = %#v, want unchanged routed report reuse", second)
 	}
 	seedReviewerReviewEvent(t, fixture, "head-1", "REQUEST_CHANGES", "reviewer-loop", 1)
 	third, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
@@ -163,8 +194,8 @@ func TestDiscoverPullRequestsReevaluatesReviewEventAtReportTimestamp(t *testing.
 		t.Fatalf("first discovery = %#v, want eligible below-threshold report", first)
 	}
 	second := discoverWithRunner(t, runner)
-	if second.Evaluated != 1 || second.Skipped != 0 {
-		t.Fatalf("second discovery = %#v, want auto trust to re-evaluate every tick", second)
+	if second.Evaluated != 0 || second.Skipped != 1 {
+		t.Fatalf("second discovery = %#v, want unchanged routed report reuse", second)
 	}
 	seedReviewerReviewEvent(t, fixture, "head-1", "REQUEST_CHANGES", "reviewer-loop", 0)
 
@@ -173,8 +204,8 @@ func TestDiscoverPullRequestsReevaluatesReviewEventAtReportTimestamp(t *testing.
 		t.Fatalf("third discovery = %#v, want re-evaluation after review event", third)
 	}
 	fourth := discoverWithRunner(t, runner)
-	if fourth.Evaluated != 1 || fourth.Skipped != 0 {
-		t.Fatalf("fourth discovery = %#v, want auto trust to re-evaluate every tick", fourth)
+	if fourth.Evaluated != 0 || fourth.Skipped != 1 {
+		t.Fatalf("fourth discovery = %#v, want consumed review evidence to permit route reuse", fourth)
 	}
 }
 
@@ -327,11 +358,51 @@ func TestSkipUnchangedReevaluatesWhenReviewEvidenceLookupFails(t *testing.T) {
 		EvaluatedAt:       now.Add(-time.Minute).Format(time.RFC3339Nano),
 		Eligible:          true,
 	}
-	if _, reused := skipUnchanged(previous, true, "same", now, "", true); reused {
+	if _, reused := skipUnchanged(previous, true, "same", config.GatekeeperTrustAuto, now, "", true); reused {
 		t.Fatal("skipUnchanged() reused a cached success when review-evidence refresh was required")
 	}
 }
 
+func TestDiscoverPullRequestsReevaluatesWhenTrustIsDemoted(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	trust := config.GatekeeperTrustAuto
+	runner := func() *Runner {
+		return New(Options{
+			Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now },
+			PolicyPermitsTarget: func(string, string, string) bool { return fixture.policyPermits },
+			TrustForProject:     func(string) config.GatekeeperTrustLevel { return trust },
+		})
+	}
+
+	first := runner().DiscoverPullRequests
+	if result, err := first(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("auto discovery() error = %v", err)
+	} else if result.Evaluated != 1 || result.Skipped != 0 {
+		t.Fatalf("auto discovery = %d evaluated / %d skipped, want 1 / 0", result.Evaluated, result.Skipped)
+	}
+	trust = config.GatekeeperTrustObserve
+	second, err := runner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("observe discovery() error = %v", err)
+	}
+	if second.Evaluated != 1 || second.Skipped != 0 {
+		t.Fatalf("demotion discovery = %d evaluated / %d skipped, want 1 / 0", second.Evaluated, second.Skipped)
+	}
+	removedAuto := false
+	for _, removal := range fixture.github.labelRemoves {
+		if len(removal.Labels) == 1 && removal.Labels[0] == labels.AutoMerge {
+			removedAuto = true
+			break
+		}
+	}
+	if !removedAuto {
+		t.Fatalf("label removals after trust demotion = %#v, want auto-merge retirement", fixture.github.labelRemoves)
+	}
+	if len(fixture.github.labelAdds) < 2 || fixture.github.labelAdds[len(fixture.github.labelAdds)-1].Labels[0] != labels.NeedsHumanReview {
+		t.Fatalf("label adds after trust demotion = %#v, want durable needs-human-review veto", fixture.github.labelAdds)
+	}
+}
 func hasReason(report Report, code ReasonCode) bool {
 	for _, reason := range report.Reasons {
 		if reason.Code == code {
@@ -341,118 +412,82 @@ func hasReason(report Report, code ReasonCode) bool {
 	return false
 }
 
-// With both budget bounds at their default of zero the gate is unlimited, so a
-// base-branch advance changes nothing Gatekeeper enforces. BaseSHA must not be
-// in the fingerprint then, or every base commit would invalidate the cached
-// report for every open pull request and pay for a full re-evaluation (and its
-// forge round trips) to recompute a verdict that cannot have changed.
-func TestDiscoverPullRequestsIgnoresBaseSHAWhenBudgetDisabled(t *testing.T) {
-	t.Parallel()
+// At auto trust the merge route is published only during an evaluation. A
+// failed check that is manually rerun to success turns the gate green without
+// moving any field the list page can observe, so the failed report must not be
+// reused — the PR is re-evaluated so the now-green eligible state is queued
+// promptly rather than waiting for maxSkipAge.
+func TestDiscoverPullRequestsReevaluatesFailedCheckAtAutoTrust(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
-	discover(t, fixture)
-	callsAfterFirst := fixture.github.perPullRequestCalls
-	if callsAfterFirst == 0 {
-		t.Fatal("first tick made no per-pull-request calls; the fixture cannot detect a skip")
+	fixture.github.checks = githubinfra.PullRequestCheckRuns{
+		TotalCount: 1,
+		CheckRuns:  []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "failure", AppID: 15368}},
+	}
+	trust := config.GatekeeperTrustAuto
+	runner := func() *Runner {
+		return New(Options{
+			Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now },
+			PolicyPermitsTarget: func(string, string, string) bool { return fixture.policyPermits },
+			TrustForProject:     func(string) config.GatekeeperTrustLevel { return trust },
+		})
 	}
 
-	changed := openPullRequestFixture()
-	changed.BaseSHA = "base-2"
-	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{changed}
-
-	second := discover(t, fixture)
-	if second.Evaluated != 0 || second.Skipped != 1 {
-		t.Fatalf("second tick = %d evaluated / %d skipped, want 0 / 1 (base SHA must not invalidate a disabled budget)", second.Evaluated, second.Skipped)
-	}
-	if fixture.github.perPullRequestCalls != callsAfterFirst {
-		t.Fatalf("per-pull-request calls = %d, want %d (disabled budget must not re-evaluate on a base advance)",
-			fixture.github.perPullRequestCalls, callsAfterFirst)
-	}
-}
-
-// When the diff budget is enabled, a rewritten base branch recomputes the
-// observed change size against a new merge base without moving the head, so the
-// base SHA must invalidate a reused report even though every other list-page
-// field is unchanged.
-func TestDiscoverPullRequestsReevaluatesOnBaseSHAWhenBudgetEnabled(t *testing.T) {
-	t.Parallel()
-	fixture := newGatekeeperFixture(t)
-	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
-	fixture.github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 5}
-	fixture.github.detail.BaseSHA = "base-1"
-	fixture.github.mergeable.BaseSHA = "base-1"
-	fixture.github.finalBaseSHA = "base-1"
-	runner := diffBudgetRunner(t, fixture, config.GatekeeperDiffBudget{MaxChangedFiles: 20}, config.GatekeeperTrustObserve)
-
-	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	first, err := runner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
 	if err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
+		t.Fatalf("first discovery() error = %v", err)
 	}
 	if first.Evaluated != 1 || first.Skipped != 0 {
 		t.Fatalf("first tick = %d evaluated / %d skipped, want 1 / 0", first.Evaluated, first.Skipped)
 	}
+	if !hasReason(first.Reports[0], ReasonCheckFailed) {
+		t.Fatalf("first report reasons = %v, want required_check_failed", reasonCodes(first.Reports[0].Reasons))
+	}
 
-	changed := openPullRequestFixture()
-	changed.BaseSHA = "base-2"
-	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{changed}
-
-	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	second, err := runner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
 	if err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
+		t.Fatalf("second discovery() error = %v", err)
 	}
 	if second.Evaluated != 1 || second.Skipped != 0 {
-		t.Fatalf("second tick = %d evaluated / %d skipped, want 1 / 0 (base SHA must invalidate a budget-enabled report)", second.Evaluated, second.Skipped)
+		t.Fatalf("auto trust second tick = %d evaluated / %d skipped, want 1 / 0 (failed check must re-evaluate)",
+			second.Evaluated, second.Skipped)
 	}
 }
 
-// The diff-budget suffix is the only fingerprint input that reflects an operator
-// changing a bound, so a budget change must force re-evaluation even when the
-// pull request list page is byte-for-byte unchanged. A regression that dropped
-// or mis-encoded the suffix would silently retain an eligible verdict until
-// maxSkipAge.
-func TestDiscoverPullRequestsReevaluatesWhenDiffBudgetChanges(t *testing.T) {
-	t.Parallel()
+func TestDiscoverPullRequestsReevaluatesCancelledCheckAtAutoTrust(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
-	fixture.github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 5}
-	fixture.github.detail.BaseSHA = "base-1"
-	fixture.github.mergeable.BaseSHA = "base-1"
-	fixture.github.finalBaseSHA = "base-1"
-	current := config.GatekeeperDiffBudget{MaxChangedFiles: 20}
-	runner := New(Options{
-		Repos:  fixture.repos,
-		GitHub: fixture.github,
-		Now:    func() time.Time { return fixture.now },
-		PolicyPermitsTarget: func(string, string, string) bool {
-			return fixture.policyPermits
-		},
-		DiffBudgetForProject: func(string) config.GatekeeperDiffBudget { return current },
-	})
+	fixture.github.checks = githubinfra.PullRequestCheckRuns{
+		TotalCount: 1,
+		CheckRuns:  []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "cancelled", AppID: 15368}},
+	}
+	trust := config.GatekeeperTrustAuto
+	runner := func() *Runner {
+		return New(Options{
+			Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now },
+			PolicyPermitsTarget: func(string, string, string) bool { return fixture.policyPermits },
+			TrustForProject:     func(string) config.GatekeeperTrustLevel { return trust },
+		})
+	}
 
-	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	first, err := runner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
 	if err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
+		t.Fatalf("first discovery() error = %v", err)
 	}
 	if first.Evaluated != 1 || first.Skipped != 0 {
 		t.Fatalf("first tick = %d evaluated / %d skipped, want 1 / 0", first.Evaluated, first.Skipped)
 	}
-	callsAfterFirst := fixture.github.perPullRequestCalls
+	if !hasReason(first.Reports[0], ReasonCheckCancelled) {
+		t.Fatalf("first report reasons = %v, want required_check_cancelled", reasonCodes(first.Reports[0].Reasons))
+	}
 
-	// Operator tightens the bound below the observed count; the PR is unchanged.
-	current = config.GatekeeperDiffBudget{MaxChangedFiles: 4}
-
-	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	second, err := runner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
 	if err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
+		t.Fatalf("second discovery() error = %v", err)
 	}
 	if second.Evaluated != 1 || second.Skipped != 0 {
-		t.Fatalf("second tick = %d evaluated / %d skipped, want 1 / 0 after the budget changed", second.Evaluated, second.Skipped)
-	}
-	if fixture.github.perPullRequestCalls == callsAfterFirst {
-		t.Fatal("per-pull-request calls did not increase; a budget change must force re-evaluation")
-	}
-	if !hasReason(second.Reports[0], ReasonDiffBudgetExceeded) {
-		t.Fatalf("second report reasons = %v, want diff_budget_exceeded against the tightened bound", reasonCodes(second.Reports[0].Reasons))
+		t.Fatalf("auto trust second tick = %d evaluated / %d skipped, want 1 / 0 (cancelled check must re-evaluate)",
+			second.Evaluated, second.Skipped)
 	}
 }
 

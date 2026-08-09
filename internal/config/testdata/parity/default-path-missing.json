@@ -213,8 +213,7 @@
           }
         },
         "gatekeeper": {
-          "requiredReviewChangedLines": 200,
-          "strategy": "squash"
+          "requiredReviewChangedLines": 200
         },
         "deployer": {
           "enabled": false

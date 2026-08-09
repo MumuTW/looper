@@ -323,6 +323,17 @@ const (
 	NeedsHuman    = "looper:needs-human"
 )
 
+// Merge queue routing labels are the integration contract with Mergify. They
+// intentionally retain the repository-level wire names used by .mergify.yml;
+// Gatekeeper is the only Looper component that writes them, and it never writes
+// or removes any other host label. The configurable namespace migration in #137
+// can move this external contract as one package-level change.
+const (
+	AutoMerge        = "auto-merge"
+	NeedsHumanReview = "needs-human-review"
+	DoNotMerge       = "do-not-merge"
+)
+
 // AwaitingHuman marks work parked for human input. Looper-owned.
 const AwaitingHuman = "looper:awaiting-human"
 
@@ -338,14 +349,6 @@ const (
 	// durable Gatekeeper veto even after a human promotes the draft to ready.
 	HoldAuditorRevert = "looper:hold:auditor-revert"
 )
-
-// DoNotMerge is the widely-used community label that is not in Looper's
-// namespace and that Looper therefore never creates, never removes, and never
-// lists in Standard() — it is read-only authority in exactly the way the holds
-// above are. It lives here anyway because the alternative is each reader
-// spelling the string itself, which is the drift this package exists to
-// prevent.
-const DoNotMerge = "do-not-merge"
 
 // Network target labels (looper:target:<node_name>) are deliberately NOT here.
 // Constructing or parsing one requires validating the node name, which is a
@@ -364,7 +367,10 @@ type Definition struct {
 	Description string `json:"description"`
 }
 
-// Standard returns every label Looper provisions into a managed repository.
+// Standard returns every default Looper-owned label it provisions into a
+// managed repository. Host-integration labels such as the Gatekeeper/Mergify
+// routing contract are intentionally separate because their wire names are
+// owned by the host integration, not by Looper's namespace.
 //
 // Provisioning creates what is missing and never edits what is already there.
 // Colors and descriptions here therefore describe the intended default for a
