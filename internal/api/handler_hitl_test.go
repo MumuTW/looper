@@ -14,6 +14,7 @@ import (
 	"github.com/MumuTW/looper/internal/loops"
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/storage"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 func TestHandlerRespondConsumesPersistedMalformedGateIdentity(t *testing.T) {
@@ -582,6 +583,17 @@ func TestHandbackLoopRejectsWhenStorageNotConfigured(t *testing.T) {
 	}
 	if !strings.Contains(typed.message, "Storage is not configured") {
 		t.Fatalf("error message = %q, want 'Storage is not configured'", typed.message)
+	}
+}
+
+func TestDeliverHumanAnswerMapsMissingLoopToNotFound(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+
+	_, err := h.deliverHumanAnswer(context.Background(), "loop_missing", "continue")
+	var typed apiError
+	if !asAPIError(err, &typed) || typed.status != http.StatusNotFound || typed.code != pkgapi.ErrorCodeLoopNotFound {
+		t.Fatalf("deliverHumanAnswer() error = %v, want LOOP_NOT_FOUND/404", err)
 	}
 }
 

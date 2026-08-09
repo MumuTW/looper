@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -147,6 +148,7 @@ type schedulerAsyncRunner interface {
 }
 
 type defaultSchedulerTickInput struct {
+	DB    *sql.DB
 	Repos *storage.Repositories
 	// CoordinatorState carries process-local maintenance readiness across tick
 	// snapshots and into the webhook targeted-evaluation adapter.
@@ -2809,7 +2811,12 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		if githubGateway != nil {
 			snapshotter = githubGateway
 		}
+		var db *sql.DB
+		if services.Coordinator != nil {
+			db = services.Coordinator.DB()
+		}
 		return defaultSchedulerTickInput{
+			DB:                   db,
 			Repos:                services.Repositories,
 			CoordinatorState:     coordinatorState,
 			GitHubGateway:        githubGateway,

@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -80,6 +81,13 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 			continue
 		}
 		if err := deliver(ctx, loopID, value); err != nil {
+			if errors.Is(err, errHITLAnswerNotApplied) {
+				// The loop is no longer awaiting this answer, so retrying the
+				// immutable inbox event can never make it applicable. Consume it
+				// without counting a delivery or invoking delivery side effects.
+				newCursor = maxFeishuInboxCursor(newCursor, e.ID)
+				continue
+			}
 			if deps.logWarn != nil {
 				deps.logWarn("hitl feishu poll: deliver failed", map[string]any{"eventId": e.ID, "loopId": loopID, "kind": e.Kind, "error": err.Error()})
 			}
@@ -155,7 +163,7 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			return loop.ID
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			if err := deliverHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer); err != nil {
+			if err := deliverHITLAnswerToLoop(ctx, input.DB, input.Repos, nowISO, loopID, answer); err != nil {
 				return err
 			}
 			if input.OnHITLAnswerDelivered != nil {

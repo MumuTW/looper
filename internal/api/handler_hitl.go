@@ -158,61 +158,32 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
 	}
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
-	// Serialize the answer transaction with worker-side post-park correlation
-	// writes. Both paths read-modify-write the same HITL metadata; without this
-	// guard a worker can persist a stale awaiting ask after the human answer has
-	// already been committed. The lock is released via defer inside an inline
-	// function so a panic in the transaction still releases it, and the release
-	// completes before mutateLoopStatus below (which re-enters the requeue path
-	// and must not nest the same per-loop guard).
-	_, err := func() (storage.LoopRecord, error) {
-		unlockRequeue := loops.LockLoopRequeue(loopID)
-		defer unlockRequeue()
-		return storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
-			repos := storage.NewRepositories(tx)
-			loop, err := repos.Loops.GetByID(ctx, loopID)
-			if err != nil {
-				return storage.LoopRecord{}, err
-			}
-			if loop == nil {
-				return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
-			}
-			if loop.Status != string(domain.LoopStatusAwaitingHuman) {
-				return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
-			}
-			ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
-			if !ok {
-				return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s has no readable HITL ask metadata", loopID)}
-			}
-			// The authenticated response is the authority to discard a malformed
-			// gate, but only when the staged filesystem identity still matches the
-			// bounded evidence persisted with this ask. A replacement leaves the
-			// loop parked and is never removed by daemon privilege.
-			if err := loops.ConsumeHITLGateEvidence(ask.GateEvidence); err != nil {
-				return storage.LoopRecord{}, fmt.Errorf("consume malformed HITL gate evidence: %w", err)
-			}
-			ask.Answer = answer
-			ask.Status = "answered"
-			ask.AnsweredAt = nowISO
-			metadataJSON, err := loops.WriteHITLAsk(loop.MetadataJSON, ask)
-			if err != nil {
-				return storage.LoopRecord{}, err
-			}
-			updated := *loop
-			updated.MetadataJSON = stringPtrOrNil(metadataJSON)
-			updated.UpdatedAt = nowISO
-			if err := repos.Loops.Upsert(ctx, updated); err != nil {
-				return storage.LoopRecord{}, err
-			}
-			return updated, nil
+	// Serialize with worker HITL correlation writes. Release before
+	// mutateLoopStatus, which acquires the same requeue lock.
+	result, err := func() (loops.HITLAnswerResult, error) {
+		unlock := loops.LockLoopRequeue(loopID)
+		defer unlock()
+		return storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (loops.HITLAnswerResult, error) {
+			return loops.RecordHITLAnswer(ctx, storage.NewRepositories(tx), loops.HITLAnswerInput{
+				LoopID: loopID, Answer: answer, NowISO: nowISO, RequireExistingAsk: true, ConsumeGateEvidence: true,
+			})
 		})
 	}()
 	if err != nil {
+		if errors.Is(err, loops.ErrLoopNotFound) {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+		}
 		var typed apiError
 		if asAPIError(err, &typed) {
 			return loopResponse{}, typed
 		}
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if !result.Applied {
+		if result.Loop.Status == string(domain.LoopStatusAwaitingHuman) {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s has no readable HITL ask metadata", loopID)}
+		}
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, result.Loop.Status)}
 	}
 
 	// Transition awaiting_human -> running (requeues + triggers a scheduler tick)

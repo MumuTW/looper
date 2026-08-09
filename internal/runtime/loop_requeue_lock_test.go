@@ -165,7 +165,7 @@ func TestDeliverHITLAnswerToLoopSharesRequeueLock(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		close(started)
-		done <- deliverHITLAnswerToLoop(context.Background(), repos, nowISO, loopID, "yes")
+		done <- deliverHITLAnswerToLoop(context.Background(), coordinator.DB(), repos, nowISO, loopID, "yes")
 	}()
 	<-started
 	select {
@@ -186,6 +186,9 @@ func TestDeliverHITLAnswerToLoopSharesRequeueLock(t *testing.T) {
 	loop, err := repos.Loops.GetByID(context.Background(), loopID)
 	if err != nil || loop == nil || loop.Status != "running" {
 		t.Fatalf("loop after answer = %#v, %v, want running", loop, err)
+	}
+	if err := deliverHITLAnswerToLoop(context.Background(), coordinator.DB(), repos, nowISO, loopID, "yes"); err != nil {
+		t.Fatalf("exact answer replay error = %v, want successful idempotent delivery", err)
 	}
 }
 
