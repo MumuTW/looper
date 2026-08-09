@@ -599,17 +599,6 @@ func requireJournalAbsent(path string) error {
 	return fmt.Errorf("an incomplete restore journal already exists at %s; recover it before restoring", path)
 }
 
-func stageSource(sourcePath, targetPath string, mode os.FileMode, description string) (string, error) {
-	temporaryPath, err := reserveRestoreArtifactPath(targetPath, "stage")
-	if err != nil {
-		return "", fmt.Errorf("reserve staged %s beside target: %w", description, err)
-	}
-	if err := stageSourceAt(sourcePath, temporaryPath, mode, description); err != nil {
-		return "", err
-	}
-	return temporaryPath, nil
-}
-
 func stageSourceAt(sourcePath, temporaryPath string, mode os.FileMode, description string) error {
 	sourceInfo, err := os.Lstat(sourcePath)
 	if err != nil {
@@ -1207,39 +1196,6 @@ func copyFileAtomicNoReplace(source, dest, description string, syncDirectory fun
 	}
 	if err := syncDirectory(filepath.Dir(dest)); err != nil {
 		return fmt.Errorf("sync destination directory after installing %s: %w", description, err)
-	}
-	return nil
-}
-
-func copyFileExclusive(source, dest string) error {
-	in, err := os.Open(source)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	info, err := in.Stat()
-	if err != nil {
-		return err
-	}
-	out, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, info.Mode().Perm())
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		_ = os.Remove(dest)
-		return err
-	}
-	// Durability: journal may reach "committed" and undo deleted; torn copy
-	// after crash would be treated as a successful restore.
-	if err := out.Sync(); err != nil {
-		_ = out.Close()
-		_ = os.Remove(dest)
-		return err
-	}
-	if err := out.Close(); err != nil {
-		_ = os.Remove(dest)
-		return err
 	}
 	return nil
 }

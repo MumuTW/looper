@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,37 @@ import (
 
 	"github.com/MumuTW/looper/internal/upgradebackup"
 )
+
+func copyFileExclusive(source, dest string) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dest)
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dest)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(dest)
+		return err
+	}
+	return nil
+}
 
 func TestRestoreRollsBackOrdinaryRenameFailure(t *testing.T) {
 	fixture := newRestoreFixture(t, true)
