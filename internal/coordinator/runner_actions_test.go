@@ -59,6 +59,39 @@ func TestRunnerAppliesLabelsThenCommentThenTriaged(t *testing.T) {
 	}
 }
 
+func TestCoordinatorMaintenanceRunsWhenTriageAdmissionSkipsLLM(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	})
+	seedDispatchIssue(fixture, 1)
+	fixture.github.issues = append(fixture.github.issues, githubinfra.IssueSummary{Number: 2})
+	fixture.github.details[2] = githubinfra.IssueDetail{
+		Number:    2,
+		Title:     "Needs triage",
+		Author:    "octo",
+		CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339),
+		State:     "open",
+	}
+	admissionCalls := 0
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{
+		ProjectID: fixture.projectID,
+		Repo:      "acme/looper",
+		TriageAdmission: func(func() error) error {
+			admissionCalls++
+			return nil
+		},
+	}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{1})
+	if admissionCalls != 1 {
+		t.Fatalf("triage admission calls = %d, want 1", admissionCalls)
+	}
+}
+
 func TestRunnerEditsExistingMarkerComment(t *testing.T) {
 	t.Parallel()
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })

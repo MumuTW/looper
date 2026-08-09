@@ -11,6 +11,11 @@ import (
 // Execution Supervisor admission is closed (daemon shutdown or degraded).
 var ErrSpawnAdmissionClosed = errors.New("agent spawn admission is closed")
 
+// ErrProviderBrownout identifies a spawn refusal caused by provider health,
+// rather than daemon lifecycle admission. Queue runners use it to requeue a
+// durable claim without charging an attempt because no agent run started.
+var ErrProviderBrownout = errors.New("agent spawn refused: provider brownout")
+
 // ErrSpawnLoopStopping is returned when a spawn is refused because the target
 // loop is already stopping.
 var ErrSpawnLoopStopping = errors.New("agent spawn refused: loop is stopping")
@@ -25,6 +30,21 @@ type SpawnMeta struct {
 	LoopID      string
 	RunID       string
 	ExecutionID string
+	Vendor      string
+	// BrownoutProbe is set by the daemon's provider-health admission when the
+	// spawn is allowed during a half-open recovery window.
+	BrownoutProbe bool
+	// BrownoutProbeGeneration identifies the half-open recovery round that
+	// reserved this probe slot. Zero is the legacy/unattributed value.
+	BrownoutProbeGeneration uint64
+	// BrownoutProbeRelease is an internal runtime hook for a probe that never
+	// reaches a terminal agent outcome. SpawnOwner invokes it when the lease is
+	// released before an outcome can be reported, such as cmd.Start failure or
+	// an operator kill.
+	BrownoutProbeRelease func()
+	// BrownoutStickySnapshot marks a retry that must use its persisted agent
+	// snapshot even when that vendor is no longer in live configuration.
+	BrownoutStickySnapshot bool
 }
 
 // SoftKillFunc notifies a running agent execution of an external stop so status

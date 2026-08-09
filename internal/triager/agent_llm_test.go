@@ -27,6 +27,18 @@ func TestCompletedAgentMessageUsesCodexFinalMessage(t *testing.T) {
 	}
 }
 
+func TestValidateDecisionOutputUsesStrictRunnerSchema(t *testing.T) {
+	if !ValidateDecisionOutput(eligibleDecisionJSON()) {
+		t.Fatal("ValidateDecisionOutput() = false, want true for a complete decision")
+	}
+	if ValidateDecisionOutput(`{"unexpected":true}`) {
+		t.Fatal("ValidateDecisionOutput() = true, want false for an unknown field")
+	}
+	if ValidateDecisionOutput(eligibleDecisionJSON() + " trailing") {
+		t.Fatal("ValidateDecisionOutput() = true, want false for trailing content")
+	}
+}
+
 func quotedJSON(value string) string {
 	quoted := strings.ReplaceAll(value, `\`, `\\`)
 	quoted = strings.ReplaceAll(quoted, `"`, `\"`)

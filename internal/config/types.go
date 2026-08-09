@@ -226,13 +226,46 @@ type StorageConfig struct {
 }
 
 type SchedulerConfig struct {
-	PollIntervalSeconds         int `json:"pollIntervalSeconds"`
-	MaxConcurrentRuns           int `json:"maxConcurrentRuns"`
-	RetryMaxAttempts            int `json:"retryMaxAttempts"`
-	ConsecutiveFailureThreshold int `json:"consecutiveFailureThreshold"`
-	RetryBaseDelayMS            int `json:"retryBaseDelayMs"`
-	SlowLaneWarnThresholdMS     int `json:"slowLaneWarnThresholdMs"`
-	DiscoveryCacheTTLSeconds    int `json:"discoveryCacheTtlSeconds"`
+	PollIntervalSeconds         int                 `json:"pollIntervalSeconds"`
+	MaxConcurrentRuns           int                 `json:"maxConcurrentRuns"`
+	RetryMaxAttempts            int                 `json:"retryMaxAttempts"`
+	ConsecutiveFailureThreshold int                 `json:"consecutiveFailureThreshold"`
+	RetryBaseDelayMS            int                 `json:"retryBaseDelayMs"`
+	SlowLaneWarnThresholdMS     int                 `json:"slowLaneWarnThresholdMs"`
+	DiscoveryCacheTTLSeconds    int                 `json:"discoveryCacheTtlSeconds"`
+	AgentBrownout               AgentBrownoutConfig `json:"agentBrownout"`
+}
+
+// AgentBrownoutConfig gates work production on looper's own agent failure rate.
+//
+// It deliberately contains no provider-specific knob: looper cannot enumerate
+// every provider's exhaustion signal (429, 503, a prose "rate limit" string, a
+// hang), so it measures the one thing it always knows first-hand — that its own
+// agent runs keep failing — and stops making more work until they stop failing.
+//
+// CooldownSeconds is the operator's safe interval. Providers state their reset
+// window in text looper does not parse, so how long to wait it out is a setting,
+// not an inference.
+type AgentBrownoutConfig struct {
+	Enabled bool `json:"enabled"`
+	// WindowSeconds is the rolling period over which agent outcomes are counted.
+	WindowSeconds int `json:"windowSeconds"`
+	// MinFailures is the floor below which the ratio says nothing: 2/2 failures
+	// on an idle daemon is not an outage.
+	MinFailures int `json:"minFailures"`
+	// FailureRatio is the share of in-window outcomes that must be failures.
+	// A ratio rather than a count so one policy fits a laptop and a fleet.
+	FailureRatio float64 `json:"failureRatio"`
+	// CooldownSeconds is how long work production stays suspended before the
+	// first probe.
+	CooldownSeconds int `json:"cooldownSeconds"`
+	// MaxCooldownSeconds caps the doubling applied when probes keep failing.
+	MaxCooldownSeconds int `json:"maxCooldownSeconds"`
+	// ProbeSuccesses is how many consecutive agent successes close the gate.
+	ProbeSuccesses int `json:"probeSuccesses"`
+	// Notify sends a system notification when the gate opens and recovers.
+	// Hours of silent failure is the symptom being fixed, so this defaults on.
+	Notify bool `json:"notify"`
 }
 
 type WebhookConfig struct {
@@ -1111,13 +1144,25 @@ type PartialStorageConfig struct {
 }
 
 type PartialSchedulerConfig struct {
-	PollIntervalSeconds         *int `json:"pollIntervalSeconds,omitempty"`
-	MaxConcurrentRuns           *int `json:"maxConcurrentRuns,omitempty"`
-	RetryMaxAttempts            *int `json:"retryMaxAttempts,omitempty"`
-	ConsecutiveFailureThreshold *int `json:"consecutiveFailureThreshold,omitempty"`
-	RetryBaseDelayMS            *int `json:"retryBaseDelayMs,omitempty"`
-	SlowLaneWarnThresholdMS     *int `json:"slowLaneWarnThresholdMs,omitempty"`
-	DiscoveryCacheTTLSeconds    *int `json:"discoveryCacheTtlSeconds,omitempty"`
+	PollIntervalSeconds         *int                        `json:"pollIntervalSeconds,omitempty"`
+	MaxConcurrentRuns           *int                        `json:"maxConcurrentRuns,omitempty"`
+	RetryMaxAttempts            *int                        `json:"retryMaxAttempts,omitempty"`
+	ConsecutiveFailureThreshold *int                        `json:"consecutiveFailureThreshold,omitempty"`
+	RetryBaseDelayMS            *int                        `json:"retryBaseDelayMs,omitempty"`
+	SlowLaneWarnThresholdMS     *int                        `json:"slowLaneWarnThresholdMs,omitempty"`
+	DiscoveryCacheTTLSeconds    *int                        `json:"discoveryCacheTtlSeconds,omitempty"`
+	AgentBrownout               *PartialAgentBrownoutConfig `json:"agentBrownout,omitempty"`
+}
+
+type PartialAgentBrownoutConfig struct {
+	Enabled            *bool    `json:"enabled,omitempty"`
+	WindowSeconds      *int     `json:"windowSeconds,omitempty"`
+	MinFailures        *int     `json:"minFailures,omitempty"`
+	FailureRatio       *float64 `json:"failureRatio,omitempty"`
+	CooldownSeconds    *int     `json:"cooldownSeconds,omitempty"`
+	MaxCooldownSeconds *int     `json:"maxCooldownSeconds,omitempty"`
+	ProbeSuccesses     *int     `json:"probeSuccesses,omitempty"`
+	Notify             *bool    `json:"notify,omitempty"`
 }
 
 type PartialWebhookConfig struct {

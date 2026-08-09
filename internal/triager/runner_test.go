@@ -107,6 +107,36 @@ func TestDiscoverIssuesHonorsExistingHoldBeforeLLM(t *testing.T) {
 	}
 }
 
+func TestDiscoverIssuesPreservesEnrollmentWhenDecisionAdmissionRefuses(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	admissionChecks := 0
+
+	result, err := fixture.runner().DiscoverIssues(context.Background(), DiscoveryInput{
+		ProjectID: "project_1", Repo: "acme/looper",
+		DecisionAdmission: func() (bool, error) {
+			admissionChecks++
+			return false, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if result.Enrolled != 1 || result.DecisionsAttempted != 0 || fixture.llm.calls != 0 {
+		t.Fatalf("DiscoverIssues() = %#v, LLM calls = %d, want enrollment without a decision", result, fixture.llm.calls)
+	}
+	if admissionChecks != 1 {
+		t.Fatalf("decision admission checks = %d, want one", admissionChecks)
+	}
+	events, err := fixture.repos.Events.List(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("Events.List() error = %v", err)
+	}
+	if len(events) != 1 || events[0].EventType != EnrollmentEventType {
+		t.Fatalf("triage lifecycle events = %#v, want the durable enrollment only", events)
+	}
+}
+
 func TestDiscoverIssuesPersistsUnsafeOrUncertainDecisionsForConfirmation(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

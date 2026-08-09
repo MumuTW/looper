@@ -38,6 +38,7 @@ func TestReloadConfigPublishesHotSnapshotAndKeepsMaterializedProjects(t *testing
 	next := loaded
 	next.Config = config.CloneConfig(cfg)
 	next.Config.Scheduler.MaxConcurrentRuns++
+	next.Config.Scheduler.AgentBrownout.Enabled = !cfg.Scheduler.AgentBrownout.Enabled
 	next.Config.Roles.Worker.AutoDiscovery = !cfg.Roles.Worker.AutoDiscovery
 	newVendor := config.AgentVendorOpenCode
 	next.Config.Agent.Vendor = &newVendor
@@ -59,6 +60,9 @@ func TestReloadConfigPublishesHotSnapshotAndKeepsMaterializedProjects(t *testing
 	got := rt.Config()
 	if got.Scheduler.MaxConcurrentRuns != next.Config.Scheduler.MaxConcurrentRuns {
 		t.Fatalf("Config().Scheduler.MaxConcurrentRuns = %d, want %d", got.Scheduler.MaxConcurrentRuns, next.Config.Scheduler.MaxConcurrentRuns)
+	}
+	if got.Scheduler.AgentBrownout.Enabled != next.Config.Scheduler.AgentBrownout.Enabled {
+		t.Fatalf("Config().Scheduler.AgentBrownout.Enabled = %v, want %v", got.Scheduler.AgentBrownout.Enabled, next.Config.Scheduler.AgentBrownout.Enabled)
 	}
 	if got.Agent.Vendor == nil || *got.Agent.Vendor != newVendor {
 		t.Fatalf("Config().Agent.Vendor = %#v, want %q", got.Agent.Vendor, newVendor)

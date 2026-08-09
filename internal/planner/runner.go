@@ -43,6 +43,7 @@ const (
 	defaultAgentTimeout     = 30 * time.Minute
 	defaultClaimTTL         = 10 * time.Minute
 	defaultRetryDelay       = 5 * time.Second
+	maxRetryDelay           = 300 * time.Second
 	defaultRetryMax         = 3
 	defaultIssueLimit       = 30
 	personalIssueQueryLimit = 100
@@ -261,6 +262,8 @@ type AgentRunInput struct {
 	SnapshotVendor          string
 	SnapshotModel           *string
 	SnapshotReasoningEffort *config.ReasoningEffort
+	CompletionContract      agent.CompletionContract
+	CompletionValidator     func(string) bool
 }
 
 type AgentResult struct {
@@ -876,7 +879,13 @@ func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.
 
 func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord, err error) (*runpipe.ProcessResult, error) {
 	failure := r.classifyFailure(err)
-	failedQueue, failErr := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
+	var failedQueue *storage.QueueItemRecord
+	var failErr error
+	if errors.Is(err, agent.ErrProviderBrownout) {
+		failedQueue, failErr = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.Kind, failure.Message)
+	} else {
+		failedQueue, failErr = r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
+	}
 	if failErr != nil {
 		return nil, failErr
 	}
@@ -1007,7 +1016,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 			r.appendEvent(ctx, eventInput{eventType: "loop.step.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"message": failure.Message, "failureKind": string(failure.Kind), "currentStep": derefString(run.CurrentStep)}})
 			r.appendEvent(ctx, eventInput{eventType: "run.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": failure.Message, "failureKind": string(failure.Kind)}})
-			failedQueue, err := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
+			var failedQueue *storage.QueueItemRecord
+			if errors.Is(stepErr, agent.ErrProviderBrownout) {
+				failedQueue, err = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.Kind, failure.Message)
+			} else {
+				failedQueue, err = r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
+			}
 			if err != nil {
 				return runpipe.ProcessResult{}, false, err
 			}
@@ -1293,6 +1307,8 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 			Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID),
 			UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
+			CompletionContract:  agent.CompletionContractPlannerMarker,
+			CompletionValidator: validatePlannerCompletionPayload,
 		})
 		if err != nil {
 			return checkpoint, err
@@ -1386,6 +1402,18 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	checkpoint.WriteSpec.GitReconciled = true
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+// validatePlannerCompletionPayload is the Planner caller's completion
+// authority. A marker is optional for the single-worker handoff, but when an
+// agent supplies workGraph the same validator used before persistence must
+// reject malformed graphs before the health gate records provider success.
+func validatePlannerCompletionPayload(payload string) bool {
+	if strings.TrimSpace(payload) == "" {
+		return true
+	}
+	_, err := workgraph.ParseResult([]byte(payload))
+	return err == nil
 }
 
 func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCheckpoint, error) {
@@ -2084,6 +2112,49 @@ func (r *Runner) wakeSchedulerAfterEnqueue() {
 
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind runpipe.QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
 	return runpipe.FailQueueItem(ctx, r.repos, r.now(), r.nowISO(), r.retryBaseDelay, queueItem, kind, message, runpipe.BackoffDelayExponential)
+}
+
+// requeueClaimedItemWithoutAttempt returns a claim refused by provider
+// brownout to queued without charging an attempt: no agent run reached the
+// executor after the durable claim.
+func (r *Runner) requeueClaimedItemWithoutAttempt(ctx context.Context, queueItem storage.QueueItemRecord, kind runpipe.QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
+	nowISO := r.nowISO()
+	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, cappedRetryDelayAttempt(queueItem.Attempts+1, queueItem.MaxAttempts))))
+	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: queueItem.Attempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		return nil, err
+	}
+	return r.repos.Queue.GetByID(ctx, queueItem.ID)
+}
+
+func backoffDelay(base time.Duration, attempts int64) time.Duration {
+	delay := base
+	for i := int64(1); i < attempts; i++ {
+		if delay >= maxRetryDelay || delay > maxRetryDelay/2 {
+			return maxRetryDelay
+		}
+		delay *= 2
+	}
+	if delay > maxRetryDelay {
+		return maxRetryDelay
+	}
+	return delay
+}
+
+func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
+	if attempts <= 0 {
+		return 1
+	}
+	if maxAttempts > 0 && attempts > maxAttempts {
+		return maxAttempts
+	}
+	return attempts
+}
+
+func optionalString(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
 }
 
 func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, error) {

@@ -119,6 +119,23 @@ func DefaultConfig(cwd string) (Config, error) {
 			RetryBaseDelayMS:            5000,
 			SlowLaneWarnThresholdMS:     5000,
 			DiscoveryCacheTTLSeconds:    30,
+			// Defaults are chosen to be inert on a working daemon rather than
+			// tuned to any one provider's limits. A 0.8 ratio over 5+ outcomes
+			// is a daemon that is failing almost everything it attempts, which
+			// no healthy configuration reaches. The 15-minute cooldown doubling
+			// to an hour is not matched to a provider's reset window — looper
+			// does not read those — it is a spacing that costs one wasted probe
+			// per round instead of hundreds of wasted calls.
+			AgentBrownout: AgentBrownoutConfig{
+				Enabled:            true,
+				WindowSeconds:      600,
+				MinFailures:        5,
+				FailureRatio:       0.8,
+				CooldownSeconds:    900,
+				MaxCooldownSeconds: 3600,
+				ProbeSuccesses:     1,
+				Notify:             true,
+			},
 		},
 		Webhook: WebhookConfig{
 			Enabled:                     false,

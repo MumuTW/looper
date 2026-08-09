@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/MumuTW/looper/internal/agent"
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/eventlog"
 	"github.com/MumuTW/looper/internal/loops"
@@ -125,6 +126,10 @@ func (r *Runner) runAssessSuitabilityStep(ctx context.Context, input stepInput) 
 		Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 		Metadata:       map[string]any{"loopType": "planner", "phase": "suitability-assessment", "repo": issue.Repo, "issueNumber": issue.IssueNumber},
 		IdempotencyKey: fmt.Sprintf("planner-assessment:%s", input.Loop.ID), UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
+		CompletionContract: agent.CompletionContractFile,
+		CompletionValidator: func(string) bool {
+			return ValidateAssessmentFile(worktree.Path) == nil
+		},
 	})
 	if err != nil {
 		return checkpoint, err
@@ -191,7 +196,7 @@ Write exactly one JSON object to %s with this schema:
 Use empty arrays when absent. Estimates must be non-negative. Only use the listed surface values. The decision request must be concrete when any configured criterion may fire.`, issue.Repo, issue.IssueNumber, issue.Title, issue.Body, string(encoded), plannerAssessmentRelPath)
 }
 
-func consumePlannerAssessment(worktree string) (plannerAssessmentEvidence, error) {
+func readPlannerAssessment(worktree string) (plannerAssessmentEvidence, error) {
 	path := filepath.Join(worktree, plannerAssessmentRelPath)
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -206,9 +211,6 @@ func consumePlannerAssessment(worktree string) (plannerAssessmentEvidence, error
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return plannerAssessmentEvidence{}, fmt.Errorf("planner assessment output missing: %w", err)
-	}
-	if err := os.Remove(path); err != nil {
-		return plannerAssessmentEvidence{}, fmt.Errorf("consume planner assessment output: %w", err)
 	}
 	var evidence plannerAssessmentEvidence
 	dec := json.NewDecoder(strings.NewReader(string(data)))
@@ -233,6 +235,26 @@ func consumePlannerAssessment(worktree string) (plannerAssessmentEvidence, error
 		}
 	}
 	evidence.Surfaces = canonical
+	return evidence, nil
+}
+
+// ValidateAssessmentFile checks the daemon-owned assessment file without
+// consuming it. The executor uses this at terminal outcome reporting, while
+// the planner consumes the same validated file before advancing its checkpoint.
+func ValidateAssessmentFile(worktree string) error {
+	_, err := readPlannerAssessment(worktree)
+	return err
+}
+
+func consumePlannerAssessment(worktree string) (plannerAssessmentEvidence, error) {
+	evidence, err := readPlannerAssessment(worktree)
+	if err != nil {
+		return plannerAssessmentEvidence{}, err
+	}
+	path := filepath.Join(worktree, plannerAssessmentRelPath)
+	if err := os.Remove(path); err != nil {
+		return plannerAssessmentEvidence{}, fmt.Errorf("consume planner assessment output: %w", err)
+	}
 	return evidence, nil
 }
 

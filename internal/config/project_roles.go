@@ -206,8 +206,14 @@ func ProjectRoleAutoDiscoveryEnabled(cfg Config, projectID, role string) bool {
 }
 
 func AnyProjectRoleAutoDiscoveryEnabled(cfg Config, role string) bool {
-	if ProjectRoleAutoDiscoveryEnabled(cfg, "", role) {
-		return true
+	// When projects are configured, their effective role policies are the
+	// authority for whether a lane can actually run. Do not let the global
+	// default masquerade as an enabled project when every project explicitly
+	// overrides the role off; that would register an otherwise unused provider
+	// and make aggregate health appear healthy. With no project catalog the
+	// daemon still operates from the global role defaults.
+	if len(cfg.Projects) == 0 {
+		return ProjectRoleAutoDiscoveryEnabled(cfg, "", role)
 	}
 	for _, project := range cfg.Projects {
 		if ProjectRoleAutoDiscoveryEnabled(cfg, project.ID, role) {

@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"sort"
 
 	"github.com/MumuTW/looper/internal/config"
@@ -9,6 +10,7 @@ import (
 	"github.com/MumuTW/looper/internal/fixer"
 	"github.com/MumuTW/looper/internal/gatekeeper"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/loops/brownout"
 	"github.com/MumuTW/looper/internal/planner"
 	"github.com/MumuTW/looper/internal/reviewer"
 	"github.com/MumuTW/looper/internal/storage"
@@ -34,6 +36,11 @@ type discoveryLane struct {
 	// missing runner is distinct from a disabled one: only the latter is
 	// worth telling the operator about.
 	Present bool
+
+	// Provider resolves the effective provider for this coding lane and
+	// project. A non-empty value selects provider-scoped admission so an open
+	// sibling breaker does not authorize discovery for this lane.
+	Provider func(projectID string) string
 
 	// Enabled is evaluated per project, because coordinator admission is
 	// per-project while the other roles use a single daemon-wide flag.
@@ -125,16 +132,38 @@ func roleDiscoverers(input defaultSchedulerTickInput) map[string]discoveryLane {
 // coordinatorLane is built separately because coordination is not a coding
 // role: it has no agent, no discovery config, and is enabled per project.
 func coordinatorLane(input defaultSchedulerTickInput) discoveryLane {
-	return discoveryLane{
+	lane := discoveryLane{
 		Name:     "coordinator",
 		Priority: config.PriorityCoordinator,
 		Present:  input.Coordinator != nil,
 		Enabled:  func(projectID string) bool { return coordinatorEnabledForProject(input, projectID) },
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
-			_, err := input.Coordinator.DiscoverIssues(ctx, coordinator.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
+			var triageAdmission func(func() error) error
+			if input.Config != nil && input.Config.Agent.Vendor != nil && input.AllowClaimForVendor != nil {
+				vendor := string(*input.Config.Agent.Vendor)
+				triageAdmission = func(fn func() error) error {
+					// This is only an early point-in-time filter. Holding the
+					// provider gate across LLM completion would deadlock when the
+					// executor reports its terminal outcome before Complete returns;
+					// the common spawn boundary remains the authority.
+					gateErr := input.AllowClaimForVendor(vendor)
+					if errors.Is(gateErr, brownout.ErrOpen) {
+						// A provider brownout suppresses only the LLM decision. The
+						// coordinator runner has already completed its non-agent
+						// maintenance phases and will treat this as a no-op decision.
+						return nil
+					}
+					if gateErr != nil {
+						return gateErr
+					}
+					return fn()
+				}
+			}
+			_, err := input.Coordinator.DiscoverIssues(ctx, coordinator.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot, TriageAdmission: triageAdmission})
 			return nil, err
 		},
 	}
+	return lane
 }
 
 // triagerLane is an internal issue-source role. Its persisted report is the
@@ -158,7 +187,7 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 	}); ok {
 		readBudget = factory.BeginPendingForgeReadTick(projectIDs)
 	}
-	return discoveryLane{
+	lane := discoveryLane{
 		Name:     "triager",
 		Priority: config.PriorityTriager,
 		Present:  input.Triager != nil,
@@ -166,9 +195,23 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 			return input.TriagerEnabled != nil && input.TriagerEnabled(projectID)
 		},
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
+			var decisionAdmission func() (bool, error)
+			if input.Config != nil && input.AllowClaimForVendor != nil {
+				if resolved, ok := config.ResolveAgent(*input.Config, projectID, config.CodingRolePlanner); ok {
+					vendor := string(resolved.Vendor)
+					decisionAdmission = func() (bool, error) {
+						err := input.AllowClaimForVendor(vendor)
+						if errors.Is(err, brownout.ErrOpen) {
+							return false, nil
+						}
+						return err == nil, err
+					}
+				}
+			}
 			result, err := input.Triager.DiscoverIssues(ctx, triager.DiscoveryInput{
 				ProjectID: projectID, Repo: repo, Snapshot: snapshot,
 				DecisionBudget: decisionBudget, PendingForgeReadBudget: readBudget,
+				DecisionAdmission: decisionAdmission,
 			})
 			if input.Logger != nil && result.PendingSourcesDeferred > 0 {
 				input.Logger.Info("triager pending forge reads exhausted", map[string]any{
@@ -182,6 +225,7 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 			return result.QueueItems, err
 		},
 	}
+	return lane
 }
 
 // discoveryLanes builds the ordered lane list for one tick from registered
@@ -215,6 +259,16 @@ func discoveryLanes(input defaultSchedulerTickInput) []discoveryLane {
 		lane.Name = name
 		lane.Priority = role.Priority
 		lane.LogWhenDisabled = true
+		roleName := name
+		if input.Config != nil {
+			lane.Provider = func(projectID string) string {
+				resolved, ok := config.ResolveAgent(*input.Config, projectID, roleName)
+				if !ok {
+					return ""
+				}
+				return string(resolved.Vendor)
+			}
+		}
 		lanes = append(lanes, lane)
 	}
 

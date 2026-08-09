@@ -51,6 +51,10 @@ type DiscoveryInput struct {
 	ProjectID string
 	Repo      string
 	Snapshot  *githubinfra.DiscoverySnapshot
+	// TriageAdmission gates only the LLM-backed triage call. Coordinator
+	// maintenance phases (merge watch, dependency actions, dispatches, and
+	// review assignments) must continue while that provider is degraded.
+	TriageAdmission func(func() error) error
 }
 
 // RetiredAutoMergeInput identifies the repository whose durable merge-watch
@@ -446,7 +450,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 		analysisStartedAt := r.now().UTC()
 		processed++
-		decision, err := r.decide(ctx, project.RepoPath, input.Repo, loadedIssue.issue, triageCfg)
+		decision, err := r.decide(ctx, project.RepoPath, input.Repo, loadedIssue.issue, triageCfg, input.TriageAdmission)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -778,7 +782,26 @@ func (r *Runner) hasDispatchWork(action dispatch.Action) bool {
 	return action.ReactionCommentID != 0 || len(action.TriggerLabels) != 0 || action.FailureCommentBody != ""
 }
 
-func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue triage.Issue, cfg triage.Config) (triage.Decision, error) {
+type admittedTriageLLM struct {
+	delegate triage.LLM
+	admit    func(func() error) error
+}
+
+func (l admittedTriageLLM) Complete(ctx context.Context, req triage.Request) (string, error) {
+	var (
+		raw string
+		err error
+	)
+	if gateErr := l.admit(func() error {
+		raw, err = l.delegate.Complete(ctx, req)
+		return err
+	}); gateErr != nil {
+		return "", gateErr
+	}
+	return raw, err
+}
+
+func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue triage.Issue, cfg triage.Config, admission func(func() error) error) (triage.Decision, error) {
 	reTriage := triage.ShouldReTriage(issue, cfg, r.now().UTC())
 	if !reTriage && !triage.ShouldTriage(issue, cfg, r.now().UTC()) {
 		return triage.NoOpDecision(), nil
@@ -789,7 +812,11 @@ func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue
 	}
 	repoCtx.Repo = repo
 	repoCtx.WorkingDirectory = repoPath
-	return triage.Decide(ctx, r.triageLLM, triage.Input{Issue: issue, RepoContext: repoCtx, Config: cfg, Now: r.now().UTC()}), nil
+	llm := r.triageLLM
+	if llm != nil && admission != nil {
+		llm = admittedTriageLLM{delegate: llm, admit: admission}
+	}
+	return triage.Decide(ctx, llm, triage.Input{Issue: issue, RepoContext: repoCtx, Config: cfg, Now: r.now().UTC()}), nil
 }
 
 func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, issue triage.Issue, cfg triage.Config, analysisStartedAt time.Time, decision triage.Decision) error {

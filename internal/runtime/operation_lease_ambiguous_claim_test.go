@@ -112,12 +112,23 @@ func TestAmbiguousClaimCancelRetainsLeaseWhenRecoveryFails(t *testing.T) {
 	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
 	t.Cleanup(func() { _ = coordinator.Close() })
 	repos := storage.NewRepositories(coordinator.DB())
-	// Close DB so recovery ListRunningClaimedBy fails after simulated cancel.
-	if err := coordinator.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	queueID := "ambiguous_claim_recovery_failure"
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: queueID, Type: "worker", TargetType: "project", TargetID: "project:ambiguous",
+		DedupeKey: queueID, Priority: storage.QueuePriorityWorker, Status: "queued",
+		AvailableAt: nowISO, MaxAttempts: 1, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert: %v", err)
 	}
 
 	testAfterClaimHook = func(*storage.QueueItemRecord, error) (*storage.QueueItemRecord, error) {
+		// Keep the scheduler's read-only lane peeks alive, then close the DB
+		// after the durable claim attempt so recovery fails after the simulated
+		// cancellation. This preserves the ambiguous-claim lease invariant now
+		// that provider lanes are inspected before choosing a candidate.
+		if err := coordinator.Close(); err != nil {
+			t.Fatalf("Close in claim hook: %v", err)
+		}
 		return nil, context.Canceled
 	}
 	t.Cleanup(func() { testAfterClaimHook = nil })

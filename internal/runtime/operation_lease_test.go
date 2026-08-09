@@ -24,6 +24,33 @@ func TestAdmitOperationRefusesWhenAdmissionClosed(t *testing.T) {
 	}
 }
 
+func TestAgentVendorsIncludesPendingAndBoundOperations(t *testing.T) {
+	t.Parallel()
+
+	reg := NewActiveExecutionRegistry()
+	lease, err := reg.AdmitOperation(context.Background(), OperationMeta{ClaimedBy: "scheduler", Vendor: "codex"})
+	if err != nil {
+		t.Fatalf("AdmitOperation: %v", err)
+	}
+	if got := reg.AgentVendors(); len(got) != 1 || got[0] != "codex" {
+		t.Fatalf("pending AgentVendors() = %#v, want [codex]", got)
+	}
+
+	loopID := "loop-operation-vendor"
+	item := storage.QueueItemRecord{ID: "qi-operation-vendor", Type: "worker", LoopID: &loopID, Status: "running"}
+	if permit, err := lease.BindClaim(item); err != nil || !permit.Valid() {
+		t.Fatalf("BindClaim() = permit=%+v err=%v, want valid permit", permit, err)
+	}
+	if got := reg.AgentVendors(); len(got) != 1 || got[0] != "codex" {
+		t.Fatalf("bound AgentVendors() = %#v, want [codex]", got)
+	}
+
+	lease.Release()
+	if got := reg.AgentVendors(); len(got) != 0 {
+		t.Fatalf("released AgentVendors() = %#v, want empty", got)
+	}
+}
+
 func TestBindClaimRefusesAfterShutdownWithoutStartingPermit(t *testing.T) {
 	t.Parallel()
 	reg := NewActiveExecutionRegistry()
