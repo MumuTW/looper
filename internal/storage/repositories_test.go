@@ -80,6 +80,46 @@ func TestParseIssueTargetIDNormalizesWhitespace(t *testing.T) {
 	}
 }
 
+func TestIssueClaimAdmissionIncludesPlannersCaseInsensitively(t *testing.T) {
+	ctx := context.Background()
+	repos := NewRepositories(openMigratedCoordinatorForRepositories(t).DB())
+	startedAt := "2026-07-31T00:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	upperRepo, lowerRepo := "Acme/Looper", "acme/looper"
+	upperTarget, lowerTarget := "issue:Acme/Looper:19", "issue:acme/looper:19"
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "planner_upper", Seq: 1, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &upperTarget, Repo: &upperRepo, Status: "running", CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+		t.Fatalf("seed planner: %v", err)
+	}
+	err := repos.Loops.Upsert(ctx, LoopRecord{ID: "planner_lower", Seq: 2, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &lowerTarget, Repo: &lowerRepo, Status: "running", CreatedAt: startedAt, UpdatedAt: startedAt})
+	if conflict, ok := IsIssueClaimConflictError(err); !ok || conflict.LoopID != "planner_upper" {
+		t.Fatalf("second planner error = %v, want case-insensitive conflict with planner_upper", err)
+	}
+}
+
+func TestIssueClaimAdmissionAllowsExistingPlannerToResumeWithDownstreamWorker(t *testing.T) {
+	ctx := context.Background()
+	repos := NewRepositories(openMigratedCoordinatorForRepositories(t).DB())
+	startedAt := "2026-07-31T00:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	repo, target := "acme/looper", "issue:acme/looper:19"
+	planner := LoopRecord{ID: "planner_resume", Seq: 1, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &target, Repo: &repo, Status: "failed", CreatedAt: startedAt, UpdatedAt: startedAt}
+	if err := repos.Loops.Upsert(ctx, planner); err != nil {
+		t.Fatalf("seed planner: %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "downstream_worker", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &target, Repo: &repo, Status: "running", CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+		t.Fatalf("seed downstream worker: %v", err)
+	}
+	planner.Status = "running"
+	planner.UpdatedAt = "2026-07-31T00:01:00.000Z"
+	if err := repos.Loops.Upsert(ctx, planner); err != nil {
+		t.Fatalf("resume existing planner: %v", err)
+	}
+}
+
 func TestIssueClaimAdmissionKeepsPersistedPRSourceWorkerIdentity(t *testing.T) {
 	ctx := context.Background()
 	coordinator := openMigratedCoordinatorForRepositories(t)

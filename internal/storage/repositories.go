@@ -1321,6 +1321,21 @@ func (r *LoopsRepository) issueClaimAdmissionRequired(ctx context.Context, curre
 	if !domain.IsConflictingActiveLoopStatus(domain.LoopStatus(candidate.Status)) {
 		return false, nil
 	}
+	if current != nil && current.Type == string(domain.LoopTypePlanner) && candidate.Type == string(domain.LoopTypePlanner) {
+		currentClaim, currentClaimsIssue, err := r.issueClaimForLoop(ctx, *current)
+		if err != nil {
+			return false, err
+		}
+		candidateClaim, candidateClaimsIssue, err := r.issueClaimForLoop(ctx, candidate)
+		if err != nil {
+			return false, err
+		}
+		if currentClaimsIssue && candidateClaimsIssue && currentClaim.issueNumber == candidateClaim.issueNumber && strings.EqualFold(currentClaim.repo, candidateClaim.repo) {
+			// Reactivation resumes this planner's existing lifecycle; its normal
+			// downstream worker is not a competing new-planner admission.
+			return false, nil
+		}
+	}
 	if current == nil || !domain.IsConflictingActiveLoopStatus(domain.LoopStatus(current.Status)) {
 		return true, nil
 	}
@@ -1572,14 +1587,14 @@ func (r *LoopsRepository) AssertIssueClaimAdmission(ctx context.Context, candida
 	}
 
 	statuses := domain.ConflictingActiveLoopStatuses()
-	args := make([]any, 0, len(statuses)+5)
-	args = append(args, candidate.ProjectID, string(domain.LoopTypeWorker), string(domain.LoopTypeFixer), string(domain.LoopTypeReviewer))
+	args := make([]any, 0, len(statuses)+6)
+	args = append(args, candidate.ProjectID, string(domain.LoopTypeWorker), string(domain.LoopTypeFixer), string(domain.LoopTypeReviewer), string(domain.LoopTypePlanner))
 	for _, status := range statuses {
 		args = append(args, string(status))
 	}
 	rows, err := r.q.QueryContext(ctx, `SELECT `+loopColumns+` FROM loops
 		WHERE project_id = ?
-		  AND type IN (?, ?, ?)
+		  AND type IN (?, ?, ?, ?)
 		  AND status IN (`+sqlPlaceholders(len(statuses))+`)
 		  AND target_type IN (?, ?)
 		ORDER BY updated_at DESC, seq DESC`, append(args, string(domain.LoopTargetTypeIssue), string(domain.LoopTargetTypePullRequest))...)
