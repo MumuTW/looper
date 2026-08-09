@@ -349,3 +349,39 @@ func TestRevokeProjectRoutesRetiresPublishedRoutes(t *testing.T) {
 		t.Fatalf("report after revocation = %#v, want ReasonRouteRevoked marker", report)
 	}
 }
+
+func TestRevokeProjectRoutesRetiresCrashPendingRoute(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	runner := trustRunner(fixture, config.GatekeeperTrustAuto)
+	established := false
+	report := Report{
+		Version: reportVersion, Mode: string(config.GatekeeperTrustAuto), Eligible: true,
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42,
+		ObservedHeadSHA: "head-1", RouteEstablished: &established,
+		Evidence: Evidence{PullRequestState: "OPEN", FinalObservedHeadSHA: "head-1"},
+	}
+	seedGateReport(t, fixture, report)
+
+	if err := runner.RevokeProjectRoutes(context.Background(), "project_1"); err != nil {
+		t.Fatalf("RevokeProjectRoutes() error = %v", err)
+	}
+	foundAutoRemoval := false
+	for _, removal := range fixture.github.labelRemoves {
+		if slices.Equal(removal.Labels, []string{labels.AutoMerge}) {
+			foundAutoRemoval = true
+		}
+	}
+	if !foundAutoRemoval {
+		t.Fatalf("label removals = %#v, want crash-pending auto-merge route retired", fixture.github.labelRemoves)
+	}
+	if len(fixture.github.commitStatuses) != 0 {
+		t.Fatalf("commit statuses = %#v, want no verdict retirement for an unpublished pending report", fixture.github.commitStatuses)
+	}
+	reports, err := latestGateReports(context.Background(), fixture.repos, "project_1")
+	if err != nil {
+		t.Fatalf("latestGateReports() error = %v", err)
+	}
+	if got := reports["acme/looper#42"]; !hasReason(got, ReasonRouteRevoked) {
+		t.Fatalf("report after revocation = %#v, want ReasonRouteRevoked", got)
+	}
+}

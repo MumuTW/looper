@@ -2760,18 +2760,31 @@ func queueRuleAppliesToBase(conditions []string, baseRefName string) bool {
 		return true
 	}
 	for _, condition := range conditions {
-		fields := strings.Fields(condition)
-		if len(fields) != 3 || fields[0] != "base" {
+		trimmed := strings.TrimSpace(condition)
+		if !strings.HasPrefix(trimmed, "base") {
 			continue
 		}
-		value := strings.Trim(strings.TrimSpace(fields[2]), "\"'")
-		switch fields[1] {
+		match := regexp.MustCompile(`^base\s*(~!=|~=|!=|=)\s*(.+)$`).FindStringSubmatch(trimmed)
+		if len(match) != 3 {
+			return false
+		}
+		value := strings.Trim(strings.TrimSpace(match[2]), "\"'")
+		switch match[1] {
 		case "=":
 			if value != baseRefName {
 				return false
 			}
 		case "!=":
 			if value == baseRefName {
+				return false
+			}
+		case "~=", "~!=":
+			pattern, err := regexp.Compile(value)
+			if err != nil {
+				return false
+			}
+			matched := pattern.MatchString(baseRefName)
+			if (match[1] == "~=" && !matched) || (match[1] == "~!=" && matched) {
 				return false
 			}
 		}

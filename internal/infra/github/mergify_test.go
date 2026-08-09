@@ -107,6 +107,30 @@ merge_protections_settings:
 	}
 }
 
+func TestQueueRuleAppliesToCompactAndRegexBaseConditions(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		conditions []string
+		base       string
+		want       bool
+	}{
+		{name: "compact exact match", conditions: []string{"base=release"}, base: "release", want: true},
+		{name: "compact exact mismatch", conditions: []string{"base=release"}, base: "main", want: false},
+		{name: "regex match", conditions: []string{`base ~= ^release/.*$`}, base: "release/1.0", want: true},
+		{name: "negative regex match", conditions: []string{`base ~!= ^release/.*$`}, base: "release/1.0", want: false},
+		{name: "invalid base condition", conditions: []string{"base ??? main"}, base: "main", want: false},
+		{name: "invalid regex", conditions: []string{"base ~= ["}, base: "main", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := queueRuleAppliesToBase(tc.conditions, tc.base); got != tc.want {
+				t.Fatalf("queueRuleAppliesToBase(%q, %q) = %t, want %t", tc.conditions, tc.base, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestValidateMergifyRoutingRejectsMissingQueueVeto(t *testing.T) {
 	t.Parallel()
 	content := `queue_rules:

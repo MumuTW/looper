@@ -40,7 +40,10 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 	}
 
 	plan := routingLabelPlan{}
-	if trust == config.GatekeeperTrustAuto && report.Eligible {
+	if reportIsTerminal(report) {
+		// Terminal pull requests are removal-only regardless of the previous
+		// route; retaining a human-review label can trigger unrelated automation.
+	} else if trust == config.GatekeeperTrustAuto && report.Eligible {
 		plan.autoMerge = true
 	} else if trust != config.GatekeeperTrustObserve && reportNeedsHumanReview(previous, report) {
 		plan.needsHumanReview = true

@@ -428,21 +428,24 @@ func (r *Runner) RevokeProjectRoutes(ctx context.Context, projectID string) erro
 	}
 	var errs []error
 	for entityID, report := range reports {
-		if !previousPublished(report) {
+		potentiallyLiveRoute := reportRouteEstablished(report) || reportNeedsRouteRecovery(report) || reportNeedsOutOfPageRouteRecheck(report)
+		if !previousPublished(report) && !potentiallyLiveRoute {
 			continue
 		}
 		if hasReasonCode(report.Reasons, ReasonRouteRevoked) {
 			continue
 		}
-		if reportRouteEstablished(report) {
+		if potentiallyLiveRoute {
 			if err := r.retireRoutingLabelsForReport(ctx, report); err != nil {
 				errs = append(errs, fmt.Errorf("revoke route %s: %w", entityID, err))
 				continue
 			}
 		}
-		if err := r.applyVerdict(ctx, verdictActionRetire, report); err != nil {
-			errs = append(errs, fmt.Errorf("retire verdict %s: %w", entityID, err))
-			continue
+		if previousPublished(report) {
+			if err := r.applyVerdict(ctx, verdictActionRetire, report); err != nil {
+				errs = append(errs, fmt.Errorf("retire verdict %s: %w", entityID, err))
+				continue
+			}
 		}
 		if err := r.markRouteRevoked(ctx, report); err != nil {
 			errs = append(errs, fmt.Errorf("mark route %s revoked: %w", entityID, err))

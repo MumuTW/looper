@@ -279,6 +279,32 @@ func TestMechanicalBlockLeavesNoRoutingLabel(t *testing.T) {
 	}
 }
 
+func TestTerminalReportOnlyRemovesRoutingLabels(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	runner := routingRunner(fixture, config.GatekeeperTrustAuto)
+	established := true
+	previous := Report{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42,
+		ObservedHeadSHA: "head-1", Eligible: true, Mode: string(config.GatekeeperTrustAuto),
+		RouteEstablished: &established,
+		Evidence:         Evidence{PullRequestState: "OPEN", FinalObservedHeadSHA: "head-1"},
+	}
+	terminal := previous
+	terminal.Eligible = false
+	terminal.Evidence.PullRequestState = "MERGED"
+	terminal.Reasons = []Reason{{Code: ReasonPullRequestNotOpen}}
+
+	if err := runner.reconcileRoutingLabels(context.Background(), terminal, &previous); err != nil {
+		t.Fatalf("reconcileRoutingLabels() error = %v", err)
+	}
+	if len(fixture.github.labelAdds) != 0 {
+		t.Fatalf("terminal label adds = %#v, want removal-only reconciliation", fixture.github.labelAdds)
+	}
+	if len(fixture.github.labelRemoves) != 2 {
+		t.Fatalf("terminal label removals = %#v, want both routing labels removed", fixture.github.labelRemoves)
+	}
+}
+
 func TestRepeatedReviewChangesEscalatesOnSecondEvaluation(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	runner := routingRunner(fixture, config.GatekeeperTrustAdvise)

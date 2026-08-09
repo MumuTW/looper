@@ -171,6 +171,9 @@ func TestApplyMergeWatchShortCircuitsMergedSnapshotBeforeCheckRuns(t *testing.T)
 	if !snapshot.Merged || snapshot.MergedAt != "2026-05-14T11:58:07.000Z" || snapshot.HeadSHA != "head-42" {
 		t.Fatalf("snapshot = %#v, want authoritative merged state", snapshot)
 	}
+	if snapshot.MergeStrategy != "" {
+		t.Fatalf("snapshot merge strategy = %q, want unknown when the forge does not report it", snapshot.MergeStrategy)
+	}
 	if reads := fixture.github.prCheckRunReads["head-42"]; reads != 0 {
 		t.Fatalf("check-runs reads = %d, want 0 (short-circuited before the read)", reads)
 	}

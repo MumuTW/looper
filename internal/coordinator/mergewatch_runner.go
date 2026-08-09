@@ -382,7 +382,7 @@ func (r *Runner) applyRoutedMergeWatch(ctx context.Context, projectID, repo, cwd
 			if !humanOwned && active && (detail.AutoMerge != nil || githubinfra.IsMergifyMergeActor(detail.MergedBy)) {
 				if err := r.recordPostMergeEvent(ctx, projectID, repo, 0, mergewatch.PRSnapshot{
 					Repo: repo, PRNumber: prNumber, HeadSHA: firstNonEmpty(detail.HeadSHA, headSHA),
-					MergeCommitSHA: detail.MergeCommitSHA, MergeStrategy: "merge",
+					MergeCommitSHA: detail.MergeCommitSHA,
 					MergedAt: detail.MergedAt, MergedBy: detail.MergedBy, Merged: true,
 				}); err != nil {
 					return err
@@ -808,7 +808,7 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 	if strings.TrimSpace(detail.MergedAt) != "" || strings.EqualFold(strings.TrimSpace(detail.State), "merged") {
 		return mergewatch.PRSnapshot{
 			Repo: repo, PRNumber: prNumber, IssueNumber: issueNumber,
-			HeadSHA: detail.HeadSHA, MergeCommitSHA: detail.MergeCommitSHA, MergeStrategy: "merge", SourceIssueRepo: repo,
+			HeadSHA: detail.HeadSHA, MergeCommitSHA: detail.MergeCommitSHA, SourceIssueRepo: repo,
 			MergedAt: detail.MergedAt, MergedBy: detail.MergedBy, Merged: true,
 			AutoMergeEnabled:       detail.AutoMerge != nil,
 			AutoMergeOwnedByLooper: autoMergeOwnedByLooper,
