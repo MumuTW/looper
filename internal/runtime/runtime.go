@@ -407,7 +407,7 @@ func New(options Options) *Runtime {
 	// Project daemon Admission onto agent spawn leases so cmd.Start is refused
 	// while starting/stopping/degraded (#576 + #575).
 	rt.activeExecutions.SetAllowSpawn(rt.allowAgentSpawn)
-	rt.activeExecutions.SetAllowDetachedOperation(rt.AllowClaim)
+	rt.activeExecutions.SetAllowDetachedOperation(rt.AllowLifecycleWork)
 	// Hard agent_executions observation failures close admission until process
 	// restart (#578 / ADR-0015 R5). Prefer split-brain stop over silent continue.
 	rt.activeExecutions.SetOnHardPersistFailure(func(err error) {

@@ -247,6 +247,13 @@ func TestReportOutcomeAcceptsReviewerOutcomes(t *testing.T) {
 	if len(outcomes) != 1 || outcomes[0].Succeeded {
 		t.Fatalf("reviewer rate-limit outcome = %#v, want one failed outcome", outcomes)
 	}
+	for _, resultType := range []string{"auth", "network", "pr_drift"} {
+		outcomes = outcomes[:0]
+		exec.reportOutcome("completed", "parsed", `{"type":"`+resultType+`","message":"review failed"}`, "")
+		if len(outcomes) != 1 || outcomes[0].Succeeded {
+			t.Fatalf("reviewer %s outcome = %#v, want one failed outcome", resultType, outcomes)
+		}
+	}
 }
 
 func TestReportOutcomeAcceptsVerifiedReviewerPublicationAfterIncompleteProcessResult(t *testing.T) {

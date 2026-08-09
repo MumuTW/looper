@@ -554,6 +554,28 @@ func TestDiscoverIssuesEnqueuesAcrossProjectsForSameIssue(t *testing.T) {
 	}
 }
 
+func TestPlannerAdmissionTreatsCaseInsensitiveConflictAsOccupied(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	repo, target := "Acme/Looper", "issue:Acme/Looper:42"
+	winner := storage.LoopRecord{
+		ID: "planner_winner", Seq: 1, ProjectID: "project_1", Type: "planner",
+		TargetType: "issue", TargetID: &target, Repo: &repo, Status: "running",
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(ctx, winner); err != nil {
+		t.Fatalf("seed winning planner: %v", err)
+	}
+	runner := &Runner{repos: fixture.repos, now: fixture.now}
+	result, skipped, err := runner.admitPlannerIssue(ctx, storage.ProjectRecord{ID: "project_1"}, "acme/looper", IssueSummary{Number: 42, Title: "Plan this"}, "fingerprint", "")
+	if err != nil {
+		t.Fatalf("admitPlannerIssue() error = %v, want occupied discovery", err)
+	}
+	if !skipped || !result.blocked || result.record.ID != winner.ID {
+		t.Fatalf("admitPlannerIssue() = (%#v, %t), want winning planner reused as blocked", result, skipped)
+	}
+}
+
 func TestDiscoverIssuesUsesSingleServerSideLabelFilterWhenConfiguredWithMultipleLabels(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

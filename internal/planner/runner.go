@@ -776,6 +776,18 @@ func (r *Runner) materializeIssue(ctx context.Context, project storage.ProjectRe
 func (r *Runner) admitPlannerIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, fingerprint, authority string) (loopUpsertResult, bool, error) {
 	loopResult, err := r.ensureLoopForIssueWithAuthority(ctx, project, repo, issue, fingerprint, authority)
 	if err != nil {
+		if conflict, ok := storage.IsIssueClaimConflictError(err); ok {
+			winner, loadErr := r.repos.Loops.GetByID(ctx, conflict.LoopID)
+			if loadErr != nil {
+				return loopUpsertResult{}, false, loadErr
+			}
+			if winner != nil && winner.ProjectID == project.ID && winner.Type == string(domain.LoopTypePlanner) {
+				// A concurrent planner won admission after our discovery snapshot.
+				// Treat the issue as occupied instead of aborting the whole batch or
+				// explicit route; the repository conflict already proved claim identity.
+				return loopUpsertResult{record: *winner, blocked: true}, true, nil
+			}
+		}
 		return loopUpsertResult{}, false, err
 	}
 	if loopResult.blocked {
