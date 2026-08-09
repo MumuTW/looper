@@ -309,7 +309,6 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 		if project.Roles == nil || (project.Roles.Gatekeeper == nil && project.Roles.Reviewer == nil) || (project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust == nil && project.Roles.Gatekeeper.DiffBudget == nil && project.Roles.Gatekeeper.ProtectedPaths == nil && project.Roles.Gatekeeper.RequiredReviewChangedLines == nil) {
 			continue
 		}
-		roles := ProjectRoleConfigs(config, project.ID)
 		reviewerAutoMerge := config.Roles.Reviewer.AutoMerge.Enabled
 		if project.Roles.Reviewer != nil && project.Roles.Reviewer.AutoMerge != nil && project.Roles.Reviewer.AutoMerge.Enabled != nil {
 			reviewerAutoMerge = *project.Roles.Reviewer.AutoMerge.Enabled
@@ -766,6 +765,18 @@ func validateGatekeeperDiffBudget(budget *GatekeeperDiffBudget, path string, iss
 		*issues = append(*issues, ValidationIssue{Path: path + ".maxChangedFiles", Message: "must be zero or a positive integer"})
 	}
 	if budget.MaxDeletions < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxDeletions", Message: "must be zero or a positive integer"})
+	}
+}
+
+func validatePartialGatekeeperDiffBudget(budget *PartialGatekeeperDiffBudget, path string, issues *[]ValidationIssue) {
+	if budget == nil {
+		return
+	}
+	if budget.MaxChangedFiles != nil && *budget.MaxChangedFiles < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxChangedFiles", Message: "must be zero or a positive integer"})
+	}
+	if budget.MaxDeletions != nil && *budget.MaxDeletions < 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".maxDeletions", Message: "must be zero or a positive integer"})
 	}
 }

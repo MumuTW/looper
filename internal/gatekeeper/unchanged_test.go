@@ -312,6 +312,7 @@ func hasReason(report Report, code ReasonCode) bool {
 	}
 	return false
 }
+
 // With both budget bounds at their default of zero the gate is unlimited, so a
 // base-branch advance changes nothing Gatekeeper enforces. BaseSHA must not be
 // in the fingerprint then, or every base commit would invalidate the cached

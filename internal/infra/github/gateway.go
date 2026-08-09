@@ -185,12 +185,12 @@ type PullRequestDetail struct {
 	// request, independent of any paginated file-list ceiling. Gatekeeper uses
 	// it to detect when the REST file-list endpoint omitted files past its cap.
 	ChangedFilesCount int
-	Mergeable          *bool
-	MergeableState     MergeabilityState
-	MergedAt           string
-	MergeCommitSHA     string
-	ClosingIssues      []IssueReference
-	AutoMerge          *PullRequestAutoMerge
+	Mergeable         *bool
+	MergeableState    MergeabilityState
+	MergedAt          string
+	MergeCommitSHA    string
+	ClosingIssues     []IssueReference
+	AutoMerge         *PullRequestAutoMerge
 }
 
 // PullRequestDiffStats is the provider-observed change size for a pull request.
