@@ -124,6 +124,13 @@ func SQLiteFilesystemPath(dbPath string) (string, bool, error) {
 		if parsed.Path == "" {
 			parsed.Path = parsed.Opaque
 		}
+		// SQLite also accepts the shared in-memory URI file::memory:?cache=shared
+		// without an explicit mode=memory query parameter. Treat its opaque/path
+		// spelling as non-filesystem so restore metadata and compatibility locks
+		// cannot turn the URI into a persistent file named "file::memory:...".
+		if parsed.Path == ":memory:" || parsed.Opaque == ":memory:" {
+			return "", false, nil
+		}
 		if parsed.Path == "" {
 			return "", false, fmt.Errorf("SQLite file URI has no filesystem path")
 		}
