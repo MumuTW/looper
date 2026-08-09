@@ -168,22 +168,30 @@ const (
 	ReviewerReviewEventRequestChanges ReviewerReviewEvent = "REQUEST_CHANGES"
 )
 
-type ReviewerAutoMergeStrategy string
+// MergeStrategy selects the forge merge method used by Merge Gatekeeper at
+// the auto trust level.
+type MergeStrategy string
 
 const (
-	ReviewerAutoMergeStrategySquash ReviewerAutoMergeStrategy = "squash"
-	ReviewerAutoMergeStrategyMerge  ReviewerAutoMergeStrategy = "merge"
-	ReviewerAutoMergeStrategyRebase ReviewerAutoMergeStrategy = "rebase"
+	MergeStrategySquash MergeStrategy = "squash"
+	MergeStrategyMerge  MergeStrategy = "merge"
+	MergeStrategyRebase MergeStrategy = "rebase"
+)
+
+// Deprecated reviewer auto-merge types remain only so old config snapshots and
+// source-compatible callers can be decoded long enough to receive the explicit
+// migration error. Runtime has no consumer for this policy.
+type ReviewerAutoMergeStrategy = MergeStrategy
+
+const (
+	ReviewerAutoMergeStrategySquash = MergeStrategySquash
+	ReviewerAutoMergeStrategyMerge  = MergeStrategyMerge
+	ReviewerAutoMergeStrategyRebase = MergeStrategyRebase
 )
 
 type ReviewerAutoMergeScope string
 
-const (
-	// ReviewerAutoMergeScopeLooperOnly is the Auto-merge scope: the
-	// Looper-only constraint identifying which PRs Looper may opt into
-	// auto-merge — the looper: label AND a tracked-Issue link, both required.
-	ReviewerAutoMergeScopeLooperOnly ReviewerAutoMergeScope = "looper-only"
-)
+const ReviewerAutoMergeScopeLooperOnly ReviewerAutoMergeScope = "looper-only"
 
 type CoordinatorMarkReadyScope string
 
@@ -584,12 +592,14 @@ type ReviewerThreadResolutionConfig struct {
 	MaxThreadsPerRun            int                                 `json:"maxThreadsPerRun"`
 }
 
+// ReviewerAutoMergeConfig is parse-only compatibility state. It is excluded
+// from projections and rejected when enabled.
 type ReviewerAutoMergeConfig struct {
-	Enabled                 bool                      `json:"enabled"`
-	Strategy                ReviewerAutoMergeStrategy `json:"strategy"`
-	RequireBranchProtection bool                      `json:"requireBranchProtection"`
-	TransientRetries        int                       `json:"transientRetries"`
-	Scope                   ReviewerAutoMergeScope    `json:"scope"`
+	Enabled                 bool
+	Strategy                MergeStrategy
+	RequireBranchProtection bool
+	TransientRetries        int
+	Scope                   ReviewerAutoMergeScope
 }
 
 type IssueRoleTriggersConfig struct {
@@ -662,7 +672,7 @@ type WorkerRoleConfig struct {
 type ReviewerRoleConfig struct {
 	Discovery    ReviewerRoleDiscoveryConfig `json:"discovery"`
 	Behavior     ReviewerConfig              `json:"behavior"`
-	AutoMerge    ReviewerAutoMergeConfig     `json:"autoMerge"`
+	AutoMerge    ReviewerAutoMergeConfig     `json:"-"`
 	Instructions string                      `json:"instructions,omitempty"`
 	Agent        *RoleAgentConfig            `json:"agent,omitempty"`
 }
@@ -867,11 +877,10 @@ const (
 	// GatekeeperTrustAdvise additionally publishes the verdict and its reasons on
 	// the pull request, so a human can decide without redoing the judgement.
 	GatekeeperTrustAdvise GatekeeperTrustLevel = "advise"
-	// GatekeeperTrustAuto publishes the required current-head status for GitHub
-	// branch protection on the pull request head SHA only. It never performs a
-	// merge itself: GitHub remains the merge authority. It does not publish
-	// status for GitHub native merge-queue merge-group SHAs; branch protection
-	// that requires Looper Gatekeeper on merge-group commits is unsupported.
+	// GatekeeperTrustAuto lets Gatekeeper merge what it judges eligible after a
+	// complete confirming evaluation. Legacy roles.reviewer.autoMerge.enabled
+	// configurations are rejected with an explicit migration error so Reviewer
+	// cannot remain a second merge authority.
 	GatekeeperTrustAuto GatekeeperTrustLevel = "auto"
 )
 
@@ -884,6 +893,8 @@ type GatekeeperRoleConfig struct {
 	// triggers a review-capacity gate. The normalized default is 200; an explicit
 	// zero disables the threshold.
 	RequiredReviewChangedLines int `json:"requiredReviewChangedLines,omitempty"`
+	// Strategy is used only at auto. Empty input normalizes to squash.
+	Strategy MergeStrategy `json:"strategy"`
 	// ProtectedPaths are repository-relative globs that require human review
 	// before an auto-trust merge. Empty preserves the provider-state-only gate.
 	ProtectedPaths []string `json:"protectedPaths,omitempty"`
@@ -1308,11 +1319,11 @@ type PartialReviewerThreadResolutionConfig struct {
 }
 
 type PartialReviewerAutoMergeConfig struct {
-	Enabled                 *bool                      `json:"enabled,omitempty"`
-	Strategy                *ReviewerAutoMergeStrategy `json:"strategy,omitempty"`
-	RequireBranchProtection *bool                      `json:"requireBranchProtection,omitempty"`
-	TransientRetries        *int                       `json:"transientRetries,omitempty"`
-	Scope                   *ReviewerAutoMergeScope    `json:"scope,omitempty"`
+	Enabled                 *bool          `json:"enabled,omitempty"`
+	Strategy                *MergeStrategy `json:"strategy,omitempty"`
+	RequireBranchProtection *bool          `json:"requireBranchProtection,omitempty"`
+	TransientRetries        *int           `json:"transientRetries,omitempty"`
+	Scope                   *string        `json:"scope,omitempty"`
 }
 
 type PartialInstructionsConfig struct {
@@ -1561,6 +1572,7 @@ type PartialGatekeeperRoleConfig struct {
 	Trust                      *GatekeeperTrustLevel        `json:"trust,omitempty"`
 	DiffBudget                 *PartialGatekeeperDiffBudget `json:"diffBudget,omitempty"`
 	RequiredReviewChangedLines *int                         `json:"requiredReviewChangedLines,omitempty"`
+	Strategy                   *MergeStrategy               `json:"strategy,omitempty"`
 	ProtectedPaths             *[]string                    `json:"protectedPaths,omitempty"`
 }
 

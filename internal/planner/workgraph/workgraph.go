@@ -103,6 +103,9 @@ func Build(nodes []Node) (Graph, error) {
 		if !keyPattern.MatchString(node.Key) {
 			return Graph{}, fmt.Errorf("invalid node key %q", raw.Key)
 		}
+		if !gitRefComponentUsable(node.Key) {
+			return Graph{}, fmt.Errorf("invalid node key %q: not a valid git ref component", node.Key)
+		}
 		if node.Goal == "" {
 			return Graph{}, fmt.Errorf("node %q goal is required", node.Key)
 		}
@@ -241,6 +244,23 @@ func stateFor(states map[string]State, key string) State {
 		return state
 	}
 	return StatePending
+}
+
+// gitRefComponentUsable mirrors git check-ref-format rules for one branch path
+// segment. Work-graph keys become looper/graph/<id>/<key> branch components.
+func gitRefComponentUsable(key string) bool {
+	if key == "" || strings.HasSuffix(key, ".") || strings.Contains(key, "..") {
+		return false
+	}
+	if strings.HasPrefix(key, ".") || strings.HasSuffix(key, ".lock") {
+		return false
+	}
+	for _, runeValue := range key {
+		if runeValue <= ' ' || runeValue == 0x7f || strings.ContainsRune("~^:?*[\\", runeValue) {
+			return false
+		}
+	}
+	return true
 }
 
 func cloneNode(node Node) Node {

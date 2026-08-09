@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -2317,6 +2318,76 @@ func (f *fixture) createRemoteRepo(t *testing.T, branch string) {
 	runGit(t, f.repoPath, "commit", "-m", "feature")
 	runGit(t, f.repoPath, "push", "-u", "origin", branch)
 	runGit(t, f.repoPath, "checkout", "main")
+}
+
+func TestGatewayMergeBaseResumesExistingConflictState(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/fixer")
+
+	// Make the PR branch and base edit the same line so the first merge leaves
+	// Git's real MERGE_HEAD and conflict markers in the linked worktree.
+	runGit(t, fixture.repoPath, "checkout", "feature/fixer")
+	writeFile(t, filepath.Join(fixture.repoPath, "README.md"), "feature change\n")
+	runGit(t, fixture.repoPath, "add", "README.md")
+	runGit(t, fixture.repoPath, "commit", "-m", "feature readme")
+	runGit(t, fixture.repoPath, "push", "origin", "feature/fixer")
+	runGit(t, fixture.repoPath, "checkout", "main")
+	writeFile(t, filepath.Join(fixture.repoPath, "README.md"), "base change\n")
+	runGit(t, fixture.repoPath, "add", "README.md")
+	runGit(t, fixture.repoPath, "commit", "-m", "base readme")
+	runGit(t, fixture.repoPath, "push", "origin", "main")
+
+	gateway := fixture.gateway()
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: "feature/fixer", BaseBranch: "main", PRNumber: 42, CheckoutMode: CheckoutModeDetached,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	first, err := gateway.MergeBaseIntoWorktree(ctx, MergeBaseInput{WorktreePath: worktree.WorktreePath, Remote: "origin", BaseBranch: "main"})
+	if err != nil || !first.Conflicted {
+		t.Fatalf("first MergeBaseIntoWorktree() = (%#v, %v), want conflict state", first, err)
+	}
+	inspectConflict, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.WorktreePath})
+	if err != nil || !inspectConflict.HasUnresolvedConflicts {
+		t.Fatalf("InspectHead() after conflict = (%#v, %v), want Git unmerged-index authority", inspectConflict, err)
+	}
+	mergeHead := strings.TrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "--git-path", "MERGE_HEAD"))
+	if !filepath.IsAbs(mergeHead) {
+		mergeHead = filepath.Join(worktree.WorktreePath, mergeHead)
+	}
+	if _, err := os.Stat(mergeHead); err != nil {
+		t.Fatalf("MERGE_HEAD stat = %v, want in-progress merge marker", err)
+	}
+
+	second, err := gateway.MergeBaseIntoWorktree(ctx, MergeBaseInput{WorktreePath: worktree.WorktreePath, Remote: "origin", BaseBranch: "main"})
+	if err != nil || !second.Conflicted {
+		t.Fatalf("resume MergeBaseIntoWorktree() = (%#v, %v), want existing conflict handed back", second, err)
+	}
+	if content := readFile(t, filepath.Join(worktree.WorktreePath, "README.md")); !strings.Contains(content, "<<<<<<<") {
+		t.Fatalf("README.md after resume = %q, want original conflict markers preserved", content)
+	}
+	runGit(t, worktree.WorktreePath, "merge", "--abort")
+	inspectResolved, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.WorktreePath})
+	if err != nil || inspectResolved.HasUnresolvedConflicts {
+		t.Fatalf("InspectHead() after abort = (%#v, %v), want no unresolved conflicts", inspectResolved, err)
+	}
+}
+
+func TestUnresolvedConflictFilesRecognizesAllUnmergedStatuses(t *testing.T) {
+	entries := []statusEntry{
+		{Code: "AA", Path: "add-add.txt"},
+		{Code: "DD", Path: "both-deleted.txt"},
+		{Code: "UU", Path: "both-modified.txt"},
+		{Code: " M", Path: "ordinary-change.txt"},
+	}
+	got := unresolvedConflictFiles(entries)
+	want := []string{"add-add.txt", "both-deleted.txt", "both-modified.txt"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unresolvedConflictFiles() = %#v, want %#v", got, want)
+	}
 }
 
 func (f *fixture) createUnfetchedRemoteBranch(t *testing.T, branch string) {

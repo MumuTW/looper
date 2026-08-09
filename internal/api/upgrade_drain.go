@@ -36,6 +36,15 @@ func (h *Handler) upgradeDrainStatus(begin bool) (upgradeDrainResponse, error) {
 			return upgradeDrainResponse{}, apiError{code: pkgapi.ErrorCodeServiceUnavailable, status: http.StatusServiceUnavailable, message: fmt.Sprintf("begin upgrade drain: %v", err)}
 		}
 	}
+	state := rt.AdmissionState()
 	snapshot := rt.DrainSnapshot()
-	return upgradeDrainResponse{AdmissionState: string(rt.AdmissionState()), Snapshot: snapshot, Drained: snapshot.Drained()}, nil
+	// Drained requires both closed admission and an empty supervisor work set.
+	// An idle ready daemon must not report drained:true or automation can
+	// cut over without ever closing admission.
+	closed := state == looperdruntime.AdmissionDraining || state == looperdruntime.AdmissionStopping
+	return upgradeDrainResponse{
+		AdmissionState: string(state),
+		Snapshot:       snapshot,
+		Drained:        closed && snapshot.Drained(),
+	}, nil
 }

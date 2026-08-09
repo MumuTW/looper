@@ -257,6 +257,7 @@ func DefaultConfig(cwd string) (Config, error) {
 			Auditor: AuditorRoleConfig{Enabled: false, WindowMinutes: 60},
 			Gatekeeper: GatekeeperRoleConfig{
 				RequiredReviewChangedLines: 200,
+				Strategy:                   MergeStrategySquash,
 			},
 			Coordinator: CoordinatorRoleConfig{
 				Enabled:      false,
@@ -350,13 +351,6 @@ func DefaultConfig(cwd string) (Config, error) {
 						RequireCurrentReviewRequest: true,
 						MaxThreadsPerRun:            10,
 					},
-				},
-				AutoMerge: ReviewerAutoMergeConfig{
-					Enabled:                 false,
-					Strategy:                ReviewerAutoMergeStrategySquash,
-					RequireBranchProtection: true,
-					TransientRetries:        3,
-					Scope:                   ReviewerAutoMergeScopeLooperOnly,
 				},
 			},
 			Fixer: FixerRoleConfig{

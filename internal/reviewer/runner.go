@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -33,8 +32,6 @@ import (
 	"github.com/MumuTW/looper/internal/loops/failureclass"
 	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/networkpolicy"
-	"github.com/MumuTW/looper/internal/reviewer/automerge"
-	"github.com/MumuTW/looper/internal/reviewer/criteria"
 	"github.com/MumuTW/looper/internal/reviewer/publish"
 	"github.com/MumuTW/looper/internal/reviewer/resolution"
 	"github.com/MumuTW/looper/internal/reviewer/workflow"
@@ -63,7 +60,6 @@ const (
 var reviewMarkerCommentPattern = regexp.MustCompile(`(?is)<!--\s*looper:review\b.*?-->`)
 var reviewHumanHTMLCommentPattern = regexp.MustCompile(`(?s)<!--.*?-->`)
 var reviewHumanReferenceDefinitionPattern = regexp.MustCompile(`(?m)^\s{0,3}\[[^\]\n]+\]:[^\n]*(?:\n[ \t]+[^\n]*)*`)
-var reviewerIssueClosingReferencePattern = regexp.MustCompile(`(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+((?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#\d+)\b`)
 
 const (
 	reviewerNativeResumeMetadataKey      = "reviewerNativeResume"
@@ -317,15 +313,12 @@ type GitHubGateway interface {
 	ViewPullRequestForDiscovery(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
 	GetPullRequestHeadSHA(context.Context, ViewPullRequestInput) (string, error)
-	GetRepositorySettings(context.Context, githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error)
-	GetBranchProtection(context.Context, githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error)
 	CapturePullRequestSnapshot(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error)
 	FindReviewMarker(context.Context, VerifyReviewMarkerInput) (ReviewMarkerResult, error)
 	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
 	ListIssueComments(context.Context, ViewPullRequestInput) ([]IssueComment, error)
 	UpdateIssueComment(context.Context, UpdateIssueCommentInput) error
 	SubmitReview(context.Context, githubinfra.SubmitReviewInput) error
-	EnableAutoMerge(context.Context, githubinfra.EnableAutoMergeInput) error
 	AddPullRequestReaction(context.Context, PullRequestReactionInput) error
 	RemovePullRequestReaction(context.Context, PullRequestReactionInput) error
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
@@ -421,7 +414,6 @@ type Options struct {
 	ThreadResolution        config.ReviewerThreadResolutionConfig
 	Disclosure              *config.DisclosureConfig
 	CustomInstructions      *config.Config
-	CriteriaVerifier        criteria.Verifier
 	AgentRuntime            string
 	AgentProfileID          string
 	AgentReasoningEffort    *config.ReasoningEffort
@@ -474,7 +466,6 @@ type Runner struct {
 	disclosure              config.DisclosureConfig
 	customInstructions      config.Config
 	projectRoleConfig       *config.Config
-	criteriaVerifier        criteria.Verifier
 	agentRuntime            string
 	agentProfileID          string
 	agentReasoningEffort    *config.ReasoningEffort
@@ -679,7 +670,6 @@ func New(options Options) *Runner {
 		disclosure:              disclosureCfg,
 		customInstructions:      customInstructionConfig(options.CustomInstructions),
 		projectRoleConfig:       options.CustomInstructions,
-		criteriaVerifier:        options.CriteriaVerifier,
 		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
 		agentProfileID:          strings.TrimSpace(options.AgentProfileID),
 		agentReasoningEffort:    cloneReasoningEffortPtr(options.AgentReasoningEffort),
@@ -1241,21 +1231,6 @@ func reviewRequestRequiredForCandidate(policy DiscoveryPolicy, labels []string) 
 		return false
 	}
 	return !(policy.MatchAnyTrigger && len(prQueryLabels(policy.Labels)) > 0 && config.LabelsMatch(labels, policy.Labels, policy.LabelMode))
-}
-
-func (r *Runner) reviewerAutoMergeConfigForProject(projectID string) config.ReviewerAutoMergeConfig {
-	if r.projectRoleConfig == nil {
-		return config.ReviewerAutoMergeConfig{}
-	}
-	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
-	return roles.Reviewer.AutoMerge
-}
-
-func (r *Runner) reviewerLabelNamespaceForProject(projectID string, metadataJSON *string) labels.Namespace {
-	if r == nil {
-		return labels.DefaultNamespace()
-	}
-	return config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, projectID, metadataJSON)
 }
 
 func (r *Runner) retryPolicyForProject(projectID string) config.ReviewerRetryConfig {
@@ -2614,7 +2589,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if err != nil {
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
-	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled)
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath)
 	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey)
 	metadata := map[string]any{
 		"loopType":            "reviewer",
@@ -2732,11 +2707,6 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, &runpipe.LoopError{Message: "Reviewer agent did not report a valid completion marker after publishing review", Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if cleanReviewNoopSummary(result.Summary) {
-		if reviewEvents.Clean == config.ReviewerReviewEventApprove && r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled && resolvePullRequestPhaseForNamespace(detailLabels(checkpoint.Detail), config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) != "spec" {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", CleanNoop: true}
-			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
-			return checkpoint, nil
-		}
 		if reviewEvents.Clean == config.ReviewerReviewEventApprove {
 			if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
@@ -2807,14 +2777,6 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		}
 		if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 			return checkpoint, &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
-		}
-		if criteriaResult, err := r.maybePublishCriteriaAnchoredCleanReview(ctx, input, checkpoint, pending, detail); err != nil {
-			return checkpoint, err
-		} else if criteriaResult != nil {
-			if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, criteriaResult.reviewEvent, detail, criteriaResult.marker, !criteriaResult.recordOnly); err != nil {
-				return checkpoint, err
-			}
-			return checkpoint, nil
 		}
 		reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 		if reviewEvents.Clean == config.ReviewerReviewEventApprove {
@@ -3293,423 +3255,6 @@ func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepIn
 	return nil
 }
 
-func (r *Runner) reviewerPublishFreshDetailForMutation(ctx context.Context, input stepInput, action string) (PullRequestDetail, error) {
-	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
-	if err != nil {
-		return PullRequestDetail{}, &runpipe.LoopError{Message: fmt.Sprintf("Failed to refresh pull request before %s: %v", action, err), Kind: runpipe.FailureRetryableAfterResume}
-	}
-	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, freshDetail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
-		return PullRequestDetail{}, &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
-	}
-	return freshDetail, nil
-}
-
-type linkedIssueReference struct {
-	Repo    string
-	Number  int64
-	Tracked bool
-}
-
-type criteriaPublishResult struct {
-	reviewEvent ReviewEvent
-	marker      ReviewMarkerResult
-	recordOnly  bool
-}
-
-func (r *Runner) maybePublishCriteriaAnchoredCleanReview(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, pending pendingReviewCheckpoint, detail PullRequestDetail) (*criteriaPublishResult, error) {
-	if resolvePullRequestPhaseForNamespace(detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) == "spec" {
-		return nil, nil
-	}
-	if r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON).Clean != config.ReviewerReviewEventApprove {
-		return nil, nil
-	}
-	autoMergeCfg := r.reviewerAutoMergeConfigForProject(input.Project.ID)
-	if !autoMergeCfg.Enabled {
-		return nil, nil
-	}
-	issueRef, issue, ok, err := r.resolveLinkedIssueForCriteria(ctx, input, detail)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return r.publishCleanReviewWithoutCriteria(ctx, input, checkpoint, pending, detail)
-	}
-	extracted := criteria.Extract(issue.Body)
-	if len(extracted) == 0 {
-		return r.publishCleanReviewWithoutCriteria(ctx, input, checkpoint, pending, detail)
-	}
-	verification, err := r.verifyAcceptanceCriteria(criteriaVerificationDiff(checkpoint, detail), extracted)
-	if err != nil {
-		return nil, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
-	}
-	if verification.Disposition != criteria.DispositionPass {
-		return r.publishCriteriaFailureReview(ctx, input, detail, pending, issueRef, issue, verification)
-	}
-	return r.publishCriteriaApprovedReview(ctx, input, checkpoint, pending, detail, autoMergeCfg, issueRef, verification)
-}
-
-func (r *Runner) publishCleanReviewWithoutCriteria(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, pending pendingReviewCheckpoint, detail PullRequestDetail) (*criteriaPublishResult, error) {
-	policy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
-	if policy.Clean != config.ReviewerReviewEventApprove {
-		if err := r.applyCleanNoopReviewSideEffects(ctx, input, checkpoint, detail); err != nil {
-			return nil, err
-		}
-		return &criteriaPublishResult{reviewEvent: ReviewEventComment, recordOnly: true}, nil
-	}
-	body := stampReviewBody(r.disclosure, publish.CleanApprovalBody(cleanReviewAuthorLogin(checkpoint, detail), publish.CriteriaVerificationHeading, nil, "No explicit acceptance criteria were stated on the linked issue, so this review follows the standard clean-review path."), "reviewer")
-	marker, err := r.submitOrReuseReview(ctx, input, detail, pending, ReviewEventApprove, "clean", body)
-	if err != nil {
-		return nil, err
-	}
-	if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, marker); err != nil {
-		return nil, err
-	}
-	return &criteriaPublishResult{reviewEvent: marker.Event, marker: marker}, nil
-}
-
-func (r *Runner) publishCriteriaApprovedReview(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, pending pendingReviewCheckpoint, detail PullRequestDetail, autoMergeCfg config.ReviewerAutoMergeConfig, issueRef linkedIssueReference, verification criteria.VerificationResult) (*criteriaPublishResult, error) {
-	body := stampReviewBody(r.disclosure, publish.CleanApprovalBody(cleanReviewAuthorLogin(checkpoint, detail), publish.CriteriaVerificationHeading, verification.Criteria, "I verified each stated acceptance criterion against the current PR diff before approving."), "reviewer")
-	marker, err := r.submitOrReuseReview(ctx, input, detail, pending, ReviewEventApprove, "clean", body)
-	if err != nil {
-		return nil, err
-	}
-	if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, marker); err != nil {
-		return nil, err
-	}
-	if marker.Event != ReviewEventApprove {
-		return &criteriaPublishResult{reviewEvent: marker.Event, marker: marker}, nil
-	}
-	decision, err := r.decideAutoMerge(ctx, input, detail, autoMergeCfg, issueRef)
-	if err != nil {
-		return nil, err
-	}
-	if decision.Reason == "" {
-		if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "enabling auto-merge"); err != nil {
-			return nil, err
-		}
-		if err := r.github.EnableAutoMerge(ctx, githubinfra.EnableAutoMergeInput{Repo: input.Repo, PRNumber: input.PRNumber, Strategy: decision.Strategy, HeadSHA: pending.HeadSHA, CWD: input.Project.RepoPath}); err != nil && !isAlreadyEnabledAutoMergeError(err) {
-			return nil, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
-		}
-		return &criteriaPublishResult{reviewEvent: marker.Event, marker: marker}, nil
-	}
-	if err := r.postStampedPRCommentIfMissing(ctx, input, detail, publish.AutoMergeRefusedMarker, fmt.Sprintf("Auto-merge opt-in was refused for this PR: %s.", decision.Reason)); err != nil {
-		return nil, err
-	}
-	return &criteriaPublishResult{reviewEvent: marker.Event, marker: marker}, nil
-}
-
-func (r *Runner) publishCriteriaFailureReview(ctx context.Context, input stepInput, detail PullRequestDetail, pending pendingReviewCheckpoint, issueRef linkedIssueReference, issue githubinfra.IssueDetail, verification criteria.VerificationResult) (*criteriaPublishResult, error) {
-	body := stampReviewBody(r.disclosure, publish.CriteriaFailureBody(verification.Criteria), "reviewer")
-	marker, err := r.submitOrReuseReview(ctx, input, detail, pending, ReviewEventComment, "non_blocking", body)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "applying criteria failure side effects"); err != nil {
-		return nil, err
-	}
-	freshIssue, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: issueRef.Repo, IssueNumber: issueRef.Number, CWD: input.Project.RepoPath})
-	if err != nil {
-		return nil, &runpipe.LoopError{Message: fmt.Sprintf("Failed to refresh linked issue before applying criteria failure side effects: %v", err), Kind: runpipe.FailureRetryableAfterResume}
-	}
-	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, freshIssue.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
-		return nil, &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", issueRef.Repo, issueRef.Number)}
-	}
-	namespace := r.reviewerLabelNamespaceForProject(input.Project.ID, input.Project.MetadataJSON)
-	if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: issueRef.Repo, IssueNumber: issueRef.Number, Labels: criteriaFailureLabels(freshIssue.Labels, namespace), CWD: input.Project.RepoPath}); err != nil {
-		return nil, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
-	}
-	if err := r.github.RemovePullRequestReaction(ctx, PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}); err != nil {
-		return nil, &runpipe.LoopError{Message: fmt.Sprintf("Failed to remove stale clean-review reaction before marking publish success: %v", err), Kind: runpipe.FailureRetryableAfterResume}
-	}
-	return &criteriaPublishResult{reviewEvent: ReviewEventComment, marker: marker}, nil
-}
-
-func (r *Runner) resolveLinkedIssueForCriteria(ctx context.Context, input stepInput, detail PullRequestDetail) (linkedIssueReference, githubinfra.IssueDetail, bool, error) {
-	if ref, ok := parseClosingReference(input.Repo, detail.Body); ok {
-		issue, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: ref.Repo, IssueNumber: ref.Number, CWD: input.Project.RepoPath})
-		if err != nil {
-			if linkedIssueLookupUnavailable(err) {
-				return linkedIssueReference{}, githubinfra.IssueDetail{}, false, nil
-			}
-			return linkedIssueReference{}, githubinfra.IssueDetail{}, false, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
-		}
-		if issue.IsPullRequest {
-			return linkedIssueReference{}, githubinfra.IssueDetail{}, false, nil
-		}
-		ref.Tracked = issueHasCoordinatorTracking(issue.Labels, r.reviewerLabelNamespaceForProject(input.Project.ID, input.Project.MetadataJSON))
-		return ref, issue, true, nil
-	}
-	return linkedIssueReference{}, githubinfra.IssueDetail{}, false, nil
-}
-
-func linkedIssueLookupUnavailable(err error) bool {
-	if err == nil || githubinfra.IsTransientError(err) {
-		return false
-	}
-	if githubinfra.IsNotFoundError(err) {
-		return true
-	}
-	message := strings.ToLower(githubinfra.ErrorMessage(err))
-	return strings.Contains(message, "resource not accessible") || strings.Contains(message, "http 403") || strings.Contains(message, "http 410")
-}
-
-func (r *Runner) verifyAcceptanceCriteria(rawDiff string, extracted []criteria.AcceptanceCriterion) (criteria.VerificationResult, error) {
-	verifier := r.criteriaVerifier
-	if verifier == nil {
-		verifier = criteria.NewDefaultVerifier()
-	}
-	return criteria.Verify(extracted, parseCriteriaPRDiff(rawDiff), verifier)
-}
-
-func (r *Runner) decideAutoMerge(ctx context.Context, input stepInput, detail PullRequestDetail, autoMergeCfg config.ReviewerAutoMergeConfig, issueRef linkedIssueReference) (automerge.AutoMergeDecision, error) {
-	namespace := r.reviewerLabelNamespaceForProject(input.Project.ID, input.Project.MetadataJSON)
-	decision := automerge.DecideForNamespace(
-		automerge.PRSnapshot{Labels: append([]string(nil), detail.Labels...), HasTrackedIssueLink: issueRef.Tracked},
-		autoMergeCfg,
-		automerge.BranchProtectionSnapshot{},
-		automerge.RepoSettingsSnapshot{},
-		namespace,
-	)
-	if decision.Reason == automerge.RefusalReasonDisabled || decision.Reason == automerge.RefusalReasonScope {
-		return decision, nil
-	}
-	settings, err := r.github.GetRepositorySettings(ctx, githubinfra.RepositorySettingsInput{Repo: input.Repo, CWD: input.Project.RepoPath})
-	if err != nil {
-		return automerge.AutoMergeDecision{}, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
-	}
-	protection := githubinfra.BranchProtection{}
-	if autoMergeCfg.RequireBranchProtection {
-		protection, err = r.github.GetBranchProtection(ctx, githubinfra.BranchProtectionInput{Repo: input.Repo, Branch: firstNonEmpty(detail.BaseRefName, "main"), CWD: input.Project.RepoPath})
-		if err != nil {
-			return automerge.AutoMergeDecision{}, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
-		}
-	}
-	return automerge.DecideForNamespace(
-		automerge.PRSnapshot{Labels: append([]string(nil), detail.Labels...), HasTrackedIssueLink: issueRef.Tracked},
-		autoMergeCfg,
-		automerge.BranchProtectionSnapshot{Exists: protection.Enabled, HasRequiredChecks: protection.HasRequiredChecks},
-		automerge.RepoSettingsSnapshot{AllowSquashMerge: settings.AllowSquashMerge, AllowMergeCommit: settings.AllowMergeCommit, AllowRebaseMerge: settings.AllowRebaseMerge, AllowAutoMerge: settings.AllowAutoMerge},
-		namespace,
-	), nil
-}
-
-func (r *Runner) submitOrReuseReview(ctx context.Context, input stepInput, detail PullRequestDetail, pending pendingReviewCheckpoint, event ReviewEvent, outcome string, body string) (ReviewMarkerResult, error) {
-	body = appendReviewMarker(body, agentNativeReviewMarker(input.Loop.ID, pending.HeadSHA, pending.IdempotencyKey), outcome)
-	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath)
-	if err != nil {
-		return ReviewMarkerResult{}, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
-	}
-	selfApprovalFallback := event == ReviewEventApprove && sameReviewAuthorLogin(detail.Author, currentLogin)
-	found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(reviewerCheckpoint{Detail: checkpointDetailFromDetail(detail)}, detail))
-	if err != nil {
-		return ReviewMarkerResult{}, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
-	}
-	if found.Found && strings.EqualFold(strings.TrimSpace(found.Outcome), strings.TrimSpace(outcome)) && (found.Event == event || (selfApprovalFallback && found.Event == ReviewEventComment)) {
-		return found, nil
-	}
-	submitEvent := event
-	if selfApprovalFallback {
-		submitEvent = ReviewEventComment
-	}
-	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "submitting review"); err != nil {
-		return ReviewMarkerResult{}, err
-	}
-	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
-	if err := r.github.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, Event: string(submitEvent), Body: body, CommitID: pending.HeadSHA, Disclosure: r.disclosure, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel, CWD: input.Project.RepoPath}); err != nil {
-		return ReviewMarkerResult{}, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
-	}
-	marker, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(reviewerCheckpoint{Detail: checkpointDetailFromDetail(detail)}, detail))
-	if err != nil {
-		return ReviewMarkerResult{}, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
-	}
-	if !marker.Found || !strings.EqualFold(strings.TrimSpace(marker.Outcome), strings.TrimSpace(outcome)) || (marker.Event != submitEvent && !(submitEvent == ReviewEventComment && event == ReviewEventApprove && sameReviewAuthorLogin(detail.Author, currentLogin))) {
-		return ReviewMarkerResult{}, &runpipe.LoopError{Message: fmt.Sprintf("Reviewer submitted %s review for outcome=%s but could not verify the idempotency marker", submitEvent, outcome), Kind: runpipe.FailureRetryableAfterResume}
-	}
-	return marker, nil
-}
-
-func appendReviewMarker(body string, marker string, outcome string) string {
-	if strings.Contains(body, marker) {
-		return body
-	}
-	markerBody := fmt.Sprintf("<!-- %s outcome=%s -->", strings.TrimSpace(marker), strings.TrimSpace(outcome))
-	trimmed := strings.TrimRight(body, "\n")
-	if trimmed == "" {
-		return markerBody
-	}
-	return trimmed + "\n\n" + markerBody
-}
-
-func (r *Runner) postStampedPRCommentIfMissing(ctx context.Context, input stepInput, detail PullRequestDetail, marker string, visible string) error {
-	if stampedCommentAlreadyPosted(detail.IssueComments, marker) {
-		return nil
-	}
-	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "posting PR comment"); err != nil {
-		return err
-	}
-	body := stampIssueComment(r.disclosure, visible+"\n\n"+marker, "reviewer")
-	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
-	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
-		return &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
-	}
-	return nil
-}
-
-func stampedCommentAlreadyPosted(comments []map[string]any, marker string) bool {
-	if marker == "" {
-		return false
-	}
-	for _, comment := range comments {
-		body, _ := stringFromAny(comment["body"])
-		if strings.Contains(body, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func parseCriteriaPRDiff(raw string) criteria.PRDiff {
-	files := []criteria.DiffFile{}
-	var current *criteria.DiffFile
-	for _, line := range strings.Split(raw, "\n") {
-		if strings.HasPrefix(line, "diff --git ") {
-			if current != nil {
-				files = append(files, *current)
-			}
-			path := parseDiffFilePath(line)
-			current = &criteria.DiffFile{Path: path}
-			continue
-		}
-		if current == nil {
-			continue
-		}
-		if current.Patch == "" {
-			current.Patch = line
-		} else {
-			current.Patch += "\n" + line
-		}
-	}
-	if current != nil {
-		files = append(files, *current)
-	}
-	return criteria.PRDiff{Files: files}
-}
-
-func criteriaVerificationDiff(checkpoint reviewerCheckpoint, detail PullRequestDetail) string {
-	if strings.TrimSpace(detail.Diff) != "" {
-		return detail.Diff
-	}
-	if checkpoint.Snapshot == nil || strings.TrimSpace(checkpoint.Snapshot.PayloadJSON) == "" {
-		return ""
-	}
-	payload := parseJSONObject(&checkpoint.Snapshot.PayloadJSON)
-	if diff, ok := payload["diff"].(string); ok {
-		return diff
-	}
-	return ""
-}
-
-func parseDiffFilePath(line string) string {
-	fields := strings.Fields(line)
-	if len(fields) < 4 {
-		return ""
-	}
-	path := strings.TrimPrefix(fields[3], "b/")
-	if path == fields[3] {
-		path = strings.TrimPrefix(fields[2], "a/")
-	}
-	return strings.Trim(path, `"`)
-}
-
-func parseClosingReference(defaultRepo, body string) (linkedIssueReference, bool) {
-	match := reviewerIssueClosingReferencePattern.FindStringSubmatch(body)
-	if len(match) != 2 {
-		return linkedIssueReference{}, false
-	}
-	reference := strings.TrimSpace(match[1])
-	repo, number, ok := splitIssueReference(defaultRepo, reference)
-	if !ok {
-		return linkedIssueReference{}, false
-	}
-	return linkedIssueReference{Repo: repo, Number: number}, true
-}
-
-func splitIssueReference(defaultRepo, reference string) (string, int64, bool) {
-	parts := strings.Split(reference, "#")
-	if len(parts) != 2 {
-		return "", 0, false
-	}
-	number, err := parseInt64(strings.TrimSpace(parts[1]))
-	if err != nil || number <= 0 {
-		return "", 0, false
-	}
-	repo := strings.TrimSpace(parts[0])
-	if repo == "" {
-		repo = strings.TrimSpace(defaultRepo)
-	}
-	if repo == "" {
-		return "", 0, false
-	}
-	return repo, number, true
-}
-
-func parseInt64(raw string) (int64, error) {
-	return strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
-}
-
-func criteriaFailureLabels(issueLabels []string, configured ...labels.Namespace) []string {
-	namespace := labels.DefaultNamespace()
-	if len(configured) > 0 {
-		namespace = configured[0]
-	}
-	triaged := "triaged"
-	if labels.Normalize(namespace.Prefix) != labels.Prefix {
-		triaged = namespace.Label(triaged)
-	}
-	toRemove := []string{}
-	for _, label := range issueLabels {
-		normalized := strings.ToLower(strings.TrimSpace(label))
-		if normalized == strings.ToLower(triaged) || namespace.IsConfiguredDispatch(label) {
-			toRemove = append(toRemove, label)
-		}
-	}
-	return toRemove
-}
-
-func issueHasCoordinatorTracking(issueLabels []string, configured ...labels.Namespace) bool {
-	namespace := labels.DefaultNamespace()
-	if len(configured) > 0 {
-		namespace = configured[0]
-	}
-	triaged := "triaged"
-	if labels.Normalize(namespace.Prefix) != labels.Prefix {
-		triaged = namespace.Label(triaged)
-	}
-	for _, label := range issueLabels {
-		normalized := strings.ToLower(strings.TrimSpace(label))
-		if normalized == strings.ToLower(triaged) || namespace.IsConfiguredDispatch(label) {
-			return true
-		}
-	}
-	return false
-}
-
-func isAlreadyEnabledAutoMergeError(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "auto-merge is already enabled") || strings.Contains(message, "already enabled for this pull request")
-}
-
-func stampReviewBody(cfg config.DisclosureConfig, body string, runner string) string {
-	return disclosure.Stamper{Config: cfg, Version: version.Current().Version}.Markdown(body, runner, disclosure.ChannelReviewComment)
-}
-
-func stampIssueComment(cfg config.DisclosureConfig, body string, runner string) string {
-	return disclosure.Stamper{Config: cfg, Version: version.Current().Version}.Markdown(body, runner, disclosure.ChannelIssueComment)
-}
-
 func cleanReviewNoopSummary(summary string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(summary))
 	if normalized == "" {
@@ -3906,10 +3451,14 @@ func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepIn
 	// The pr.review.posted event is the authority Gatekeeper uses for the
 	// current-head review projection. It is written before advancing the loop
 	// checkpoint so a failed local append leaves the publish step retryable.
+	outcome := normalizeCommentOnlyOutcome(pending.Outcome)
+	if outcome == "" {
+		outcome = normalizeCommentOnlyOutcome(marker.Outcome)
+	}
 	if err := r.appendEventChecked(ctx, eventInput{
 		eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID,
 		entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber),
-		payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA, "markerVerified": markerVerified},
+		payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "outcome": outcome, "headSha": pending.HeadSHA, "markerVerified": markerVerified},
 	}); err != nil {
 		return fmt.Errorf("record published review progress: append pr.review.posted: %w", err)
 	}
@@ -5947,7 +5496,7 @@ func reviewerAgentSideGitHubFetchContract() string {
 	}, "\n")
 }
 
-func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string, autoMergeEnabled bool) (string, config.CustomInstructionBlock) {
+func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) (string, config.CustomInstructionBlock) {
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
 	phase := resolvePullRequestPhaseForNamespace(detailLabels(checkpoint.Detail), config.ProjectLabelNamespace(&instructionConfig, projectID))
@@ -5990,9 +5539,6 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	cleanReviewAuthorMention := cleanReviewAuthorTarget(checkpoint)
 	cleanNoopInstruction := "For no-actionable-finding results when the clean review policy is COMMENT, do not submit a clean COMMENT or APPROVE review; finish successfully with the `No actionable findings` summary only. After Looper validates that no clean review marker was required for this run, the runner will reconcile the clean-signal +1 reaction."
 	cleanInstruction := cleanNoopInstruction
-	if autoMergeEnabled && phase != "spec" {
-		cleanInstruction = "For no-actionable-finding results on this implementation PR, do not submit a clean GitHub review yourself. Finish successfully with a summary beginning `No actionable findings`; the runner will verify the linked issue's acceptance criteria and decide whether to publish APPROVE, COMMENT, or no clean review."
-	}
 	if looperCLIPath == "" {
 		cleanInstruction = "For no-actionable-finding results, do not use the clean COMMENT no-op path and do not finish successfully because the trusted review-submit capability is unavailable; exit non-zero with the exact message `trusted looper review submit capability unavailable`."
 	}
@@ -6004,7 +5550,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		reviewerModeFlag = fmt.Sprintf(" --reviewer-manual --reviewer-run-id %s", runID)
 	}
 	actionableReviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s%s %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags)
-	if reviewEvents.Clean == config.ReviewerReviewEventApprove && looperCLIPath != "" && !(autoMergeEnabled && phase != "spec") {
+	if reviewEvents.Clean == config.ReviewerReviewEventApprove && looperCLIPath != "" {
 		cleanInstruction = fmt.Sprintf("For no-actionable-finding results when the clean review policy is APPROVE, submit exactly one APPROVE review through the trusted Looper review-submit capability with `outcome=clean`, no inline `comments`, and no extra PR conversation comment: `%s review submit %s#%d --event APPROVE --commit-id %s%s %s`. The APPROVE review body must not be empty or disclosure-only: the visible body must start with `%s`, briefly summarize what changed or what you verified, and include a warm, friendly, encouraging acknowledgement of the author's work. Then include exactly one clean review marker and any required Looper disclosure. Do not use a bare LGTM or marker/disclosure-only body; the capability rejects clean APPROVE reviews that do not start with an @mention or lack enough human-written summary text. If the authenticated GitHub user authored the pull request, the capability will downgrade the submission to a COMMENT because GitHub rejects self-approval. After Looper validates the matching APPROVED clean review marker, or the self-authored clean COMMENT fallback, the runner will reconcile the clean-signal +1 reaction and any eligible spec label transition.", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags, cleanReviewAuthorMention)
 		specLabelInstruction = "Do not transition spec-review labels yourself. Looper may transition spec-review labels only after a new matching APPROVED clean review is validated for this head, or when idempotency finds an existing matching APPROVED clean review for this head."
 	}

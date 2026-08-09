@@ -94,6 +94,9 @@ func runServicePlanCommand(ctx context.Context, subcommand string, args []string
 		return 1
 	}
 
+	// Prefer root/current/looperd when this binary lives under a release tree so
+	// activate-release can switch the supervised process without rewriting units.
+	executablePath = daemonservice.PreferReleaseCurrentExecutable(executablePath)
 	plan, err := daemonservice.Build(daemonservice.Input{
 		Config:         loaded.Config.Daemon,
 		ToolDetection:  loaded.Metadata.ToolDetection,
