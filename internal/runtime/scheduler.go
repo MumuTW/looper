@@ -2078,6 +2078,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			RequiredReviewChangedLinesForProject: func(projectID string) int {
 				return gatekeeperRequiredReviewChangedLinesForProject(cfg, projectID)
 			},
+			ProtectedPathsForProject: func(projectID string) []string {
+				return append([]string(nil), config.ProjectRoleConfigs(cfg, projectID).Gatekeeper.ProtectedPaths...)
+			},
 			LogWarn: func(msg string, fields map[string]any) {
 				if logger != nil {
 					logger.Warn(msg, fields)
