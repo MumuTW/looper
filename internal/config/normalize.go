@@ -1294,6 +1294,9 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 		if partial.Auditor.WindowMinutes != nil {
 			config.Auditor.WindowMinutes = *partial.Auditor.WindowMinutes
 		}
+		if partial.Auditor.AllowRevertProposals != nil {
+			config.Auditor.AllowRevertProposals = *partial.Auditor.AllowRevertProposals
+		}
 	}
 	if partial.Gatekeeper != nil {
 		mergeGatekeeperRoleConfig(&config.Gatekeeper, *partial.Gatekeeper)
@@ -2270,6 +2273,10 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 		if configs.Auditor.WindowMinutes != nil {
 			window := *configs.Auditor.WindowMinutes
 			auditor.WindowMinutes = &window
+		}
+		if configs.Auditor.AllowRevertProposals != nil {
+			allow := *configs.Auditor.AllowRevertProposals
+			auditor.AllowRevertProposals = &allow
 		}
 		cloned.Auditor = &auditor
 	}

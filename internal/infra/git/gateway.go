@@ -55,11 +55,14 @@ type Gateway struct {
 }
 
 type CreateWorktreeInput struct {
-	ProjectID         string
-	RepoPath          string
-	WorktreeRoot      string
-	Branch            string
-	BaseBranch        string
+	ProjectID    string
+	RepoPath     string
+	WorktreeRoot string
+	Branch       string
+	BaseBranch   string
+	// BaseSHA pins creation of a new branch to the caller's observed base
+	// commit. When empty, creation retains the ordinary live-base behavior.
+	BaseSHA           string
 	PRNumber          int64
 	ProtectedBranches []string
 	CheckoutMode      CheckoutMode
@@ -164,6 +167,39 @@ type CommitInput struct {
 
 type CommitResult struct {
 	CommitSHA string
+}
+
+type RevertCommitInput struct {
+	RepoPath     string
+	WorktreeRoot string
+	WorktreePath string
+	CommitSHA    string
+}
+
+// VerifyRevertCommitInput identifies an existing single commit that may have
+// been produced by a prior revert attempt. Verification compares the exact
+// resulting tree with the inverse of RevertedCommitSHA applied to BaseSHA.
+type VerifyRevertCommitInput struct {
+	RepoPath          string
+	WorktreeRoot      string
+	WorktreePath      string
+	BaseSHA           string
+	ExistingCommitSHA string
+	RevertedCommitSHA string
+}
+
+var commitSHAPattern = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
+
+func revertCommitArgs(parentLine string) []string {
+	fields := strings.Fields(parentLine)
+	args := []string{"revert", "--no-edit", "--no-gpg-sign"}
+	if len(fields) > 2 {
+		args = append(args, "-m", "1")
+	}
+	if len(fields) > 0 {
+		args = append(args, fields[0])
+	}
+	return args
 }
 
 type CleanupWorktreeInput struct {
@@ -322,7 +358,7 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		if branchExists {
 			addArgs = append(addArgs, worktreePath, input.Branch)
 		} else {
-			startPoint, err := g.resolveAttachedStartPoint(ctx, input.RepoPath, input.Branch, input.BaseBranch)
+			startPoint, err := g.resolveAttachedStartPoint(ctx, input.RepoPath, input.Branch, input.BaseBranch, input.BaseSHA)
 			if err != nil {
 				return storage.WorktreeRecord{}, err
 			}
@@ -1703,7 +1739,7 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 	if err := g.runGit(ctx, input.WorktreePath, nil, "add", "-A"); err != nil {
 		return CommitResult{}, err
 	}
-	if err := g.runGit(ctx, input.WorktreePath, nil, "commit", "-m", input.Message); err != nil {
+	if err := g.runGit(ctx, input.WorktreePath, nil, "commit", "--no-gpg-sign", "-m", input.Message); err != nil {
 		return CommitResult{}, err
 	}
 
@@ -1716,6 +1752,113 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 	}
 
 	return CommitResult{CommitSHA: headSHA}, nil
+}
+
+// RevertCommit creates one inverse commit in a managed, non-protected
+// worktree. A failed revert is aborted before returning so retry never adopts
+// conflict markers or an incomplete index.
+func (g *Gateway) RevertCommit(ctx context.Context, input RevertCommitInput) (CommitResult, error) {
+	if err := g.validateMutationWorktree(input.WorktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
+		return CommitResult{}, err
+	}
+	commitSHA := strings.TrimSpace(input.CommitSHA)
+	if !commitSHAPattern.MatchString(commitSHA) {
+		return CommitResult{}, fmt.Errorf("revert commit requires a commit SHA")
+	}
+	parents, err := g.runGitResult(ctx, input.WorktreePath, nil, "rev-list", "--parents", "-n", "1", commitSHA)
+	if err != nil {
+		return CommitResult{}, err
+	}
+	// A merge commit needs the default-branch parent selected explicitly;
+	// otherwise git refuses before creating the inverse commit.
+	revertArgs := revertCommitArgs(strings.TrimSpace(parents.Stdout))
+	if err := g.runGit(ctx, input.WorktreePath, nil, revertArgs...); err != nil {
+		_ = g.runGit(ctx, input.WorktreePath, nil, "revert", "--abort")
+		return CommitResult{}, err
+	}
+	headSHA, err := g.getHeadSHA(ctx, input.WorktreePath)
+	if err != nil {
+		return CommitResult{}, err
+	}
+	if headSHA == "" {
+		return CommitResult{}, fmt.Errorf("revert commit did not produce a commit SHA")
+	}
+	return CommitResult{CommitSHA: headSHA}, nil
+}
+
+// VerifyRevertCommit proves that an existing proposal commit is exactly the
+// inverse that RevertCommit would create from the frozen base. It uses a
+// temporary index, so retry verification never mutates the retained proposal
+// worktree or its branch.
+func (g *Gateway) VerifyRevertCommit(ctx context.Context, input VerifyRevertCommitInput) error {
+	if err := g.validateMutationWorktree(input.WorktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
+		return err
+	}
+	baseSHA := strings.TrimSpace(input.BaseSHA)
+	existingSHA := strings.TrimSpace(input.ExistingCommitSHA)
+	revertedSHA := strings.TrimSpace(input.RevertedCommitSHA)
+	for name, value := range map[string]string{"base SHA": baseSHA, "existing commit SHA": existingSHA, "reverted commit SHA": revertedSHA} {
+		if !commitSHAPattern.MatchString(value) {
+			return fmt.Errorf("verify revert commit requires a valid %s", name)
+		}
+	}
+
+	existingParents, err := g.runGitResult(ctx, input.WorktreePath, nil, "rev-list", "--parents", "-n", "1", existingSHA)
+	if err != nil {
+		return err
+	}
+	existingFields := strings.Fields(existingParents.Stdout)
+	if len(existingFields) != 2 || existingFields[1] != baseSHA {
+		return fmt.Errorf("existing revert commit %s is not based directly on frozen base %s", existingSHA, baseSHA)
+	}
+
+	revertedParents, err := g.runGitResult(ctx, input.WorktreePath, nil, "rev-list", "--parents", "-n", "1", revertedSHA)
+	if err != nil {
+		return err
+	}
+	revertedFields := strings.Fields(revertedParents.Stdout)
+	if len(revertedFields) < 2 {
+		return fmt.Errorf("reverted commit %s has no parent", revertedSHA)
+	}
+	diff, err := g.runGitResult(ctx, input.WorktreePath, nil, "diff", "--binary", "--full-index", revertedFields[1], revertedSHA)
+	if err != nil {
+		return err
+	}
+	if diff.StdoutTruncated {
+		return fmt.Errorf("verify revert commit diff exceeded capture limit")
+	}
+
+	verifyRoot, err := os.MkdirTemp(filepath.Dir(input.WorktreePath), ".looper-revert-verify-")
+	if err != nil {
+		return fmt.Errorf("create revert verification directory: %w", err)
+	}
+	defer os.RemoveAll(verifyRoot)
+	patchPath := filepath.Join(verifyRoot, "inverse.patch")
+	if err := os.WriteFile(patchPath, []byte(diff.Stdout), 0o600); err != nil {
+		return fmt.Errorf("write revert verification patch: %w", err)
+	}
+	indexPath := filepath.Join(verifyRoot, "index")
+	env := map[string]string{"GIT_INDEX_FILE": indexPath}
+	if err := g.runGit(ctx, input.WorktreePath, env, "read-tree", baseSHA); err != nil {
+		return fmt.Errorf("load frozen base for revert verification: %w", err)
+	}
+	if strings.TrimSpace(diff.Stdout) != "" {
+		if err := g.runGit(ctx, input.WorktreePath, env, "apply", "--cached", "--reverse", patchPath); err != nil {
+			return fmt.Errorf("apply expected inverse for revert verification: %w", err)
+		}
+	}
+	expectedTree, err := g.runGitResult(ctx, input.WorktreePath, env, "write-tree")
+	if err != nil {
+		return fmt.Errorf("write expected revert tree: %w", err)
+	}
+	actualTree, err := g.runGitResult(ctx, input.WorktreePath, nil, "rev-parse", existingSHA+"^{tree}")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(expectedTree.Stdout) != strings.TrimSpace(actualTree.Stdout) {
+		return fmt.Errorf("existing revert commit %s does not match the exact inverse of %s from base %s", existingSHA, revertedSHA, baseSHA)
+	}
+	return nil
 }
 
 func (g *Gateway) validateMutationWorktree(worktreePath, repoPath, worktreeRoot string) error {
@@ -1789,13 +1932,22 @@ func (g *Gateway) resolveDetachedStartPoint(ctx context.Context, input CreateWor
 	return "", fmt.Errorf("resolve detached start point: no local or remote ref found for branch %q or base branch %q", input.Branch, input.BaseBranch)
 }
 
-func (g *Gateway) resolveAttachedStartPoint(ctx context.Context, repoPath, branch, baseBranch string) (string, error) {
+func (g *Gateway) resolveAttachedStartPoint(ctx context.Context, repoPath, branch, baseBranch, baseSHA string) (string, error) {
 	startPoint, ok, err := g.resolveDetachedStartPointRef(ctx, repoPath, branch)
 	if err != nil {
 		return "", err
 	}
 	if ok {
 		return startPoint, nil
+	}
+	if baseSHA = strings.TrimSpace(baseSHA); baseSHA != "" {
+		if !commitSHAPattern.MatchString(baseSHA) {
+			return "", fmt.Errorf("resolve attached start point: invalid base SHA %q", baseSHA)
+		}
+		if err := g.ensureRevisionAvailable(ctx, repoPath, baseBranch, baseSHA); err != nil {
+			return "", err
+		}
+		return baseSHA, nil
 	}
 
 	startPoint, ok, err = g.resolveDetachedStartPointRef(ctx, repoPath, baseBranch)
@@ -1810,6 +1962,22 @@ func (g *Gateway) resolveAttachedStartPoint(ctx context.Context, repoPath, branc
 		return startPoint, nil
 	}
 	return "", fmt.Errorf("resolve attached start point: no local or remote ref found for base branch %q", baseBranch)
+}
+
+func (g *Gateway) ensureRevisionAvailable(ctx context.Context, repoPath, baseBranch, baseSHA string) error {
+	if _, err := g.getRevision(ctx, repoPath, baseSHA+"^{commit}"); err == nil {
+		return nil
+	}
+	if strings.TrimSpace(baseBranch) == "" {
+		return fmt.Errorf("resolve attached start point: base SHA %s is not available locally and base branch is empty", baseSHA)
+	}
+	if err := g.runGit(ctx, repoPath, nil, "fetch", "origin", fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", baseBranch, baseBranch)); err != nil {
+		return fmt.Errorf("fetch base branch for pinned SHA %s: %w", baseSHA, err)
+	}
+	if _, err := g.getRevision(ctx, repoPath, baseSHA+"^{commit}"); err != nil {
+		return fmt.Errorf("resolve attached start point: pinned base SHA %s is unavailable after fetching %s: %w", baseSHA, baseBranch, err)
+	}
+	return nil
 }
 
 func (g *Gateway) resolveDetachedStartPointRef(ctx context.Context, repoPath, branch string) (string, bool, error) {

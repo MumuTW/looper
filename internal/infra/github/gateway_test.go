@@ -991,22 +991,22 @@ func TestViewPullRequestForGatekeeperRetriesWithoutOptionalClosingIssues(t *test
 	}
 }
 
-func TestViewPullRequestForGatekeeperDoesNotRetryProviderFailures(t *testing.T) {
+func TestViewPullRequestForGatekeeperDoesNotRetryUnrelatedErrors(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
 	call := 0
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		call++
 		if !strings.Contains(strings.Join(options.Args, " "), "closingIssuesReferences") {
-			t.Fatalf("gatekeeper view args = %q, want optional field on the only attempt", strings.Join(options.Args, " "))
+			t.Fatalf("gatekeeper view args = %q, want original optional provenance field", strings.Join(options.Args, " "))
 		}
-		return shell.Result{}, errors.New("rate limit exceeded")
+		return shell.Result{}, errors.New("authentication failed")
 	}
 
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
 	_, err := gateway.ViewPullRequestForGatekeeper(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
-	if err == nil || call != 1 {
-		t.Fatalf("ViewPullRequestForGatekeeper() error=%v calls=%d, want one provider attempt", err, call)
+	if err == nil || !strings.Contains(err.Error(), "authentication failed") || call != 1 {
+		t.Fatalf("ViewPullRequestForGatekeeper() = %v; calls=%d, want one unchanged error", err, call)
 	}
 }
 
@@ -3077,6 +3077,35 @@ func TestGatewayCloseIssueUsesTypedReasonAndIsIdempotent(t *testing.T) {
 	}
 	if strings.Contains(log, "issue close 9 --repo acme/looper") {
 		t.Fatalf("gh log unexpectedly closed an already-closed issue\n%s", log)
+	}
+}
+
+func TestGatewayReopenIssueIsIdempotent(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		switch args := strings.Join(options.Args, " "); args {
+		case "api repos/acme/looper/issues/8 --jq .state":
+			return shell.Result{Stdout: "closed\n"}, nil
+		case "issue reopen 8 --repo acme/looper":
+			return shell.Result{}, nil
+		case "api repos/acme/looper/issues/9 --jq .state":
+			return shell.Result{Stdout: "open\n"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.ReopenIssue(context.Background(), ReopenIssueInput{Repo: "acme/looper", IssueNumber: 8}); err != nil {
+		t.Fatalf("ReopenIssue(closed) error = %v", err)
+	}
+	if err := gateway.ReopenIssue(context.Background(), ReopenIssueInput{Repo: "acme/looper", IssueNumber: 9}); err != nil {
+		t.Fatalf("ReopenIssue(open) error = %v", err)
+	}
+	if strings.Contains(strings.Join(runner.calls, "\n"), "issue reopen 9") {
+		t.Fatalf("reopened already-open issue: %#v", runner.calls)
 	}
 }
 
