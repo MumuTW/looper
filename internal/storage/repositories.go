@@ -1321,21 +1321,6 @@ func (r *LoopsRepository) issueClaimAdmissionRequired(ctx context.Context, curre
 	if !domain.IsConflictingActiveLoopStatus(domain.LoopStatus(candidate.Status)) {
 		return false, nil
 	}
-	if current != nil && current.Type == string(domain.LoopTypePlanner) && candidate.Type == string(domain.LoopTypePlanner) {
-		currentClaim, currentClaimsIssue, err := r.issueClaimForLoop(ctx, *current)
-		if err != nil {
-			return false, err
-		}
-		candidateClaim, candidateClaimsIssue, err := r.issueClaimForLoop(ctx, candidate)
-		if err != nil {
-			return false, err
-		}
-		if currentClaimsIssue && candidateClaimsIssue && currentClaim.issueNumber == candidateClaim.issueNumber && strings.EqualFold(currentClaim.repo, candidateClaim.repo) {
-			// Reactivation resumes this planner's existing lifecycle; its normal
-			// downstream worker is not a competing new-planner admission.
-			return false, nil
-		}
-	}
 	if current == nil || !domain.IsConflictingActiveLoopStatus(domain.LoopStatus(current.Status)) {
 		return true, nil
 	}
@@ -1352,6 +1337,11 @@ func (r *LoopsRepository) issueClaimAdmissionRequired(ctx context.Context, curre
 		return false, nil
 	}
 	if !currentClaimsIssue {
+		return true, nil
+	}
+	if current.ID == candidate.ID && candidate.Type == string(domain.LoopTypePlanner) {
+		// Planner refresh/resume must rescan the complete claim set. Skipping
+		// admission here can reactivate an older planner beside a newer owner.
 		return true, nil
 	}
 	return currentClaim.issueNumber != candidateClaim.issueNumber || !strings.EqualFold(currentClaim.repo, candidateClaim.repo), nil

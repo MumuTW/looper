@@ -288,7 +288,7 @@ func validReviewerMarkerOutcome(payload string) bool {
 	}
 	if encoded, ok := raw["type"]; ok {
 		var resultType string
-		if json.Unmarshal(encoded, &resultType) != nil || strings.EqualFold(strings.TrimSpace(resultType), "rate_limit") {
+		if json.Unmarshal(encoded, &resultType) != nil || strings.TrimSpace(resultType) != "" {
 			return false
 		}
 	}

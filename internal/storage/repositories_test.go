@@ -98,7 +98,7 @@ func TestIssueClaimAdmissionIncludesPlannersCaseInsensitively(t *testing.T) {
 	}
 }
 
-func TestIssueClaimAdmissionAllowsExistingPlannerToResumeWithDownstreamWorker(t *testing.T) {
+func TestIssueClaimAdmissionRejectsPlannerResumeBesideActiveWorker(t *testing.T) {
 	ctx := context.Background()
 	repos := NewRepositories(openMigratedCoordinatorForRepositories(t).DB())
 	startedAt := "2026-07-31T00:00:00.000Z"
@@ -115,8 +115,10 @@ func TestIssueClaimAdmissionAllowsExistingPlannerToResumeWithDownstreamWorker(t 
 	}
 	planner.Status = "running"
 	planner.UpdatedAt = "2026-07-31T00:01:00.000Z"
-	if err := repos.Loops.Upsert(ctx, planner); err != nil {
-		t.Fatalf("resume existing planner: %v", err)
+	if err := repos.Loops.Upsert(ctx, planner); err == nil {
+		t.Fatal("resume existing planner error = nil, want active-worker conflict")
+	} else if conflict, ok := IsIssueClaimConflictError(err); !ok || conflict.LoopID != "downstream_worker" {
+		t.Fatalf("resume existing planner error = %v, want downstream_worker conflict", err)
 	}
 }
 
