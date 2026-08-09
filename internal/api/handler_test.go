@@ -1444,7 +1444,7 @@ func TestHandlerStatusUsesLiveConfigForReviewPublishReadiness(t *testing.T) {
 
 func TestBuildConfigResponseExposesCanonicalCodingRoles(t *testing.T) {
 	_, cfg := startTestRuntime(t)
-	cfg.Roles.Gatekeeper = config.GatekeeperRoleConfig{Trust: config.GatekeeperTrustAuto, Strategy: config.MergeStrategyRebase}
+	cfg.Roles.Gatekeeper = config.GatekeeperRoleConfig{Trust: config.GatekeeperTrustAuto}
 	cfg.Roles.Escalator = config.EscalatorRoleConfig{Enabled: true, CadenceSeconds: 600, MaxItems: 42}
 	worker := config.EffectiveCodingRoles(cfg.Roles)[config.CodingRoleWorker]
 	worker.Priority = 7
@@ -1459,7 +1459,7 @@ func TestBuildConfigResponseExposesCanonicalCodingRoles(t *testing.T) {
 	if response.Roles.Worker.AutoDiscovery == got.Discovery.Enabled {
 		t.Fatal("test setup did not retain a divergent legacy worker field")
 	}
-	if response.Roles.Gatekeeper.Trust != config.GatekeeperTrustAuto || response.Roles.Gatekeeper.Strategy != config.MergeStrategyRebase {
+	if response.Roles.Gatekeeper.Trust != config.GatekeeperTrustAuto {
 		t.Fatalf("roles.gatekeeper = %#v, want inspectable auto/rebase authority", response.Roles.Gatekeeper)
 	}
 	if !response.Roles.Escalator.Enabled || response.Roles.Escalator.CadenceSeconds != 600 || response.Roles.Escalator.MaxItems != 42 {

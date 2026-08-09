@@ -105,7 +105,6 @@ func TestIsHotEditablePathUsesExplicitAllowlist(t *testing.T) {
 		"hitl.github.mentionLogins",
 		"notifications.webhook.verificationTokenEnv",
 		"roles.gatekeeper.trust",
-		"roles.gatekeeper.strategy",
 		"roles.coordinator.enabled",
 		"roles.coordinator.dependencies.enabled",
 		"roles.coordinator.agent",

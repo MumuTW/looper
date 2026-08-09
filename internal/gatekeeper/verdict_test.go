@@ -174,9 +174,9 @@ func TestAdviseUpdatesTheExistingVerdictInPlace(t *testing.T) {
 	}
 }
 
-// An unchanged verdict must cost nothing at all — not a write, and not the reads
-// that would be needed to discover there is nothing to write. A quiet pull
-// request otherwise pays a comment page and a user lookup every tick.
+// An unchanged verdict must not rewrite the owned comment or scan its discussion
+// again. Routing labels are intentionally reconciled separately on every
+// published evaluation so an external label edit cannot disable the queue route.
 func TestUnchangedVerdictPerformsNoForgeCalls(t *testing.T) {
 	t.Parallel()
 	github := &fakeGatekeeperGitHub{}

@@ -1351,13 +1351,6 @@ func mergeGatekeeperRoleConfig(config *GatekeeperRoleConfig, partial PartialGate
 	if partial.ProtectedPaths != nil {
 		config.ProtectedPaths = cloneStrings(*partial.ProtectedPaths)
 	}
-	if partial.Strategy != nil {
-		strategy := MergeStrategy(strings.TrimSpace(string(*partial.Strategy)))
-		if strategy == "" {
-			strategy = MergeStrategySquash
-		}
-		config.Strategy = strategy
-	}
 	if partial.RequiredReviewChangedLines != nil {
 		config.RequiredReviewChangedLines = *partial.RequiredReviewChangedLines
 	}
@@ -2290,10 +2283,6 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			gatekeeper.Trust = &trust
 		}
 		gatekeeper.DiffBudget = clonePartialGatekeeperDiffBudget(configs.Gatekeeper.DiffBudget)
-		if configs.Gatekeeper.Strategy != nil {
-			strategy := *configs.Gatekeeper.Strategy
-			gatekeeper.Strategy = &strategy
-		}
 		if configs.Gatekeeper.RequiredReviewChangedLines != nil {
 			threshold := *configs.Gatekeeper.RequiredReviewChangedLines
 			gatekeeper.RequiredReviewChangedLines = &threshold

@@ -64,16 +64,23 @@ type PRSnapshot struct {
 	PRNumber               int64
 	IssueNumber            int64
 	HeadSHA                string
+	MergeCommitSHA         string
+	MergeStrategy          string
+	SourceIssueRepo        string
 	MergedAt               string
+	MergedBy               string
 	Merged                 bool
 	Open                   bool
 	AutoMergeEnabled       bool
 	AutoMergeOwnedByLooper bool
-	HasLooperLabel         bool
-	Mergeable              *bool
-	MergeableState         githubinfra.MergeabilityState
-	RequiredChecks         RequiredCheckSummary
-	TemporaryError         *TemporaryError
+	// AutoMergeRouteEnabled is true for either GitHub auto-merge owned by
+	// Looper or the repository's Mergify auto-merge label route.
+	AutoMergeRouteEnabled bool
+	HasLooperLabel        bool
+	Mergeable             *bool
+	MergeableState        githubinfra.MergeabilityState
+	RequiredChecks        RequiredCheckSummary
+	TemporaryError        *TemporaryError
 }
 
 type WatchAction struct {
@@ -99,7 +106,7 @@ func Classify(snapshot PRSnapshot, prior *PriorWatchMarker, budget RetryBudget) 
 	if snapshot.Merged {
 		return WatchAction{Kind: ActionMerged}
 	}
-	if prior != nil && prior.PRNumber == snapshot.PRNumber && !snapshot.AutoMergeEnabled {
+	if prior != nil && prior.PRNumber == snapshot.PRNumber && !snapshot.AutoMergeEnabled && !snapshot.AutoMergeRouteEnabled {
 		return WatchAction{Kind: ActionHumanDisabledAutoMerge}
 	}
 	if snapshot.Mergeable == nil || snapshot.MergeableState.IsUnknown() {

@@ -274,7 +274,6 @@ func DefaultConfig(cwd string) (Config, error) {
 			Auditor: AuditorRoleConfig{Enabled: false, WindowMinutes: 60},
 			Gatekeeper: GatekeeperRoleConfig{
 				RequiredReviewChangedLines: 200,
-				Strategy:                   MergeStrategySquash,
 			},
 			Coordinator: CoordinatorRoleConfig{
 				Enabled:      false,

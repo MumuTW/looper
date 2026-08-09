@@ -13,15 +13,61 @@ import (
 	"github.com/MumuTW/looper/internal/storage"
 )
 
-// Post-merge digest events are intentionally ordinary EventLog records. The
-// digest consumes these durable observations instead of querying GitHub at
-// report time, so a daily report has one local source of truth.
+// CoordinatorPullRequestMergedEventType records a merge-watch observation of
+// a pull request merged by the forge (including Mergify). The forge's
+// MergedAt value in the payload is the merge-time authority; CreatedAt is only
+// when the daemon observed it.
+const CoordinatorPullRequestMergedEventType = "coordinator.pull_request.merged"
+
+// Post-merge digest events are ordinary EventLog records so downstream
+// consumers have one durable local source of truth.
 const (
-	CoordinatorPullRequestMergedEventType  = "coordinator.pull_request.merged"
 	CoordinatorCloseAndRegenerateEventType = "coordinator.close_and_regenerate"
 	FixerCloseAndRegenerateEventType       = "fixer.close_and_regenerate"
 	PostMergeDigestSentEventType           = "coordinator.post_merge_digest.sent"
 )
+
+// CoordinatorPullRequestMerged is the durable payload for a merge-watch merge
+// observation. It carries the identity needed by downstream audit consumers
+// without requiring another forge read.
+type CoordinatorPullRequestMerged struct {
+	Version        int            `json:"version"`
+	ProjectID      string         `json:"projectId"`
+	Repo           string         `json:"repo"`
+	PRNumber       int64          `json:"prNumber"`
+	IssueNumber    int64          `json:"issueNumber,omitempty"`
+	HeadSHA        string         `json:"headSha"`
+	MergeCommitSHA string         `json:"mergeCommitSha,omitempty"`
+	MergeStrategy  string         `json:"mergeStrategy,omitempty"`
+	SourceIssue    IssueReference `json:"sourceIssue,omitempty"`
+	MergedAt       string         `json:"mergedAt"`
+}
+
+type IssueReference struct {
+	Number int64  `json:"number"`
+	Repo   string `json:"repo"`
+}
+
+// CoordinatorRoutedMergeWatchEventType records that a routed pull request (one
+// carrying the Mergify auto-merge route label) is under merge-watch
+// independent of issue discovery. The open-issue loop loses a routed merge the
+// moment its body closes the tracked issue, so this registry keeps the PR
+// number durable until the merge (or a non-merge close) is observed.
+const CoordinatorRoutedMergeWatchEventType = "coordinator.routed_merge_watch"
+
+// CoordinatorRoutedMergeWatch is the durable payload for one routed-PR
+// merge-watch registration. Settled marks a terminal observation (merged and
+// recorded, closed without merge, or handed to a competing human-owned native
+// auto-merge route); the reader keeps the newest record per entity.
+type CoordinatorRoutedMergeWatch struct {
+	Version   int    `json:"version"`
+	Revision  int64  `json:"revision,omitempty"`
+	ProjectID string `json:"projectId"`
+	Repo      string `json:"repo"`
+	PRNumber  int64  `json:"prNumber"`
+	HeadSHA   string `json:"headSha"`
+	Settled   bool   `json:"settled,omitempty"`
+}
 
 type AppendInput struct {
 	ID               string
