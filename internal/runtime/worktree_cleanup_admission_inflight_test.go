@@ -11,7 +11,7 @@ import (
 // Contract (#592 review): CleanupWorktree does not hold admission.mu, so
 // MarkDegraded can close admission and cancel producers while git remove is
 // in flight. The in-flight remove may still finish; durable cleaned is gated
-// under a short post-command WithAllowClaim hold.
+// under a short post-command WithAllowLifecycleWork hold.
 func TestWorktreeCleanupInFlightDoesNotHoldAdmissionAcrossCleanup(t *testing.T) {
 	t.Parallel()
 

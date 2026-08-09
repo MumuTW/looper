@@ -11,10 +11,12 @@ import (
 	"testing"
 	"time"
 
+	agentpkg "github.com/MumuTW/looper/internal/agent"
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/disclosure"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/lifecycle"
+	"github.com/MumuTW/looper/internal/loops/brownout"
 	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
@@ -795,6 +797,42 @@ func TestRunWriteSpecStepRechecksPlannerHoldBeforeStartingAgent(t *testing.T) {
 	}
 }
 
+func TestRunWriteSpecStepRejectsWorkGraphWhenAutoPushDisabled(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	worktreeRoot := t.TempDir()
+	worktreePath := filepath.Join(worktreeRoot, "wt")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	issue := &checkpointIssue{Repo: "acme/looper", IssueNumber: 339, Title: "Stack work", SpecPath: "specs/339.md"}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, issue.Repo, IssueSummary{Number: issue.IssueNumber, Title: issue.Title}, buildPlannerDiscoveryFingerprint(issue.Repo, fixture.now(), IssueSummary{Number: issue.IssueNumber, Title: issue.Title}))
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	runID := "run_write_spec_graph_manual"
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopResult.record.ID, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	payload := `{"summary":"decomposed","workGraph":{"nodes":[{"key":"storage","goal":"Persist graph","acceptanceCriteria":["migration"],"expectedPrScope":"storage"}]}}`
+	allowAutoPush := false
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "decomposed", CompletionPayload: payload}}}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: &allowAutoPush})
+
+	_, err = runner.runWriteSpecStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir(), MetadataJSON: &metadata},
+		Loop:    loopResult.record,
+		Run:     storage.RunRecord{ID: runID, LoopID: loopResult.record.ID},
+		Checkpoint: plannerCheckpoint{
+			Issue: issue, Worktree: &checkpointWorktree{Path: worktreePath, Branch: "looper/planner/339-stack", BaseBranch: "main"},
+		},
+	})
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureNonRetryable || !strings.Contains(loopErr.Message, "allowAutoPush=false") {
+		t.Fatalf("runWriteSpecStep() error = %v, want non-retryable allowAutoPush rejection", err)
+	}
+}
+
 func TestRunWriteSpecStepPersistsStructuredWorkGraphAndQueuesOnlyRoot(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -814,7 +852,8 @@ func TestRunWriteSpecStepPersistsStructuredWorkGraphAndQueuesOnlyRoot(t *testing
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 	payload := `{"summary":"decomposed","workGraph":{"nodes":[{"key":"storage","goal":"Persist graph","acceptanceCriteria":["migration"],"expectedPrScope":"storage"},{"key":"api","goal":"Expose graph","acceptanceCriteria":["route"],"dependencies":["storage"],"expectedPrScope":"api"}]}}`
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "decomposed", CompletionPayload: payload}}}, Logger: fixture.logger, Now: fixture.now})
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "decomposed", CompletionPayload: payload}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
 
 	checkpoint, err := runner.runWriteSpecStep(context.Background(), stepInput{
 		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir(), MetadataJSON: &metadata},
@@ -826,6 +865,15 @@ func TestRunWriteSpecStepPersistsStructuredWorkGraphAndQueuesOnlyRoot(t *testing
 	})
 	if err != nil {
 		t.Fatalf("runWriteSpecStep() error = %v", err)
+	}
+	if len(agent.starts) != 1 || agent.starts[0].CompletionContract != agentpkg.CompletionContractPlannerMarker || agent.starts[0].CompletionValidator == nil {
+		t.Fatalf("agent start = %#v, want Planner optional-marker contract and validator", agent.starts)
+	}
+	if !agent.starts[0].CompletionValidator(`{"summary":"single-worker handoff"}`) || !agent.starts[0].CompletionValidator(payload) {
+		t.Fatal("Planner completion validator rejected valid marker payloads")
+	}
+	if agent.starts[0].CompletionValidator(`{"summary":"done","workGraph":{"nodes":[]}}`) {
+		t.Fatal("Planner completion validator accepted an invalid work graph")
 	}
 	if checkpoint.WriteSpec == nil || checkpoint.WriteSpec.WorkGraphID == "" {
 		t.Fatalf("checkpoint.WriteSpec = %#v, want persisted graph id", checkpoint.WriteSpec)
@@ -1512,6 +1560,42 @@ func TestWriteSpecFailureMarksRunQueueLoop(t *testing.T) {
 	}
 	if loop == nil || loop.Status != "queued" {
 		t.Fatalf("loop = %#v, want queued for retry", loop)
+	}
+}
+
+func TestPlannerProviderBrownoutRequeuesClaimWithoutChargingAttempt(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed"}}, waitErr: errors.Join(agentpkg.ErrProviderBrownout, brownout.ErrOpen)}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+
+	_, _ = runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "planner-worker-1", "planner")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient {
+		t.Fatalf("result = %#v, want retryable brownout failure", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "queued" || queue.Attempts != claim.Attempts {
+		t.Fatalf("queue = %#v, want queued without charging attempt from %d", queue, claim.Attempts)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop = %#v, want queued for brownout retry", loop)
 	}
 }
 

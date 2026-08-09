@@ -220,6 +220,50 @@ func signalNotifierOrDefault(notifier SignalNotifier) SignalNotifier {
 	return osSignalNotifier{}
 }
 
+// ValidateConfiguredToolPaths is the read-only tool-path prerequisite check
+// shared by Bootstrap and looperd --check-config. It only inspects paths the
+// operator explicitly configured; detected/default paths are not required to
+// exist for a config-compatibility report.
+func ValidateConfiguredToolPaths(cfg config.Config, detection map[string]config.ToolDetectionStatus) error {
+	return validateConfiguredToolPaths(cfg, detection)
+}
+
+// ValidateSandboxRuntime is the read-only sandbox readiness check shared by
+// Bootstrap and looperd --check-config. check defaults to the process sandbox
+// Available probe when nil. Prefer ValidateSandboxRuntimeForConfig when the
+// daemon working directory is known so the probe matches service startup.
+func ValidateSandboxRuntime(cfg config.Config, check func() error) error {
+	if check == nil {
+		check = processsandbox.Available
+	}
+	return validateSandboxRuntime(cfg, check)
+}
+
+// ValidateSandboxRuntimeForConfig runs the sandbox readiness check in the
+// environment the configured daemon mode actually boots with.
+func ValidateSandboxRuntimeForConfig(cfg config.Config) error {
+	cwd := strings.TrimSpace(cfg.Daemon.WorkingDirectory)
+	if cwd == "" {
+		var err error
+		cwd, err = os.Getwd()
+		if err != nil {
+			return fmt.Errorf("determine working directory for sandbox check: %w", err)
+		}
+	}
+	return validateSandboxRuntime(cfg, func() error {
+		// foreground inherits the invoking shell PATH; supervised units use a
+		// manager-default PATH (see processsandbox.ServiceProbePATH*).
+		switch cfg.Daemon.Mode {
+		case config.DaemonModeLaunchd:
+			return processsandbox.AvailableInServiceEnvironment(cwd, processsandbox.ServiceProbePATHLaunchd)
+		case config.DaemonModeSystemd:
+			return processsandbox.AvailableInServiceEnvironment(cwd, processsandbox.ServiceProbePATHSystemd)
+		default:
+			return processsandbox.AvailableInDirectory(cwd)
+		}
+	})
+}
+
 func validateConfiguredToolPaths(cfg config.Config, detection map[string]config.ToolDetectionStatus) error {
 	checks := []struct {
 		statusKey string

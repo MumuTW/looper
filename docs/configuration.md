@@ -99,14 +99,14 @@ The hot-safe surface is an explicit allowlist (see [ADR-0014](adr/0014-config-fi
 - the current `disclosure.*` fields
 - `defaults.allowAutoCommit`, `defaults.allowAutoPush`, `defaults.allowRiskyFixes`, `defaults.openPrStrategy`, and `defaults.addSnapshotMode`; `defaults.baseBranch` is restart-bound because configured project records materialize it
 - `instructions.enabled` only
-- the current Planner discovery/trigger/instruction fields; all current Worker and Fixer discovery/trigger/instruction fields; Reviewer discovery, most behavior, and instructions; and Coordinator polling, triage, dispatch, and merge-watch policy except `mergeWatch.transientRetries`
+- the current Planner discovery/trigger/instruction fields; all current Worker and Fixer discovery/trigger/instruction fields; Reviewer discovery, most behavior, and instructions; and Coordinator polling, triage, dispatch, merge-watch, and conflict-policy fields except `mergeWatch.transientRetries`
 - `tools.looperPath` and `tools.osascriptPath`
 
 Profile and role agent vendor/model/reasoning-effort fields are hot-safe curated identity fields: a claim made after publication resolves against the new config; an already active run keeps the frozen agent snapshot it started with (resume/retry lineages copy that predecessor snapshot rather than re-resolving live config).
 
 `agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and no explicit model is being silently carried across vendors. If `agent.model` is set, change or unset it in the same candidate; an unchanged explicit model blocks that vendor-to-vendor switch. Clearing a configured vendor uses the same guard, so a retained profile cannot be laundered through an intermediate `null`. The same leave/switch guards apply to each coding role's *resolved* vendor after global → profile → role overlay. Configuring the first vendor may use an already prepared model/params profile. Continuations of failed or interrupted runs copy the predecessor's durable `agent_snapshot_json` (sticky identity across the retry lineage) while retaining checkpoint, worktree, HITL answer, and queued human instructions. Only legacy predecessors with a null snapshot adopt the runner's current resolved identity. Looper never sends an old vendor's native session ID to a different CLI.
 
-Notably, `agent.nativeResume`, `agent.params`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `intake.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
+Notably, `agent.nativeResume`, `agent.params`, `roles.coordinator.enabled`, `roles.gatekeeper.*`, `instructions.maxBytes`, all `hitl.*`, all `intake.*`, all `notifications.webhook.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
 
 Deprecated file-layer aliases for `agent.timeouts.{planner,worker,reviewer,fixer}Seconds`, `defaults.allowAutoApprove`, and `defaults.fixAllPullRequests` are normalized into their canonical hot-safe fields so existing files can still reload without a restart. They remain file-only compatibility syntax: the dashboard exposes and writes only canonical paths, and a canonical dashboard edit removes the corresponding alias leaf so a later unset cannot resurrect the old value.
 
@@ -504,7 +504,7 @@ All role-specific config lives under `roles.<role>`.
 
 `roles.coding` is the canonical runtime registry for the four compiled agent runners: `planner`, `worker`, `reviewer`, and `fixer`. Its `priority`, `discovery`, `instructions`, and `agent` fields drive the scheduler, runner policy, prompt instructions, and agent identity.
 
-The existing named `roles.<name>.*` sections remain supported as compatibility input: Looper projects them into the registry first, then overlays the matching `roles.coding.<name>` fields. This means a legacy-only configuration keeps its behavior, while an authored registry entry wins for the fields it sets. Reviewer-only behavior such as `autoMerge`, `behavior`, and `specReview` remains under `roles.reviewer.*` because only the reviewer runner implements it.
+The existing named `roles.<name>.*` sections remain supported as compatibility input: Looper projects them into the registry first, then overlays the matching `roles.coding.<name>` fields. This means a legacy-only configuration keeps its behavior, while an authored registry entry wins for the fields it sets. Reviewer-only behavior such as `behavior` and `specReview` remains under `roles.reviewer.*` because only the reviewer runner implements it.
 
 - Only `planner`, `worker`, `reviewer`, and `fixer` are valid keys. Any other name is rejected because no compiled runner could execute it.
 - `gatekeeper` is a compiled policy role, not an authorable registry entry. Its source, priority, and policy cannot be overridden.
@@ -587,6 +587,14 @@ Coordinator triage lives under `roles.coordinator.triage.*`:
 | `roles.coordinator.triage.disposition.reTriageOnAuthorReply` | Re-opens the triage loop when the original author clarifies a `needs-info` issue | `true` |
 
 Coordinator clears and rewrites its own label namespace on each successful triage pass: `kind/*`, `area/*`, `complexity/*`, `<namespace>dispatch:*`, `wontfix`, and `needs-info`. Bare `dispatch/*` labels are foreign host state and are never removed. It then posts or edits the marker comment and writes the project-scoped completion marker last.
+
+### Conflict-repair policy
+
+Coordinator carries the conflict count in the durable merge-watch comment, so it survives daemon restarts and continues across new PR head SHAs. When the limit is reached, the existing Fixer close-and-regenerate authority closes a Looper-authored PR and sends its originating Issue back to Planner. PRs with human commits are escalated with `looper:needs-human` instead.
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.coordinator.conflictPolicy.maxRepairs` | Number of merge-conflict repairs allowed for one PR before close-and-regenerate | `2` |
 
 ### Dispatch settings
 
@@ -712,6 +720,9 @@ outOfScopeLabel = "wontfix"
 unclearLabel = "needs-info"
 reTriageOnAuthorReply = true
 
+[roles.coordinator.conflictPolicy]
+maxRepairs = 2
+
 [roles.coordinator.dispatch]
 mode = "human-gated"
 assignTo = ""
@@ -787,49 +798,9 @@ reReviewPromptOnHeadChange = false
 
 The reviewer defaults above are intentionally aggressive: clean reviews publish `APPROVE`, blocking reviews publish `REQUEST_CHANGES`, and `enableSelfReview` still defaults to `false`.
 
-### Reviewer convergence settings
+### Removed Reviewer auto-merge
 
-`roles.reviewer.behavior.convergence.*` is the per-project authority for
-semantic Reviewer↔Fixer loop bounds. The structured `looper:review-item`
-severity marker remains the forge authority; the reviewer persists only the
-observed round history and decision in the existing loop metadata.
-
-| Path | Purpose | Default | Valid values |
-| --- | --- | --- | --- |
-| `roles.reviewer.behavior.convergence.maxConsecutiveUnproductive` | Consecutive rounds with no new item or explicit resolution before human escalation | `3` | positive integers |
-| `roles.reviewer.behavior.convergence.maxFixerAttemptsPerItem` | Distinct structured Fixer attempts allowed for one open item before it is deferred | `4` | positive integers |
-| `roles.reviewer.behavior.convergence.maxTotalRounds` | Absolute runaway backstop, reported separately from a stall | `40` | positive integers |
-| `roles.reviewer.behavior.convergence.severityFloor` | Lowest severity that continues the loop and blocks progress | `"non_blocking"` | `"blocking"`, `"non_blocking"`, `"all"` |
-
-When a stall or absolute ceiling fires, Reviewer records the reason, round
-history, and open item IDs in loop metadata and parks the loop as
-`awaiting_human`; the HITL answer `resume` resets only the stall counter,
-while `close` ends that reviewer loop. Global role leaves are hot-reloadable
-for new claims; project catalog changes retain the normal project restart
-boundary. An already-started loop keeps the policy snapshot stored with its
-convergence state.
-
-The loop API projects this stored state as `loop.convergence`. The dashboard's
-Loop Detail view shows the round budget, consecutive-unproductive counter,
-current open items, and recent productive/unproductive round history. This is
-an observation of the persisted metadata; it does not infer status from review
-prose or change merge eligibility.
-
-### Reviewer auto-merge settings
-
-Reviewer auto-merge lives under `roles.reviewer.autoMerge.*`:
-
-| Path | Purpose | Default | Valid values | Validation |
-| --- | --- | --- | --- | --- |
-| `roles.reviewer.autoMerge.enabled` | Enables Reviewer's auto-merge opt-in flow for in-scope code PRs | `false` | `true`, `false` | When `true`, project startup fails fast unless the repo allows auto-merge, the configured merge strategy is enabled in repo settings, the repo is known, and GitHub validation is configured |
-| `roles.reviewer.autoMerge.strategy` | Merge strategy passed to `gh pr merge --auto` | `"squash"` | `"squash"`, `"merge"`, `"rebase"` | Config validation rejects any other value; when `enabled=true`, startup also fails fast if the repo disallows the chosen strategy |
-| `roles.reviewer.autoMerge.requireBranchProtection` | Requires base-branch protection with required checks before Reviewer opts in | `true` | `true`, `false` | When `true` and `enabled=true`, startup fails fast unless the default/base branch is known and GitHub reports branch protection with required checks |
-| `roles.reviewer.autoMerge.transientRetries` | Retry budget for transient merge-watch failures | `3` | positive integers | Config validation rejects values less than `1` |
-| `roles.reviewer.autoMerge.scope` | v1 scope guard for which PRs Looper may opt into auto-merge | `"looper-only"` | `"looper-only"` | Config validation rejects any other value; startup validation also rejects unsupported scopes |
-
-Project-level overrides use the same shape under `projects[].roles.reviewer.autoMerge.*`.
-
-When `roles.reviewer.autoMerge.enabled = true`, Looper performs a repo-aware startup validation pass: the project must have a known GitHub repo, GitHub auto-merge must be enabled for that repo, the configured strategy must be allowed, and — if `requireBranchProtection=true` — the effective base branch must exist with required checks enabled.
+Reviewer no longer holds merge authority and never calls `gh pr merge`. Legacy `roles.reviewer.autoMerge` input is accepted only so an upgraded daemon can report a precise migration error. Its old scope required both a Looper-owned label and a tracked-Issue link; Gatekeeper `auto` evaluates every eligible open PR, so migration is not a silent scope-preserving mapping. If its effective `enabled` value is `true`, startup fails and asks the operator to review that widened scope, cancel any pending GitHub auto-merge, set `roles.gatekeeper.trust = "auto"`, and configure the merge method in `.mergify.yml`. A disabled legacy block is ignored only when it uses the old default `squash` strategy; `merge` or `rebase` fails startup so an upgrade cannot silently change merge behavior. Compatibility blocks are omitted from global and project config projections; delete them after upgrading. When Coordinator runs, its migration cleanup cancels Looper-owned pending native auto-merges; otherwise cancel them manually with `gh pr merge <number> --disable-auto --repo <owner>/<repo>` before promoting trust.
 
 ### Post-merge digest
 
@@ -938,7 +909,7 @@ decides what it may do with that judgement.
 
 ### How `auto` reaches the merge queue
 
-**Known limitations at `auto`:**
+**Immediate-merge safety at `auto`:**
 
 At `auto`, Gatekeeper revalidates the observed head before each routing-label
 mutation. An eligible report gets `auto-merge`, which is the sole opt-in signal
@@ -973,6 +944,10 @@ set of gates.
 trust = "auto"
 # additions + deletions; omitted uses the normalized default of 200
 requiredReviewChangedLines = 200
+# squash, merge, or rebase; used only at auto
+strategy = "squash"
+# Optional repository-relative globs that always require human review.
+protectedPaths = [".github/workflows/*", "internal/migrations/**"]
 ```
 
 `requiredReviewChangedLines` is the additions-plus-deletions threshold for the
@@ -985,8 +960,12 @@ markers, but it does not require a clean review to proceed. The counts and
 threshold are persisted as Gate evidence, and the provider's pull-request
 statistics plus merge-base SHA are the authority for the verdict.
 
-Project overrides use `projects[].roles.gatekeeper.trust` and
-`projects[].roles.gatekeeper.requiredReviewChangedLines`.
+The merge method is owned by the Mergify queue contract in `.mergify.yml`, not
+by Gatekeeper configuration.
+
+Project overrides use `projects[].roles.gatekeeper.trust`,
+`projects[].roles.gatekeeper.requiredReviewChangedLines`, and
+`projects[].roles.gatekeeper.protectedPaths`.
 
 Reviewer writes `pr.review.completed` only after it re-reads and verifies the
 GitHub marker. A structured `type = "rate_limit"` completion writes
@@ -1038,7 +1017,7 @@ changing afterwards invalidates it. That is not decoration: holds, reviews,
 threads, and policy can all change without moving the head, which is why the Gate
 report is audit evidence rather than merge authority.
 
-### Relationship to `roles.reviewer.autoMerge`
+### Migration from `roles.reviewer.autoMerge`
 
 These are two different responsibilities. Reviewer can opt a PR into GitHub's
 native auto-merge, while `Gatekeeper = auto` supplies the externally enforced
@@ -1459,13 +1438,6 @@ blocking = "REQUEST_CHANGES"
 onHeadChange = false
 reReviewPromptOnHeadChange = false
 
-[roles.reviewer.autoMerge]
-enabled = false
-strategy = "squash"
-requireBranchProtection = true
-transientRetries = 3
-scope = "looper-only"
-
 [roles.fixer.discovery]
 autoDiscovery = true
 
@@ -1719,7 +1691,7 @@ The gate is coupled to the agent vendor: it can only run on a vendor whose CLI c
 
 The trade-off is deliberate: the gated agent and repository-controlled validation cannot fetch new remote state, query the forge, or download dependencies while they run. Required tools must be on the daemon's `PATH`; dependencies must already exist in the worktree or approved read-only caches. Linked-worktree Git metadata and the discovered Go toolchain/GOROOT are mounted read-only so normal local Git and Go validation still work. Remote context must be present in the daemon-supplied prompt and prepared checkout. If a task needs fresh remote information, let the daemon rediscover/restart it rather than weakening the gate. The agent receives a non-secret local Git identity so local commits still work; remote credentials remain daemon-side authority. Validation uses the same internal sandbox boundary for every configured agent provider; sandbox implementation details are not exposed through provider configuration.
 
-Validation policy is restart-bound. Repository CI remains the merge authority after publication: configure required checks/branch protection and keep `roles.reviewer.autoMerge.requireBranchProtection = true`; auto-merge then waits for those checks to be green.
+Validation policy is restart-bound. Repository CI and branch protection remain inputs to merge eligibility after publication; configure required checks, and use `roles.gatekeeper.trust = "auto"` only when Gatekeeper should re-evaluate those gates and merge immediately.
 
 ### `roles`
 

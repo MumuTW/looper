@@ -54,6 +54,7 @@ type ReasonCode string
 
 const (
 	ReasonHeadStale                ReasonCode = "head_stale"
+	ReasonBaseStale                ReasonCode = "base_stale"
 	ReasonPullRequestNotOpen       ReasonCode = "pull_request_not_open"
 	ReasonPullRequestDraft         ReasonCode = "pull_request_draft"
 	ReasonMergeConflict            ReasonCode = "merge_conflict"
@@ -74,6 +75,7 @@ const (
 	ReasonHold                     ReasonCode = "hold"
 	ReasonDoNotMerge               ReasonCode = "do_not_merge"
 	ReasonDiffBudgetExceeded       ReasonCode = "diff_budget_exceeded"
+	ReasonProtectedPathTouched     ReasonCode = "protected_path_touched"
 	ReasonProviderStateUnavailable ReasonCode = "provider_state_unavailable"
 	ReasonProviderStateAmbiguous   ReasonCode = "provider_state_ambiguous"
 	ReasonRoutingProjectionFailed  ReasonCode = "routing_projection_failed"
@@ -114,6 +116,7 @@ type CodexReviewEvidence struct {
 	RequiredHeadSHA  string `json:"requiredHeadSha"`
 	ReviewedHeadSHA  string `json:"reviewedHeadSha,omitempty"`
 	Event            string `json:"event,omitempty"`
+	Outcome          string `json:"outcome,omitempty"`
 	RecordedAt       string `json:"recordedAt,omitempty"`
 	CurrentHeadValid bool   `json:"currentHeadValid"`
 }
@@ -124,6 +127,7 @@ type Evidence struct {
 	MergedAt                     string                       `json:"mergedAt,omitempty"`
 	Draft                        bool                         `json:"draft"`
 	BaseRefName                  string                       `json:"baseRefName,omitempty"`
+	BaseSHA                      string                       `json:"baseSha,omitempty"`
 	Mergeable                    *bool                        `json:"mergeable,omitempty"`
 	MergeableState               string                       `json:"mergeableState,omitempty"`
 	RequiredChecks               []string                     `json:"requiredChecks"`
@@ -135,9 +139,11 @@ type Evidence struct {
 	HoldLabels                   []string                     `json:"holdLabels"`
 	DoNotMergeVeto               bool                         `json:"doNotMergeVeto,omitempty"`
 	DiffBudget                   *DiffBudgetEvidence          `json:"diffBudget,omitempty"`
+	ProtectedPaths               []string                     `json:"protectedPaths,omitempty"`
 	ReviewerConvergence          *ReviewerConvergenceEvidence `json:"reviewerConvergence,omitempty"`
 	ProjectPolicyPermitsTarget   bool                         `json:"projectPolicyPermitsTarget"`
 	FinalObservedHeadSHA         string                       `json:"finalObservedHeadSha,omitempty"`
+	FinalObservedBaseSHA         string                       `json:"finalObservedBaseSha,omitempty"`
 	CodexReviewOutcome           string                       `json:"codexReviewOutcome,omitempty"`
 	ReviewProvenance             ReviewProvenance             `json:"reviewProvenance,omitempty"`
 	Additions                    int                          `json:"additions,omitempty"`
@@ -193,6 +199,7 @@ type EvaluationInput struct {
 	PRNumber        int64
 	CWD             string
 	ExpectedHeadSHA string
+	ExpectedBaseSHA string
 	// SourceFingerprint is recorded on the resulting report. Empty means the caller
 	// had no list-page observation, in which case the report can never be skipped.
 	SourceFingerprint string
@@ -272,15 +279,11 @@ type Options struct {
 	// TrustForProject reports a project's merge-authority level. Nil means every
 	// project stays at observe, which is also the configured default.
 	TrustForProject func(projectID string) config.GatekeeperTrustLevel
-	// MergeStrategyForProject selects the strategy used at the auto trust level.
-	MergeStrategyForProject func(projectID string) config.ReviewerAutoMergeStrategy
 	// DiffBudgetForProject returns the effective boolean change-size limits. Zero
 	// bounds are unlimited; nil means every project has no configured limit.
-	DiffBudgetForProject func(projectID string) config.GatekeeperDiffBudget
-	// RequiredReviewChangedLinesForProject returns the effective review-capacity
-	// threshold. Zero explicitly disables the threshold; a normalized config
-	// default supplies the ordinary 200-line policy when omitted.
+	DiffBudgetForProject                 func(projectID string) config.GatekeeperDiffBudget
 	RequiredReviewChangedLinesForProject func(projectID string) int
+	ProtectedPathsForProject             func(projectID string) []string
 	// ConfiguredTargetBranch reports the project policy's configured base branch.
 	// It is folded into the discovery fingerprint so a policy generation change
 	// invalidates reused success within the skip window.
@@ -308,6 +311,7 @@ type Runner struct {
 	requiredReviewChangedLinesForProject func(projectID string) int
 	reviewEvidenceLookup                 reviewEvidenceLookup
 	configuredTargetBranch               func(projectID string) string
+	protectedPathsForProject             func(projectID string) []string
 	logWarn                              func(msg string, fields map[string]any)
 	outOfPageRouteMu                     sync.Mutex
 	outOfPageRouteChecks                 map[string]time.Time
@@ -331,11 +335,13 @@ func New(options Options) *Runner {
 	}
 	return &Runner{
 		repos: options.Repos, github: options.GitHub, now: now, policyPermitsTarget: policy,
-		trustForProject: options.TrustForProject, diffBudgetForProject: options.DiffBudgetForProject,
+		trustForProject:                      options.TrustForProject,
+		diffBudgetForProject:                 options.DiffBudgetForProject,
 		requiredReviewChangedLinesForProject: options.RequiredReviewChangedLinesForProject,
 		reviewEvidenceLookup:                 reviewerReviewEvidenceAppearedSince,
 		labelNamespaceForProject:             options.LabelNamespaceForProject,
 		configuredTargetBranch:               options.ConfiguredTargetBranch,
+		protectedPathsForProject:             options.ProtectedPathsForProject,
 		logWarn:                              options.LogWarn,
 		repositoryIdentity:                   options.RepositoryIdentity,
 		outOfPageRouteChecks:                 make(map[string]time.Time),
@@ -733,7 +739,7 @@ func (r *Runner) sourceFingerprintForProjectWithContract(pullRequest githubinfra
 	budgetEnabled := budget.MaxChangedFiles > 0 || budget.MaxDeletions > 0
 	reviewThreshold := r.requiredReviewChangedLinesFor(projectID)
 	reviewPolicyEnabled := r.trustFor(projectID) == config.GatekeeperTrustAuto && reviewThreshold > 0
-	base := sourceFingerprint(pullRequest, budgetEnabled, reviewPolicyEnabled)
+	base := sourceFingerprint(pullRequest, budgetEnabled, r.protectedPaths(projectID), reviewPolicyEnabled)
 	permitsTarget := r.policyPermitsTarget(projectID, repo, pullRequest.BaseRefName)
 	return strings.Join([]string{
 		base,
@@ -804,6 +810,9 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	// Only the emptiness check is trimmed; the original key is preserved.
 	input.Repo = strings.TrimSpace(input.Repo)
 	input.ExpectedHeadSHA = strings.TrimSpace(input.ExpectedHeadSHA)
+	input.ExpectedBaseSHA = strings.TrimSpace(input.ExpectedBaseSHA)
+	diffBudget := r.diffBudget(input.ProjectID)
+	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0
 	if strings.TrimSpace(input.ProjectID) == "" || input.Repo == "" || input.PRNumber <= 0 {
 		return Report{}, fmt.Errorf("gatekeeper project, repository, and pull request number are required")
 	}
@@ -826,7 +835,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		EvaluatedAt:       r.now().UTC().Format(time.RFC3339Nano),
 		SourceFingerprint: input.SourceFingerprint,
 	}
-	viewInput := githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD}
+	viewInput := githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, ProtectedPaths: r.protectedPaths(input.ProjectID)}
 	detail, err := r.github.ViewPullRequestForGatekeeper(ctx, viewInput)
 	if err != nil {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "pull_request")
@@ -837,6 +846,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	report.Evidence.MergedAt = strings.TrimSpace(detail.MergedAt)
 	report.Evidence.Draft = detail.IsDraft
 	report.Evidence.BaseRefName = strings.TrimSpace(detail.BaseRefName)
+	report.Evidence.BaseSHA = strings.TrimSpace(detail.BaseSHA)
 	report.Evidence.ReviewDecision = strings.ToUpper(strings.TrimSpace(detail.ReviewDecision))
 	reviewThreshold := r.requiredReviewChangedLinesFor(input.ProjectID)
 	reviewPolicyEnabled := r.trustFor(input.ProjectID) == config.GatekeeperTrustAuto && reviewThreshold > 0
@@ -846,6 +856,10 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	report.Evidence.ReviewRequiredByPolicy = reviewPolicyEnabled && report.Evidence.ChangedLines >= reviewThreshold
 	if input.ExpectedHeadSHA != "" && report.ObservedHeadSHA != input.ExpectedHeadSHA {
 		report.Reasons = []Reason{{Code: ReasonHeadStale}}
+		return r.persist(ctx, report)
+	}
+	if input.ExpectedBaseSHA != "" && report.Evidence.BaseSHA != input.ExpectedBaseSHA {
+		report.Reasons = []Reason{{Code: ReasonBaseStale}}
 		return r.persist(ctx, report)
 	}
 	if detail.Number != input.PRNumber || report.ObservedHeadSHA == "" || report.Evidence.BaseRefName == "" {
@@ -864,8 +878,12 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "codex_review")
 	}
 	report.Evidence.CodexReview = &codexReview
+	report.Evidence.CodexReviewOutcome = strings.ToLower(strings.TrimSpace(codexReview.Outcome))
 	if !codexReview.CurrentHeadValid {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewMissing, Subject: codexReviewReasonSubject(codexReview)})
+	}
+	if codexReview.CurrentHeadValid && report.Evidence.CodexReviewOutcome == "blocking" {
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewBlocked, Subject: report.Evidence.CodexReviewOutcome})
 	}
 	if r.trustFor(input.ProjectID) == config.GatekeeperTrustAuto && !report.Evidence.ReviewRequiredByPolicy {
 		// Small changes and an explicit zero threshold waive only the clean-review
@@ -882,6 +900,11 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	// the report an operator later reads to ask whether the merged change was
 	// ever reviewed.
 	report.Evidence.ReviewProvenance = r.observeReviewProvenance(ctx, input)
+
+	if protectedPaths := matchedProtectedPaths(detail.ChangedFiles, r.protectedPaths(input.ProjectID)); len(protectedPaths) > 0 {
+		report.Evidence.ProtectedPaths = protectedPaths
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonProtectedPathTouched, Subject: protectedPathReasonSubject(protectedPaths)})
+	}
 
 	if report.Evidence.PullRequestState != "OPEN" {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonPullRequestNotOpen})
@@ -922,6 +945,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if strings.TrimSpace(mergeability.HeadSHA) != report.ObservedHeadSHA {
 		report.Reasons = []Reason{{Code: ReasonHeadStale}}
 		report.Evidence.FinalObservedHeadSHA = strings.TrimSpace(mergeability.HeadSHA)
+		report.Evidence.FinalObservedBaseSHA = strings.TrimSpace(mergeability.BaseSHA)
 		return r.persist(ctx, report)
 	}
 	report.Evidence.Mergeable = mergeability.Mergeable
@@ -995,8 +1019,6 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	// before accepting the budget verdict; fail closed when those stats are
 	// unavailable. diffBudgetBaseSHA records the base the accepted counts were
 	// observed against so the final revalidation can detect a later advance.
-	diffBudget := r.diffBudget(input.ProjectID)
-	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0
 	diffBudgetBaseSHA := ""
 	if budgetEnabled {
 		stats := detail.DiffStats
@@ -1116,10 +1138,12 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	// when the budget is disabled a base advance is not a gate input, so the
 	// lighter head-only read is sufficient.
 	var finalHead, finalBase string
-	if budgetEnabled || reviewPolicyEnabled {
+	baseSensitive := budgetEnabled || reviewPolicyEnabled || len(r.protectedPaths(input.ProjectID)) > 0
+	if baseSensitive {
 		finalHead, finalBase, err = r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
 	} else {
 		finalHead, err = r.github.GetPullRequestHeadSHA(ctx, viewInput)
+		finalBase = report.Evidence.BaseSHA
 	}
 
 	if r.trustFor(input.ProjectID) == config.GatekeeperTrustAuto {
@@ -1147,11 +1171,12 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 			if report.Evidence.CodexReviewOutcome == "blocking" {
 				report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewBlocked, Subject: report.Evidence.CodexReviewOutcome})
 			}
-		} else if report.Evidence.CodexReview != nil && report.Evidence.CodexReview.CurrentHeadValid && report.Evidence.CodexReview.Event == "COMMENT" {
+		} else if report.Evidence.CodexReview != nil && report.Evidence.CodexReview.CurrentHeadValid && report.Evidence.CodexReview.Event == "COMMENT" && strings.EqualFold(strings.TrimSpace(report.Evidence.CodexReview.Outcome), "clean") {
 			// Markerless clean COMMENT policy records pr.review.posted with
-			// markerVerified=true but leaves no forge marker for FindReviewMarker.
+			// markerVerified=true and outcome=clean, but leaves no forge marker
+			// for FindReviewMarker. An empty or blocking outcome must fail closed.
 			report.Evidence.CodexReviewOutcome = "clean"
-		} else if report.Evidence.ReviewRequiredByPolicy {
+		} else if report.Evidence.ReviewRequiredByPolicy && !strings.EqualFold(strings.TrimSpace(report.Evidence.CodexReview.Outcome), "blocking") {
 			report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewRequired, Subject: "current_head"})
 		}
 	}
@@ -1159,8 +1184,12 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "head_revalidation")
 	}
 	report.Evidence.FinalObservedHeadSHA = strings.TrimSpace(finalHead)
+	report.Evidence.FinalObservedBaseSHA = strings.TrimSpace(finalBase)
 	if report.Evidence.FinalObservedHeadSHA == "" {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "head_revalidation")
+	}
+	if report.Evidence.FinalObservedBaseSHA == "" {
+		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "base_revalidation")
 	}
 	if report.Evidence.FinalObservedHeadSHA != report.ObservedHeadSHA {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonHeadStale})
@@ -1176,6 +1205,9 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	if reviewPolicyEnabled && strings.TrimSpace(finalBase) != reviewCapacityBaseSHA {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "review_capacity_base")
+	}
+	if !budgetEnabled && len(r.protectedPaths(input.ProjectID)) > 0 && report.Evidence.FinalObservedBaseSHA != report.Evidence.BaseSHA {
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonBaseStale})
 	}
 	return r.persist(ctx, report)
 }
@@ -1294,6 +1326,13 @@ func diffBudgetExceededSubject(stats githubinfra.PullRequestDiffStats, budget co
 		parts = append(parts, fmt.Sprintf("deletions %d > max %d", stats.Deletions, budget.MaxDeletions))
 	}
 	return strings.Join(parts, "; ")
+}
+
+func (r *Runner) protectedPaths(projectID string) []string {
+	if r == nil || r.protectedPathsForProject == nil {
+		return nil
+	}
+	return append([]string(nil), r.protectedPathsForProject(projectID)...)
 }
 
 // confirmingKey marks an evaluation as the pass performed immediately before a

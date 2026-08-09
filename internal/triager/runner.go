@@ -238,6 +238,10 @@ type DiscoveryInput struct {
 	ProjectID string
 	Repo      string
 	Snapshot  *githubinfra.DiscoverySnapshot
+	// DecisionAdmission is a non-holding point check for the LLM decision.
+	// Enrollment, retirement, and confirmation processing must continue when
+	// the provider is brownout-open; the common executor owns spawn admission.
+	DecisionAdmission func() (bool, error)
 	// DecisionBudget is the tick-wide decision cap shared by every project in the
 	// tick. Nil means uncapped.
 	DecisionBudget *DecisionBudget
@@ -427,7 +431,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
-		if err := r.processSourceState(ctx, *project, input.Repo, state, repositoryVisibility, input.DecisionBudget, input.PendingForgeReadBudget, &result); err != nil {
+		if err := r.processSourceState(ctx, *project, input.Repo, state, repositoryVisibility, input.DecisionBudget, input.PendingForgeReadBudget, input.DecisionAdmission, &result); err != nil {
 			if errors.Is(err, errPendingForgeReadBudgetExhausted) {
 				result.PendingSourcesDeferred++
 				result.Skipped++
@@ -535,7 +539,7 @@ func pendingSourceStates(states map[string]*sourceState) []*sourceState {
 	return pending
 }
 
-func (r *Runner) processSourceState(ctx context.Context, project storage.ProjectRecord, repo string, state *sourceState, repositoryVisibility string, decisionBudget *DecisionBudget, readBudget *PendingForgeReadBudget, result *DiscoveryResult) error {
+func (r *Runner) processSourceState(ctx context.Context, project storage.ProjectRecord, repo string, state *sourceState, repositoryVisibility string, decisionBudget *DecisionBudget, readBudget *PendingForgeReadBudget, decisionAdmission func() (bool, error), result *DiscoveryResult) error {
 	enrollment := state.enrollment
 	if !reservePendingForgeRead(readBudget, project.ID, result) {
 		return errPendingForgeReadBudgetExhausted
@@ -578,6 +582,15 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 			// auto/ignore decisions cannot starve another project's assessment.
 			if result.DecisionsAttempted >= r.decisionLimit {
 				return nil
+			}
+			if decisionAdmission != nil {
+				admitted, err := decisionAdmission()
+				if err != nil {
+					return err
+				}
+				if !admitted {
+					return nil
+				}
 			}
 			if !decisionBudget.Reserve() {
 				return nil
@@ -853,6 +866,16 @@ func (r *Runner) decide(ctx context.Context, project storage.ProjectRecord, repo
 	if err != nil {
 		return Decision{}, err
 	}
+	decision, err := decodeDecision(raw)
+	if err != nil {
+		return Decision{}, err
+	}
+	decision.Rationale = strings.TrimSpace(decision.Rationale)
+	decision.MissingInformation = compactStrings(decision.MissingInformation)
+	return decision, nil
+}
+
+func decodeDecision(raw string) (Decision, error) {
 	var decision Decision
 	decoder := json.NewDecoder(bytes.NewBufferString(strings.TrimSpace(raw)))
 	decoder.DisallowUnknownFields()
@@ -862,9 +885,15 @@ func (r *Runner) decide(ctx context.Context, project storage.ProjectRecord, repo
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return Decision{}, fmt.Errorf("decode triage decision: trailing content")
 	}
-	decision.Rationale = strings.TrimSpace(decision.Rationale)
-	decision.MissingInformation = compactStrings(decision.MissingInformation)
 	return decision, nil
+}
+
+// ValidateDecisionOutput is the same strict decoder used by Runner.decide. The
+// executor calls it before reporting provider health so unknown fields and
+// trailing content cannot be counted as successful triage work.
+func ValidateDecisionOutput(raw string) bool {
+	_, err := decodeDecision(raw)
+	return err == nil
 }
 
 func validateDecision(decision Decision, policy LegacyPolicy) PolicyDecision {

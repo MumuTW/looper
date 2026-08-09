@@ -268,7 +268,17 @@
             "consecutiveFailureThreshold": 3,
             "retryBaseDelayMs": 5000,
             "slowLaneWarnThresholdMs": 5000,
-            "discoveryCacheTtlSeconds": 30
+            "discoveryCacheTtlSeconds": 30,
+            "agentBrownout": {
+              "enabled": true,
+              "windowSeconds": 600,
+              "minFailures": 5,
+              "failureRatio": 0.8,
+              "cooldownSeconds": 900,
+              "maxCooldownSeconds": 3600,
+              "probeSuccesses": 1,
+              "notify": true
+            }
           },
           "webhook": {
             "enabled": false,
@@ -510,13 +520,6 @@
                   "requireCurrentReviewRequest": true,
                   "maxThreadsPerRun": 10
                 }
-              },
-              "autoMerge": {
-                "enabled": false,
-                "strategy": "squash",
-                "requireBranchProtection": true,
-                "transientRetries": 3,
-                "scope": "looper-only"
               }
             },
             "fixer": {
@@ -579,6 +582,9 @@
                 "enabled": false,
                 "scope": "looper-only"
               }
+            },
+            "gatekeeper": {
+              "requiredReviewChangedLines": 200
             },
             "escalator": {
               "enabled": false,
@@ -626,7 +632,17 @@
             "consecutiveFailureThreshold": 3,
             "retryBaseDelayMs": 5000,
             "slowLaneWarnThresholdMs": 5000,
-            "discoveryCacheTtlSeconds": 30
+            "discoveryCacheTtlSeconds": 30,
+            "agentBrownout": {
+              "enabled": true,
+              "windowSeconds": 600,
+              "minFailures": 5,
+              "failureRatio": 0.8,
+              "cooldownSeconds": 900,
+              "maxCooldownSeconds": 3600,
+              "probeSuccesses": 1,
+              "notify": true
+            }
           },
           "webhook": {
             "enabled": false,
@@ -868,13 +884,6 @@
                   "requireCurrentReviewRequest": true,
                   "maxThreadsPerRun": 10
                 }
-              },
-              "autoMerge": {
-                "enabled": false,
-                "strategy": "squash",
-                "requireBranchProtection": true,
-                "transientRetries": 3,
-                "scope": "looper-only"
               }
             },
             "fixer": {
@@ -937,6 +946,9 @@
                 "enabled": false,
                 "scope": "looper-only"
               }
+            },
+            "gatekeeper": {
+              "requiredReviewChangedLines": 200
             },
             "escalator": {
               "enabled": false,

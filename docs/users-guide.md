@@ -198,7 +198,10 @@ Autonomous dispatch stops immediately when any veto signal is present:
 
 `looper:hold` is the operator-facing global hold contract for Coordinator dispatch.
 
-`looper:hold` blocks Coordinator's autonomous Dispatch, but it does not directly block Reviewer's `gh pr merge --auto` call once a PR is already open. If `looper:hold` causes the linked Issue to skip re-Triage, merge-watch's `BranchProtectionChanged` re-Triage action becomes a silent no-op, which is the intended hold semantic.
+`looper:hold` blocks Coordinator's autonomous Dispatch. Gatekeeper also treats
+the hold as a merge gate during its fresh evaluation, so an open PR cannot be
+merged at `auto` while the hold is present. A legacy GitHub-native auto-merge
+request is cancelled by the migration cleanup before merge-watch continues.
 
 ## 6. Planner: from issue to spec PR
 

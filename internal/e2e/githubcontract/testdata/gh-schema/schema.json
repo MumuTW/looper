@@ -38,6 +38,7 @@
       "createdAt",
       "updatedAt",
       "closedAt",
+      "mergedAt",
       "isDraft",
       "reviewDecision",
       "labels",

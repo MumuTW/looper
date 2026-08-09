@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -96,14 +97,11 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Roles.Reviewer.Behavior.ThreadResolution.Mode == ReviewerThreadResolutionModeResolveObjective && !config.Roles.Reviewer.Behavior.ThreadResolution.RequireAuditComment {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.threadResolution.requireAuditComment", Message: "must be true when mode is resolve_objective"})
 	}
-	if !isValidReviewerAutoMergeStrategy(config.Roles.Reviewer.AutoMerge.Strategy) {
-		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.strategy", Message: fmt.Sprintf("must be one of: %s, %s, %s", ReviewerAutoMergeStrategySquash, ReviewerAutoMergeStrategyMerge, ReviewerAutoMergeStrategyRebase)})
+	if config.Roles.Reviewer.AutoMerge.Enabled {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.enabled", Message: "Reviewer auto-merge was removed; it previously required a Looper-owned label and tracked Issue link, while Gatekeeper auto evaluates every eligible open PR. Review that widened scope, cancel any pending GitHub auto-merge, set roles.gatekeeper.trust = \"auto\", and configure the merge method in .mergify.yml"})
 	}
-	if config.Roles.Reviewer.AutoMerge.TransientRetries < 1 {
-		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.transientRetries", Message: "must be a positive integer"})
-	}
-	if config.Roles.Reviewer.AutoMerge.Scope != ReviewerAutoMergeScopeLooperOnly {
-		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.scope", Message: fmt.Sprintf("must be %s", ReviewerAutoMergeScopeLooperOnly)})
+	if strategy := config.Roles.Reviewer.AutoMerge.Strategy; strategy != "" && strategy != MergeStrategySquash {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.strategy", Message: "Reviewer auto-merge was removed; configure the merge method in .mergify.yml"})
 	}
 	if config.Roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment && config.Roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventApprove {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.reviewEvents.clean", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerReviewEventComment, ReviewerReviewEventApprove)})
@@ -300,6 +298,9 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 		if project.Roles.Auditor.WindowMinutes != nil {
 			role.WindowMinutes = *project.Roles.Auditor.WindowMinutes
 		}
+		if project.Roles.Auditor.AllowRevertProposals != nil {
+			role.AllowRevertProposals = *project.Roles.Auditor.AllowRevertProposals
+		}
 		validateAuditorRoleConfig(role, fmt.Sprintf("projects[%d].roles.auditor", i), issues)
 	}
 	for i, project := range config.Projects {
@@ -311,6 +312,9 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 		if project.Roles.Reviewer != nil && project.Roles.Reviewer.AutoMerge != nil && project.Roles.Reviewer.AutoMerge.Enabled != nil {
 			reviewerAutoMerge = *project.Roles.Reviewer.AutoMerge.Enabled
 		}
+		validatePartialGatekeeperDiffBudget(
+			project.Roles.Gatekeeper.DiffBudget,
+			fmt.Sprintf("projects[%d].roles.gatekeeper.diffBudget", i), issues)
 		validateGatekeeperRoleConfig(
 			roles.Gatekeeper,
 			fmt.Sprintf("projects[%d].roles.gatekeeper", i), reviewerAutoMerge, issues)
@@ -510,7 +514,47 @@ func validateSchedulerConfig(scheduler SchedulerConfig, issues *[]ValidationIssu
 	if scheduler.DiscoveryCacheTTLSeconds < 0 {
 		*issues = append(*issues, ValidationIssue{Path: "scheduler.discoveryCacheTtlSeconds", Message: "must be an integer >= 0"})
 	}
+	validateAgentBrownoutConfig(scheduler.AgentBrownout, issues)
 }
+
+// validateAgentBrownoutConfig rejects settings that would make the gate either
+// never trip or never recover. A disabled gate is not validated: an operator
+// turning it off should not have to keep its numbers coherent.
+func validateAgentBrownoutConfig(brownout AgentBrownoutConfig, issues *[]ValidationIssue) {
+	if !brownout.Enabled {
+		return
+	}
+	if brownout.WindowSeconds < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.windowSeconds", Message: "must be a positive integer"})
+	} else if int64(brownout.WindowSeconds) > maxAgentBrownoutDurationSeconds {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.windowSeconds", Message: "must not exceed time.Duration maximum in seconds"})
+	}
+	if brownout.MinFailures < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.minFailures", Message: "must be a positive integer"})
+	}
+	if math.IsNaN(brownout.FailureRatio) || math.IsInf(brownout.FailureRatio, 0) || brownout.FailureRatio <= 0 || brownout.FailureRatio > 1 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.failureRatio", Message: "must be a number in (0, 1]"})
+	}
+	if brownout.CooldownSeconds < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.cooldownSeconds", Message: "must be a positive integer"})
+	} else if int64(brownout.CooldownSeconds) > maxAgentBrownoutDurationSeconds {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.cooldownSeconds", Message: "must not exceed time.Duration maximum in seconds"})
+	}
+	// A max below the base would silently shorten the operator's chosen safe
+	// interval on the second trip, which is the opposite of backing off.
+	if brownout.MaxCooldownSeconds < brownout.CooldownSeconds {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.maxCooldownSeconds", Message: "must be an integer >= scheduler.agentBrownout.cooldownSeconds"})
+	} else if int64(brownout.MaxCooldownSeconds) > maxAgentBrownoutDurationSeconds {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.maxCooldownSeconds", Message: "must not exceed time.Duration maximum in seconds"})
+	}
+	if brownout.ProbeSuccesses < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.probeSuccesses", Message: "must be a positive integer"})
+	}
+}
+
+// time.Duration stores nanoseconds in a signed 64-bit integer. Keep seconds
+// within that representable range before runtime converts the config values.
+const maxAgentBrownoutDurationSeconds = int64((1<<63 - 1) / int64(time.Second))
 
 func validateWebhookConfig(config Config, issues *[]ValidationIssue) {
 	if config.Webhook.FallbackPollIntervalSeconds < 60 {
@@ -608,8 +652,8 @@ func validateIntakeConfig(config Config, issues *[]ValidationIssue) {
 	*issues = append(*issues, ValidationIssue{Path: "intake.telegram.defaultProjectId", Message: fmt.Sprintf("must name a configured project; %q is not in projects[]", defaultProject)})
 }
 
-// validateGatekeeperRoleConfig rejects unknown Gatekeeper trust levels.
-//
+// validateGatekeeperRoleConfig validates Gatekeeper's graduated trust and
+// project-local safety gates.
 // validateDeployerRoleConfig fails startup rather than at deploy time. A project
 // configured to deploy but unable to is otherwise only discovered on the first
 // merge, which is the worst moment to learn it.
@@ -639,11 +683,44 @@ func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, 
 	if gatekeeper.RequiredReviewChangedLines < 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".requiredReviewChangedLines", Message: "must be zero (to disable the threshold) or a positive integer"})
 	}
+	validateProtectedPathPatterns(gatekeeper.ProtectedPaths, path+".protectedPaths", issues)
 	if gatekeeperTrustIsAuto(gatekeeper.Trust) && reviewerAutoMerge {
-		*issues = append(*issues, ValidationIssue{
-			Path:    path + ".trust",
-			Message: "cannot be auto while Reviewer native auto-merge is enabled; choose one merge authority",
-		})
+		*issues = append(*issues, ValidationIssue{Path: path + ".trust", Message: "cannot be auto while Reviewer native auto-merge is enabled; choose one merge authority"})
+	}
+}
+
+func validateProtectedPathPatterns(patterns []string, pathPrefix string, issues *[]ValidationIssue) {
+	for index, pattern := range patterns {
+		trimmed := strings.TrimSpace(pattern)
+		itemPath := fmt.Sprintf("%s[%d]", pathPrefix, index)
+		if trimmed == "" {
+			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must be a non-empty repository-relative glob"})
+			continue
+		}
+		if trimmed != pattern {
+			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must not contain leading or trailing whitespace"})
+		}
+		normalized := strings.TrimPrefix(strings.ReplaceAll(trimmed, "\\", "/"), "./")
+		cleaned := path.Clean(normalized)
+		if strings.HasPrefix(normalized, "/") || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must be repository-relative"})
+		}
+		if cleaned == "." || cleaned == "" {
+			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must contain a usable repository-relative path"})
+		}
+		for _, segment := range strings.Split(normalized, "/") {
+			if segment == "" {
+				*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must not contain empty path segments or trailing separators"})
+				break
+			}
+			if segment == "." || segment == ".." {
+				*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must not contain \".\" or \"..\" path segments"})
+				break
+			}
+		}
+		if _, err := path.Match(normalized, "example/path.go"); err != nil {
+			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must be a valid glob"})
+		}
 	}
 }
 
@@ -655,6 +732,18 @@ func validateGatekeeperDiffBudget(budget *GatekeeperDiffBudget, path string, iss
 		*issues = append(*issues, ValidationIssue{Path: path + ".maxChangedFiles", Message: "must be zero or a positive integer"})
 	}
 	if budget.MaxDeletions < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxDeletions", Message: "must be zero or a positive integer"})
+	}
+}
+
+func validatePartialGatekeeperDiffBudget(budget *PartialGatekeeperDiffBudget, path string, issues *[]ValidationIssue) {
+	if budget == nil {
+		return
+	}
+	if budget.MaxChangedFiles != nil && *budget.MaxChangedFiles < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxChangedFiles", Message: "must be zero or a positive integer"})
+	}
+	if budget.MaxDeletions != nil && *budget.MaxDeletions < 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".maxDeletions", Message: "must be zero or a positive integer"})
 	}
 }
@@ -1665,24 +1754,12 @@ func isValidFixerAuthorFilter(filter FixerAuthorFilter) bool {
 	}
 }
 
-func isValidReviewerAutoMergeStrategy(strategy ReviewerAutoMergeStrategy) bool {
-	switch strategy {
-	case ReviewerAutoMergeStrategySquash, ReviewerAutoMergeStrategyMerge, ReviewerAutoMergeStrategyRebase:
-		return true
-	default:
-		return false
-	}
-}
-
 func validatePartialReviewerAutoMerge(partial PartialReviewerAutoMergeConfig, path string, issues *[]ValidationIssue) {
-	if partial.Strategy != nil && !isValidReviewerAutoMergeStrategy(*partial.Strategy) {
-		*issues = append(*issues, ValidationIssue{Path: path + ".strategy", Message: fmt.Sprintf("must be one of: %s, %s, %s", ReviewerAutoMergeStrategySquash, ReviewerAutoMergeStrategyMerge, ReviewerAutoMergeStrategyRebase)})
+	if partial.Enabled != nil && *partial.Enabled {
+		*issues = append(*issues, ValidationIssue{Path: path + ".enabled", Message: "Reviewer auto-merge was removed; it previously required a Looper-owned label and tracked Issue link, while Gatekeeper auto evaluates every eligible open PR. Review that widened scope, cancel any pending GitHub auto-merge, set the matching roles.gatekeeper.trust = \"auto\", and configure the merge method in .mergify.yml"})
 	}
-	if partial.TransientRetries != nil && *partial.TransientRetries < 1 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".transientRetries", Message: "must be a positive integer"})
-	}
-	if partial.Scope != nil && *partial.Scope != ReviewerAutoMergeScopeLooperOnly {
-		*issues = append(*issues, ValidationIssue{Path: path + ".scope", Message: fmt.Sprintf("must be %s", ReviewerAutoMergeScopeLooperOnly)})
+	if partial.Strategy != nil && *partial.Strategy != MergeStrategySquash {
+		*issues = append(*issues, ValidationIssue{Path: path + ".strategy", Message: "Reviewer auto-merge was removed; configure the merge method in .mergify.yml"})
 	}
 }
 
@@ -1783,6 +1860,13 @@ func validateCoordinatorRoleConfig(config CoordinatorRoleConfig, path string, is
 		if config.PostMergeDigest.MaxItems < 1 || config.PostMergeDigest.MaxItems > 200 {
 			*issues = append(*issues, ValidationIssue{Path: path + ".postMergeDigest.maxItems", Message: "must be an integer between 1 and 200"})
 		}
+	}
+	maxConflictRepairs := 2
+	if config.ConflictPolicy != nil {
+		maxConflictRepairs = config.ConflictPolicy.MaxRepairs
+	}
+	if maxConflictRepairs <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".conflictPolicy.maxRepairs", Message: "must be a positive integer"})
 	}
 	validateDistinctLabels([]labelPathValue{
 		{Path: path + ".triage.triagedLabel", Value: config.Triage.TriagedLabel},

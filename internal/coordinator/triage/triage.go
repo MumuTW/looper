@@ -88,6 +88,10 @@ type Input struct {
 type Request struct {
 	Prompt           string
 	WorkingDirectory string
+	// Config is the project-specific parser configuration for the response.
+	// The LLM adapter uses it for completion health accounting so the
+	// validator accepts exactly the labels that Decide will consume.
+	Config Config
 }
 
 type LLM interface {
@@ -119,7 +123,7 @@ func Decide(ctx context.Context, llm LLM, input Input) Decision {
 	if llm == nil {
 		return NoOpDecision()
 	}
-	raw, err := llm.Complete(ctx, Request{Prompt: BuildPrompt(input), WorkingDirectory: input.RepoContext.WorkingDirectory})
+	raw, err := llm.Complete(ctx, Request{Prompt: BuildPrompt(input), WorkingDirectory: input.RepoContext.WorkingDirectory, Config: input.Config})
 	if err != nil {
 		return NoOpDecision()
 	}
@@ -128,6 +132,22 @@ func Decide(ctx context.Context, llm LLM, input Input) Decision {
 		return NoOpDecision()
 	}
 	return decision
+}
+
+// ValidateOutput checks the coordinator classifier's semantic output contract
+// without applying project-specific label names. The executor uses this as the
+// health-accounting authority so syntactically valid but unusable JSON cannot
+// dilute the provider failure signal before Decide parses it for a project.
+func ValidateOutput(raw string) bool {
+	return ValidateOutputForConfig(raw, Config{})
+}
+
+// ValidateOutputForConfig checks the same project-aware semantic contract
+// that Decide applies after the agent returns. Keeping the default helper
+// preserves callers that intentionally validate the default namespace.
+func ValidateOutputForConfig(raw string, cfg Config) bool {
+	_, err := parseDecision(raw, cfg)
+	return err == nil
 }
 
 func NoOpDecision() Decision {

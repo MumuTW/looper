@@ -23,6 +23,7 @@ import (
 	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/network/protocol"
 	"github.com/MumuTW/looper/internal/networkpolicy"
+	"github.com/MumuTW/looper/internal/reproducer"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -172,6 +173,49 @@ func TestDiscoverIssuesSkipsWorkerHoldLabel(t *testing.T) {
 	}
 	if len(result.QueueItems) != 0 || len(result.CreatedLoopIDs) != 0 || result.Skipped != 1 {
 		t.Fatalf("result = %#v, want held issue skipped", result)
+	}
+}
+
+func TestFinishHeldGraphWorkerPreservesResumableQueue(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	projectID := "project_1"
+	repo := "acme/looper"
+	loopID := "loop_graph_hold"
+	targetID := "project:" + projectID
+	payloadJSON := runpipe.MustMarshalJSON(map[string]any{"workGraphID": "workgraph_1", "workGraphNodeKey": "storage", "repo": repo, "executionMode": "create-pr"})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 201, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Repo: &repo, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_graph_hold", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, Repo: &repo, DedupeKey: "workgraph:workgraph_1:storage", Priority: storage.QueuePriorityWorker, Status: "running", AvailableAt: nowISO, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_graph_hold", LoopID: loopID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("GetByID(loop) = %#v, %v", loop, err)
+	}
+
+	result, err := runner.finishHeldWorkerQueueItem(context.Background(), storage.ProjectRecord{ID: projectID}, *loop, &run, queue, workerCheckpoint{}, "held for manual review")
+	if err != nil {
+		t.Fatalf("finishHeldWorkerQueueItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result.Status = %q, want skipped", result.Status)
+	}
+	updatedQueue, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
+	if err != nil || updatedQueue == nil || updatedQueue.Status != "queued" {
+		t.Fatalf("queue = %#v, %v, want requeued delivery", updatedQueue, err)
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || updatedLoop == nil || updatedLoop.Status != "queued" || updatedLoop.NextRunAt == nil {
+		t.Fatalf("loop = %#v, %v, want queued with NextRunAt", updatedLoop, err)
 	}
 }
 
@@ -894,8 +938,8 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	if completed[0].Status != "success" || completed[0].PullRequestNumber != 101 || completed[0].PullRequestURL != "https://example/pr/101" {
 		t.Fatalf("completed[0] = %#v, want success with PR details", completed[0])
 	}
-	if !strings.Contains(agent.starts[0].Prompt, `__LOOPER_RESULT__={"summary":"<one-sentence summary>"}`) {
-		t.Fatalf("prompt = %q, want canonical completion instruction", agent.starts[0].Prompt)
+	if !strings.Contains(agent.starts[0].Prompt, `__LOOPER_RESULT__={"summary":"<one-sentence summary>","reproduction":null}`) {
+		t.Fatalf("prompt = %q, want Worker completion instruction with optional reproduction", agent.starts[0].Prompt)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
 	if err != nil {
@@ -1495,6 +1539,129 @@ func TestRunExecuteStepFailsResumedCompletedCheckpointWithoutParsedResult(t *tes
 	want := "Worker completed without a valid structured result (parse status: missing). See Looper logs for details."
 	if err.Error() != want {
 		t.Fatalf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+func TestRunExecuteStepPersistsPendingExecutionWhenWaitFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	project := fixture.project(t)
+	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	worktreePath := fixture.usableWorktree(t, "wait-error-retry")
+	run := storage.RunRecord{ID: "run_worker_wait_error", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	fixtureRoot, _ := writeWorkerReproductionFixture(t)
+	agent := &fakeAgentExecutor{wait: func(context.Context) error {
+		for _, relative := range []string{"internal/bug_test.go", reproducer.ManifestPath} {
+			source := filepath.Join(fixtureRoot, relative)
+			target := filepath.Join(worktreePath, relative)
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			contents, err := os.ReadFile(source)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(target, contents, 0o644); err != nil {
+				return err
+			}
+		}
+		return errors.New("agent wait interrupted")
+	}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+
+	checkpoint, err := runner.runExecuteStep(ctx, stepInput{
+		Project: project, Loop: *loop, Run: run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "wt_wait_error", Path: worktreePath, Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "agent wait interrupted") {
+		t.Fatalf("runExecuteStep() = %v, want Wait error", err)
+	}
+	if checkpoint.Execution == nil || checkpoint.Execution.Status != "running" || checkpoint.Execution.ExecutionID == "" {
+		t.Fatalf("checkpoint.Execution = %#v, want live execution boundary", checkpoint.Execution)
+	}
+
+	storedRun, err := fixture.repos.Runs.GetByID(ctx, run.ID)
+	if err != nil || storedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want stored run", storedRun, err)
+	}
+	storedCheckpoint, err := parseCheckpoint(storedRun.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint() error = %v", err)
+	}
+	if storedCheckpoint.Execution == nil || storedCheckpoint.Execution.Status != "running" || storedCheckpoint.Execution.ExecutionID != checkpoint.Execution.ExecutionID {
+		t.Fatalf("stored checkpoint.Execution = %#v, want retained live execution", storedCheckpoint.Execution)
+	}
+	if err := captureWorkerReproduction(&checkpoint, worktreePath); err != nil {
+		t.Fatalf("captureWorkerReproduction() = %v, want manifest deferred for retry", err)
+	}
+	if checkpoint.Work.Reproduction != nil || !checkpoint.ReproductionAbsent {
+		t.Fatalf("checkpoint after retry capture = %#v, want untrusted manifest deferred", checkpoint)
+	}
+}
+
+func TestRunExecuteStepDoesNotDowngradeTimeoutObservedDuringStart(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	project := fixture.project(t)
+	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	worktreePath := fixture.usableWorktree(t, "timeout-during-start")
+	run := storage.RunRecord{ID: "run_worker_timeout_during_start", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{
+		HeadSHA: "timeout-head", Branch: "looper/feature", ChangedFiles: []string{"changed.go"},
+		DiffFingerprint: "timeout-status", ContentFingerprint: "timeout-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "timeout-index",
+	}}
+	agent := &timeoutDuringStartAgentExecutor{
+		observation: agent.TimeoutObservation{TimeoutType: "idle", LastProgressAt: "2026-04-11T12:00:01.000Z"},
+		waitErr:     errors.New("daemon exited after timeout observation"),
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+
+	checkpoint, err := runner.runExecuteStep(ctx, stepInput{
+		Project: project, Loop: *loop, Run: run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "wt_timeout_start", Path: worktreePath, Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "daemon exited after timeout observation") {
+		t.Fatalf("runExecuteStep() error = %v, want Wait error after timeout observation", err)
+	}
+	if agent.observationErr != nil {
+		t.Fatalf("OnBeforeTimeout() error = %v", agent.observationErr)
+	}
+	if checkpoint.Execution == nil || checkpoint.Execution.Status != "timeout_observing" || checkpoint.Execution.ProgressBeforeTimeout == nil {
+		t.Fatalf("checkpoint.Execution = %#v, want timeout evidence retained", checkpoint.Execution)
+	}
+	storedRun, err := fixture.repos.Runs.GetByID(ctx, run.ID)
+	if err != nil || storedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want stored run", storedRun, err)
+	}
+	storedCheckpoint, err := parseCheckpoint(storedRun.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint() error = %v", err)
+	}
+	if storedCheckpoint.Execution == nil || storedCheckpoint.Execution.Status != "timeout_observing" || storedCheckpoint.Execution.ProgressBeforeTimeout == nil {
+		t.Fatalf("stored checkpoint.Execution = %#v, want timeout evidence not running", storedCheckpoint.Execution)
 	}
 }
 
@@ -3076,8 +3243,8 @@ func TestCreateRunContextReplaysExecuteWhenResumeCheckpointParseStatusIsInvalid(
 	if !resumed.Resumed || resumed.StartStep != stepExecute {
 		t.Fatalf("resumed = %#v, want resumed execute replay", resumed)
 	}
-	if resumed.Checkpoint.Execution != nil {
-		t.Fatalf("Execution = %#v, want cleared execution checkpoint", resumed.Checkpoint.Execution)
+	if resumed.Checkpoint.Execution == nil || resumed.Checkpoint.Execution.Status != "completed" || resumed.Checkpoint.Execution.ParseStatus != "" {
+		t.Fatalf("Execution = %#v, want invalid completed evidence retained for replay", resumed.Checkpoint.Execution)
 	}
 	if resumed.Checkpoint.Validation != nil {
 		t.Fatalf("Validation = %#v, want cleared validation checkpoint", resumed.Checkpoint.Validation)
@@ -3130,8 +3297,8 @@ func TestCreateRunContextReplaysExecuteWhenExecuteCheckpointIsInvalid(t *testing
 	if !resumed.Resumed || resumed.StartStep != stepExecute {
 		t.Fatalf("resumed = %#v, want execute replay for invalid execute checkpoint", resumed)
 	}
-	if resumed.Checkpoint.Execution != nil {
-		t.Fatalf("Execution = %#v, want cleared invalid execution checkpoint", resumed.Checkpoint.Execution)
+	if resumed.Checkpoint.Execution == nil || resumed.Checkpoint.Execution.Status != "completed" || resumed.Checkpoint.Execution.ParseStatus != "" {
+		t.Fatalf("Execution = %#v, want invalid completed evidence retained for replay", resumed.Checkpoint.Execution)
 	}
 }
 
@@ -4340,6 +4507,40 @@ func TestProcessClaimedItemTreatsWorkerSetupFailureAsRetryable(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedQueueItemRequeuesProviderBrownoutWithoutAttempt(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	agentExec := &fakeAgentExecutor{startErr: agent.ErrProviderBrownout}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: agentExec, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed worker", claim, err)
+	}
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient {
+		t.Fatalf("result = %#v, want retryable recovered failed result", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "queued" || queue.Attempts != claim.Attempts || queue.FinishedAt != nil || queue.LastErrorKind == nil || *queue.LastErrorKind != string(runpipe.FailureRetryableTransient) {
+		t.Fatalf("queue = %#v, want retryable queued item with attempts=%d and no terminal timestamp", queue, claim.Attempts)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop = %#v, want queued after provider brownout refusal", loop)
+	}
+}
+
 func TestProcessClaimedItemRestartsFromDiscoverAfterStaleValidationFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -4637,47 +4838,43 @@ func TestRecoverClaimedItemReconcilesRunningLoopState(t *testing.T) {
 	}
 }
 
-// TestRecoverClaimedItemFinishesAfterQueueFailureAlreadyCommitted models the
-// partial transition where ProcessClaimedItem terminalized the queue item but
-// failed while updating the loop. Recovery must reconcile the loop from the
-// durable terminal queue row and must not resurrect it as a retry merely
-// because the second error is classified as transient.
-func TestRecoverClaimedItemFinishesAfterQueueFailureAlreadyCommitted(t *testing.T) {
+func TestRecoverClaimedItemRequeuesProviderBrownoutWithoutAttempt(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	nowISO := fixture.nowISO()
 	loopTarget := "project:project_1"
-	loopID := "loop_worker_partial_failure"
-	projectID := "project_1"
-	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 2, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &loopTarget, Repo: runpipe.StringPtr("acme/looper"), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	loopID := "loop_worker_brownout_requeue"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 3, ProjectID: "project_1", Type: "worker", TargetType: "project", TargetID: &loopTarget, Repo: runpipe.StringPtr("acme/looper"), Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	payload := `{"title":"Recover worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}`
-	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_partial_failure", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: runpipe.StringPtr("acme/looper"), DedupeKey: "worker:loop_worker_partial_failure", Priority: 1, Status: "manual_intervention", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	projectID := "project_1"
+	payload := `{"title":"Brownout retry","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}`
+	queue := storage.QueueItemRecord{ID: "queue_worker_brownout_requeue", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: runpipe.StringPtr("acme/looper"), DedupeKey: "worker:loop_worker_brownout_requeue", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 2, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
-	queueItem := storage.QueueItemRecord{ID: "queue_worker_partial_failure", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: runpipe.StringPtr("acme/looper"), DedupeKey: "worker:loop_worker_partial_failure", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
-	result, err := runner.recoverClaimedItem(context.Background(), queueItem, &runpipe.LoopError{Message: "loop reconciliation interrupted", Kind: runpipe.FailureRetryableTransient})
+
+	result, err := runner.recoverClaimedItem(context.Background(), queue, agent.ErrProviderBrownout)
 	if err != nil {
 		t.Fatalf("recoverClaimedItem() error = %v", err)
 	}
-	if result == nil || result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient {
-		t.Fatalf("result = %#v, want failed transient recovery", result)
+	if result == nil || result.Status != "failed" {
+		t.Fatalf("result = %#v, want recovered result", result)
 	}
-	queue, err := fixture.repos.Queue.GetByID(context.Background(), queueItem.ID)
+	got, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "manual_intervention" {
-		t.Fatalf("queue = %#v, want existing terminal manual_intervention row preserved", queue)
+	if got == nil || got.Status != "queued" || got.Attempts != queue.Attempts || got.FinishedAt != nil {
+		t.Fatalf("queue = %#v, want queued with attempts=%d and no terminal timestamp", got, queue.Attempts)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
-		t.Fatalf("loop = %#v, want paused loop after idempotent recovery", loop)
+	if loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop = %#v, want queued after provider brownout refusal", loop)
 	}
 }
 
@@ -6529,15 +6726,19 @@ func (f *fakeGitGateway) Push(_ context.Context, input PushInput) error {
 }
 
 type fakeAgentExecutor struct {
-	starts  []AgentRunInput
-	results []AgentResult
-	index   int
-	waitErr error
-	wait    func(context.Context) error
+	starts   []AgentRunInput
+	results  []AgentResult
+	index    int
+	startErr error
+	waitErr  error
+	wait     func(context.Context) error
 }
 
 func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
 	f.starts = append(f.starts, input)
+	if f.startErr != nil {
+		return nil, f.startErr
+	}
 	result := AgentResult{Status: "completed", Summary: "done", ParseStatus: "parsed"}
 	if f.index < len(f.results) {
 		result = f.results[f.index]
@@ -6568,6 +6769,19 @@ func (f fakeAgentExecution) Wait(ctx context.Context) (AgentResult, error) {
 }
 
 func (f fakeAgentExecution) Kill(string) error { return nil }
+
+type timeoutDuringStartAgentExecutor struct {
+	observation    agent.TimeoutObservation
+	waitErr        error
+	observationErr error
+}
+
+func (f *timeoutDuringStartAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
+	if input.OnBeforeTimeout != nil {
+		f.observationErr = input.OnBeforeTimeout(context.Background(), f.observation)
+	}
+	return fakeAgentExecution{waitErr: f.waitErr}, nil
+}
 
 type timeoutObservingAgentExecutor struct {
 	starts           []AgentRunInput

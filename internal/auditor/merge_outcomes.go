@@ -33,7 +33,7 @@ func CandidatesFromMergeOutcomes(events []storage.EventLogRecord) ([]MergeCandid
 			// own authoritative snapshot; an empty or absent list remains blocked
 			// until the confirmation lane re-reads the PR files from GitHub.
 			filesAvailable := outcome.TouchedFilesAvailable || (outcome.Version < 2 && len(outcome.TouchedFiles) > 0)
-			candidate = MergeCandidate{ProjectID: outcome.ProjectID, Repo: outcome.Repo, PRNumber: outcome.PRNumber, HeadSHA: outcome.HeadSHA, MergeCommitSHA: outcome.MergeCommitSHA, SourceIssue: outcome.SourceIssue, TouchedFiles: append([]string(nil), outcome.TouchedFiles...), TouchedFilesAvailable: filesAvailable}
+			candidate = MergeCandidate{ProjectID: outcome.ProjectID, Repo: outcome.Repo, PRNumber: outcome.PRNumber, HeadSHA: outcome.HeadSHA, MergeCommitSHA: outcome.MergeCommitSHA, MergeStrategy: outcome.MergeStrategy, SourceIssue: outcome.SourceIssue, TouchedFiles: append([]string(nil), outcome.TouchedFiles...), TouchedFilesAvailable: filesAvailable}
 			mergedAtText = outcome.AttemptedAt
 			if strings.TrimSpace(mergedAtText) == "" {
 				mergedAtText = event.CreatedAt

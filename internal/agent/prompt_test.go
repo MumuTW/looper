@@ -51,6 +51,19 @@ func TestAppendCompletionInstruction(t *testing.T) {
 	}
 }
 
+func TestAppendWorkerCompletionInstructionAttestsInheritedManifest(t *testing.T) {
+	t.Parallel()
+	prompt := AppendWorkerCompletionInstruction("do the work", true)
+	for _, needle := range []string{
+		"whether you created it this turn or inherited it from a retry",
+		"Leave it null only when no manifest is present.",
+	} {
+		if !strings.Contains(prompt, needle) {
+			t.Fatalf("worker prompt = %q, want %q", prompt, needle)
+		}
+	}
+}
+
 func TestAppendFixerCompletionInstructionIncludesOutcomeContract(t *testing.T) {
 	t.Parallel()
 

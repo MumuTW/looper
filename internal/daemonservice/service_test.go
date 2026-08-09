@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/processsandbox"
 )
 
 func testInput(goos string, mutate func(*Input)) Input {
@@ -78,9 +79,10 @@ func TestBuildSystemdHonoursXDGConfigHome(t *testing.T) {
 	}
 }
 
-// The unit carries no environment at all. Accepting daemon.environment would put
-// the same values in a second file and let the supervised daemon diverge from the
-// foreground one — including through LOOPER_* variables that change configuration.
+// The unit carries no user-configurable environment. The systemd unit has one
+// fixed PATH so sandbox preflight and the manager run under the same search
+// path; accepting daemon.environment would put user values in a second file
+// and let the supervised daemon diverge from the foreground one.
 func TestBuildRefusesDaemonEnvironment(t *testing.T) {
 	t.Parallel()
 
@@ -99,8 +101,13 @@ func TestBuildRefusesDaemonEnvironment(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: Build() error = %v", goos, err)
 		}
-		if strings.Contains(plan.Unit, "Environment") {
-			t.Fatalf("%s: unit carries an environment section:\n%s", goos, plan.Unit)
+		if goos == "linux" {
+			want := "Environment=PATH=" + processsandbox.ServiceProbePATHSystemd
+			if !strings.Contains(plan.Unit, want) {
+				t.Fatalf("linux: unit missing fixed service PATH %q:\n%s", want, plan.Unit)
+			}
+		} else if strings.Contains(plan.Unit, "Environment") {
+			t.Fatalf("%s: unit carries an unexpected environment section:\n%s", goos, plan.Unit)
 		}
 	}
 }

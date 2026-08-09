@@ -388,7 +388,7 @@ func TestHandleTerminalExhaustionEscalationDeduplicatesContextWithheldEventAcros
 	if err != nil {
 		t.Fatalf("Events.ListByEntityAndEventTypes() error = %v", err)
 	}
-	wantEventID := contextWithheldEventID(loop.ID, "acme/looper", 42, "pull request contains a human-authored commit")
+	wantEventID := contextWithheldEventID(loop.ID, "acme/looper", 42, "pull request contains a commit not authored by the Looper identity")
 	if events[0].ID != wantEventID {
 		t.Fatalf("context_withheld event ID = %q, want deterministic escalation-scoped ID %q", events[0].ID, wantEventID)
 	}
@@ -438,7 +438,7 @@ func TestHandleTerminalExhaustionIgnoresStaleContextWithheldEvent(t *testing.T) 
 	if err != nil {
 		t.Fatalf("list context-withheld events: %v", err)
 	}
-	wantEventID := contextWithheldEventID(loop.ID, "acme/looper", 42, "pull request contains a human-authored commit")
+	wantEventID := contextWithheldEventID(loop.ID, "acme/looper", 42, "pull request contains a commit not authored by the Looper identity")
 	foundCurrent := false
 	for _, event := range events {
 		if event.ID == wantEventID {

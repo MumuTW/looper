@@ -70,6 +70,19 @@ function admissionColor(state: string): string {
   }
 }
 
+function agentHealthColor(state: string): string {
+  switch (state) {
+    case "closed":
+      return "var(--ok)";
+    case "half_open":
+      return "var(--warning)";
+    case "open":
+      return "var(--danger)";
+    default:
+      return "var(--text-muted)";
+  }
+}
+
 function FullPageError({ message }: { message: string }) {
   return (
     <div className="mx-auto flex max-w-lg flex-col gap-3 py-10">
@@ -451,6 +464,39 @@ export function OverviewPage({
               value={status?.service?.startedAt ?? healthData?.startedAt ?? "—"}
             />
             <Kv label="Agent" value={status?.agent?.vendor ?? "—"} />
+            {status?.service?.agentHealth ? (
+              <>
+                <Kv
+                  label="Agent health"
+                  value={
+                    <span
+                      style={{
+                        color: agentHealthColor(status.service.agentHealth.state ?? ""),
+                      }}
+                    >
+                      {status.service.agentHealth.state ?? "—"}
+                      {status.service.agentHealth.partial ? " (partial)" : ""}
+                    </span>
+                  }
+                />
+                <Kv
+                  label="Retry at"
+                  value={status.service.agentHealth.openUntil ?? "—"}
+                />
+                {(status.service.agentHealth.providers ?? []).map((provider) => (
+                  <Kv
+                    key={provider.provider ?? "unknown"}
+                    label={`Provider ${provider.provider ?? "—"}`}
+                    value={
+                      <span style={{ color: agentHealthColor(provider.state ?? "") }}>
+                        {provider.state ?? "—"}
+                        {provider.openUntil ? ` · retry ${provider.openUntil}` : ""}
+                      </span>
+                    }
+                  />
+                ))}
+              </>
+            ) : null}
           </dl>
         </Card>
 

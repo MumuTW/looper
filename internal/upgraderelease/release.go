@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -21,6 +22,9 @@ import (
 const ManifestVersion = 1
 
 var releaseIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+var stageSyncDirectory = syncDirectory
+var activateSyncDirectory = syncDirectory
 
 type File struct {
 	SHA256 string `json:"sha256"`
@@ -55,6 +59,10 @@ type ActivationResult struct {
 	RootDir           string `json:"rootDir"`
 	PreviousReleaseID string `json:"previousReleaseId,omitempty"`
 	CurrentReleaseID  string `json:"currentReleaseId"`
+	// ServiceExecutable is the path a supervised unit must launch after
+	// activation (root/current/looperd). Install via looperd service install
+	// rewrites release-tree binaries onto this pointer automatically.
+	ServiceExecutable string `json:"serviceExecutable"`
 }
 
 // Stage copies both executable inputs into a new immutable release directory.
@@ -84,8 +92,20 @@ func Stage(input StageInput) (StageResult, error) {
 		return StageResult{}, fmt.Errorf("create releases directory: %w", err)
 	}
 	destination := filepath.Join(releasesDir, input.ReleaseID)
-	if _, err := os.Lstat(destination); err == nil {
-		return StageResult{}, fmt.Errorf("release %s already exists", input.ReleaseID)
+	if info, err := os.Lstat(destination); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return StageResult{}, fmt.Errorf("release destination %s must be a real directory, not a symlink or other file", destination)
+		}
+		// Idempotent restage: later cutovers re-stage the live pair that is
+		// already this release id from a prior candidate stage.
+		result, err := reuseExistingRelease(root, input)
+		if err != nil {
+			return StageResult{}, err
+		}
+		if err := stageSyncDirectory(filepath.Join(root, "releases")); err != nil {
+			return StageResult{}, fmt.Errorf("sync reused releases directory: %w", err)
+		}
+		return result, nil
 	} else if !os.IsNotExist(err) {
 		return StageResult{}, fmt.Errorf("inspect release destination: %w", err)
 	}
@@ -122,10 +142,59 @@ func Stage(input StageInput) (StageResult, error) {
 	if err := os.Rename(temporary, destination); err != nil {
 		return fail(fmt.Errorf("publish release directory: %w", err))
 	}
-	if err := syncDirectory(releasesDir); err != nil {
+	if err := stageSyncDirectory(releasesDir); err != nil {
 		return StageResult{}, err
 	}
 	return StageResult{RootDir: root, ReleaseID: input.ReleaseID, Directory: destination, Manifest: manifest}, nil
+}
+
+// reuseExistingRelease returns a verified existing release when the operator
+// re-stages the same build (normal on the second+ cutover). Rejects a
+// same-id directory whose build or binary bytes differ.
+func reuseExistingRelease(root string, input StageInput) (StageResult, error) {
+	existing, err := Verify(root, input.ReleaseID)
+	if err != nil {
+		return StageResult{}, fmt.Errorf("release %s already exists but is not a valid immutable stage: %w", input.ReleaseID, err)
+	}
+	if !releaseBuildMatches(existing.Manifest.Build, input.Build) {
+		return StageResult{}, fmt.Errorf("release %s already exists with a different build identity", input.ReleaseID)
+	}
+	for _, item := range []struct {
+		source string
+		name   string
+	}{{input.CLIBinaryPath, "looper"}, {input.DaemonBinaryPath, "looperd"}} {
+		want, ok := existing.Manifest.Files[item.name]
+		if !ok {
+			return StageResult{}, fmt.Errorf("release %s is missing staged %s", input.ReleaseID, item.name)
+		}
+		got, err := describeFile(item.source, item.name)
+		if err != nil {
+			return StageResult{}, fmt.Errorf("hash input %s for existing release %s: %w", item.name, input.ReleaseID, err)
+		}
+		if got.SHA256 != want.SHA256 || got.Size != want.Size {
+			return StageResult{}, fmt.Errorf("release %s already exists but %s bytes differ from the staged copy", input.ReleaseID, item.name)
+		}
+	}
+	return existing, nil
+}
+
+func releaseBuildMatches(existing, input version.Info) bool {
+	if existing.Complete() && input.Complete() {
+		return existing.SameBuild(input)
+	}
+	// Incomplete identities (tests, partial metadata) still require the fields
+	// Stage already validated plus matching optional commit when both present.
+	if existing.Version != input.Version ||
+		existing.Metadata.VersionSource != input.Metadata.VersionSource ||
+		existing.Metadata.Channel != input.Metadata.Channel ||
+		existing.Metadata.APIVersion != input.Metadata.APIVersion {
+		return false
+	}
+	if existing.Metadata.GitCommitSHA != nil && input.Metadata.GitCommitSHA != nil &&
+		*existing.Metadata.GitCommitSHA != *input.Metadata.GitCommitSHA {
+		return false
+	}
+	return true
 }
 
 // Verify confirms a staged release has the exact immutable layout Stage
@@ -140,6 +209,13 @@ func Verify(rootDir, releaseID string) (StageResult, error) {
 		return StageResult{}, err
 	}
 	directory := filepath.Join(root, "releases", releaseID)
+	directoryInfo, err := os.Lstat(directory)
+	if err != nil {
+		return StageResult{}, fmt.Errorf("inspect release directory: %w", err)
+	}
+	if directoryInfo.Mode()&os.ModeSymlink != 0 || !directoryInfo.IsDir() {
+		return StageResult{}, fmt.Errorf("release directory %s must be a real directory, not a symlink or other file", directory)
+	}
 	manifestPath := filepath.Join(directory, "manifest.json")
 	if err := requireRegularFile(manifestPath, "release manifest"); err != nil {
 		return StageResult{}, err
@@ -182,8 +258,38 @@ func Verify(rootDir, releaseID string) (StageResult, error) {
 	return StageResult{RootDir: root, ReleaseID: releaseID, Directory: directory, Manifest: manifest}, nil
 }
 
+// Remove discards an unpublished staged release after a caller's post-copy
+// verification fails. The exact release ID is validated before deletion so a
+// failed stage cannot broaden cleanup to an arbitrary path.
+func Remove(rootDir, releaseID string) error {
+	root, err := normalizedRoot(rootDir)
+	if err != nil {
+		return err
+	}
+	if err := validateReleaseID(releaseID); err != nil {
+		return err
+	}
+	directory := filepath.Join(root, "releases", releaseID)
+	info, err := os.Lstat(directory)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect release for removal: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("release path %s is not a directory", releaseID)
+	}
+	if err := os.RemoveAll(directory); err != nil {
+		return fmt.Errorf("remove failed staged release: %w", err)
+	}
+	return syncDirectory(filepath.Join(root, "releases"))
+}
+
 // Activate switches root/current to a verified release through one atomic
 // rename of a relative symlink. It never starts, stops, or signals looperd.
+// The returned ServiceExecutable is root/current/looperd — the path supervised
+// installs must use so activation alone switches the next service start.
 func Activate(rootDir, releaseID string) (ActivationResult, error) {
 	staged, err := Verify(rootDir, releaseID)
 	if err != nil {
@@ -193,8 +299,13 @@ func Activate(rootDir, releaseID string) (ActivationResult, error) {
 	if err != nil {
 		return ActivationResult{}, err
 	}
+	serviceExecutable := CurrentDaemonExecutable(staged.RootDir)
 	if previous == releaseID {
-		return ActivationResult{RootDir: staged.RootDir, PreviousReleaseID: previous, CurrentReleaseID: releaseID}, nil
+		// Idempotent activate: still ensure the durability barrier for current.
+		if err := activateSyncDirectory(staged.RootDir); err != nil {
+			return ActivationResult{}, fmt.Errorf("sync already-active release pointer: %w", err)
+		}
+		return ActivationResult{RootDir: staged.RootDir, PreviousReleaseID: previous, CurrentReleaseID: releaseID, ServiceExecutable: serviceExecutable}, nil
 	}
 	temporary, err := os.CreateTemp(staged.RootDir, ".current-")
 	if err != nil {
@@ -216,10 +327,67 @@ func Activate(rootDir, releaseID string) (ActivationResult, error) {
 		_ = os.Remove(temporaryPath)
 		return ActivationResult{}, fmt.Errorf("atomically switch current release: %w", err)
 	}
-	if err := syncDirectory(staged.RootDir); err != nil {
-		return ActivationResult{}, err
+	if err := activateSyncDirectory(staged.RootDir); err != nil {
+		// current already points at the candidate; restore previous through an
+		// atomic temporary-symlink rename and surface every rollback failure.
+		var restoreErr error
+		selected, selectErr := currentReleaseID(staged.RootDir)
+		switch {
+		case selectErr != nil:
+			restoreErr = fmt.Errorf("inspect current pointer before rollback: %w", selectErr)
+		case selected != releaseID:
+			restoreErr = fmt.Errorf("current pointer changed to %q before rollback", selected)
+		default:
+			restoreErr = restoreCurrentPointer(staged.RootDir, currentPath, previous)
+		}
+		if restoreErr != nil {
+			return ActivationResult{}, fmt.Errorf("sync current release pointer after activate: %v; restore previous %q: %w", err, previous, restoreErr)
+		}
+		return ActivationResult{}, fmt.Errorf("sync current release pointer after activate (restored previous %q): %w", previous, err)
 	}
-	return ActivationResult{RootDir: staged.RootDir, PreviousReleaseID: previous, CurrentReleaseID: releaseID}, nil
+	return ActivationResult{RootDir: staged.RootDir, PreviousReleaseID: previous, CurrentReleaseID: releaseID, ServiceExecutable: serviceExecutable}, nil
+}
+
+func restoreCurrentPointer(root, currentPath, previous string) error {
+	if previous == "" {
+		if err := os.Remove(currentPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove candidate current pointer: %w", err)
+		}
+		return activateSyncDirectory(root)
+	}
+	temporary, err := os.CreateTemp(root, ".current-restore-")
+	if err != nil {
+		return fmt.Errorf("reserve previous current pointer: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	if err := temporary.Close(); err != nil {
+		_ = os.Remove(temporaryPath)
+		return fmt.Errorf("close previous current pointer reservation: %w", err)
+	}
+	if err := os.Remove(temporaryPath); err != nil {
+		return fmt.Errorf("prepare previous current pointer: %w", err)
+	}
+	if err := os.Symlink(filepath.Join("releases", previous), temporaryPath); err != nil {
+		return fmt.Errorf("create previous current pointer: %w", err)
+	}
+	if err := os.Rename(temporaryPath, currentPath); err != nil {
+		_ = os.Remove(temporaryPath)
+		return fmt.Errorf("atomically restore previous current pointer: %w", err)
+	}
+	if err := activateSyncDirectory(root); err != nil {
+		return fmt.Errorf("sync restored current pointer: %w", err)
+	}
+	return nil
+}
+
+// CurrentDaemonExecutable is the supervised-launch path for an activated
+// release tree (root/current/looperd).
+func CurrentDaemonExecutable(rootDir string) string {
+	root := strings.TrimSpace(rootDir)
+	if root == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Clean(root), "current", "looperd")
 }
 
 func ReleaseIDs(rootDir string) ([]string, error) {

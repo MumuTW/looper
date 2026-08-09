@@ -223,6 +223,31 @@ func TestConfiguredExecutorRejectsRestrictedUnsupportedVendor(t *testing.T) {
 	}
 }
 
+func TestConfiguredExecutorPropagatesProviderBrownoutAdmission(t *testing.T) {
+	t.Parallel()
+
+	providerErr := errors.Join(ErrProviderBrownout, errors.New("recovery probe capacity exhausted"))
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": "/bin/false"}},
+		Owner:  providerBrownoutOwner{err: providerErr},
+	})
+	_, err := executor.Start(context.Background(), RunInput{Prompt: "do work", WorkingDirectory: t.TempDir()})
+	if !errors.Is(err, ErrProviderBrownout) {
+		t.Fatalf("Start() error = %v, want ErrProviderBrownout", err)
+	}
+	if !errors.Is(err, providerErr) {
+		t.Fatalf("Start() error = %v, want original provider admission error", err)
+	}
+}
+
+type providerBrownoutOwner struct {
+	err error
+}
+
+func (o providerBrownoutOwner) AdmitSpawn(context.Context, SpawnMeta) (SpawnLease, error) {
+	return nil, o.err
+}
+
 // TestToolNetworkDenialVendorsMatchAdapterTable is the drift guard between the
 // adapter table (source of truth) and the allowlist internal/config carries so
 // startup validation can reject the mismatch without importing internal/agent.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -55,6 +56,39 @@ func TestRunnerAppliesLabelsThenCommentThenTriaged(t *testing.T) {
 	assertOrderedOps(t, fixture.github.ops, want)
 	if body := fixture.github.createdBodies[0]; !containsAll(body, triageCommentMarker, "<!-- looper:stamp v=1 -->", "runner=coordinator") {
 		t.Fatalf("comment body = %q, want coordinator marker and disclosure stamp", body)
+	}
+}
+
+func TestCoordinatorMaintenanceRunsWhenTriageAdmissionSkipsLLM(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	})
+	seedDispatchIssue(fixture, 1)
+	fixture.github.issues = append(fixture.github.issues, githubinfra.IssueSummary{Number: 2})
+	fixture.github.details[2] = githubinfra.IssueDetail{
+		Number:    2,
+		Title:     "Needs triage",
+		Author:    "octo",
+		CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339),
+		State:     "open",
+	}
+	admissionCalls := 0
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{
+		ProjectID: fixture.projectID,
+		Repo:      "acme/looper",
+		TriageAdmission: func(func() error) error {
+			admissionCalls++
+			return nil
+		},
+	}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{1})
+	if admissionCalls != 1 {
+		t.Fatalf("triage admission calls = %d, want 1", admissionCalls)
 	}
 }
 
@@ -1608,6 +1642,7 @@ type stubCoordinatorGitHub struct {
 	createdBodies                 []string
 	updatedBodies                 []string
 	commentReads                  map[int64]int
+	commentContainingReads        int
 	failAddLabels                 map[string]error
 	failBlockedByIssues           map[int64][]error
 	addedLabels                   []githubinfra.IssueLabelsInput
@@ -1647,6 +1682,10 @@ type stubCoordinatorGitHub struct {
 	prCommitReads                 map[int64]int
 	prDraftEventRevalidations     map[int64][]githubinfra.PullRequestDraftEvent
 	prDraftEventReads             map[int64]int
+	mergeWatchIssues              []githubinfra.IssueSummary
+	disabledAutoMerges            []githubinfra.DisablePullRequestAutoMergeInput
+	disableAutoMergeErr           error
+	deletedCommentIDs             []int64
 }
 
 func (s *stubCoordinatorGitHub) ListOpenIssues(_ context.Context, input githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
@@ -1655,11 +1694,9 @@ func (s *stubCoordinatorGitHub) ListOpenIssues(_ context.Context, input githubin
 	}
 	return append([]githubinfra.IssueSummary(nil), s.issues...), nil
 }
-
-// ListOpenPullRequests projects both Pull Request maps, so a fixture that
-// registers a PR only for the merge-watch reads is still listed as open. The
-// forge makes no such distinction, and a lane that prefilters on this listing
-// would otherwise see an empty repository.
+func (s *stubCoordinatorGitHub) ListMergeWatchIssues(context.Context, githubinfra.ListMergeWatchIssuesInput) ([]githubinfra.IssueSummary, error) {
+	return append([]githubinfra.IssueSummary(nil), s.mergeWatchIssues...), nil
+}
 func (s *stubCoordinatorGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error) {
 	if s.openPullRequestSummaries != nil {
 		return append([]githubinfra.PullRequestSummary(nil), s.openPullRequestSummaries...), nil
@@ -1725,6 +1762,26 @@ func (s *stubCoordinatorGitHub) ListIssueComments(_ context.Context, input githu
 	}
 	s.commentReads[input.IssueNumber]++
 	return append([]githubinfra.CommentInfo(nil), batches[reads]...), nil
+}
+func (s *stubCoordinatorGitHub) ListIssueCommentsContaining(_ context.Context, input githubinfra.ViewIssueInput, markers []string) ([]githubinfra.CommentInfo, error) {
+	s.commentContainingReads++
+	if len(markers) == 0 {
+		return nil, nil
+	}
+	batches := s.comments[input.IssueNumber]
+	if len(batches) == 0 {
+		return nil, nil
+	}
+	filtered := make([]githubinfra.CommentInfo, 0, len(batches[0]))
+	for _, comment := range batches[0] {
+		for _, marker := range markers {
+			if strings.Contains(comment.Body, marker) {
+				filtered = append(filtered, comment)
+				break
+			}
+		}
+	}
+	return filtered, nil
 }
 func (s *stubCoordinatorGitHub) ListIssueBlockedBy(_ context.Context, input githubinfra.ListIssueBlockedByInput) ([]githubinfra.IssueDependency, error) {
 	s.blockedByReads++
@@ -1816,6 +1873,7 @@ func (s *stubCoordinatorGitHub) UpdateIssueComment(_ context.Context, input gith
 }
 func (s *stubCoordinatorGitHub) DeleteIssueComment(_ context.Context, input githubinfra.DeleteIssueCommentInput) error {
 	s.ops = append(s.ops, "delete-comment")
+	s.deletedCommentIDs = append(s.deletedCommentIDs, input.CommentID)
 	return nil
 }
 func (s *stubCoordinatorGitHub) AddPullRequestReviewers(_ context.Context, input githubinfra.PullRequestReviewersInput) error {
@@ -1857,6 +1915,14 @@ func (s *stubCoordinatorGitHub) ViewPullRequestMergeWatch(_ context.Context, inp
 		return revalidated, nil
 	}
 	return s.prDetails[input.PRNumber], nil
+}
+func (s *stubCoordinatorGitHub) DisablePullRequestAutoMerge(_ context.Context, input githubinfra.DisablePullRequestAutoMergeInput) error {
+	s.ops = append(s.ops, "disable-auto")
+	if s.disableAutoMergeErr != nil {
+		return s.disableAutoMergeErr
+	}
+	s.disabledAutoMerges = append(s.disabledAutoMerges, input)
+	return nil
 }
 func (s *stubCoordinatorGitHub) ListPullRequestCheckRuns(_ context.Context, input githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error) {
 	if err := s.failPRCheckRuns[input.Ref]; err != nil {
@@ -2003,6 +2069,204 @@ func TestRunnerMergeWatchConflictRoutesToFixerAndUpdatesMarker(t *testing.T) {
 	}
 	if len(fixture.github.createdBodies) != 0 {
 		t.Fatalf("createdBodies = %v, want no new comments", fixture.github.createdBodies)
+	}
+}
+
+func TestRunnerMergeWatchCancelsRetiredLooperAutoMerge(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })
+	fixture.runner.cancelRetiredAutoMerge = true
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{
+		Number: 1,
+		Title:  "Bug",
+		Author: "octo",
+		Labels: []string{"triaged"},
+		Comments: []githubinfra.CommentInfo{{
+			ID: 44, Author: "looper",
+			Body:      mergeWatchCommentBody(fixture.cfg, 77, "abc123", 3, nil, nil, "watching"),
+			CreatedAt: fixture.now.Format(time.RFC3339),
+		}},
+		CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339),
+	}
+	fixture.github.prDetails[77] = githubinfra.PullRequestDetail{
+		Number: 77, Body: "Closes #1", State: "open", HeadSHA: "abc123", BaseRefName: "main",
+		Labels: []string{labels.DefaultPlanTrigger}, Mergeable: boolPtr(true), MergeableState: "blocked",
+		AutoMerge: &githubinfra.PullRequestAutoMerge{EnabledBy: "looper"},
+	}
+	fixture.github.timeline[1] = []map[string]any{{"source": map[string]any{"issue": map[string]any{"pull_request": map[string]any{"number": 77, "html_url": "https://github.com/acme/looper/pull/77"}}}}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"disable-auto", "delete-comment"})
+	if len(fixture.github.disabledAutoMerges) != 1 || fixture.github.disabledAutoMerges[0].PRNumber != 77 {
+		t.Fatalf("disabledAutoMerges = %#v, want PR #77", fixture.github.disabledAutoMerges)
+	}
+}
+
+func TestRunnerMergeWatchCancelsRetiredAutoMergeBeforeDeferredRetry(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })
+	fixture.runner.cancelRetiredAutoMerge = true
+	retryAt := fixture.now.Add(10 * time.Minute)
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{
+		Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"},
+		Comments: []githubinfra.CommentInfo{{
+			ID: 44, Author: "looper",
+			Body: mergeWatchCommentBody(fixture.cfg, 77, "abc123", 2, nil, &retryAt, "retry later"),
+		}},
+	}
+	fixture.github.prDetails[77] = githubinfra.PullRequestDetail{
+		Number: 77, Body: "Closes #1", State: "open", HeadSHA: "abc123", BaseRefName: "main",
+		Labels: []string{labels.DefaultPlanTrigger}, Mergeable: boolPtr(true), MergeableState: "blocked",
+		AutoMerge: &githubinfra.PullRequestAutoMerge{EnabledBy: "looper"},
+	}
+	fixture.github.timeline[1] = []map[string]any{{"source": map[string]any{"issue": map[string]any{"pull_request": map[string]any{"number": 77, "html_url": "https://github.com/acme/looper/pull/77"}}}}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"disable-auto", "delete-comment"})
+	if len(fixture.github.disabledAutoMerges) != 1 || fixture.github.disabledAutoMerges[0].PRNumber != 77 {
+		t.Fatalf("disabledAutoMerges = %#v, want PR #77", fixture.github.disabledAutoMerges)
+	}
+}
+
+// Migration cleanup is independent of normal Coordinator discovery: the
+// tracked issue may be closed and its historical triaged label may no longer
+// match the current configuration.
+func TestRunnerRetiredAutoMergeReconciliationFindsClosedUntriagedIssue(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = false })
+	fixture.runner.cancelRetiredAutoMerge = true
+	fixture.github.mergeWatchIssues = []githubinfra.IssueSummary{{Number: 1, State: "closed", Labels: []string{"legacy-triage"}}}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{
+		ID: 44, Author: "looper",
+		Body: mergeWatchCommentBody(fixture.cfg, 77, "abc123", 2, nil, nil, "watching"),
+	}}}
+	fixture.github.prDetails[77] = githubinfra.PullRequestDetail{
+		Number: 77, State: "open", HeadSHA: "abc123", BaseRefName: "main",
+		AutoMerge: &githubinfra.PullRequestAutoMerge{EnabledBy: "looper"},
+	}
+
+	if err := fixture.runner.ReconcileRetiredAutoMerge(context.Background(), RetiredAutoMergeInput{
+		ProjectID: fixture.projectID, Repo: "acme/looper", CWD: "repo",
+	}); err != nil {
+		t.Fatalf("ReconcileRetiredAutoMerge() error = %v", err)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"disable-auto", "delete-comment"})
+	if len(fixture.github.disabledAutoMerges) != 1 || fixture.github.disabledAutoMerges[0].PRNumber != 77 {
+		t.Fatalf("disabledAutoMerges = %#v, want PR #77", fixture.github.disabledAutoMerges)
+	}
+	if fixture.github.commentContainingReads != 1 {
+		t.Fatalf("marker comment reads = %d, want one provider-filtered read", fixture.github.commentContainingReads)
+	}
+}
+
+func TestRunnerRetiredAutoMergeReconciliationUsesMarkerAuthorAfterCredentialRotation(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = false })
+	fixture.runner.cancelRetiredAutoMerge = true
+	fixture.github.currentLogin = "new-looper"
+	fixture.github.mergeWatchIssues = []githubinfra.IssueSummary{{Number: 1, State: "closed"}}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{
+		ID: 44, Author: "old-looper",
+		Body: mergeWatchCommentBody(fixture.cfg, 77, "abc123", 2, nil, nil, "watching"),
+	}}}
+	fixture.github.prDetails[77] = githubinfra.PullRequestDetail{
+		Number: 77, State: "open", HeadSHA: "abc123", BaseRefName: "main",
+		AutoMerge: &githubinfra.PullRequestAutoMerge{EnabledBy: "old-looper"},
+	}
+
+	if err := fixture.runner.ReconcileRetiredAutoMerge(context.Background(), RetiredAutoMergeInput{
+		ProjectID: fixture.projectID, Repo: "acme/looper", CWD: "repo",
+	}); err != nil {
+		t.Fatalf("ReconcileRetiredAutoMerge() error = %v", err)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"disable-auto", "delete-comment"})
+	if len(fixture.github.disabledAutoMerges) != 1 || fixture.github.disabledAutoMerges[0].PRNumber != 77 {
+		t.Fatalf("disabledAutoMerges = %#v, want PR #77 after credential rotation", fixture.github.disabledAutoMerges)
+	}
+}
+
+func TestRunnerRetiredAutoMergeReconciliationInspectsAllHistoricalMarkers(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = false })
+	fixture.runner.cancelRetiredAutoMerge = true
+	fixture.github.mergeWatchIssues = []githubinfra.IssueSummary{{Number: 1, State: "closed"}}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{
+		{
+			ID: 44, Author: "old-looper",
+			Body: mergeWatchCommentBody(fixture.cfg, 77, "abc123", 2, nil, nil, "watching"),
+		},
+		{
+			ID: 45, Author: "another-bot",
+			Body: mergeWatchCommentBody(fixture.cfg, 77, "abc123", 0, nil, nil, "newer marker"),
+		},
+	}}
+	fixture.github.prDetails[77] = githubinfra.PullRequestDetail{
+		Number: 77, State: "open", HeadSHA: "abc123", BaseRefName: "main",
+		AutoMerge: &githubinfra.PullRequestAutoMerge{EnabledBy: "old-looper"},
+	}
+
+	if err := fixture.runner.ReconcileRetiredAutoMerge(context.Background(), RetiredAutoMergeInput{
+		ProjectID: fixture.projectID, Repo: "acme/looper", CWD: "repo",
+	}); err != nil {
+		t.Fatalf("ReconcileRetiredAutoMerge() error = %v", err)
+	}
+	if len(fixture.github.disabledAutoMerges) != 1 || fixture.github.disabledAutoMerges[0].PRNumber != 77 {
+		t.Fatalf("disabledAutoMerges = %#v, want historical owner marker to disable PR #77 once", fixture.github.disabledAutoMerges)
+	}
+	if got := fixture.github.deletedCommentIDs; !slices.Equal(got, []int64{45, 44}) {
+		t.Fatalf("deleted comment IDs = %v, want every marker settled newest-first", got)
+	}
+}
+
+func TestRunnerRetiredAutoMergeReconciliationRejectsIndeterminatePRProjection(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = false })
+	fixture.runner.cancelRetiredAutoMerge = true
+	fixture.github.mergeWatchIssues = []githubinfra.IssueSummary{{Number: 1, State: "closed"}}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{
+		ID: 44, Author: "looper",
+		Body: mergeWatchCommentBody(fixture.cfg, 77, "abc123", 2, nil, nil, "watching"),
+	}}}
+	fixture.github.prDetails[77] = githubinfra.PullRequestDetail{Number: 0}
+
+	err := fixture.runner.ReconcileRetiredAutoMerge(context.Background(), RetiredAutoMergeInput{
+		ProjectID: fixture.projectID, Repo: "acme/looper", CWD: "repo",
+	})
+	if err == nil || !strings.Contains(err.Error(), "provider returned PR #0") {
+		t.Fatalf("ReconcileRetiredAutoMerge() error = %v, want incomplete cleanup error", err)
+	}
+	if len(fixture.github.disabledAutoMerges) != 0 || len(fixture.github.deletedCommentIDs) != 0 {
+		t.Fatalf("cleanup mutations = disables %#v deletes %v, want marker preserved", fixture.github.disabledAutoMerges, fixture.github.deletedCommentIDs)
+	}
+}
+
+func TestRunnerMergeWatchDoesNotCancelMarkerlessSameIdentityAutoMerge(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })
+	fixture.runner.cancelRetiredAutoMerge = true
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}}
+	fixture.github.prDetails[77] = githubinfra.PullRequestDetail{
+		Number: 77, Body: "Closes #1", State: "open", HeadSHA: "abc123", BaseRefName: "main",
+		Labels: []string{labels.DefaultPlanTrigger}, Mergeable: boolPtr(true), MergeableState: "blocked",
+		AutoMerge: &githubinfra.PullRequestAutoMerge{EnabledBy: "looper"},
+	}
+	fixture.github.timeline[1] = []map[string]any{{"source": map[string]any{"issue": map[string]any{"pull_request": map[string]any{"number": 77, "html_url": "https://github.com/acme/looper/pull/77"}}}}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.disabledAutoMerges) != 0 {
+		t.Fatalf("disabledAutoMerges = %#v, want no cancellation without marker provenance", fixture.github.disabledAutoMerges)
+	}
+	if len(fixture.github.createdBodies) != 0 || len(fixture.github.updatedBodies) != 0 {
+		t.Fatalf("watch comments created=%v updated=%v, want no marker for unproven same-identity auto-merge", fixture.github.createdBodies, fixture.github.updatedBodies)
 	}
 }
 

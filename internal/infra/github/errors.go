@@ -33,6 +33,12 @@ func IsTransientError(err error) bool {
 	}
 	var commandErr *shell.CommandExecutionError
 	if errors.As(err, &commandErr) {
+		// A supervised gh timeout is indeterminate: GitHub may have accepted
+		// the request before the local process was killed. Treat it as
+		// retryable instead of recording a definitive forge refusal.
+		if commandErr.Category == shell.FailureSupervisorTimeout {
+			return true
+		}
 		message := strings.Join([]string{commandErr.Message, commandErr.Result.Stdout, commandErr.Result.Stderr}, "\n")
 		return (looksLikeGitHubFailure(message) && isTransientGitHubMessage(message)) || isExplicitTransientGitHubStatus(message)
 	}
@@ -41,6 +47,34 @@ func IsTransientError(err error) bool {
 		return false
 	}
 	return isTransientGitHubMessage(message)
+}
+
+// IsAuthorizationError reports whether GitHub rejected a request because the
+// active credential is missing authentication, permission, or token scope.
+// Callers must surface these failures instead of recording them as a normal
+// forge refusal because a later credential refresh can make the request valid.
+func IsAuthorizationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(ErrorMessage(err))
+	for _, fragment := range []string{
+		"http 401",
+		"401 unauthorized",
+		"bad credentials",
+		"requires authentication",
+		"http 403",
+		"403 forbidden",
+		"resource not accessible by integration",
+		"resource not accessible by personal access token",
+		"insufficient oauth scope",
+		"insufficient scope",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 // ErrorMessage returns the most useful user-facing text for a GitHub CLI/API

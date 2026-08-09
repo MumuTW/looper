@@ -20,6 +20,7 @@ type MergeOutcome struct {
 	// commit that was merged.
 	HeadSHA        string                      `json:"headSha"`
 	MergeCommitSHA string                      `json:"mergeCommitSha,omitempty"`
+	MergeStrategy  string                      `json:"mergeStrategy,omitempty"`
 	SourceIssue    *githubinfra.IssueReference `json:"sourceIssue,omitempty"`
 	// TouchedFiles is GitHub's authoritative pull-request file list captured
 	// after a successful merge. Auditor may use it as attribution evidence.

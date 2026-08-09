@@ -17,13 +17,15 @@ const (
 // ConfirmationInput compares the failed checks observed on the default branch
 // with one completed re-run on the same audited ref.
 type ConfirmationInput struct {
-	InitialFailedChecks      []string
-	InitialFailedPaths       []string
-	InitialFailureSignatures []FailurePathSignature
-	RerunCompleted           bool
-	RerunFailedChecks        []string
-	RerunFailedPaths         []string
-	RerunFailureSignatures   []FailurePathSignature
+	InitialFailedChecks       []string
+	InitialFailedPaths        []string
+	InitialFailedPathsByCheck map[string][]string
+	InitialFailureSignatures  []FailurePathSignature
+	RerunCompleted            bool
+	RerunFailedChecks         []string
+	RerunFailedPaths          []string
+	RerunFailedPathsByCheck   map[string][]string
+	RerunFailureSignatures    []FailurePathSignature
 }
 
 type ConfirmationResult struct {
@@ -80,6 +82,30 @@ func matchingFailureChecks(input ConfirmationInput, initial, rerun map[string]st
 		}
 		return matching
 	}
+	if len(input.InitialFailedPathsByCheck) > 0 && len(input.RerunFailedPathsByCheck) > 0 {
+		for check, rerunPaths := range input.RerunFailedPathsByCheck {
+			normalizedCheck := strings.ToLower(strings.TrimSpace(check))
+			if normalizedCheck == "" {
+				continue
+			}
+			if _, ok := initial[normalizedCheck]; !ok {
+				continue
+			}
+			initialPaths := input.InitialFailedPathsByCheck[check]
+			if len(initialPaths) == 0 {
+				for initialCheck, paths := range input.InitialFailedPathsByCheck {
+					if strings.EqualFold(strings.TrimSpace(initialCheck), normalizedCheck) {
+						initialPaths = paths
+						break
+					}
+				}
+			}
+			if hasPathOverlap(initialPaths, rerunPaths) {
+				matching[normalizedCheck] = struct{}{}
+			}
+		}
+		return matching
+	}
 	initialPathCount, rerunPathCount := len(input.InitialFailedPaths), len(input.RerunFailedPaths)
 	if !((initialPathCount == 0 && rerunPathCount == 0) || (initialPathCount > 0 && rerunPathCount > 0 && hasPathOverlap(input.InitialFailedPaths, input.RerunFailedPaths))) {
 		return matching
@@ -118,7 +144,6 @@ func hasPathOverlap(left, right []string) bool {
 	}
 	return false
 }
-
 func normalizedSet(checks []string) map[string]struct{} {
 	result := make(map[string]struct{}, len(checks))
 	for _, check := range checks {

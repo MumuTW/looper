@@ -74,6 +74,7 @@ const (
 	// longer than a queue claim window without an active agent execution.
 	defaultLegacyMarkerlessRunGrace = 24 * time.Hour
 	defaultRetryDelay               = 5 * time.Second
+	maxRetryDelay                   = 300 * time.Second
 	defaultRetryMax                 = 3
 	// durableRecoveryTimeout bounds the detached context used after a claimed
 	// operation has already failed. Queue/loop reconciliation must survive the
@@ -122,6 +123,7 @@ type PullRequestSummary struct {
 type PullRequestDetail struct {
 	Number         int64
 	State          string
+	MergedAt       string
 	IsDraft        bool
 	Labels         []string
 	HeadSHA        string
@@ -293,6 +295,26 @@ type RegenerateIssueFunc func(context.Context, RegenerateIssueInput) error
 // closing it when the downstream Planner authority is unavailable.
 type RegenerationAvailabilityFunc func(projectID string) string
 
+// ConflictRegenerationInput is the coordinator handoff for a PR that has
+// repeatedly conflicted with its base branch. Unlike ordinary Fixer
+// exhaustion it has no agent run or queue row; the durable authority is the
+// merge-watch marker, while this method reuses the same close-and-regenerate
+// side-effect contract.
+type ConflictRegenerationInput struct {
+	ProjectID       string
+	Repo            string
+	IssueRepo       string
+	IssueNumber     int64
+	PRNumber        int64
+	ConflictRepairs int
+	CWD             string
+}
+
+type ConflictRegenerationResult struct {
+	Completed bool
+	Escalated bool
+}
+
 // RegenerationGateway is deliberately separate from GitHubGateway.  Existing
 // fixer fakes and integrations remain source-compatible while terminal
 // exhaustion opts into the stronger close-and-regenerate capability.
@@ -317,8 +339,9 @@ type IssueDetail struct {
 }
 
 type IssueComment struct {
-	ID   int64
-	Body string
+	ID     int64
+	Author string
+	Body   string
 }
 
 type IssueLabelsInput struct {
@@ -329,10 +352,11 @@ type IssueLabelsInput struct {
 }
 
 type ClosePullRequestInput struct {
-	Repo         string
-	PRNumber     int64
-	DeleteBranch bool
-	CWD          string
+	Repo            string
+	PRNumber        int64
+	DeleteBranch    bool
+	ExpectedHeadSHA string
+	CWD             string
 }
 
 type PullRequestCommit struct {
@@ -340,7 +364,6 @@ type PullRequestCommit struct {
 	AuthorLogin    string
 	CommitterLogin string
 }
-
 type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	GetCurrentUserLogin(context.Context, string, string) (string, error)
@@ -408,10 +431,12 @@ type InspectHeadInput struct {
 }
 
 type InspectHeadResult struct {
-	HeadSHA               string
-	NewCommitSHAs         []string
-	HasUncommittedChanges bool
-	ChangedFiles          []string
+	HeadSHA                 string
+	NewCommitSHAs           []string
+	HasUncommittedChanges   bool
+	ChangedFiles            []string
+	HasUnresolvedConflicts  bool
+	UnresolvedConflictFiles []string
 }
 
 type CommitInput struct {
@@ -576,6 +601,11 @@ type Options struct {
 	RetryBaseDelay              time.Duration
 	RetryMaxAttempts            int64
 	MaxConsecutiveFixerFailures int
+	// PlannerRegenerationAvailable is nil for standalone/test runners, which
+	// retain the historical assumption that their callback is authoritative. A
+	// daemon passes the resolved Planner availability explicitly so an
+	// unconfigured Planner cannot be reached after a destructive PR close.
+	PlannerRegenerationAvailable *bool
 	// MaxFixerRoundsPerPullRequest bounds how many pushes this fixer may draw
 	// review on for one pull request before the loop is parked for a human.
 	MaxFixerRoundsPerPullRequest int
@@ -597,42 +627,43 @@ type DiscoveryPolicy struct {
 // Runner is the Fixer: a reactive Role that addresses review feedback on a
 // Pull Request. Stateful: it persists runs in the local SQLite database.
 type Runner struct {
-	db                          *sql.DB
-	repos                       *storage.Repositories
-	github                      GitHubGateway
-	git                         GitGateway
-	agentExecutor               AgentExecutor
-	logger                      bootstrap.Logger
-	now                         func() time.Time
-	agentTimeout                time.Duration
-	agentIdleTimeout            time.Duration
-	claimTTL                    time.Duration
-	validationCommands          []string
-	validationCommandsByProject map[string][]string
-	validationRunner            ValidationRunner
-	containmentTracker          processcontainment.LiveTracker
-	allowAutoCommit             bool
-	allowAutoPush               bool
-	allowRiskyFixes             bool
-	fixAllPullRequests          bool
-	discoveryPolicy             DiscoveryPolicy
-	disclosure                  config.DisclosureConfig
-	agentRuntime                string
-	agentProfileID              string
-	agentReasoningEffort        *config.ReasoningEffort
-	customInstructions          config.Config
-	projectRoleConfig           *config.Config
-	agentModel                  *string
-	sleep                       func(time.Duration)
-	retryBaseDelay              time.Duration
-	retryMaxAttempts            int64
-	consecutiveFailureThreshold int
-	maxFixerRounds              int
-	onAgentExecutionStarted     AgentExecutionStartedFunc
-	onQueueItemEnqueued         func()
-	onRegenerateIssue           RegenerateIssueFunc
-	regenerationAvailability    RegenerationAvailabilityFunc
-	deleteBranchOnRegeneration  func(projectID string) bool
+	db                           *sql.DB
+	repos                        *storage.Repositories
+	github                       GitHubGateway
+	git                          GitGateway
+	agentExecutor                AgentExecutor
+	logger                       bootstrap.Logger
+	now                          func() time.Time
+	agentTimeout                 time.Duration
+	agentIdleTimeout             time.Duration
+	claimTTL                     time.Duration
+	validationCommands           []string
+	validationCommandsByProject  map[string][]string
+	validationRunner             ValidationRunner
+	containmentTracker           processcontainment.LiveTracker
+	allowAutoCommit              bool
+	allowAutoPush                bool
+	allowRiskyFixes              bool
+	fixAllPullRequests           bool
+	discoveryPolicy              DiscoveryPolicy
+	disclosure                   config.DisclosureConfig
+	agentRuntime                 string
+	agentProfileID               string
+	agentReasoningEffort         *config.ReasoningEffort
+	customInstructions           config.Config
+	projectRoleConfig            *config.Config
+	agentModel                   *string
+	sleep                        func(time.Duration)
+	retryBaseDelay               time.Duration
+	retryMaxAttempts             int64
+	consecutiveFailureThreshold  int
+	maxFixerRounds               int
+	onAgentExecutionStarted      AgentExecutionStartedFunc
+	onQueueItemEnqueued          func()
+	onRegenerateIssue            RegenerateIssueFunc
+	regenerationAvailability     RegenerationAvailabilityFunc
+	deleteBranchOnRegeneration   func(projectID string) bool
+	plannerRegenerationAvailable bool
 }
 
 type DiscoveryInput struct {
@@ -818,9 +849,28 @@ type fixerCheckpoint struct {
 	// ReproductionAbsent is set when the first capture observes no committed
 	// manifest. Later captures refuse to adopt an agent-authored manifest so
 	// the daemon cannot execute a testCommand that was not present at run start.
-	ReproductionAbsent bool   `json:"reproductionAbsent,omitempty"`
-	SkipReason         string `json:"skipReason,omitempty"`
+	ReproductionAbsent bool `json:"reproductionAbsent,omitempty"`
+	// ReproductionMergePhase records daemon-controlled base-merge authority
+	// across the conflict-resolution handoff. It is intentionally separate from
+	// ReproductionAbsent: a merge may introduce or update the contract even
+	// when the PR started without one.
+	ReproductionMergePhase fixerReproductionMergePhase `json:"reproductionMergePhase,omitempty"`
+	// ReproductionMergeUnresolved is refreshed from Git's unmerged index state
+	// while the merge phase is conflicted. It is deliberately separate from
+	// file contents: conflict-marker literals in a valid test are not merge
+	// authority.
+	ReproductionMergeUnresolved    bool     `json:"reproductionMergeUnresolved,omitempty"`
+	ReproductionMergeConflictFiles []string `json:"reproductionMergeConflictFiles,omitempty"`
+	SkipReason                     string   `json:"skipReason,omitempty"`
 }
+
+type fixerReproductionMergePhase string
+
+const (
+	fixerReproductionMergePending    fixerReproductionMergePhase = "pending"
+	fixerReproductionMergeConflicted fixerReproductionMergePhase = "conflicted"
+	fixerReproductionMergeCompleted  fixerReproductionMergePhase = "completed"
+)
 
 type checkpointPause struct {
 	Reason              string   `json:"reason,omitempty"`
@@ -1029,22 +1079,79 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 	}
 	manifest, err := reproducer.Load(worktreePath)
 	if err != nil {
+		if checkpoint.ReproductionAbsent && fixerRetryHasUnfinishedRepair(checkpoint) {
+			// A retry may inherit a partially written manifest from the
+			// interrupted repair. Keep the durable negative observation
+			// authoritative and let the replacement agent remove or finish
+			// the untrusted file.
+			return nil
+		}
+		if fixerMergePhaseDefersCapture(*checkpoint) {
+			return nil
+		}
 		return fixerReproductionFailure(err)
+	}
+	if (checkpoint.ReproductionMergePhase == fixerReproductionMergePending || checkpoint.ReproductionMergePhase == fixerReproductionMergeConflicted) && len(checkpoint.ReproductionMergeConflictFiles) > 0 {
+		checkpoint.ReproductionMergeUnresolved = fixerReproductionConflictAffectsContract(*checkpoint, manifest, checkpoint.ReproductionMergeConflictFiles)
 	}
 	if checkpoint.Reproduction != nil {
 		if manifest == nil {
 			return fixerReproductionFailure(errors.New("reproduction manifest is missing"))
 		}
 		if !checkpoint.Reproduction.Equal(*manifest) {
+			if checkpoint.ReproductionMergePhase == fixerReproductionMergeCompleted || checkpoint.ReproductionMergePhase == fixerReproductionMergeConflicted {
+				if err := manifest.Verify(worktreePath); err != nil {
+					if fixerMergePhaseDefersCapture(*checkpoint) {
+						return nil
+					}
+					return fixerReproductionFailure(err)
+				}
+				checkpoint.Reproduction = manifest
+				checkpoint.ReproductionAbsent = false
+				checkpoint.ReproductionMergePhase = ""
+				checkpoint.ReproductionMergeUnresolved = false
+				checkpoint.ReproductionMergeConflictFiles = nil
+				return nil
+			}
 			return fixerReproductionFailure(errors.New("reproduction manifest changed during run"))
 		}
 		if err := checkpoint.Reproduction.Verify(worktreePath); err != nil {
+			if fixerMergePhaseDefersCapture(*checkpoint) {
+				return nil
+			}
 			return fixerReproductionFailure(err)
+		}
+		if checkpoint.ReproductionMergePhase == fixerReproductionMergeConflicted {
+			checkpoint.ReproductionMergePhase = ""
+			checkpoint.ReproductionMergeUnresolved = false
+			checkpoint.ReproductionMergeConflictFiles = nil
 		}
 		return nil
 	}
 	if manifest != nil {
 		if checkpoint.ReproductionAbsent {
+			if fixerRetryHasUnfinishedRepair(checkpoint) {
+				// The previous repair attempt did not complete. Keep the
+				// durable negative observation authoritative, but let the
+				// agent retry against the retained worktree instead of
+				// converting an untrusted mid-attempt manifest into manual
+				// intervention.
+				return nil
+			}
+			if checkpoint.ReproductionMergePhase == fixerReproductionMergeCompleted || checkpoint.ReproductionMergePhase == fixerReproductionMergeConflicted {
+				if fixerMergePhaseDefersCapture(*checkpoint) {
+					return nil
+				}
+				if err := manifest.Verify(worktreePath); err != nil {
+					return fixerReproductionFailure(err)
+				}
+				checkpoint.Reproduction = manifest
+				checkpoint.ReproductionAbsent = false
+				checkpoint.ReproductionMergePhase = ""
+				checkpoint.ReproductionMergeUnresolved = false
+				checkpoint.ReproductionMergeConflictFiles = nil
+				return nil
+			}
 			// The Fixer started without a committed reproduction contract. An
 			// agent-authored manifest mid-run is not authority: adopting it
 			// would let the agent invent the testCommand the daemon executes.
@@ -1064,8 +1171,72 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 	}
 	// Persist the negative observation so a later capture cannot treat a
 	// newly written manifest as the original contract.
+	if checkpoint.ReproductionMergePhase == fixerReproductionMergeConflicted && !checkpoint.ReproductionMergeUnresolved {
+		checkpoint.ReproductionMergePhase = ""
+		checkpoint.ReproductionMergeConflictFiles = nil
+	}
 	checkpoint.ReproductionAbsent = true
 	return nil
+}
+
+func fixerRetryHasUnfinishedRepair(checkpoint *fixerCheckpoint) bool {
+	if checkpoint == nil {
+		return false
+	}
+	// PendingAgentExecutionID is persisted after Start and before Wait. A
+	// Wait error therefore leaves Repair nil even though the agent may already
+	// have written a manifest; that manifest must remain untrusted but
+	// deferrable while the replacement agent owns the retry.
+	if strings.TrimSpace(checkpoint.PendingAgentExecutionID) != "" {
+		return true
+	}
+	if checkpoint.Repair == nil {
+		return false
+	}
+	status := strings.TrimSpace(checkpoint.Repair.Status)
+	return status != "" && !strings.EqualFold(status, "completed")
+}
+
+func fixerMergePhaseDefersCapture(checkpoint fixerCheckpoint) bool {
+	if checkpoint.ReproductionMergePhase != fixerReproductionMergePending && checkpoint.ReproductionMergePhase != fixerReproductionMergeConflicted {
+		return false
+	}
+	return checkpoint.ReproductionMergeUnresolved
+}
+
+func (r *Runner) refreshFixerMergeConflictState(ctx context.Context, input stepInput, checkpoint *fixerCheckpoint, worktreePath, worktreeRoot string) error {
+	if checkpoint == nil || checkpoint.ReproductionMergePhase != fixerReproductionMergeConflicted || r.git == nil {
+		return nil
+	}
+	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{
+		RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktreePath,
+	})
+	if err != nil {
+		return err
+	}
+	checkpoint.ReproductionMergeConflictFiles = append([]string(nil), inspect.UnresolvedConflictFiles...)
+	checkpoint.ReproductionMergeUnresolved = fixerReproductionConflictAffectsContract(*checkpoint, nil, checkpoint.ReproductionMergeConflictFiles)
+	return nil
+}
+
+func fixerReproductionConflictAffectsContract(checkpoint fixerCheckpoint, manifest *reproducer.Manifest, paths []string) bool {
+	if len(paths) == 0 {
+		return false
+	}
+	wanted := map[string]struct{}{filepath.Clean(reproducer.ManifestPath): {}}
+	contract := manifest
+	if contract == nil {
+		contract = checkpoint.Reproduction
+	}
+	if contract != nil && strings.TrimSpace(contract.TestPath) != "" {
+		wanted[filepath.Clean(contract.TestPath)] = struct{}{}
+	}
+	for _, path := range paths {
+		if _, ok := wanted[filepath.Clean(path)]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // fixerPastInitialReproductionCapture reports whether the run already advanced
@@ -1080,19 +1251,40 @@ func fixerPastInitialReproductionCapture(checkpoint fixerCheckpoint) bool {
 	// Steps after the initial capture opportunity. Repair is assigned only
 	// after Wait returns; PendingAgentExecutionID covers the active-agent
 	// window so a crash mid-Wait fails closed for legacy adoption.
-	return checkpoint.Repair != nil ||
+	if checkpoint.Repair != nil ||
 		strings.TrimSpace(checkpoint.PendingAgentExecutionID) != "" ||
 		checkpoint.Validation != nil ||
 		checkpoint.Push != nil ||
 		checkpoint.ReconcileCommits != nil ||
 		checkpoint.ResolvedComments != nil ||
 		checkpoint.SummaryComment != nil ||
-		checkpoint.Recheck != nil
+		checkpoint.Recheck != nil {
+		return true
+	}
+	// A legacy retry can fail after capture but before Repair is assigned. Use
+	// the durable failure step only for repair and downstream phases; discovery,
+	// claim, collect-fixes, and prepare failures have not reached the capture
+	// boundary and must not block a valid base-branch manifest on resume.
+	if checkpoint.Outcome != nil && checkpoint.Outcome.PrimaryFailure != nil {
+		switch FixerStep(strings.TrimSpace(checkpoint.Outcome.PrimaryFailure.Step)) {
+		case stepRepair, stepReconcileCommits, stepValidate, stepPush, stepResolveComments, stepRecheck:
+			return true
+		}
+	}
+	return false
 }
 
 func verifyFixerReproduction(checkpoint fixerCheckpoint, worktreePath string) error {
 	if checkpoint.Reproduction == nil {
 		return nil
+	}
+	if checkpoint.ReproductionMergePhase == fixerReproductionMergeConflicted {
+		// The merge authority remains pending until capture sees a resolved
+		// manifest/test after the agent turn. Do not compare the pre-merge
+		// contract against conflict markers or a legitimate base update.
+		if checkpoint.ReproductionMergeUnresolved {
+			return nil
+		}
 	}
 	if err := checkpoint.Reproduction.Verify(worktreePath); err != nil {
 		return fixerReproductionFailure(err)
@@ -1163,6 +1355,12 @@ func validateCompletedRepairCheckpoint(repair *checkpointRepair, worktree *check
 
 func checkpointRepairFromAgentResult(executionID, headSHA string, result AgentResult, nowISO string) *checkpointRepair {
 	return &checkpointRepair{AgentExecutionID: executionID, Status: result.Status, Summary: result.Summary, HeadSHA: headSHA, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, CompletedAt: nowISO, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}
+}
+
+func fixerRetryPendingRepair(executionID, headSHA string, result AgentResult, nowISO string) *checkpointRepair {
+	repair := checkpointRepairFromAgentResult(executionID, headSHA, result, nowISO)
+	repair.Status = "retry_pending"
+	return repair
 }
 
 // maxReplyExplanationLength caps each agent-supplied explanation. Replies are
@@ -1738,42 +1936,43 @@ func New(options Options) *Runner {
 		}
 	}
 	return &Runner{
-		db:                          options.DB,
-		repos:                       options.Repos,
-		github:                      options.GitHub,
-		git:                         options.Git,
-		agentExecutor:               options.AgentExecutor,
-		logger:                      options.Logger,
-		now:                         now,
-		agentTimeout:                agentTimeout,
-		agentIdleTimeout:            agentIdleTimeout,
-		claimTTL:                    claimTTL,
-		validationCommands:          append([]string(nil), options.ValidationCommands...),
-		validationCommandsByProject: cloneValidationCommandsByProject(options.ValidationCommandsByProject),
-		validationRunner:            options.ValidationRunner,
-		containmentTracker:          options.ContainmentTracker,
-		allowAutoCommit:             options.AllowAutoCommit,
-		allowAutoPush:               options.AllowAutoPush,
-		allowRiskyFixes:             options.AllowRiskyFixes,
-		fixAllPullRequests:          options.FixAllPullRequests,
-		discoveryPolicy:             policy,
-		disclosure:                  disclosureCfg,
-		agentRuntime:                strings.TrimSpace(options.AgentRuntime),
-		agentProfileID:              strings.TrimSpace(options.AgentProfileID),
-		agentReasoningEffort:        cloneReasoningEffortPtr(options.AgentReasoningEffort),
-		customInstructions:          customInstructionConfig(options.CustomInstructions),
-		projectRoleConfig:           options.CustomInstructions,
-		agentModel:                  cloneStringPtr(options.AgentModel),
-		sleep:                       sleep,
-		retryBaseDelay:              retryBaseDelay,
-		retryMaxAttempts:            retryMax,
-		consecutiveFailureThreshold: consecutiveFailureThreshold,
-		maxFixerRounds:              maxFixerRounds,
-		onAgentExecutionStarted:     options.OnAgentExecutionStarted,
-		onQueueItemEnqueued:         options.OnQueueItemEnqueued,
-		onRegenerateIssue:           options.OnRegenerateIssue,
-		regenerationAvailability:    options.RegenerationAvailability,
-		deleteBranchOnRegeneration:  options.DeleteBranchOnRegeneration,
+		db:                           options.DB,
+		repos:                        options.Repos,
+		github:                       options.GitHub,
+		git:                          options.Git,
+		agentExecutor:                options.AgentExecutor,
+		logger:                       options.Logger,
+		now:                          now,
+		agentTimeout:                 agentTimeout,
+		agentIdleTimeout:             agentIdleTimeout,
+		claimTTL:                     claimTTL,
+		validationCommands:           append([]string(nil), options.ValidationCommands...),
+		validationCommandsByProject:  cloneValidationCommandsByProject(options.ValidationCommandsByProject),
+		validationRunner:             options.ValidationRunner,
+		containmentTracker:           options.ContainmentTracker,
+		allowAutoCommit:              options.AllowAutoCommit,
+		allowAutoPush:                options.AllowAutoPush,
+		allowRiskyFixes:              options.AllowRiskyFixes,
+		fixAllPullRequests:           options.FixAllPullRequests,
+		discoveryPolicy:              policy,
+		disclosure:                   disclosureCfg,
+		agentRuntime:                 strings.TrimSpace(options.AgentRuntime),
+		agentProfileID:               strings.TrimSpace(options.AgentProfileID),
+		agentReasoningEffort:         cloneReasoningEffortPtr(options.AgentReasoningEffort),
+		customInstructions:           customInstructionConfig(options.CustomInstructions),
+		projectRoleConfig:            options.CustomInstructions,
+		agentModel:                   cloneStringPtr(options.AgentModel),
+		sleep:                        sleep,
+		retryBaseDelay:               retryBaseDelay,
+		retryMaxAttempts:             retryMax,
+		consecutiveFailureThreshold:  consecutiveFailureThreshold,
+		maxFixerRounds:               maxFixerRounds,
+		onAgentExecutionStarted:      options.OnAgentExecutionStarted,
+		onQueueItemEnqueued:          options.OnQueueItemEnqueued,
+		onRegenerateIssue:            options.OnRegenerateIssue,
+		regenerationAvailability:     options.RegenerationAvailability,
+		deleteBranchOnRegeneration:   options.DeleteBranchOnRegeneration,
+		plannerRegenerationAvailable: options.PlannerRegenerationAvailable == nil || *options.PlannerRegenerationAvailable,
 	}
 }
 
@@ -2324,7 +2523,9 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	var breakerLoop *storage.LoopRecord
 	breakerStreak := 0
 	var failErr error
-	if errors.As(err, &activeErr) {
+	if errors.Is(err, agent.ErrProviderBrownout) {
+		failedQueue, failErr = r.requeueQueueItem(ctx, queueItem, failure.Kind, failure.Message, queueItem.Attempts)
+	} else if errors.As(err, &activeErr) {
 		failedQueue, failErr = r.requeueQueueItem(ctx, queueItem, failure.Kind, failure.Message, queueItem.Attempts)
 	} else if errors.As(err, &runFailure) && queueItem.LoopID != nil {
 		loop, loopErr := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
@@ -2383,10 +2584,10 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 			if project == nil {
 				return nil, fmt.Errorf("project not found: %s", loop.ProjectID)
 			}
-			resumed := false
 			if runFailure != nil {
 				if breakerStreak > 0 && breakerPause != nil {
 					var resumeErr error
+					var resumed bool
 					resumed, resumeErr = r.finishFailureStreakBreaker(ctx, *project, *breakerPause, queueItem, runFailure.runID, &runFailure.checkpoint)
 					if resumeErr != nil {
 						return nil, resumeErr
@@ -2395,9 +2596,7 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 						return &runpipe.ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.Message, FailureKind: failure.Kind}, nil
 					}
 				}
-				if !resumed {
-					r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, runFailure.runID, &runFailure.checkpoint)
-				}
+				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, runFailure.runID, &runFailure.checkpoint)
 			}
 			scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber)
 			if err != nil {
@@ -2499,6 +2698,29 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				if err := r.completeRegenerationReplayClaim(ctx, *loop, queueItem, *project); err != nil {
 					return runpipe.ProcessResult{}, err
 				}
+				return runpipe.ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: replayFailure.Message, FailureKind: replayFailure.Kind}, nil
+			}
+		}
+	}
+	// A terminal handoff is itself durable work. If the daemon was restarted
+	// after the PR comment/close but before Planner accepted the route, replay
+	// that suffix instead of treating the paused/failed loop as an ordinary
+	// fixer item (which would strand the closed PR forever).
+	if r.onRegenerateIssue != nil {
+		if state, ok := parseRegenerationState(parseJSONObject(loop.MetadataJSON)); ok && !state.Routed {
+			project, projectErr := r.repos.Projects.GetByID(ctx, loop.ProjectID)
+			if projectErr != nil {
+				return runpipe.ProcessResult{}, projectErr
+			}
+			if project == nil {
+				return runpipe.ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+			}
+			replayFailure := regenerationFailureFromState(state)
+			_, action, replayErr := r.applyTerminalRegeneration(ctx, *project, *loop, queueItem, fixerCheckpoint{}, replayFailure)
+			if replayErr != nil {
+				return runpipe.ProcessResult{}, replayErr
+			}
+			if action == regenerationCompleted || action == regenerationEscalated {
 				return runpipe.ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: replayFailure.Message, FailureKind: replayFailure.Kind}, nil
 			}
 		}
@@ -2699,6 +2921,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				return runpipe.ProcessResult{}, err
 			}
 		}
+		if failedQueue != nil && failedQueue.Status == "failed" {
+			if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
+				return runpipe.ProcessResult{}, err
+			}
+		}
 		if queueResultIsTerminalForCleanup(failedQueue) {
 			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &latest)
 		}
@@ -2807,7 +3034,16 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			// Consecutive-failure circuit breaker: once the same step/fix-items
 			// state has failed r.consecutiveFailureThreshold runs in a row, stop
 			// requeueing and park the loop until discovery sees new feedback.
-			failedQueue, breakerStreak, err := r.failQueueItemWithBreaker(ctx, *loop, queueItem, run.ID, latest, step, failure)
+			var failedQueue *storage.QueueItemRecord
+			breakerStreak := 0
+			if errors.Is(err, agent.ErrProviderBrownout) {
+				// The common executor refused before starting an agent. Requeue the
+				// durable claim without charging an attempt or the fixer failure
+				// streak; no fixer work reached the provider.
+				failedQueue, err = r.requeueQueueItem(ctx, queueItem, failure.Kind, failure.Message, queueItem.Attempts)
+			} else {
+				failedQueue, breakerStreak, err = r.failQueueItemWithBreaker(ctx, *loop, queueItem, run.ID, latest, step, failure)
+			}
 			if err != nil {
 				return runpipe.ProcessResult{}, err
 			}
@@ -2847,6 +3083,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				}
 			}
 			if queueResultAllowsRegeneration(failedQueue, failure) {
+				if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
+					return runpipe.ProcessResult{}, err
+				}
+			}
+			if failedQueue != nil && failedQueue.Status == "failed" {
 				if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
 					return runpipe.ProcessResult{}, err
 				}
@@ -3560,10 +3801,16 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, nil
 	}
 	if checkpoint.Repair != nil {
-		if err := validateCompletedRepairCheckpoint(checkpoint.Repair, checkpoint.Worktree); err != nil {
-			return checkpoint, err
+		if !fixerRetryHasUnfinishedRepair(&checkpoint) {
+			if err := validateCompletedRepairCheckpoint(checkpoint.Repair, checkpoint.Worktree); err != nil {
+				return checkpoint, err
+			}
+			return checkpoint, nil
 		}
-		return checkpoint, nil
+		// A retryable non-completed execution is replayed from repair. Keep
+		// its status through the reproduction capture boundary so a manifest
+		// written by that attempt remains untrusted, then discard the stale
+		// repair record before starting the replacement execution.
 	}
 	if len(checkpoint.FixItems) == 0 {
 		return checkpoint, &runpipe.LoopError{Message: "Missing fix items checkpoint for repair step", Kind: runpipe.FailureRetryableTransient}
@@ -3610,27 +3857,76 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	} else if held {
 		return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 	}
-	// Autonomous conflict resolution (risky fixes on): merge the base into the
-	// worktree so the agent has the conflict markers to resolve, instead of punting
-	// the conflict to a human. A merge that fails for a non-conflict reason falls
-	// back to manual intervention.
+	// Autonomous conflict resolution (risky fixes on): capture the PR-side
+	// reproduction before the daemon merge, then persist the merge authority
+	// before handing conflict markers to the agent. This keeps an existing
+	// contract available for recovery and lets a daemon-introduced contract be
+	// adopted only after the merge completes.
+	mergeConflicted := false
 	if hasConflict {
-		base := strings.TrimSpace(checkpoint.Detail.BaseRefName)
-		if base == "" {
-			base = "main"
-		}
-		if _, mergeErr := r.git.MergeBaseIntoWorktree(ctx, MergeBaseInput{WorktreePath: worktree.Path, Remote: "origin", BaseBranch: base}); mergeErr != nil {
-			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
-			checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
-			return checkpoint, &runpipe.LoopError{Message: fmt.Sprintf("Could not merge base %q into %s#%d for conflict resolution: %v", base, input.Repo, input.PRNumber, mergeErr), Kind: runpipe.FailureManualIntervention}
+		switch checkpoint.ReproductionMergePhase {
+		case fixerReproductionMergeConflicted:
+			mergeConflicted = true
+		case fixerReproductionMergeCompleted:
+			// The daemon already completed the merge and persisted that
+			// authority. Resume directly at post-merge capture; re-running
+			// merge here would either duplicate a clean merge or discard a
+			// recovered conflict.
+		default:
+			// An empty phase is the first attempt and must capture before the
+			// merge. A pending phase means that capture and the pending
+			// boundary were already persisted before a crash; resume the
+			// gateway directly so it can recover MERGE_HEAD or a clean merge.
+			if checkpoint.ReproductionMergePhase != fixerReproductionMergePending {
+				if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
+					return checkpoint, err
+				}
+				checkpoint.ReproductionMergePhase = fixerReproductionMergePending
+				if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
+					return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+				}
+			}
+			base := strings.TrimSpace(checkpoint.Detail.BaseRefName)
+			if base == "" {
+				base = "main"
+			}
+			mergeResult, mergeErr := r.git.MergeBaseIntoWorktree(ctx, MergeBaseInput{WorktreePath: worktree.Path, Remote: "origin", BaseBranch: base})
+			if mergeErr != nil {
+				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+				checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
+				return checkpoint, &runpipe.LoopError{Message: fmt.Sprintf("Could not merge base %q into %s#%d for conflict resolution: %v", base, input.Repo, input.PRNumber, mergeErr), Kind: runpipe.FailureManualIntervention}
+			}
+			mergeConflicted = mergeResult.Conflicted
+			if mergeConflicted {
+				checkpoint.ReproductionMergePhase = fixerReproductionMergeConflicted
+				checkpoint.ReproductionMergeUnresolved = true
+				if err := r.refreshFixerMergeConflictState(ctx, input, &checkpoint, worktree.Path, worktreeRoot); err != nil {
+					return checkpoint, err
+				}
+			} else {
+				checkpoint.ReproductionMergePhase = fixerReproductionMergeCompleted
+				checkpoint.ReproductionMergeUnresolved = false
+				checkpoint.ReproductionMergeConflictFiles = nil
+			}
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+			}
 		}
 	}
-	// Capture after daemon-controlled merge so a base-introduced reproduction
-	// contract is accepted; later agent-authored files remain rejected via
-	// ReproductionAbsent. Persist before agent start so crash-resume sees the
-	// durable negative/positive observation.
-	if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
-		return checkpoint, err
+	if !mergeConflicted || !checkpoint.ReproductionMergeUnresolved {
+		// Capture after a clean daemon merge so a base-introduced or updated
+		// contract is adopted under the merge phase; ordinary later
+		// agent-authored files remain fenced by ReproductionAbsent.
+		if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
+			return checkpoint, err
+		}
+		// The completed phase authorizes only this immediate post-merge
+		// observation. Clear it before the agent starts so a later file is
+		// never mistaken for daemon-introduced authority after a retry.
+		if checkpoint.ReproductionMergePhase == fixerReproductionMergeCompleted {
+			checkpoint.ReproductionMergePhase = ""
+			checkpoint.ReproductionMergeUnresolved = false
+		}
 	}
 	validationCommands = fixerValidationCommands(validationCommands, checkpoint)
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
@@ -3673,9 +3969,11 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 			return checkpoint, err
 		}
 	}
-	// Durable "agent is live" marker before Wait. Repair is only written after
-	// Wait; without this, a crash mid-Wait leaves no past-initial evidence and
-	// resume could adopt an agent-authored reproduction manifest.
+	// Durable "agent is live" marker before Wait. Clear a retained
+	// non-completed repair only in the same checkpoint that records replacement
+	// startup; before this point a startup failure must leave retry provenance
+	// available so an untrusted manifest remains deferrable.
+	checkpoint.Repair = nil
 	checkpoint.PendingAgentExecutionID = executionID
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
 		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
@@ -3698,6 +3996,12 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		}
 		message := firstNonEmpty(result.Summary, result.Stderr, "Fixer agent "+result.Status)
 		return checkpoint, &runpipe.LoopError{Message: message, Kind: runpipe.FailureRetryableTransient}
+	}
+	if err := r.refreshFixerMergeConflictState(ctx, input, &checkpoint, worktree.Path, worktreeRoot); err != nil {
+		return checkpoint, err
+	}
+	if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
 	}
 	if err := verifyFixerReproduction(checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
@@ -3741,20 +4045,29 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// local-only via RestrictToolNetwork -- and closing it means changing the
 	// fixer's push model, tracked separately rather than folded into this gate.
 	//
-	// Neither rejection path records checkpoint.Repair. A stored repair record with
-	// ParseStatus "parsed" is what the replay guard at the top of this function
-	// treats as a finished repair, so recording one here would let the next
-	// automatic retry of a retryable block skip the agent entirely and publish
-	// whatever the blocked attempt left behind. The agent's own reason survives as
-	// the run's failure summary and in the event log; leaving the repair unrecorded
-	// keeps the step replayable, which is what a retryable classification means.
+	// A retry-pending repair record is distinct from a completed parsed repair:
+	// it preserves the post-agent boundary so reproduction capture can defer an
+	// untrusted manifest on the next run, while the replay guard still starts a
+	// replacement agent.
 	blocked, blockedMessage, blockedKind, outcomeErr := fixerRepairTaskOutcome(result)
 	if outcomeErr != nil {
+		checkpoint.Repair = fixerRetryPendingRepair(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
+		checkpoint.ResumePolicy = "retry_from_timeout_context"
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		}
 		return checkpoint, outcomeErr
 	}
 	if blocked {
 		// A declared block is the agent reporting it could not do the work, not a
 		// Looper failure, so it fails with the kind the agent declared.
+		if blockedKind != runpipe.FailureManualIntervention {
+			checkpoint.Repair = fixerRetryPendingRepair(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
+			checkpoint.ResumePolicy = "retry_from_timeout_context"
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+			}
+		}
 		return checkpoint, &runpipe.LoopError{Message: blockedMessage, Kind: blockedKind}
 	}
 	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
@@ -3797,6 +4110,9 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 	worktreeRoot, rootErr := fixerWorktreeRoot(input.Project)
 	if rootErr != nil {
 		return checkpoint, rootErr
+	}
+	if err := r.refreshFixerMergeConflictState(ctx, input, &checkpoint, worktree.Path, worktreeRoot); err != nil {
+		return checkpoint, err
 	}
 	if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
@@ -3895,16 +4211,19 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	if err != nil {
 		return checkpoint, err
 	}
+	worktreeRoot, rootErr := fixerWorktreeRoot(input.Project)
+	if rootErr != nil {
+		return checkpoint, rootErr
+	}
+	if err := r.refreshFixerMergeConflictState(ctx, input, &checkpoint, worktree.Path, worktreeRoot); err != nil {
+		return checkpoint, err
+	}
 	if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
 	}
 	validationCommands = fixerValidationCommands(validationCommands, checkpoint)
 	if err := verifyFixerReproduction(checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
-	}
-	worktreeRoot, rootErr := fixerWorktreeRoot(input.Project)
-	if rootErr != nil {
-		return checkpoint, rootErr
 	}
 	branch := firstNonEmpty(worktree.Branch, detailHeadRefName(checkpoint.Detail))
 	if branch == "" {
@@ -5541,15 +5860,19 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 	if r.db == nil {
 		return loopUpsertResult{}, fmt.Errorf("fixer runner database is not configured")
 	}
-	var metadataJSON *string
-	if sourceWorkerID := fixerSourceWorkerIDForPullRequest(existingLoops, project.ID, repo, prNumber); sourceWorkerID != "" {
-		metadata, err := json.Marshal(map[string]any{"sourceWorkerId": sourceWorkerID})
-		if err != nil {
-			return loopUpsertResult{}, err
-		}
-		text := string(metadata)
-		metadataJSON = &text
+	metadata := map[string]any{}
+	if seededHead := strings.TrimSpace(headSHA); seededHead != "" {
+		metadata["fixerRoundBudget"] = roundBudgetState{Rounds: 0, LastHeadSHA: seededHead, FirstRoundAt: nowISO, RecordedAt: nowISO}
+		metadata["fixerRoundBudgetSeeded"] = true
 	}
+	if sourceWorkerID := fixerSourceWorkerIDForPullRequest(existingLoops, project.ID, repo, prNumber); sourceWorkerID != "" {
+		metadata["sourceWorkerId"] = sourceWorkerID
+	}
+	metadataEncoded, err := json.Marshal(metadata)
+	if err != nil {
+		return loopUpsertResult{}, err
+	}
+	metadataJSON := runpipe.StringPtr(string(metadataEncoded))
 	var loop storage.LoopRecord
 	if err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
 		repos := storage.NewRepositories(tx)
@@ -7158,7 +7481,7 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 		// project+PR owns the detached path even when this Fixer loop is
 		// terminal. Re-check under the PR target lock so takeover cannot
 		// commit human_takeover between the lookup and CleanupWorktree.
-		if skip, reason := r.siblingHumanTakeoverOwnsWorktree(ctx, *loop); skip {
+		if skip, reason := r.siblingHumanTakeoverOwnsWorktree(ctx, *loop, checkpoint.Worktree.Path); skip {
 			cause := errors.New(reason)
 			r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.cleanup_skipped", projectID: project.ID, loopID: loop.ID, runID: runID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"path": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "reason": cause.Error()}})
 			r.recordCleanupSecondaryIssue(ctx, runID, checkpoint, cause)
@@ -7201,7 +7524,7 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 
 // siblingHumanTakeoverOwnsWorktree reports whether another loop for the same
 // project+PR is in human_takeover and therefore owns the shared managed checkout.
-func (r *Runner) siblingHumanTakeoverOwnsWorktree(ctx context.Context, loop storage.LoopRecord) (bool, string) {
+func (r *Runner) siblingHumanTakeoverOwnsWorktree(ctx context.Context, loop storage.LoopRecord, worktreePath string) (bool, string) {
 	if r.repos == nil || r.repos.Loops == nil {
 		return false, ""
 	}
@@ -7225,11 +7548,63 @@ func (r *Runner) siblingHumanTakeoverOwnsWorktree(ctx context.Context, loop stor
 		if sibling.ProjectID != loop.ProjectID {
 			continue
 		}
-		if sibling.Status == string(domain.LoopStatusHumanTakeover) {
-			return true, fmt.Sprintf("sibling loop %s is human_takeover for the same PR worktree", sibling.ID)
+		if sibling.Status != string(domain.LoopStatusHumanTakeover) {
+			continue
 		}
+		if sibling.Type == string(domain.LoopTypeWorker) {
+			owns, err := r.siblingWorkerOwnsWorktree(ctx, sibling, worktreePath)
+			if err != nil {
+				// A missing or legacy checkpoint cannot prove that this Worker
+				// uses the separate branch checkout. Retain the worktree rather
+				// than risk deleting an interactive detached checkout.
+				return true, "sibling Worker worktree ownership is unavailable: " + err.Error()
+			}
+			if owns {
+				return true, fmt.Sprintf("sibling Worker loop %s owns the same detached PR worktree", sibling.ID)
+			}
+			continue
+		}
+		return true, fmt.Sprintf("sibling loop %s is human_takeover for the same PR worktree", sibling.ID)
 	}
 	return false, ""
+}
+
+// siblingWorkerOwnsWorktree identifies the checkout recorded by a PR-target
+// Worker takeover. Worker loop type alone is not enough: Workers can resume
+// legacy detached checkpoints that share the Fixer/Reviewer path, while newer
+// Workers normally use a separate branch checkout.
+func (r *Runner) siblingWorkerOwnsWorktree(ctx context.Context, sibling storage.LoopRecord, worktreePath string) (bool, error) {
+	if r.repos == nil || r.repos.Runs == nil {
+		return false, errors.New("runs repository is unavailable")
+	}
+	run, err := r.repos.Runs.GetLatestByLoopID(ctx, sibling.ID)
+	if err != nil {
+		return false, err
+	}
+	if run == nil || run.CheckpointJSON == nil || strings.TrimSpace(*run.CheckpointJSON) == "" {
+		// Legacy Worker loops have no durable checkout identity. Retain the
+		// path conservatively because it may be the old shared detached path.
+		return true, nil
+	}
+	var checkpoint struct {
+		Worktree *struct {
+			Path         string `json:"path,omitempty"`
+			CheckoutMode string `json:"checkoutMode,omitempty"`
+		} `json:"worktree,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(*run.CheckpointJSON), &checkpoint); err != nil {
+		return false, fmt.Errorf("decode checkpoint: %w", err)
+	}
+	if checkpoint.Worktree == nil || strings.TrimSpace(checkpoint.Worktree.Path) == "" {
+		// A checkpoint without a path is also legacy/ambiguous. Fail closed
+		// for cleanup rather than infer branch-mode ownership from loop type.
+		return true, nil
+	}
+	if !sameManagedWorktreePath(checkpoint.Worktree.Path, worktreePath) {
+		return false, nil
+	}
+	mode := strings.TrimSpace(checkpoint.Worktree.CheckoutMode)
+	return mode == "" || strings.EqualFold(mode, "detached"), nil
 }
 
 // recordCleanupSecondaryIssue records a refused removal on the run's outcome.
@@ -8312,7 +8687,9 @@ func rewindCheckpointForPrepareRetry(checkpoint fixerCheckpoint) fixerCheckpoint
 		worktree.CleanedAt = ""
 		checkpoint.Worktree = &worktree
 	}
-	checkpoint.Repair = nil
+	if !fixerRetryHasUnfinishedRepair(&checkpoint) {
+		checkpoint.Repair = nil
+	}
 	checkpoint.ReconcileCommits = nil
 	checkpoint.Validation = nil
 	checkpoint.Push = nil

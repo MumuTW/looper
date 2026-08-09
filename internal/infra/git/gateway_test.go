@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +37,10 @@ func TestGatewayRejectsRepoPathAsMutationWorktree(t *testing.T) {
 			_, err := gateway.Commit(ctx, CommitInput{RepoPath: fixture.repoPath, WorktreePath: fixture.repoPath, Message: "test"})
 			return err
 		}},
+		{name: "revert", run: func() error {
+			_, err := gateway.RevertCommit(ctx, RevertCommitInput{RepoPath: fixture.repoPath, WorktreePath: fixture.repoPath, CommitSHA: "deadbeef"})
+			return err
+		}},
 		{name: "push", run: func() error {
 			return gateway.Push(ctx, PushInput{RepoPath: fixture.repoPath, WorktreePath: fixture.repoPath, Branch: "feature/test"})
 		}},
@@ -50,6 +56,92 @@ func TestGatewayRejectsRepoPathAsMutationWorktree(t *testing.T) {
 				t.Fatalf("error = %v, want repo-path safety failure", err)
 			}
 		})
+	}
+}
+
+func TestGatewayRevertCommitCreatesOneInverseCommitInManagedWorktree(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	writeFile(t, filepath.Join(fixture.repoPath, "README.md"), "broken\n")
+	runGit(t, fixture.repoPath, "add", "README.md")
+	runGit(t, fixture.repoPath, "commit", "-m", "bad change")
+	badCommit := stringsTrimSpace(runGit(t, fixture.repoPath, "rev-parse", "HEAD"))
+	runGit(t, fixture.repoPath, "push", "origin", "main")
+
+	gateway := fixture.gateway()
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "looper/auditor/revert-bad", BaseBranch: "main", ProtectedBranches: []string{"main"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := gateway.RevertCommit(ctx, RevertCommitInput{RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: worktree.WorktreePath, CommitSHA: badCommit})
+	if err != nil || result.CommitSHA == "" {
+		t.Fatalf("RevertCommit() = %#v, %v", result, err)
+	}
+	if got := readFile(t, filepath.Join(worktree.WorktreePath, "README.md")); got != "hello\n" {
+		t.Fatalf("README after revert = %q, want original content", got)
+	}
+}
+
+func TestGatewayPinsWorktreeBaseAndVerifiesExactRevertCommit(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+
+	writeFile(t, filepath.Join(fixture.repoPath, "README.md"), "broken\n")
+	runGit(t, fixture.repoPath, "add", "README.md")
+	runGit(t, fixture.repoPath, "commit", "-m", "bad change")
+	baseSHA := stringsTrimSpace(runGit(t, fixture.repoPath, "rev-parse", "HEAD"))
+	runGit(t, fixture.repoPath, "push", "origin", "main")
+
+	// Advance the live base after the candidate was captured. A pinned create
+	// must still start from baseSHA, not the newer branch tip.
+	writeFile(t, filepath.Join(fixture.repoPath, "README.md"), "later\n")
+	runGit(t, fixture.repoPath, "add", "README.md")
+	runGit(t, fixture.repoPath, "commit", "-m", "later change")
+	runGit(t, fixture.repoPath, "push", "origin", "main")
+
+	gateway := fixture.gateway()
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: "looper/auditor/revert-pinned", BaseBranch: "main", BaseSHA: baseSHA,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	if got := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "HEAD")); got != baseSHA {
+		t.Fatalf("pinned worktree HEAD = %q, want captured base %q", got, baseSHA)
+	}
+	reverted, err := gateway.RevertCommit(ctx, RevertCommitInput{RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: worktree.WorktreePath, CommitSHA: baseSHA})
+	if err != nil {
+		t.Fatalf("RevertCommit() error = %v", err)
+	}
+	if err := gateway.VerifyRevertCommit(ctx, VerifyRevertCommitInput{RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: worktree.WorktreePath, BaseSHA: baseSHA, ExistingCommitSHA: reverted.CommitSHA, RevertedCommitSHA: baseSHA}); err != nil {
+		t.Fatalf("VerifyRevertCommit(valid) error = %v", err)
+	}
+
+	wrong, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: "looper/auditor/revert-wrong", BaseBranch: "main", BaseSHA: baseSHA,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree(wrong) error = %v", err)
+	}
+	writeFile(t, filepath.Join(wrong.WorktreePath, "README.md"), "wrong inverse\n")
+	runGit(t, wrong.WorktreePath, "add", "README.md")
+	runGit(t, wrong.WorktreePath, "commit", "-m", "wrong revert")
+	wrongSHA := stringsTrimSpace(runGit(t, wrong.WorktreePath, "rev-parse", "HEAD"))
+	if err := gateway.VerifyRevertCommit(ctx, VerifyRevertCommitInput{RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: wrong.WorktreePath, BaseSHA: baseSHA, ExistingCommitSHA: wrongSHA, RevertedCommitSHA: baseSHA}); err == nil {
+		t.Fatal("VerifyRevertCommit(wrong) error = nil, want exact inverse mismatch")
+	}
+}
+
+func TestRevertCommitArgsSelectMainlineForMergeCommit(t *testing.T) {
+	if got := revertCommitArgs("deadbeef\n"); !slices.Equal(got, []string{"revert", "--no-edit", "--no-gpg-sign", "deadbeef"}) {
+		t.Fatalf("revertCommitArgs(single) = %#v", got)
+	}
+	if got := revertCommitArgs("deadbeef parent-one parent-two\n"); !slices.Equal(got, []string{"revert", "--no-edit", "--no-gpg-sign", "-m", "1", "deadbeef"}) {
+		t.Fatalf("revertCommitArgs(merge) = %#v", got)
 	}
 }
 
@@ -1665,7 +1757,7 @@ count=$((count + 1))
 printf '%s' "$count" > "$count_file"
 if [ "$count" -eq 1 ]; then
 	cat >&2 <<'EOF'
-From github.com:nexu-io/open-design
+From github.com:MumuTW/open-design
  * branch                main       -> FETCH_HEAD
 error: cannot lock ref 'refs/remotes/origin/main': is at e64f1d8497409e76387cce3afcd5c51406a4174d but expected 6bf865a43beb8149c8f64a0af297c09c313f9a4a
  ! 6bf865a43..e64f1d849  main       -> origin/main  (unable to update local ref)
@@ -2226,6 +2318,76 @@ func (f *fixture) createRemoteRepo(t *testing.T, branch string) {
 	runGit(t, f.repoPath, "commit", "-m", "feature")
 	runGit(t, f.repoPath, "push", "-u", "origin", branch)
 	runGit(t, f.repoPath, "checkout", "main")
+}
+
+func TestGatewayMergeBaseResumesExistingConflictState(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/fixer")
+
+	// Make the PR branch and base edit the same line so the first merge leaves
+	// Git's real MERGE_HEAD and conflict markers in the linked worktree.
+	runGit(t, fixture.repoPath, "checkout", "feature/fixer")
+	writeFile(t, filepath.Join(fixture.repoPath, "README.md"), "feature change\n")
+	runGit(t, fixture.repoPath, "add", "README.md")
+	runGit(t, fixture.repoPath, "commit", "-m", "feature readme")
+	runGit(t, fixture.repoPath, "push", "origin", "feature/fixer")
+	runGit(t, fixture.repoPath, "checkout", "main")
+	writeFile(t, filepath.Join(fixture.repoPath, "README.md"), "base change\n")
+	runGit(t, fixture.repoPath, "add", "README.md")
+	runGit(t, fixture.repoPath, "commit", "-m", "base readme")
+	runGit(t, fixture.repoPath, "push", "origin", "main")
+
+	gateway := fixture.gateway()
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: "feature/fixer", BaseBranch: "main", PRNumber: 42, CheckoutMode: CheckoutModeDetached,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	first, err := gateway.MergeBaseIntoWorktree(ctx, MergeBaseInput{WorktreePath: worktree.WorktreePath, Remote: "origin", BaseBranch: "main"})
+	if err != nil || !first.Conflicted {
+		t.Fatalf("first MergeBaseIntoWorktree() = (%#v, %v), want conflict state", first, err)
+	}
+	inspectConflict, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.WorktreePath})
+	if err != nil || !inspectConflict.HasUnresolvedConflicts {
+		t.Fatalf("InspectHead() after conflict = (%#v, %v), want Git unmerged-index authority", inspectConflict, err)
+	}
+	mergeHead := strings.TrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "--git-path", "MERGE_HEAD"))
+	if !filepath.IsAbs(mergeHead) {
+		mergeHead = filepath.Join(worktree.WorktreePath, mergeHead)
+	}
+	if _, err := os.Stat(mergeHead); err != nil {
+		t.Fatalf("MERGE_HEAD stat = %v, want in-progress merge marker", err)
+	}
+
+	second, err := gateway.MergeBaseIntoWorktree(ctx, MergeBaseInput{WorktreePath: worktree.WorktreePath, Remote: "origin", BaseBranch: "main"})
+	if err != nil || !second.Conflicted {
+		t.Fatalf("resume MergeBaseIntoWorktree() = (%#v, %v), want existing conflict handed back", second, err)
+	}
+	if content := readFile(t, filepath.Join(worktree.WorktreePath, "README.md")); !strings.Contains(content, "<<<<<<<") {
+		t.Fatalf("README.md after resume = %q, want original conflict markers preserved", content)
+	}
+	runGit(t, worktree.WorktreePath, "merge", "--abort")
+	inspectResolved, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.WorktreePath})
+	if err != nil || inspectResolved.HasUnresolvedConflicts {
+		t.Fatalf("InspectHead() after abort = (%#v, %v), want no unresolved conflicts", inspectResolved, err)
+	}
+}
+
+func TestUnresolvedConflictFilesRecognizesAllUnmergedStatuses(t *testing.T) {
+	entries := []statusEntry{
+		{Code: "AA", Path: "add-add.txt"},
+		{Code: "DD", Path: "both-deleted.txt"},
+		{Code: "UU", Path: "both-modified.txt"},
+		{Code: " M", Path: "ordinary-change.txt"},
+	}
+	got := unresolvedConflictFiles(entries)
+	want := []string{"add-add.txt", "both-deleted.txt", "both-modified.txt"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unresolvedConflictFiles() = %#v, want %#v", got, want)
+	}
 }
 
 func (f *fixture) createUnfetchedRemoteBranch(t *testing.T, branch string) {

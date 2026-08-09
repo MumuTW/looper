@@ -1180,9 +1180,9 @@ func TestRunRecoveryPipelineNormalizesQueuedReviewerLoopToTerminalMetadataStatus
 	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	repo := "nexu-io/vela"
+	repo := "MumuTW/vela"
 	prNumber := int64(223)
-	targetID := "pr:nexu-io/vela:223"
+	targetID := "pr:MumuTW/vela:223"
 	metadata := mustMarshalJSON(map[string]any{"loop": map[string]any{"status": "terminated", "terminationReason": "pr_closed_or_merged", "lastStatus": "failed", "failureCount": 5, "lastFailure": "Reviewer review agent timed out (idle)..."}})
 	loopID := "loop_reviewer_terminal_metadata"
 	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1697, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: stringPtr(nowISO), MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
@@ -1194,7 +1194,7 @@ func TestRunRecoveryPipelineNormalizesQueuedReviewerLoopToTerminalMetadataStatus
 	}
 	queueErrorKind := "retryable_transient"
 	queueError := "loop_terminated"
-	if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_terminal_metadata", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_reviewer_terminal_metadata:nexu-io/vela:223", Priority: storage.QueuePriorityReviewer, Status: "cancelled", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 5, FinishedAt: &nowISO, LastError: &queueError, LastErrorKind: &queueErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_terminal_metadata", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_reviewer_terminal_metadata:MumuTW/vela:223", Priority: storage.QueuePriorityReviewer, Status: "cancelled", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 5, FinishedAt: &nowISO, LastError: &queueError, LastErrorKind: &queueErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
@@ -1262,9 +1262,9 @@ func TestRunRecoveryPipelineCancelsActiveQueueForTerminalReviewerMetadata(t *tes
 	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	repo := "nexu-io/vela"
+	repo := "MumuTW/vela"
 	prNumber := int64(223)
-	targetID := "pr:nexu-io/vela:223"
+	targetID := "pr:MumuTW/vela:223"
 	metadata := mustMarshalJSON(map[string]any{"loop": map[string]any{"status": "terminated", "terminationReason": "pr_closed_or_merged"}})
 	loopID := "loop_reviewer_terminal_metadata_active_queue"
 	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1699, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: stringPtr(nowISO), MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
@@ -1273,7 +1273,7 @@ func TestRunRecoveryPipelineCancelsActiveQueueForTerminalReviewerMetadata(t *tes
 	if err := repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_reviewer_terminal_metadata_active_queue", LoopID: loopID, Status: "interrupted", StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_terminal_metadata_active_queue", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_reviewer_terminal_metadata_active_queue:nexu-io/vela:223", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, StartedAt: stringPtr(nowISO), Attempts: 1, MaxAttempts: 5, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_terminal_metadata_active_queue", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_reviewer_terminal_metadata_active_queue:MumuTW/vela:223", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, StartedAt: stringPtr(nowISO), Attempts: 1, MaxAttempts: 5, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
@@ -1324,9 +1324,9 @@ func TestRunRecoveryPipelineRepairsFailedReviewerLoopToTerminalMetadataStatus(t 
 	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	repo := "nexu-io/vela"
+	repo := "MumuTW/vela"
 	prNumber := int64(223)
-	targetID := "pr:nexu-io/vela:223"
+	targetID := "pr:MumuTW/vela:223"
 	metadata := mustMarshalJSON(map[string]any{"loop": map[string]any{"status": "terminated", "terminationReason": "pr_closed_or_merged", "lastStatus": "failed"}})
 	loopID := "loop_reviewer_failed_terminal_metadata"
 	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1698, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
@@ -1339,7 +1339,7 @@ func TestRunRecoveryPipelineRepairsFailedReviewerLoopToTerminalMetadataStatus(t 
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 	queueErrorKind := "retryable_after_resume"
-	if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_failed_terminal_metadata", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_reviewer_failed_terminal_metadata:nexu-io/vela:223", Priority: storage.QueuePriorityReviewer, Status: "failed", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 5, FinishedAt: &nowISO, LastError: &errorMessage, LastErrorKind: &queueErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_failed_terminal_metadata", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_reviewer_failed_terminal_metadata:MumuTW/vela:223", Priority: storage.QueuePriorityReviewer, Status: "failed", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 5, FinishedAt: &nowISO, LastError: &errorMessage, LastErrorKind: &queueErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
@@ -1383,9 +1383,9 @@ func TestRunRecoveryPipelineKeepsQueuedReviewerLoopPausedWhenLatestRunFailed(t *
 	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	repo := "nexu-io/vela"
+	repo := "MumuTW/vela"
 	prNumber := int64(223)
-	targetID := "pr:nexu-io/vela:223"
+	targetID := "pr:MumuTW/vela:223"
 	loopID := "loop_reviewer_queued_failed_run_pauses"
 	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1700, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -1396,7 +1396,7 @@ func TestRunRecoveryPipelineKeepsQueuedReviewerLoopPausedWhenLatestRunFailed(t *
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 	queueErrorKind := "manual_intervention"
-	if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_queued_failed_run_pauses", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_reviewer_queued_failed_run_pauses:nexu-io/vela:223", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 5, LastError: &errorMessage, LastErrorKind: &queueErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_queued_failed_run_pauses", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_reviewer_queued_failed_run_pauses:MumuTW/vela:223", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 5, LastError: &errorMessage, LastErrorKind: &queueErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})

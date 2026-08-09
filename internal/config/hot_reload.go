@@ -25,8 +25,16 @@ var hotEditablePaths = map[string]struct{}{
 	"agent.timeouts.fixerIdleTimeoutSeconds":    {},
 	"agent.timeouts.fixerMaxRuntimeSeconds":     {},
 
-	"scheduler.maxConcurrentRuns":       {},
-	"scheduler.slowLaneWarnThresholdMs": {},
+	"scheduler.maxConcurrentRuns":                {},
+	"scheduler.slowLaneWarnThresholdMs":          {},
+	"scheduler.agentBrownout.enabled":            {},
+	"scheduler.agentBrownout.windowSeconds":      {},
+	"scheduler.agentBrownout.minFailures":        {},
+	"scheduler.agentBrownout.failureRatio":       {},
+	"scheduler.agentBrownout.cooldownSeconds":    {},
+	"scheduler.agentBrownout.maxCooldownSeconds": {},
+	"scheduler.agentBrownout.probeSuccesses":     {},
+	"scheduler.agentBrownout.notify":             {},
 
 	// The cleanup loop rereads these each iteration and a reload wakes it, so
 	// none of them replace a process-owned resource. Only the leaves are hot;
@@ -67,6 +75,7 @@ var hotEditablePaths = map[string]struct{}{
 	"defaults.openPrStrategy":                       {},
 	"defaults.addSnapshotMode":                      {},
 	"instructions.enabled":                          {},
+	"roles.auditor.allowRevertProposals":            {},
 
 	"roles.planner.autoDiscovery":                                          {},
 	"roles.planner.triggers.labels":                                        {},
@@ -139,6 +148,7 @@ var hotEditablePaths = map[string]struct{}{
 	"roles.coordinator.dispatch.autonomous.holdLabel":                      {},
 	"roles.coordinator.dispatch.assignTo":                                  {},
 	"roles.coordinator.mergeWatch.maxIndeterminateDuration":                {},
+	"roles.coordinator.conflictPolicy.maxRepairs":                          {},
 
 	"tools.looperPath":    {},
 	"tools.osascriptPath": {},

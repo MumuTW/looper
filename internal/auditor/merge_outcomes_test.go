@@ -10,7 +10,7 @@ import (
 )
 
 func TestCandidatesFromMergeOutcomesUsesOnlySuccessfulGatekeeperEvents(t *testing.T) {
-	payload, err := json.Marshal(gatekeeper.MergeOutcome{Version: 1, ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, HeadSHA: "abc", Merged: true, TouchedFilesAvailable: true})
+	payload, err := json.Marshal(gatekeeper.MergeOutcome{Version: 1, ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, HeadSHA: "abc", MergeStrategy: "squash", Merged: true, TouchedFilesAvailable: true})
 	if err != nil {
 		t.Fatal(err)
 	}

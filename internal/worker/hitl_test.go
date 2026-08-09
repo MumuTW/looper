@@ -16,8 +16,6 @@ import (
 	"github.com/MumuTW/looper/internal/storage"
 )
 
-const hitlSentinelRelPath = ".looper/ask.json"
-
 func TestConsumeAskSentinelReadsAndRemoves(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, ".looper"), 0o755); err != nil {
@@ -55,6 +53,29 @@ func TestConsumeAskSentinelReadsAndRemoves(t *testing.T) {
 	}
 	if missing, missingEv, err := consumeAskSentinel(t.TempDir()); err != nil || missing != nil || missingEv != nil {
 		t.Fatalf("consumeAskSentinel(empty dir) = (%#v, %#v, %v), want (nil, nil, nil)", missing, missingEv, err)
+	}
+}
+
+func TestValidAskSentinelForHealthIsReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, hitlSentinelRelPath)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll error = %v", err)
+	}
+	if err := os.WriteFile(path, []byte(`{"question":"Which datastore?","options":["redis","postgres"]}`), 0o600); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	if !validAskSentinelForHealth(dir) {
+		t.Fatal("validAskSentinelForHealth() = false, want true")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("health check removed ask sentinel: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(`{"options":["redis"]}`), 0o600); err != nil {
+		t.Fatalf("WriteFile malformed error = %v", err)
+	}
+	if validAskSentinelForHealth(dir) {
+		t.Fatal("validAskSentinelForHealth() = true for ask without question")
 	}
 }
 
@@ -1148,6 +1169,32 @@ func TestMergeHITLCorrelationPreservesHumanAnswer(t *testing.T) {
 	}
 	if merged.GateEvidence == nil || merged.GateEvidence.WorktreeRoot != "/tmp/wt" {
 		t.Fatalf("merged.GateEvidence = %#v, want delivery evidence kept", merged.GateEvidence)
+	}
+}
+
+func TestMergeHITLCorrelationDoesNotCarryAnswerOntoNewQuestion(t *testing.T) {
+	t.Parallel()
+	// A resumed agent consumed the answered ask and emitted a different
+	// question in the same turn while the old ask is still stored as answered.
+	// The old answer must not follow onto the new question, or the loop parks
+	// with a question that already appears answered by the previous decision.
+	delivered := loops.HITLAsk{
+		Question: "Ship the migration?", Status: "awaiting", Transport: "github",
+		PRNumber: 42, AskCommentID: 99,
+	}
+	answeredMeta, err := loops.WriteHITLAsk(nil, loops.HITLAsk{
+		Question: "Continue?", Status: "answered", Answer: "yes ship it", AnsweredAt: "2026-08-01T00:00:00.000Z",
+	})
+	if err != nil {
+		t.Fatalf("WriteHITLAsk() error = %v", err)
+	}
+	metaPtr := &answeredMeta
+	merged := mergeHITLCorrelation(delivered, metaPtr)
+	if merged.Answer != "" || merged.AnsweredAt != "" || merged.Status != "awaiting" {
+		t.Fatalf("merged = %#v, want new question without the old answer", merged)
+	}
+	if merged.PRNumber != 42 || merged.AskCommentID != 99 {
+		t.Fatalf("merged correlation = pr=%d comment=%d, want delivery values", merged.PRNumber, merged.AskCommentID)
 	}
 }
 

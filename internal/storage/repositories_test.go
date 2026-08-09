@@ -1767,6 +1767,53 @@ func TestQueueRequeueFailedByIDRequiresMatchingLoopAndNoActiveQueue(t *testing.T
 	}
 }
 
+func TestListQueuedSnapshotVendorsIgnoresMalformedSnapshotJSON(t *testing.T) {
+	t.Parallel()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_snapshot_json", Name: "Snapshot JSON", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	for _, loop := range []LoopRecord{
+		{ID: "loop_bad_snapshot", Seq: 1, ProjectID: "project_snapshot_json", Type: "reviewer", TargetType: "pull_request", Status: "queued", CreatedAt: now, UpdatedAt: now},
+		{ID: "loop_valid_snapshot", Seq: 2, ProjectID: "project_snapshot_json", Type: "reviewer", TargetType: "pull_request", Status: "queued", CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+	malformed := "{not-json"
+	valid := `{"vendor":"codex"}`
+	for _, run := range []RunRecord{
+		{ID: "run_bad_snapshot", LoopID: "loop_bad_snapshot", Status: "failed", StartedAt: now, CreatedAt: now, UpdatedAt: now, AgentSnapshotJSON: &malformed},
+		{ID: "run_valid_snapshot", LoopID: "loop_valid_snapshot", Status: "failed", StartedAt: now, CreatedAt: now, UpdatedAt: now, AgentSnapshotJSON: &valid},
+	} {
+		if err := repos.Runs.Upsert(ctx, run); err != nil {
+			t.Fatalf("Runs.Upsert(%s) error = %v", run.ID, err)
+		}
+	}
+	badLoopID := "loop_bad_snapshot"
+	validLoopID := "loop_valid_snapshot"
+	for _, item := range []QueueItemRecord{
+		{ID: "queue_bad_snapshot", LoopID: &badLoopID, Type: "reviewer", Priority: QueuePriorityReviewer, DedupeKey: "snapshot-bad", Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "queue_valid_snapshot", LoopID: &validLoopID, Type: "reviewer", Priority: QueuePriorityReviewer, DedupeKey: "snapshot-valid", Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := repos.Queue.Upsert(ctx, item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	vendors, err := repos.Queue.ListQueuedSnapshotVendors(ctx, []string{"reviewer"})
+	if err != nil {
+		t.Fatalf("ListQueuedSnapshotVendors() error = %v", err)
+	}
+	if len(vendors) != 1 || vendors[0] != "codex" {
+		t.Fatalf("ListQueuedSnapshotVendors() = %#v, want [codex]", vendors)
+	}
+}
+
 func TestQueueRequeueFailedByIDWithAttemptsPreservesAttemptBudget(t *testing.T) {
 	t.Parallel()
 
@@ -3281,6 +3328,55 @@ func TestQueueStickySnapshotClaimInspectsNewestTiedRun(t *testing.T) {
 	}
 	if second != nil {
 		t.Fatalf("second ClaimNextNonLongTermRetryAmongTypeSets() = %#v, want nil: newest tied run is completed", second)
+	}
+}
+
+func TestQueueListRunningSnapshotVendorsIncludesClaimedItems(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_running", Name: "running", RepoPath: "/tmp/running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loopID := "loop_running_snapshot_vendor"
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_running", Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	snapshot := `{"vendor":"codex"}`
+	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_running_snapshot_vendor", LoopID: loopID, Status: "running", AgentSnapshotJSON: &snapshot, StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: "qi_running_snapshot_vendor", LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: "project_running", DedupeKey: "running-snapshot-vendor", Priority: 1, Status: "running", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	queuedLoopID := "loop_queued_snapshot_vendor"
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: queuedLoopID, Seq: 2, ProjectID: "project_running", Type: "worker", TargetType: "project", Status: "queued", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(queued) error = %v", err)
+	}
+	failed := "failed"
+	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_queued_snapshot_vendor", LoopID: queuedLoopID, Status: failed, AgentSnapshotJSON: &snapshot, StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert(queued) error = %v", err)
+	}
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: "qi_queued_snapshot_vendor", LoopID: &queuedLoopID, Type: "worker", TargetType: "project", TargetID: "project_running", DedupeKey: "queued-snapshot-vendor", Priority: 1, Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert(queued) error = %v", err)
+	}
+
+	vendors, err := repos.Queue.ListRunningSnapshotVendors(ctx, []string{"worker"})
+	if err != nil {
+		t.Fatalf("ListRunningSnapshotVendors() error = %v", err)
+	}
+	if len(vendors) != 1 || vendors[0] != "codex" {
+		t.Fatalf("ListRunningSnapshotVendors() = %#v, want [codex]", vendors)
+	}
+	activeVendors, err := repos.Queue.ListActiveSnapshotVendors(ctx, []string{"worker"})
+	if err != nil {
+		t.Fatalf("ListActiveSnapshotVendors() error = %v", err)
+	}
+	if len(activeVendors) != 1 || activeVendors[0] != "codex" {
+		t.Fatalf("ListActiveSnapshotVendors() = %#v, want [codex] from queued+running snapshot", activeVendors)
 	}
 }
 

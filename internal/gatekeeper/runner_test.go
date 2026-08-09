@@ -254,6 +254,13 @@ func TestEvaluatePullRequestBlocksEachSafetyCondition(t *testing.T) {
 			want: []ReasonCode{ReasonHold},
 		},
 		{
+			name: "do not merge veto",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.detail.Labels = []string{labels.DoNotMerge}
+			},
+			want: []ReasonCode{ReasonDoNotMerge},
+		},
+		{
 			name: "provider mergeability is ambiguous",
 			mutate: func(f *gatekeeperFixture) {
 				f.github.mergeable.Mergeable = nil
@@ -317,10 +324,12 @@ func TestEvaluatePullRequestBlocksEachSafetyCondition(t *testing.T) {
 }
 
 type gatekeeperFixture struct {
-	repos         *storage.Repositories
-	github        *fakeGatekeeperGitHub
-	now           time.Time
-	policyPermits bool
+	repos          *storage.Repositories
+	github         *fakeGatekeeperGitHub
+	now            time.Time
+	policyPermits  bool
+	execSQL        func(string) error
+	protectedPaths []string
 	// closeDB closes the underlying SQLite coordinator so a test can force a
 	// persistence failure mid-discovery.
 	closeDB func() error
@@ -356,9 +365,13 @@ func newGatekeeperFixtureWithReview(t *testing.T, seedReview bool) *gatekeeperFi
 	fixture := &gatekeeperFixture{
 		repos: repos,
 		now:   now,
+		execSQL: func(query string) error {
+			_, err := coordinator.DB().ExecContext(context.Background(), query)
+			return err
+		},
 		github: &fakeGatekeeperGitHub{
 			detail:    githubinfra.PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-1", BaseRefName: "main", BaseSHA: "base-1", ReviewDecision: "APPROVED", AdditionsKnown: true, DeletionsKnown: true},
-			mergeable: githubinfra.PullRequestDetail{Number: 42, HeadSHA: "head-1", BaseSHA: "base-1", Mergeable: &mergeable, MergeableState: "clean", AdditionsKnown: true, DeletionsKnown: true},
+			mergeable: githubinfra.PullRequestDetail{Number: 42, HeadSHA: "head-1", BaseSHA: "base-1", MergeCommitSHA: "merge-commit-1", Mergeable: &mergeable, MergeableState: "clean", AdditionsKnown: true, DeletionsKnown: true},
 			protection: githubinfra.BranchProtection{
 				Enabled: true, HasRequiredChecks: true, RequiredChecks: []string{"ci", RequiredStatusContext},
 				RequiredCheckRules: []githubinfra.RequiredCheckRule{{Context: "ci", AppID: 15368}},
@@ -393,6 +406,9 @@ func (f *gatekeeperFixture) autoRunner() *Runner {
 		Repos: f.repos, GitHub: f.github, Now: func() time.Time { return f.now },
 		PolicyPermitsTarget: func(string, string, string) bool { return f.policyPermits },
 		TrustForProject:     func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+		ProtectedPathsForProject: func(string) []string {
+			return append([]string(nil), f.protectedPaths...)
+		},
 	})
 }
 
@@ -479,7 +495,7 @@ func TestAutoGatekeeperAllowsSmallChangeWithoutCleanReview(t *testing.T) {
 		t.Fatalf("report = %#v, want eligible below threshold", report)
 	}
 	if len(fixture.github.reviewMarkerCalls) != 1 {
-		t.Fatalf("review marker calls = %#v, want one blocking-marker check", fixture.github.reviewMarkerCalls)
+		t.Fatalf("review marker calls = %#v, want one routing evaluation marker check", fixture.github.reviewMarkerCalls)
 	}
 	if got := fixture.github.statusCalls; len(got) != 1 || got[0].State != "success" {
 		t.Fatalf("status calls = %#v, want success", got)
@@ -953,6 +969,10 @@ func (f *fakeGatekeeperGitHub) ValidateMergifyRouting(_ context.Context, input g
 	f.validateMergifyCalls++
 	f.validateMergifyInputs = append(f.validateMergifyInputs, input)
 	return f.validateMergifyErr
+}
+
+func (f *fakeGatekeeperGitHub) GetPullRequestBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error) {
+	return f.finalBaseSHA, nil
 }
 
 func reasonCodes(reasons []Reason) []ReasonCode {

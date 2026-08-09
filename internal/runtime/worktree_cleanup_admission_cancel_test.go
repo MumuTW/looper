@@ -11,7 +11,7 @@ import (
 
 // Contract (#592 review): cleanWorktreeCandidate must not start the remove
 // after the cleanup context is canceled — AdmitStart rechecks ctx under the
-// same WithAllowClaim hold as process Start.
+// same WithAllowLifecycleWork hold as process Start.
 func TestCleanWorktreeCandidateSkipsWhenContextCanceledAfterAllowClaim(t *testing.T) {
 	t.Parallel()
 

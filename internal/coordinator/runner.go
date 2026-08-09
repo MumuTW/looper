@@ -51,6 +51,18 @@ type DiscoveryInput struct {
 	ProjectID string
 	Repo      string
 	Snapshot  *githubinfra.DiscoverySnapshot
+	// TriageAdmission gates only the LLM-backed triage call. Coordinator
+	// maintenance phases (merge watch, dependency actions, dispatches, and
+	// review assignments) must continue while that provider is degraded.
+	TriageAdmission func(func() error) error
+}
+
+// RetiredAutoMergeInput identifies the repository whose durable merge-watch
+// markers must be reconciled during the Reviewer-to-Gatekeeper migration.
+type RetiredAutoMergeInput struct {
+	ProjectID string
+	Repo      string
+	CWD       string
 }
 
 type DiscoveryResult struct {
@@ -65,12 +77,14 @@ type IssueSummary struct {
 
 type GitHubGateway interface {
 	ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error)
+	ListMergeWatchIssues(context.Context, githubinfra.ListMergeWatchIssuesInput) ([]githubinfra.IssueSummary, error)
 	ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error)
 	ListLinkedPullRequests(context.Context, githubinfra.LinkedPullRequestsInput) ([]githubinfra.LinkedPullRequest, error)
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
 	ViewPullRequest(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
 	ViewPullRequestForDiscovery(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
 	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
+	ListIssueCommentsContaining(context.Context, githubinfra.ViewIssueInput, []string) ([]githubinfra.CommentInfo, error)
 	ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error)
 	ListIssueBlockedBy(context.Context, githubinfra.ListIssueBlockedByInput) ([]githubinfra.IssueDependency, error)
 	GetIssueState(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueState, error)
@@ -89,6 +103,7 @@ type GitHubGateway interface {
 	AddPullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
 	RemovePullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
 	ViewPullRequestMergeWatch(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
+	DisablePullRequestAutoMerge(context.Context, githubinfra.DisablePullRequestAutoMergeInput) error
 	ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error)
 	ListPullRequestCommits(context.Context, githubinfra.ListPullRequestCommitsInput) ([]githubinfra.PullRequestCommit, error)
 	ListPullRequestDraftEvents(context.Context, githubinfra.PullRequestDraftEventsInput) ([]githubinfra.PullRequestDraftEvent, error)
@@ -100,34 +115,94 @@ type RepositoryInspector interface {
 	Inspect(context.Context, string, triage.Issue) (triage.RepoContext, error)
 }
 
+// ConflictRegenerationInput is the coordinator-to-fixer handoff used when a
+// PR has lost the race with the base branch too many times. The fixer owns the
+// close-and-regenerate side effects; Coordinator owns the observed PR and the
+// durable conflict count.
+type ConflictRegenerationInput struct {
+	ProjectID       string
+	Repo            string
+	IssueRepo       string
+	IssueNumber     int64
+	PRNumber        int64
+	ConflictRepairs int
+	CWD             string
+}
+
+type ConflictRegenerationResult struct {
+	Completed bool
+	Escalated bool
+}
+
+type ConflictRegenerationFunc func(context.Context, ConflictRegenerationInput) (ConflictRegenerationResult, error)
+
 type Options struct {
-	Repos      *storage.Repositories
-	GitHub     GitHubGateway
-	Config     *config.Config
-	Logger     bootstrap.Logger
-	Now        func() time.Time
-	TriageLLM  triage.LLM
-	Inspector  RepositoryInspector
-	Disclosure *config.DisclosureConfig
-	Network    NetworkGateway
-	State      *RuntimeState
+	Repos                  *storage.Repositories
+	GitHub                 GitHubGateway
+	Config                 *config.Config
+	Logger                 bootstrap.Logger
+	Now                    func() time.Time
+	TriageLLM              triage.LLM
+	Inspector              RepositoryInspector
+	Disclosure             *config.DisclosureConfig
+	Network                NetworkGateway
+	State                  *RuntimeState
+	CancelRetiredAutoMerge bool
+	RegenerateConflict     ConflictRegenerationFunc
 }
 
 // RuntimeState contains coordinator lifecycle state that must outlive one
 // immutable configuration snapshot. Snapshot-specific policy remains on Runner.
 type RuntimeState struct {
-	mu                       sync.Mutex
-	lastTickByProject        map[string]time.Time
-	watchLocks               map[string]*sync.Mutex
-	lastRoutedWatchCheckByID map[string]time.Time
+	mu                        sync.Mutex
+	lastTickByProject         map[string]time.Time
+	watchLocks                map[string]*sync.Mutex
+	lastRoutedWatchCheckByID  map[string]time.Time
+	retiredAutoMergeCleanupOK map[string]bool
 }
 
 func NewRuntimeState() *RuntimeState {
 	return &RuntimeState{
-		lastTickByProject:        map[string]time.Time{},
-		watchLocks:               map[string]*sync.Mutex{},
-		lastRoutedWatchCheckByID: map[string]time.Time{},
+		lastTickByProject:         map[string]time.Time{},
+		watchLocks:                map[string]*sync.Mutex{},
+		lastRoutedWatchCheckByID:  map[string]time.Time{},
+		retiredAutoMergeCleanupOK: map[string]bool{},
 	}
+}
+
+// RetiredAutoMergeCleanupReady reports whether the process-local maintenance
+// pass has completed successfully for this project and repository binding.
+// The key includes the repository because a config reassignment must not reuse
+// readiness earned for a different forge target.
+func (s *RuntimeState) RetiredAutoMergeCleanupReady(projectID, repo string) bool {
+	if s == nil {
+		return true
+	}
+	key := retiredAutoMergeCleanupKey(projectID, repo)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.retiredAutoMergeCleanupOK[key]
+}
+
+// SetRetiredAutoMergeCleanupReady records the result of the latest maintenance
+// pass. A failure clears prior readiness so scheduled and webhook Gatekeeper
+// paths share the same fail-closed project barrier.
+func (s *RuntimeState) SetRetiredAutoMergeCleanupReady(projectID, repo string, ready bool) {
+	if s == nil {
+		return
+	}
+	key := retiredAutoMergeCleanupKey(projectID, repo)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ready {
+		s.retiredAutoMergeCleanupOK[key] = true
+	} else {
+		delete(s.retiredAutoMergeCleanupOK, key)
+	}
+}
+
+func retiredAutoMergeCleanupKey(projectID, repo string) string {
+	return strings.TrimSpace(projectID) + "\x1f" + strings.TrimSpace(repo)
 }
 
 // Runner is the Coordinator: a proactive, LLM-driven Role for the legacy
@@ -142,16 +217,18 @@ func NewRuntimeState() *RuntimeState {
 // timing and watch locks), which does not survive restarts and is never an
 // authority.
 type Runner struct {
-	repos      *storage.Repositories
-	github     GitHubGateway
-	config     *config.Config
-	logger     bootstrap.Logger
-	now        func() time.Time
-	triageLLM  triage.LLM
-	inspector  RepositoryInspector
-	disclosure *config.DisclosureConfig
-	network    NetworkGateway
-	state      *RuntimeState
+	repos                  *storage.Repositories
+	github                 GitHubGateway
+	config                 *config.Config
+	logger                 bootstrap.Logger
+	now                    func() time.Time
+	triageLLM              triage.LLM
+	inspector              RepositoryInspector
+	disclosure             *config.DisclosureConfig
+	network                NetworkGateway
+	state                  *RuntimeState
+	cancelRetiredAutoMerge bool
+	regenerateConflict     ConflictRegenerationFunc
 }
 
 type loadedIssue struct {
@@ -200,16 +277,18 @@ func New(options Options) *Runner {
 		state = NewRuntimeState()
 	}
 	runner := &Runner{
-		repos:      options.Repos,
-		github:     options.GitHub,
-		config:     options.Config,
-		logger:     options.Logger,
-		now:        now,
-		triageLLM:  options.TriageLLM,
-		inspector:  inspector,
-		network:    options.Network,
-		disclosure: options.Disclosure,
-		state:      state,
+		repos:                  options.Repos,
+		github:                 options.GitHub,
+		config:                 options.Config,
+		logger:                 options.Logger,
+		now:                    now,
+		triageLLM:              options.TriageLLM,
+		inspector:              inspector,
+		network:                options.Network,
+		disclosure:             options.Disclosure,
+		state:                  state,
+		cancelRetiredAutoMerge: options.CancelRetiredAutoMerge,
+		regenerateConflict:     options.RegenerateConflict,
 	}
 	runner.warnMarkReadyReviewerUnreachable()
 	return runner
@@ -373,7 +452,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 		analysisStartedAt := r.now().UTC()
 		processed++
-		decision, err := r.decide(ctx, project.RepoPath, input.Repo, loadedIssue.issue, triageCfg)
+		decision, err := r.decide(ctx, project.RepoPath, input.Repo, loadedIssue.issue, triageCfg, input.TriageAdmission)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -392,6 +471,69 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{Ticked: true}, err
 	}
 	return DiscoveryResult{Ticked: true}, nil
+}
+
+// ReconcileRetiredAutoMerge independently cleans up native auto-merge requests
+// created by the retired Reviewer path.  The marker search deliberately spans
+// all issue states and does not consult Coordinator labels or enablement, so a
+// closed issue or a renamed triage label cannot leave a pending forge action
+// behind when authority changes.
+func (r *Runner) ReconcileRetiredAutoMerge(ctx context.Context, input RetiredAutoMergeInput) error {
+	if r == nil || !r.cancelRetiredAutoMerge || r.github == nil {
+		return nil
+	}
+	if strings.TrimSpace(input.Repo) == "" {
+		return fmt.Errorf("retired auto-merge reconciliation repository is required")
+	}
+	if _, err := r.github.GetCurrentUserLoginForRepo(ctx, input.Repo, input.CWD); err != nil {
+		return err
+	}
+	issues, err := r.github.ListMergeWatchIssues(ctx, githubinfra.ListMergeWatchIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: 1000})
+	if err != nil {
+		return fmt.Errorf("list retired merge-watch markers: %w", err)
+	}
+	for _, summary := range issues {
+		comments, err := r.github.ListIssueCommentsContaining(ctx, githubinfra.ViewIssueInput{Repo: input.Repo, IssueNumber: summary.Number, CWD: input.CWD}, []string{mergeWatchCommentMarkerPrefix})
+		if err != nil {
+			return fmt.Errorf("read retired merge-watch marker for issue #%d: %w", summary.Number, err)
+		}
+		// A credential rotation can leave a valid historical marker authored by
+		// the old bot login. The marker's author is the provenance for the
+		// native auto-merge request; the current login is only the identity used
+		// for the provider calls below.
+		disabledPRs := map[int64]struct{}{}
+		for _, marker := range mergeWatchComments(comments, "") {
+			if marker.Marker.PRNumber <= 0 {
+				continue
+			}
+			detail, err := r.github.ViewPullRequestMergeWatch(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: marker.Marker.PRNumber, CWD: input.CWD})
+			if err != nil {
+				return fmt.Errorf("inspect retired merge-watch PR #%d: %w", marker.Marker.PRNumber, err)
+			}
+			if detail.Number != marker.Marker.PRNumber {
+				// A zero or mismatched projection is not evidence that the request is
+				// gone. Preserve the marker and fail the cleanup barrier so the
+				// scheduler retries instead of caching incomplete cleanup as ready.
+				return fmt.Errorf("inspect retired merge-watch PR #%d: provider returned PR #%d", marker.Marker.PRNumber, detail.Number)
+			}
+			markerAuthor := strings.TrimSpace(marker.Author)
+			owned := markerAuthor != "" && detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), markerAuthor)
+			_, alreadyDisabled := disabledPRs[marker.Marker.PRNumber]
+			if owned && !alreadyDisabled && !strings.EqualFold(strings.TrimSpace(detail.State), "merged") && strings.TrimSpace(detail.MergedAt) == "" {
+				if err := r.github.DisablePullRequestAutoMerge(ctx, githubinfra.DisablePullRequestAutoMergeInput{Repo: input.Repo, PRNumber: marker.Marker.PRNumber, CWD: input.CWD}); err != nil {
+					return fmt.Errorf("disable retired auto-merge for PR #%d: %w", marker.Marker.PRNumber, err)
+				}
+				disabledPRs[marker.Marker.PRNumber] = struct{}{}
+			}
+			// Once migration has observed the PR, the marker has served its provenance
+			// purpose. Removing every historical marker prevents a newer marker from
+			// hiding an older request authored by the identity that enabled auto-merge.
+			if err := r.deleteMergeWatchComment(ctx, input.Repo, input.CWD, &marker); err != nil {
+				return fmt.Errorf("delete retired merge-watch marker for issue #%d: %w", summary.Number, err)
+			}
+		}
+	}
+	return nil
 }
 
 func (r *Runner) listCoordinatorBacklog(ctx context.Context, projectID, repo, cwd string, triageCfg triage.Config, dispatchCfg dispatch.Config, recent []githubinfra.IssueSummary, limit int) ([]githubinfra.IssueSummary, error) {
@@ -649,7 +791,26 @@ func (r *Runner) hasDispatchWork(action dispatch.Action) bool {
 	return action.ReactionCommentID != 0 || len(action.TriggerLabels) != 0 || action.FailureCommentBody != ""
 }
 
-func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue triage.Issue, cfg triage.Config) (triage.Decision, error) {
+type admittedTriageLLM struct {
+	delegate triage.LLM
+	admit    func(func() error) error
+}
+
+func (l admittedTriageLLM) Complete(ctx context.Context, req triage.Request) (string, error) {
+	var (
+		raw string
+		err error
+	)
+	if gateErr := l.admit(func() error {
+		raw, err = l.delegate.Complete(ctx, req)
+		return err
+	}); gateErr != nil {
+		return "", gateErr
+	}
+	return raw, err
+}
+
+func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue triage.Issue, cfg triage.Config, admission func(func() error) error) (triage.Decision, error) {
 	reTriage := triage.ShouldReTriage(issue, cfg, r.now().UTC())
 	if !reTriage && !triage.ShouldTriage(issue, cfg, r.now().UTC()) {
 		return triage.NoOpDecision(), nil
@@ -660,7 +821,11 @@ func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue
 	}
 	repoCtx.Repo = repo
 	repoCtx.WorkingDirectory = repoPath
-	return triage.Decide(ctx, r.triageLLM, triage.Input{Issue: issue, RepoContext: repoCtx, Config: cfg, Now: r.now().UTC()}), nil
+	llm := r.triageLLM
+	if llm != nil && admission != nil {
+		llm = admittedTriageLLM{delegate: llm, admit: admission}
+	}
+	return triage.Decide(ctx, llm, triage.Input{Issue: issue, RepoContext: repoCtx, Config: cfg, Now: r.now().UTC()}), nil
 }
 
 func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, issue triage.Issue, cfg triage.Config, analysisStartedAt time.Time, decision triage.Decision) error {

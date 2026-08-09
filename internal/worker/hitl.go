@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -40,6 +42,8 @@ When you DO escalate, make it a decision brief the human can confirm in seconds 
 question + options are required; the rest are strongly encouraged (a bare question with no homework is a poor ask). Then STOP immediately without making further changes. A human will answer and you will be resumed in this same session with their decision.
 ---`
 
+const hitlSentinelRelPath = ".looper/ask.json"
+
 type hitlAsk struct {
 	Question          string            `json:"question"`
 	Options           []string          `json:"options"`
@@ -52,6 +56,27 @@ type hitlAsk struct {
 // maxAskSentinelBytes bounds a sentinel read; a decision brief is small, and
 // an enormous file is not a decodable gate request.
 const maxAskSentinelBytes = 1 << 20
+
+// validAskSentinelForHealth is a non-mutating health check. The worker runner
+// later stages the sentinel as durable gate evidence; health accounting must
+// only verify that the same structured HITL request exists, never consume it
+// before the caller can persist the awaiting-human transition.
+func validAskSentinelForHealth(worktreePath string) bool {
+	path := filepath.Join(worktreePath, hitlSentinelRelPath)
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > maxAskSentinelBytes {
+		return false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var ask hitlAsk
+	if err := json.Unmarshal(raw, &ask); err != nil {
+		return false
+	}
+	return strings.TrimSpace(ask.Question) != ""
+}
 
 // consumeAskSentinel stages and reads the agent's ask sentinel from the
 // worktree, if present. A missing sentinel is the ONLY no-question case:
@@ -197,8 +222,15 @@ func mergeHITLCorrelation(delivered loops.HITLAsk, currentMetadata *string) loop
 		return delivered
 	}
 	merged := delivered
-	// Preserve human answer authority.
-	if strings.TrimSpace(existing.Answer) != "" {
+	// Preserve human answer authority, but only onto the same question. A
+	// resumed agent can consume an answered ask and emit a different ask in
+	// the same turn while the old one is still stored as answered; carrying
+	// that answer onto the new question would park the loop with a question
+	// that already appears answered by the previous decision. An empty
+	// delivered question is a correlation-only update of the stored ask.
+	sameQuestion := strings.TrimSpace(delivered.Question) == "" ||
+		strings.TrimSpace(existing.Question) == strings.TrimSpace(delivered.Question)
+	if sameQuestion && strings.TrimSpace(existing.Answer) != "" {
 		merged.Answer = existing.Answer
 		merged.AnsweredAt = existing.AnsweredAt
 		if existing.Status == "answered" || existing.Status == "consumed" {
@@ -206,7 +238,7 @@ func mergeHITLCorrelation(delivered loops.HITLAsk, currentMetadata *string) loop
 		} else if merged.Status == "" || merged.Status == "awaiting" {
 			merged.Status = "answered"
 		}
-	} else if existing.Status == "answered" || existing.Status == "consumed" {
+	} else if sameQuestion && (existing.Status == "answered" || existing.Status == "consumed") {
 		merged.Status = existing.Status
 		merged.AnsweredAt = existing.AnsweredAt
 	}

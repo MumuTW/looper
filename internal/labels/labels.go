@@ -345,6 +345,9 @@ const (
 	HoldWorker   = "looper:hold:worker"
 	HoldFixer    = "looper:hold:fixer"
 	HoldReviewer = "looper:hold:reviewer"
+	// HoldAuditorRevert is applied to generated revert proposals and remains a
+	// durable Gatekeeper veto even after a human promotes the draft to ready.
+	HoldAuditorRevert = "looper:hold:auditor-revert"
 )
 
 // Network target labels (looper:target:<node_name>) are deliberately NOT here.
@@ -379,7 +382,13 @@ type Definition struct {
 // from the start instead of the table quietly describing a different label
 // than the one in use.
 func Standard() []Definition {
-	return DefaultNamespace().Standard()
+	definitions := DefaultNamespace().Standard()
+	definitions = append(definitions, Definition{
+		Name:        HoldAuditorRevert,
+		Color:       "b60205",
+		Description: "Keep automated auditor revert proposals out of auto-merge",
+	})
+	return definitions
 }
 
 // Normalize puts a label into the form comparisons use. Forge labels are

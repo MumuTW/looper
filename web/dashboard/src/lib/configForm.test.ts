@@ -59,7 +59,6 @@ function fixture(): ConfigData {
           reviewEvents: { clean: "COMMENT", blocking: "COMMENT" },
           threadResolution: { enabled: true, mode: "report_only" },
         },
-        autoMerge: { enabled: false },
       },
     },
     metadata: {
@@ -203,6 +202,41 @@ describe("config form contract", () => {
     expect(configSelectOptions(roleAgentPath("worker", "reasoningEffort"))).toEqual([
       ...AGENT_REASONING_EFFORT_OPTIONS,
     ]);
+  });
+
+  it("accepts decimal agent brownout ratios while keeping other scheduler numbers integral", () => {
+    const data = fixture();
+    data.scheduler = {
+      ...data.scheduler,
+      agentBrownout: {
+        enabled: true,
+        windowSeconds: 600,
+        minFailures: 5,
+        failureRatio: 0.8,
+        cooldownSeconds: 900,
+        maxCooldownSeconds: 3600,
+        probeSuccesses: 1,
+        notify: true,
+      },
+    };
+    data.metadata.fields["scheduler.agentBrownout.failureRatio"] = {
+      source: "config-file",
+      editable: true,
+      applyMode: "hot",
+    };
+    const scheduler = CONFIG_GROUPS.find((group) => group.id === "scheduler")!;
+    expect(configFieldPaths(data, scheduler)).toContain(
+      "scheduler.agentBrownout.failureRatio",
+    );
+    const ratio = buildConfigPatch(data, {
+      "scheduler.agentBrownout.failureRatio": "0.65",
+    }, []).body.set["scheduler.agentBrownout.failureRatio"];
+    expect(ratio).toBe(0.65);
+
+    const integerError = buildConfigPatch(data, {
+      "scheduler.agentBrownout.minFailures": "2.5",
+    }, []).errors["scheduler.agentBrownout.minFailures"];
+    expect(integerError).toContain("whole number");
   });
 
   it("builds patches for agent profiles and role agent bindings without params", () => {
@@ -560,7 +594,6 @@ describe("config form contract", () => {
           reviewEvents: { clean: "COMMENT", blocking: "COMMENT" },
           threadResolution: { enabled: true, mode: "report_only" },
         },
-        autoMerge: { enabled: false },
         agent: { vendor: "codex" },
       },
     };
@@ -665,7 +698,6 @@ describe("config form contract", () => {
         reviewEvents: { clean: "COMMENT", blocking: "COMMENT" },
         threadResolution: { enabled: true, mode: "report_only" },
       },
-      autoMerge: { enabled: false },
     };
     const globalWithRoleModel = buildConfigPatch(
       data,

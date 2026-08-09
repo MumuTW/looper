@@ -3,9 +3,10 @@
 //
 // # Authority
 //
-// The configuration file decides everything about how the daemon runs. The unit
-// adds nothing: it names the executable, points at that config file, and sets
-// restart behaviour. It injects no environment and invents no paths.
+// The configuration file decides everything about how the daemon runs. The
+// unit names the executable, points at that config file, sets restart
+// behaviour, and supplies the fixed service PATH used by sandbox preflight.
+// It injects no user-configurable environment and invents no tool paths.
 //
 // That is a deliberate narrowing. An earlier design let the unit carry
 // daemon.environment and a custom unit path, which meant the supervised daemon
@@ -45,6 +46,7 @@ import (
 	"strings"
 
 	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/processsandbox"
 )
 
 // Label identifies the service to the platform supervisor. It is also the
@@ -273,6 +275,10 @@ func renderSystemdUnit(input Input) string {
 	b.WriteString("[Unit]\nDescription=Looper daemon\nAfter=network-online.target\n\n")
 	b.WriteString("[Service]\nType=simple\n")
 	b.WriteString("ExecStart=" + systemdExecStart(programArguments(input)) + "\n")
+	// Keep the manager's actual PATH identical to the PATH used by
+	// ValidateSandboxRuntimeForConfig. A user manager can otherwise inherit a
+	// different PATH from the login session than the preflight probe assumes.
+	b.WriteString("Environment=PATH=" + systemdValue(processsandbox.ServiceProbePATHSystemd) + "\n")
 	b.WriteString("WorkingDirectory=" + systemdValue(input.Config.WorkingDirectory) + "\n")
 	switch input.Config.RestartPolicy {
 	case config.DaemonRestartAlways:

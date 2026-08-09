@@ -247,6 +247,36 @@ describe("OverviewPage", { timeout: 30_000 }, () => {
     expect(screen.getByText("/tmp/looper.sqlite")).toBeTruthy();
   });
 
+  it("surfaces provider brownout state and retry time", async () => {
+    stubDaemon({
+      status: () =>
+        response(
+          statusFixture({
+            service: {
+              ...statusFixture().service,
+              agentHealth: {
+                state: "closed",
+                partial: true,
+                providers: [
+                  { provider: "codex", state: "open", openUntil: "2026-07-30T12:15:00Z" },
+                  { provider: "claude-code", state: "closed" },
+                ],
+              },
+            },
+          }),
+        ),
+    });
+
+    renderOverview();
+
+    await waitFor(() => {
+      expect(screen.getByText("Agent health")).toBeTruthy();
+    });
+    expect(screen.getByText("closed (partial)")).toBeTruthy();
+    expect(screen.getByText("Provider codex")).toBeTruthy();
+    expect(screen.getByText(/2026-07-30T12:15:00Z/)).toBeTruthy();
+  });
+
   it("lists running loops with their seq, target, and status", async () => {
     stubDaemon({
       activeRuns: () =>

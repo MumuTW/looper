@@ -1816,6 +1816,28 @@ func TestCoordinatorRoleProjectOverrideAffectsRoleHelpers(t *testing.T) {
 	}
 }
 
+func TestAnyProjectRoleAutoDiscoveryEnabledHonorsExplicitProjectDisables(t *testing.T) {
+	globalEnabled := true
+	projectDisabled := false
+	cfg := Config{
+		Roles: RoleConfigs{Coordinator: CoordinatorRoleConfig{Enabled: globalEnabled}},
+		Projects: []ProjectRefConfig{{
+			ID:    "disabled",
+			Roles: &PartialRoleConfigs{Coordinator: &PartialCoordinatorRoleConfig{Enabled: &projectDisabled}},
+		}},
+	}
+	if AnyProjectRoleAutoDiscoveryEnabled(cfg, "coordinator") {
+		t.Fatal("AnyProjectRoleAutoDiscoveryEnabled(coordinator) = true, want false when every project disables the role")
+	}
+
+	// With no project catalog, the daemon's global role defaults remain the
+	// authority for embedders and legacy configurations.
+	cfg.Projects = nil
+	if !AnyProjectRoleAutoDiscoveryEnabled(cfg, "coordinator") {
+		t.Fatal("AnyProjectRoleAutoDiscoveryEnabled(coordinator) = false, want global default with no projects")
+	}
+}
+
 func TestValidateRejectsInvalidCoordinatorConfig(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
@@ -4159,7 +4181,7 @@ id = "forgejo-main"
 kind = "forgejo"
 baseUrl = "https://code.example.com"
 auth = "tea"
-teaLogin = "powerformer-code"
+teaLogin = "example-code"
 teaPath = "/opt/homebrew/bin/tea"
 
 [[projects]]
