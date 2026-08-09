@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -171,6 +172,9 @@ func TestApplyMergeWatchShortCircuitsMergedSnapshotBeforeCheckRuns(t *testing.T)
 	if !snapshot.Merged || snapshot.MergedAt != "2026-05-14T11:58:07.000Z" || snapshot.HeadSHA != "head-42" {
 		t.Fatalf("snapshot = %#v, want authoritative merged state", snapshot)
 	}
+	if snapshot.MergeStrategy != "" {
+		t.Fatalf("snapshot merge strategy = %q, want unknown when the forge does not report it", snapshot.MergeStrategy)
+	}
 	if reads := fixture.github.prCheckRunReads["head-42"]; reads != 0 {
 		t.Fatalf("check-runs reads = %d, want 0 (short-circuited before the read)", reads)
 	}
@@ -192,6 +196,24 @@ func TestApplyMergeWatchMergedSnapshotUsesProjectNamespace(t *testing.T) {
 	}
 	if !snapshot.Merged || !snapshot.HasLooperLabel {
 		t.Fatalf("snapshot = %#v, want merged snapshot with custom-namespace Looper label", snapshot)
+	}
+}
+
+func TestMergedSnapshotPreservesLooperOwnedNativeMergeStrategy(t *testing.T) {
+	fixture := newCoordinatorFixture(t)
+	fixture.github.currentLogin = "looper"
+	fixture.github.prDetails[42] = githubinfra.PullRequestDetail{
+		Number: 42, State: "closed", HeadSHA: "head-42", BaseRefName: "main",
+		MergedAt: "2026-05-14T11:58:07.000Z", MergedBy: "looper",
+		AutoMerge: &githubinfra.PullRequestAutoMerge{EnabledBy: "looper", MergeMethod: "SQUASH"},
+	}
+
+	snapshot, tempErr, err := fixture.runner.mergeWatchSnapshot(context.Background(), "acme/looper", t.TempDir(), 7, 42, labels.DefaultNamespace(), "looper")
+	if err != nil || tempErr != nil {
+		t.Fatalf("mergeWatchSnapshot() = %#v, %v, %v", snapshot, tempErr, err)
+	}
+	if snapshot.MergeStrategy != "squash" {
+		t.Fatalf("snapshot merge strategy = %q, want normalized forge strategy", snapshot.MergeStrategy)
 	}
 }
 
@@ -251,15 +273,63 @@ func TestApplyRoutedMergeWatchRecordsMergeEvidenceOutsideIssueDiscovery(t *testi
 	if err != nil {
 		t.Fatalf("ListByEntity() error = %v", err)
 	}
-	found := false
+	var mergedEvent *eventlog.CoordinatorPullRequestMerged
 	for _, event := range events {
 		if event.EventType == eventlog.CoordinatorPullRequestMergedEventType {
-			found = true
+			var payload eventlog.CoordinatorPullRequestMerged
+			if err := json.Unmarshal([]byte(event.PayloadJSON), &payload); err != nil {
+				t.Fatalf("decode Coordinator merge event: %v", err)
+			}
+			mergedEvent = &payload
 		}
 	}
-	if !found {
+	if mergedEvent == nil {
 		t.Fatalf("routed merge outside issue discovery recorded no Coordinator merge event: %#v", events)
 	}
+	if mergedEvent.MergeStrategy != "" {
+		t.Fatalf("routed merge strategy = %q, want unknown when the forge omits it", mergedEvent.MergeStrategy)
+	}
+}
+
+func TestApplyRoutedMergeWatchPreservesNativeMergeStrategy(t *testing.T) {
+	fixture := newCoordinatorFixture(t)
+	fixture.github.currentLogin = "looper"
+	cwd := t.TempDir()
+	seedCoordinatorGatekeeperRoute(t, fixture, 42, "head-42")
+	fixture.github.prDetails[42] = githubinfra.PullRequestDetail{
+		Number: 42, State: "OPEN", HeadSHA: "head-42", BaseRefName: "main",
+		Labels: []string{labels.DefaultPlanTrigger, labels.AutoMerge},
+	}
+	if err := fixture.runner.applyRoutedMergeWatch(context.Background(), fixture.projectID, "acme/looper", cwd); err != nil {
+		t.Fatalf("applyRoutedMergeWatch() register error = %v", err)
+	}
+	fixture.github.prDetails[42] = githubinfra.PullRequestDetail{
+		Number: 42, State: "closed", HeadSHA: "head-42", BaseRefName: "main",
+		MergedAt: "2026-05-14T11:58:07.000Z", MergedBy: "looper",
+		Labels:    []string{labels.DefaultPlanTrigger, labels.AutoMerge},
+		AutoMerge: &githubinfra.PullRequestAutoMerge{EnabledBy: "looper", MergeMethod: "REBASE"},
+	}
+	if err := fixture.runner.applyRoutedMergeWatch(context.Background(), fixture.projectID, "acme/looper", cwd); err != nil {
+		t.Fatalf("applyRoutedMergeWatch() settle error = %v", err)
+	}
+	events, err := fixture.runner.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("ListByEntity() error = %v", err)
+	}
+	for _, event := range events {
+		if event.EventType != eventlog.CoordinatorPullRequestMergedEventType {
+			continue
+		}
+		var payload eventlog.CoordinatorPullRequestMerged
+		if err := json.Unmarshal([]byte(event.PayloadJSON), &payload); err != nil {
+			t.Fatalf("decode Coordinator merge event: %v", err)
+		}
+		if payload.MergeStrategy != "rebase" {
+			t.Fatalf("routed native merge strategy = %q, want normalized forge strategy", payload.MergeStrategy)
+		}
+		return
+	}
+	t.Fatalf("routed native merge recorded no Coordinator merge event: %#v", events)
 }
 
 func TestApplyRoutedMergeWatchSettlesHumanOwnedMergeWithoutEvidence(t *testing.T) {

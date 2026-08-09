@@ -123,6 +123,14 @@ func TestReconciliationLeavesEligibilityUnchanged(t *testing.T) {
 	if final.PRNumber != open.Reports[0].PRNumber {
 		t.Fatalf("reconciled %d, want the same pull request the open tick evaluated", final.PRNumber)
 	}
+	reports, err := latestGateReports(ctx, fixture.repos, "project_1")
+	if err != nil {
+		t.Fatalf("latestGateReports() error = %v", err)
+	}
+	latest := reports["acme/looper#42"]
+	if latest.Evidence.PullRequestState != "MERGED" || hasReason(latest, ReasonRouteRevoked) {
+		t.Fatalf("latest report = %#v, want fresh terminal report without stale route-revoked overwrite", latest)
+	}
 }
 
 // TestReconciliationIsBounded pins what stops this from becoming a poller over

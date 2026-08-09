@@ -458,6 +458,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	// as routing projections. Routed reports are handled by the label-aware
 	// out-of-page pass below, which also records Mergify merge evidence.
 	pageIDs := pageEntityIDs(input.Repo, pullRequests)
+	reconciledDeparted := make(map[string]struct{})
 	for _, entityID := range r.departedFromOpenSet(input.Repo, pullRequests, limit, previousReports, pageIDs) {
 		previous := previousReports[entityID]
 		if hasReasonCode(previous.Reasons, ReasonRouteRevoked) {
@@ -466,7 +467,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		// Routed reports have their own out-of-page lifecycle below. Published
 		// advice and blocked/non-routed reports still need a terminal evaluation
 		// when they leave the open set so their verdict and labels cannot linger.
-		if previousPublished(previous) && reportRouteEstablished(previous) {
+		if reportRouteEstablished(previous) || reportNeedsRouteRecovery(previous) {
 			continue
 		}
 		report, err := r.EvaluatePullRequest(ctx, EvaluationInput{
@@ -478,6 +479,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 		result.Reconciled++
 		result.Reports = append(result.Reports, report)
+		reconciledDeparted[entityID] = struct{}{}
 	}
 	// Reconcile previously published routes whose pull requests are absent from
 	// the bounded discovery page: retire routes whose routing inputs no longer
@@ -486,6 +488,11 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	pageEntityIDs := make(map[string]struct{}, len(pullRequests))
 	for _, pullRequest := range pullRequests {
 		pageEntityIDs[fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)] = struct{}{}
+	}
+	for entityID := range reconciledDeparted {
+		// This entity already received a fresh terminal evaluation above. Do
+		// not let the out-of-page pass act on the stale pre-evaluation report.
+		pageEntityIDs[entityID] = struct{}{}
 	}
 	if reconcileErr := r.reconcileRoutedReportsOutsideDiscoveryPage(ctx, input, pageEntityIDs, previousReports); reconcileErr != nil {
 		evaluationErrs = append(evaluationErrs, reconcileErr)

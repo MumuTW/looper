@@ -35,6 +35,15 @@ func TestReconcileRecordsMergeEvidenceForOutOfPageMergedRoute(t *testing.T) {
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
 		t.Fatalf("initial discovery() error = %v", err)
 	}
+	initialReports, err := latestGateReports(context.Background(), fixture.repos, "project_1")
+	if err != nil {
+		t.Fatalf("latestGateReports() error = %v", err)
+	}
+	crashPending := initialReports["acme/looper#42"]
+	notEstablished := false
+	crashPending.RouteEstablished = &notEstablished
+	crashPending.SourceFingerprint = ""
+	seedGateReport(t, fixture, crashPending)
 	// The pull request merged through Mergify: it is gone from the open list
 	// (outside the discovery page) and GitHub reports it closed with a merge
 	// timestamp.
@@ -280,6 +289,15 @@ func TestReconcileRetiresOutOfPageRouteAfterProviderMove(t *testing.T) {
 	if _, err := oldRunner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
 		t.Fatalf("initial provider discovery() error = %v", err)
 	}
+	initialReports, err := latestGateReports(context.Background(), fixture.repos, "project_1")
+	if err != nil {
+		t.Fatalf("latestGateReports() error = %v", err)
+	}
+	crashPending := initialReports["acme/looper#42"]
+	notEstablished := false
+	crashPending.RouteEstablished = &notEstablished
+	crashPending.SourceFingerprint = ""
+	seedGateReport(t, fixture, crashPending)
 
 	// Keep the same owner/slug while moving the project to another forge. The
 	// durable route must be retired before the new provider can reuse the PR
@@ -347,5 +365,64 @@ func TestRevokeProjectRoutesRetiresPublishedRoutes(t *testing.T) {
 	}
 	if !hasReason(report, ReasonRouteRevoked) {
 		t.Fatalf("report after revocation = %#v, want ReasonRouteRevoked marker", report)
+	}
+}
+
+func TestRevokeProjectRoutesRetiresCrashPendingRoute(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	runner := trustRunner(fixture, config.GatekeeperTrustAuto)
+	established := false
+	report := Report{
+		Version: reportVersion, Mode: string(config.GatekeeperTrustAuto), Eligible: true,
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42,
+		ObservedHeadSHA: "head-1", RouteEstablished: &established,
+		Evidence: Evidence{PullRequestState: "OPEN", FinalObservedHeadSHA: "head-1"},
+	}
+	seedGateReport(t, fixture, report)
+
+	if err := runner.RevokeProjectRoutes(context.Background(), "project_1"); err != nil {
+		t.Fatalf("RevokeProjectRoutes() error = %v", err)
+	}
+	foundAutoRemoval := false
+	for _, removal := range fixture.github.labelRemoves {
+		if slices.Equal(removal.Labels, []string{labels.AutoMerge}) {
+			foundAutoRemoval = true
+		}
+	}
+	if !foundAutoRemoval {
+		t.Fatalf("label removals = %#v, want crash-pending auto-merge route retired", fixture.github.labelRemoves)
+	}
+	if len(fixture.github.commitStatuses) != 0 {
+		t.Fatalf("commit statuses = %#v, want no verdict retirement for an unpublished pending report", fixture.github.commitStatuses)
+	}
+	reports, err := latestGateReports(context.Background(), fixture.repos, "project_1")
+	if err != nil {
+		t.Fatalf("latestGateReports() error = %v", err)
+	}
+	if got := reports["acme/looper#42"]; !hasReason(got, ReasonRouteRevoked) {
+		t.Fatalf("report after revocation = %#v, want ReasonRouteRevoked", got)
+	}
+}
+
+func TestRevokeProjectRoutesClearsTerminalProjectionRetry(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	runner := trustRunner(fixture, config.GatekeeperTrustAuto)
+	report := Report{
+		Version: reportVersion, Mode: string(config.GatekeeperTrustAuto),
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42,
+		ObservedHeadSHA: "head-1",
+		Reasons:         []Reason{{Code: ReasonPullRequestNotOpen}, {Code: ReasonRoutingProjectionFailed}},
+		Evidence:        Evidence{PullRequestState: "CLOSED", FinalObservedHeadSHA: "head-1"},
+	}
+	seedGateReport(t, fixture, report)
+
+	if err := runner.RevokeProjectRoutes(context.Background(), "project_1"); err != nil {
+		t.Fatalf("RevokeProjectRoutes() error = %v", err)
+	}
+	if len(fixture.github.labelAdds) != 0 {
+		t.Fatalf("label adds = %#v, want terminal retry removal-only cleanup", fixture.github.labelAdds)
+	}
+	if len(fixture.github.labelRemoves) != 2 {
+		t.Fatalf("label removals = %#v, want both terminal routing labels cleared", fixture.github.labelRemoves)
 	}
 }

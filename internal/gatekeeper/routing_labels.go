@@ -35,12 +35,15 @@ type routingLabelPlan struct {
 // evaluation rather than routing a different commit or policy state.
 func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, previous *Report) error {
 	trust := r.trustFor(report.ProjectID)
-	if trust == config.GatekeeperTrustObserve && (previous == nil || !previousPublished(*previous)) {
+	if trust == config.GatekeeperTrustObserve && !reportIsTerminal(report) && (previous == nil || !previousPublished(*previous)) {
 		return nil
 	}
 
 	plan := routingLabelPlan{}
-	if trust == config.GatekeeperTrustAuto && report.Eligible {
+	if reportIsTerminal(report) {
+		// Terminal pull requests are removal-only regardless of the previous
+		// route; retaining a human-review label can trigger unrelated automation.
+	} else if trust == config.GatekeeperTrustAuto && report.Eligible {
 		plan.autoMerge = true
 	} else if trust != config.GatekeeperTrustObserve && reportNeedsHumanReview(previous, report) {
 		plan.needsHumanReview = true

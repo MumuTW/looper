@@ -81,7 +81,7 @@ func (r *Runner) recordTerminalAdviceOutcomes(ctx context.Context, terminal Repo
 			resolved[key] = struct{}{}
 		}
 	}
-	previousTerminalIndex := previousTerminalAdviceBoundary(events, terminalReportEventID)
+	previousTerminalIndex := previousTerminalAdviceBoundary(events, terminalReportEventID, terminal.ProjectID)
 	for index, record := range events {
 		if record.EventType != GateReportEventType || record.ID == terminalReportEventID {
 			continue
@@ -132,7 +132,7 @@ func isAdviseVerdict(report Report) bool {
 // the current terminal evaluation. Advice written before that boundary belongs
 // to an earlier close/merge epoch and must not be re-resolved when the PR is
 // closed again after a reopen.
-func previousTerminalAdviceBoundary(events []storage.EventLogRecord, currentReportID string) int {
+func previousTerminalAdviceBoundary(events []storage.EventLogRecord, currentReportID, projectID string) int {
 	currentIndex := len(events)
 	for index, record := range events {
 		if record.ID == currentReportID {
@@ -151,6 +151,9 @@ func previousTerminalAdviceBoundary(events []storage.EventLogRecord, currentRepo
 			continue
 		}
 		if report.PendingProjection || hasReasonCode(report.Reasons, ReasonRoutingProjectionFailed) {
+			continue
+		}
+		if report.ProjectID != "" && report.ProjectID != projectID {
 			continue
 		}
 		if isTerminalAdviceReport(report) {

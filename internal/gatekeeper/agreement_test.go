@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestAdviceAgreementsStayWithinTheCurrentTerminalEpoch(t *testing.T) {
@@ -88,6 +90,52 @@ func TestProjectionMarkersAreNotAdviceVerdicts(t *testing.T) {
 	}
 	if previousPublished(pending) {
 		t.Fatal("pending projection was treated as a published verdict")
+	}
+}
+
+func TestAdviceBoundaryIgnoresOtherProjects(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	runner := fixture.runner()
+	ctx := context.Background()
+	entityID := "acme/looper#42"
+	nowISO := fixture.now.Format(time.RFC3339Nano)
+	if err := fixture.repos.Projects.Upsert(ctx, storage.ProjectRecord{
+		ID: "project_2", Name: "Other", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	verdict := Report{
+		Version: reportVersion, Mode: "advise", Eligible: true,
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42,
+		ObservedHeadSHA: "head-1", Evidence: Evidence{PullRequestState: "OPEN", FinalObservedHeadSHA: "head-1"},
+	}
+	appendAgreementTestReport(t, runner, entityID, "local-verdict", verdict, time.Date(2026, time.July, 30, 10, 0, 0, 0, time.UTC))
+	foreignTerminal := verdict
+	foreignTerminal.ProjectID = "project_2"
+	foreignTerminal.Eligible = false
+	foreignTerminal.Evidence.PullRequestState = "CLOSED"
+	foreignTerminal.Reasons = []Reason{{Code: ReasonPullRequestNotOpen}}
+	appendAgreementTestReport(t, runner, entityID, "foreign-terminal", foreignTerminal, time.Date(2026, time.July, 30, 10, 5, 0, 0, time.UTC))
+	localTerminal := verdict
+	localTerminal.Evidence.PullRequestState = "MERGED"
+	appendAgreementTestReport(t, runner, entityID, "local-terminal", localTerminal, time.Date(2026, time.July, 30, 10, 10, 0, 0, time.UTC))
+
+	if err := runner.recordTerminalAdviceOutcomes(ctx, localTerminal, "local-terminal"); err != nil {
+		t.Fatalf("recordTerminalAdviceOutcomes() error = %v", err)
+	}
+	events, err := fixture.repos.Events.ListByEntity(ctx, "pull_request", entityID)
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	foundLocalVerdict := false
+	for _, event := range events {
+		if event.EventType == AdviceAgreementEventType && event.CausationID != nil && *event.CausationID == "local-verdict" {
+			foundLocalVerdict = true
+		}
+	}
+	if !foundLocalVerdict {
+		t.Fatal("local advice verdict was hidden by another project's terminal boundary")
 	}
 }
 

@@ -428,21 +428,30 @@ func (r *Runner) RevokeProjectRoutes(ctx context.Context, projectID string) erro
 	}
 	var errs []error
 	for entityID, report := range reports {
-		if !previousPublished(report) {
+		potentiallyLiveRoute := reportRouteEstablished(report) || reportNeedsRouteRecovery(report) || reportNeedsOutOfPageRouteRecheck(report)
+		if !previousPublished(report) && !potentiallyLiveRoute {
 			continue
 		}
 		if hasReasonCode(report.Reasons, ReasonRouteRevoked) {
 			continue
 		}
-		if reportRouteEstablished(report) {
-			if err := r.retireRoutingLabelsForReport(ctx, report); err != nil {
+		if potentiallyLiveRoute {
+			var err error
+			if reportIsTerminal(report) {
+				err = r.clearRoutingLabelsForReport(ctx, report)
+			} else {
+				err = r.retireRoutingLabelsForReport(ctx, report)
+			}
+			if err != nil {
 				errs = append(errs, fmt.Errorf("revoke route %s: %w", entityID, err))
 				continue
 			}
 		}
-		if err := r.applyVerdict(ctx, verdictActionRetire, report); err != nil {
-			errs = append(errs, fmt.Errorf("retire verdict %s: %w", entityID, err))
-			continue
+		if previousPublished(report) {
+			if err := r.applyVerdict(ctx, verdictActionRetire, report); err != nil {
+				errs = append(errs, fmt.Errorf("retire verdict %s: %w", entityID, err))
+				continue
+			}
 		}
 		if err := r.markRouteRevoked(ctx, report); err != nil {
 			errs = append(errs, fmt.Errorf("mark route %s revoked: %w", entityID, err))

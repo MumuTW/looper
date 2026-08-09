@@ -2754,24 +2754,44 @@ func (g *Gateway) ValidateMergifyRouting(ctx context.Context, input ValidateMerg
 	return nil
 }
 
+var mergifyBaseConditionPattern = regexp.MustCompile(`^base\s*(~!=|~=|!=|=)\s*(?:"([^"]*)"|'([^']*)'|([^\s"']+))\s*$`)
+
 func queueRuleAppliesToBase(conditions []string, baseRefName string) bool {
 	baseRefName = strings.TrimSpace(baseRefName)
 	if baseRefName == "" {
 		return true
 	}
 	for _, condition := range conditions {
-		fields := strings.Fields(condition)
-		if len(fields) != 3 || fields[0] != "base" {
+		trimmed := strings.TrimSpace(condition)
+		if !strings.HasPrefix(trimmed, "base") {
 			continue
 		}
-		value := strings.Trim(strings.TrimSpace(fields[2]), "\"'")
-		switch fields[1] {
+		match := mergifyBaseConditionPattern.FindStringSubmatch(trimmed)
+		if len(match) != 5 {
+			return false
+		}
+		value := match[2]
+		if match[3] != "" {
+			value = match[3]
+		} else if match[4] != "" {
+			value = match[4]
+		}
+		switch match[1] {
 		case "=":
 			if value != baseRefName {
 				return false
 			}
 		case "!=":
 			if value == baseRefName {
+				return false
+			}
+		case "~=", "~!=":
+			pattern, err := regexp.Compile(value)
+			if err != nil {
+				return false
+			}
+			matched := pattern.MatchString(baseRefName)
+			if (match[1] == "~=" && !matched) || (match[1] == "~!=" && matched) {
 				return false
 			}
 		}
