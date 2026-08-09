@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -254,14 +255,21 @@ func TestApplyRoutedMergeWatchRecordsMergeEvidenceOutsideIssueDiscovery(t *testi
 	if err != nil {
 		t.Fatalf("ListByEntity() error = %v", err)
 	}
-	found := false
+	var mergedEvent *eventlog.CoordinatorPullRequestMerged
 	for _, event := range events {
 		if event.EventType == eventlog.CoordinatorPullRequestMergedEventType {
-			found = true
+			var payload eventlog.CoordinatorPullRequestMerged
+			if err := json.Unmarshal([]byte(event.PayloadJSON), &payload); err != nil {
+				t.Fatalf("decode Coordinator merge event: %v", err)
+			}
+			mergedEvent = &payload
 		}
 	}
-	if !found {
+	if mergedEvent == nil {
 		t.Fatalf("routed merge outside issue discovery recorded no Coordinator merge event: %#v", events)
+	}
+	if mergedEvent.MergeStrategy != "" {
+		t.Fatalf("routed merge strategy = %q, want unknown when the forge omits it", mergedEvent.MergeStrategy)
 	}
 }
 

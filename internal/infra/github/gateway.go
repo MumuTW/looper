@@ -2754,6 +2754,8 @@ func (g *Gateway) ValidateMergifyRouting(ctx context.Context, input ValidateMerg
 	return nil
 }
 
+var mergifyBaseConditionPattern = regexp.MustCompile(`^base\s*(~!=|~=|!=|=)\s*(?:"([^"]*)"|'([^']*)'|([^\s"']+))\s*$`)
+
 func queueRuleAppliesToBase(conditions []string, baseRefName string) bool {
 	baseRefName = strings.TrimSpace(baseRefName)
 	if baseRefName == "" {
@@ -2764,11 +2766,16 @@ func queueRuleAppliesToBase(conditions []string, baseRefName string) bool {
 		if !strings.HasPrefix(trimmed, "base") {
 			continue
 		}
-		match := regexp.MustCompile(`^base\s*(~!=|~=|!=|=)\s*(.+)$`).FindStringSubmatch(trimmed)
-		if len(match) != 3 {
+		match := mergifyBaseConditionPattern.FindStringSubmatch(trimmed)
+		if len(match) != 5 {
 			return false
 		}
-		value := strings.Trim(strings.TrimSpace(match[2]), "\"'")
+		value := match[2]
+		if match[3] != "" {
+			value = match[3]
+		} else if match[4] != "" {
+			value = match[4]
+		}
 		switch match[1] {
 		case "=":
 			if value != baseRefName {

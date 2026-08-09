@@ -107,6 +107,32 @@ merge_protections_settings:
 	}
 }
 
+func TestValidateMergifyRoutingRejectsMalformedNegativeBaseCondition(t *testing.T) {
+	t.Parallel()
+	content := `queue_rules:
+  - name: malformed
+    queue_conditions:
+      - base != "main" trailing
+      - label != needs-human-review
+      - label != do-not-merge
+merge_protections:
+  - name: mergeable shape
+merge_protections_settings:
+  auto_merge_conditions:
+    - label = auto-merge
+    - check-success = "Looper Gatekeeper"
+`
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		return shell.Result{Stdout: base64.StdEncoding.EncodeToString([]byte(content))}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.ValidateMergifyRouting(context.Background(), ValidateMergifyRoutingInput{Repo: "acme/looper", BaseRefName: "main"}); err == nil {
+		t.Fatal("ValidateMergifyRouting() error = nil, want malformed base condition to fail closed")
+	}
+}
+
 func TestQueueRuleAppliesToCompactAndRegexBaseConditions(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -120,6 +146,8 @@ func TestQueueRuleAppliesToCompactAndRegexBaseConditions(t *testing.T) {
 		{name: "regex match", conditions: []string{`base ~= ^release/.*$`}, base: "release/1.0", want: true},
 		{name: "negative regex match", conditions: []string{`base ~!= ^release/.*$`}, base: "release/1.0", want: false},
 		{name: "invalid base condition", conditions: []string{"base ??? main"}, base: "main", want: false},
+		{name: "trailing text", conditions: []string{`base != "main" trailing`}, base: "main", want: false},
+		{name: "unmatched quote", conditions: []string{`base != "main`}, base: "main", want: false},
 		{name: "invalid regex", conditions: []string{"base ~= ["}, base: "main", want: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
