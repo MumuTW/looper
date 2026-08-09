@@ -187,6 +187,9 @@ func TestDeliverHITLAnswerToLoopSharesRequeueLock(t *testing.T) {
 	if err != nil || loop == nil || loop.Status != "running" {
 		t.Fatalf("loop after answer = %#v, %v, want running", loop, err)
 	}
+	if err := deliverHITLAnswerToLoop(context.Background(), coordinator.DB(), repos, nowISO, loopID, "yes"); err != nil {
+		t.Fatalf("exact answer replay error = %v, want successful idempotent delivery", err)
+	}
 }
 
 // TestEnqueueHumanMessageToLoopSharesTargetLock ensures free-text requeue of a

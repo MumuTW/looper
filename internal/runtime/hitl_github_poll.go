@@ -287,7 +287,7 @@ func deliverHITLAnswerToLoop(ctx context.Context, db *sql.DB, repos *storage.Rep
 	if err != nil {
 		return err
 	}
-	if !result.Applied {
+	if !result.Applied && !result.Replayed {
 		return errHITLAnswerNotApplied
 	}
 	return nil
