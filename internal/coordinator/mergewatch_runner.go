@@ -380,10 +380,14 @@ func (r *Runner) applyRoutedMergeWatch(ctx context.Context, projectID, repo, cwd
 				return routeErr
 			}
 			if !humanOwned && active && (detail.AutoMerge != nil || githubinfra.IsMergifyMergeActor(detail.MergedBy)) {
+				mergeStrategy := ""
+				if detail.AutoMerge != nil {
+					mergeStrategy = strings.ToLower(strings.TrimSpace(detail.AutoMerge.MergeMethod))
+				}
 				if err := r.recordPostMergeEvent(ctx, projectID, repo, 0, mergewatch.PRSnapshot{
 					Repo: repo, PRNumber: prNumber, HeadSHA: firstNonEmpty(detail.HeadSHA, headSHA),
-					MergeCommitSHA: detail.MergeCommitSHA,
-					MergedAt:       detail.MergedAt, MergedBy: detail.MergedBy, Merged: true,
+					MergeCommitSHA: detail.MergeCommitSHA, MergeStrategy: mergeStrategy,
+					MergedAt: detail.MergedAt, MergedBy: detail.MergedBy, Merged: true,
 				}); err != nil {
 					return err
 				}
@@ -805,10 +809,14 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 	// merge evidence. The merged snapshot carries enough identity for
 	// recordPostMergeEvent without the check summary.
 	autoMergeOwnedByLooper := detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin))
+	mergeStrategy := ""
+	if autoMergeOwnedByLooper {
+		mergeStrategy = strings.ToLower(strings.TrimSpace(detail.AutoMerge.MergeMethod))
+	}
 	if strings.TrimSpace(detail.MergedAt) != "" || strings.EqualFold(strings.TrimSpace(detail.State), "merged") {
 		return mergewatch.PRSnapshot{
 			Repo: repo, PRNumber: prNumber, IssueNumber: issueNumber,
-			HeadSHA: detail.HeadSHA, MergeCommitSHA: detail.MergeCommitSHA, SourceIssueRepo: repo,
+			HeadSHA: detail.HeadSHA, MergeCommitSHA: detail.MergeCommitSHA, MergeStrategy: mergeStrategy, SourceIssueRepo: repo,
 			MergedAt: detail.MergedAt, MergedBy: detail.MergedBy, Merged: true,
 			AutoMergeEnabled:       detail.AutoMerge != nil,
 			AutoMergeOwnedByLooper: autoMergeOwnedByLooper,

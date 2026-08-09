@@ -467,7 +467,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		// Routed reports have their own out-of-page lifecycle below. Published
 		// advice and blocked/non-routed reports still need a terminal evaluation
 		// when they leave the open set so their verdict and labels cannot linger.
-		if previousPublished(previous) && reportRouteEstablished(previous) {
+		if reportRouteEstablished(previous) || reportNeedsRouteRecovery(previous) {
 			continue
 		}
 		report, err := r.EvaluatePullRequest(ctx, EvaluationInput{

@@ -305,6 +305,29 @@ func TestTerminalReportOnlyRemovesRoutingLabels(t *testing.T) {
 	}
 }
 
+func TestObserveTrustTerminalCrashPendingReportRemovesRoutingLabels(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	runner := routingRunner(fixture, config.GatekeeperTrustObserve)
+	established := false
+	previous := Report{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42,
+		ObservedHeadSHA: "head-1", Eligible: true, Mode: string(config.GatekeeperTrustAuto),
+		RouteEstablished: &established,
+		Evidence:         Evidence{PullRequestState: "OPEN", FinalObservedHeadSHA: "head-1"},
+	}
+	terminal := previous
+	terminal.Eligible = false
+	terminal.Evidence.PullRequestState = "MERGED"
+	terminal.Reasons = []Reason{{Code: ReasonPullRequestNotOpen}}
+
+	if err := runner.reconcileRoutingLabels(context.Background(), terminal, &previous); err != nil {
+		t.Fatalf("reconcileRoutingLabels() error = %v", err)
+	}
+	if len(fixture.github.labelAdds) != 0 || len(fixture.github.labelRemoves) != 2 {
+		t.Fatalf("adds=%#v removes=%#v, want terminal removal-only cleanup under observe trust", fixture.github.labelAdds, fixture.github.labelRemoves)
+	}
+}
+
 func TestRepeatedReviewChangesEscalatesOnSecondEvaluation(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	runner := routingRunner(fixture, config.GatekeeperTrustAdvise)

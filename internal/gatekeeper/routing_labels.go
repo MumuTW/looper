@@ -35,7 +35,7 @@ type routingLabelPlan struct {
 // evaluation rather than routing a different commit or policy state.
 func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, previous *Report) error {
 	trust := r.trustFor(report.ProjectID)
-	if trust == config.GatekeeperTrustObserve && (previous == nil || !previousPublished(*previous)) {
+	if trust == config.GatekeeperTrustObserve && !reportIsTerminal(report) && (previous == nil || !previousPublished(*previous)) {
 		return nil
 	}
 

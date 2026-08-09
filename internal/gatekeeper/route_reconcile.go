@@ -436,7 +436,13 @@ func (r *Runner) RevokeProjectRoutes(ctx context.Context, projectID string) erro
 			continue
 		}
 		if potentiallyLiveRoute {
-			if err := r.retireRoutingLabelsForReport(ctx, report); err != nil {
+			var err error
+			if reportIsTerminal(report) {
+				err = r.clearRoutingLabelsForReport(ctx, report)
+			} else {
+				err = r.retireRoutingLabelsForReport(ctx, report)
+			}
+			if err != nil {
 				errs = append(errs, fmt.Errorf("revoke route %s: %w", entityID, err))
 				continue
 			}
