@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -180,7 +181,8 @@ func TestHandlerLoopRetryWithoutExistingQueueReturnsUUIDQueueID(t *testing.T) {
 	}
 	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
 	queueID, ok := data["queueItemId"].(string)
-	if !ok || len(queueID) != 36 || strings.Count(queueID, "-") != 4 {
+	canonicalUUID := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	if !ok || !canonicalUUID.MatchString(queueID) {
 		t.Fatalf("queueItemId = %#v, want UUID", data["queueItemId"])
 	}
 	queue, err := services.Repositories.Queue.GetByID(context.Background(), queueID)

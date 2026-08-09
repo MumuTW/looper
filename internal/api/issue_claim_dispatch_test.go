@@ -329,6 +329,32 @@ func TestHandlerWorkerCreateAllowsWhenOnlyPlannerIsLive(t *testing.T) {
 	assertQueuedIssueWorker(t, fixture)
 }
 
+func TestHandlerPlannerCreateRefusesIssueClaimOwnedByWorker(t *testing.T) {
+	fixture := newTestFixture(t)
+	repoPath := filepath.Join(fixture.rootDir, "repo-planner-claim-conflict")
+	metadata := `{"repo":"acme/looper"}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repos := fixture.runtime.Services().Repositories
+	targetID := "issue:acme/looper:77"
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: "loop_worker_77", Seq: 1, ProjectID: "project_1", Type: string(domain.LoopTypeWorker),
+		TargetType: string(domain.LoopTargetTypeIssue), TargetID: &targetID, Repo: strPtr("acme/looper"),
+		Status: string(domain.LoopStatusRunning), CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString),
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/planners", strings.NewReader(`{"projectId":"project_1","issueNumber":77}`))
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+	newIssueClaimHandler(fixture).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "loop_worker_77") {
+		t.Fatalf("planner create status = %d, body=%s; want worker issue-claim conflict", recorder.Code, recorder.Body.String())
+	}
+}
+
 // Verifies that worker loops are NOT treated as collisions (loop reuse
 // handles them upstream).
 func TestHandlerWorkerCreateAllowsWhenOnlyWorkerIsLive(t *testing.T) {
