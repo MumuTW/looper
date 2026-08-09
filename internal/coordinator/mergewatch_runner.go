@@ -383,7 +383,7 @@ func (r *Runner) applyRoutedMergeWatch(ctx context.Context, projectID, repo, cwd
 				if err := r.recordPostMergeEvent(ctx, projectID, repo, 0, mergewatch.PRSnapshot{
 					Repo: repo, PRNumber: prNumber, HeadSHA: firstNonEmpty(detail.HeadSHA, headSHA),
 					MergeCommitSHA: detail.MergeCommitSHA,
-					MergedAt: detail.MergedAt, MergedBy: detail.MergedBy, Merged: true,
+					MergedAt:       detail.MergedAt, MergedBy: detail.MergedBy, Merged: true,
 				}); err != nil {
 					return err
 				}
