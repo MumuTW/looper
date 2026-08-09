@@ -1649,6 +1649,8 @@ type stubCoordinatorGitHub struct {
 	removedLabels                 []githubinfra.IssueLabelsInput
 	assigned                      []githubinfra.IssueAssigneesInput
 	prDetails                     map[int64]githubinfra.PullRequestDetail
+	openPullRequestSummaries      []githubinfra.PullRequestSummary
+	mergeWatchReads               int
 	prDetailRevalidations         map[int64]githubinfra.PullRequestDetail
 	prDetailReads                 map[int64]int
 	failPRDetails                 map[int64][]error
@@ -1696,6 +1698,9 @@ func (s *stubCoordinatorGitHub) ListMergeWatchIssues(context.Context, githubinfr
 	return append([]githubinfra.IssueSummary(nil), s.mergeWatchIssues...), nil
 }
 func (s *stubCoordinatorGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error) {
+	if s.openPullRequestSummaries != nil {
+		return append([]githubinfra.PullRequestSummary(nil), s.openPullRequestSummaries...), nil
+	}
 	result := make([]githubinfra.PullRequestSummary, 0, len(s.pullRequests)+len(s.prDetails))
 	summarize := func(detail githubinfra.PullRequestDetail) githubinfra.PullRequestSummary {
 		return githubinfra.PullRequestSummary{Number: detail.Number, State: detail.State, Labels: append([]string(nil), detail.Labels...), Author: detail.Author, ReviewRequests: append([]string(nil), detail.ReviewRequests...), ReviewRequestUsers: append([]githubinfra.GitHubUser(nil), detail.ReviewRequestUsers...), IsDraft: detail.IsDraft}
@@ -1891,6 +1896,7 @@ func (s *stubCoordinatorGitHub) RemovePullRequestLabels(_ context.Context, input
 // of a Pull Request onwards, which is how a test says "this changed between the
 // evidence and the mutation" without racing a real forge.
 func (s *stubCoordinatorGitHub) ViewPullRequestMergeWatch(_ context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
+	s.mergeWatchReads++
 	if failures := s.failPRDetails[input.PRNumber]; len(failures) > 0 {
 		err := failures[0]
 		s.failPRDetails[input.PRNumber] = failures[1:]

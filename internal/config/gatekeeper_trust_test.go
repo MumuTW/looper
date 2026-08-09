@@ -1,85 +1,48 @@
 package config
 
 import (
-	"encoding/json"
-	"strings"
 	"testing"
 )
 
 func gatekeeperIssues(cfg Config) []ValidationIssue {
 	var issues []ValidationIssue
-	validateGatekeeperRoleConfig(cfg.Roles.Gatekeeper, "roles.gatekeeper", &issues)
+	validateGatekeeperRoleConfig(cfg.Roles.Gatekeeper, "roles.gatekeeper", cfg.Roles.Reviewer.AutoMerge.Enabled, &issues)
 	return issues
 }
 
-func TestGatekeeperDefaultsOwnMergeStrategy(t *testing.T) {
+func TestGatekeeperTrustDefaultsToObserve(t *testing.T) {
 	t.Parallel()
+
 	cfg, err := DefaultConfig(t.TempDir())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("DefaultConfig() error = %v", err)
 	}
-	if cfg.Roles.Gatekeeper.Strategy != MergeStrategySquash {
-		t.Fatalf("strategy = %q, want squash", cfg.Roles.Gatekeeper.Strategy)
+	if trust := cfg.Roles.Gatekeeper.Trust; trust != "" && trust != GatekeeperTrustObserve {
+		t.Fatalf("default trust = %q, want observe (or unset)", trust)
 	}
 	if issues := gatekeeperIssues(cfg); len(issues) != 0 {
 		t.Fatalf("default config produced issues: %+v", issues)
 	}
 }
 
-func TestEmptyGatekeeperStrategyNormalizesToSquash(t *testing.T) {
+func TestGatekeeperTrustAcceptsObserveAndAdvise(t *testing.T) {
 	t.Parallel()
-	empty := MergeStrategy(" \t")
-	cfg, err := Normalize(t.TempDir(), PartialConfig{Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Strategy: &empty}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Roles.Gatekeeper.Strategy != MergeStrategySquash {
-		t.Fatalf("strategy = %q, want squash", cfg.Roles.Gatekeeper.Strategy)
-	}
-	if err := Validate(cfg); err != nil {
-		t.Fatalf("normalized empty strategy rejected: %v", err)
-	}
-}
 
-func TestGatekeeperTrustAndStrategyValidation(t *testing.T) {
-	t.Parallel()
-	for _, trust := range []GatekeeperTrustLevel{GatekeeperTrustObserve, GatekeeperTrustAdvise, GatekeeperTrustAuto} {
-		for _, strategy := range []MergeStrategy{MergeStrategySquash, MergeStrategyMerge, MergeStrategyRebase} {
-			cfg := Config{Roles: RoleConfigs{Gatekeeper: GatekeeperRoleConfig{Trust: trust, Strategy: strategy}}}
-			if issues := gatekeeperIssues(cfg); len(issues) != 0 {
-				t.Fatalf("trust=%q strategy=%q issues=%+v", trust, strategy, issues)
-			}
-		}
-	}
-	for _, test := range []struct {
-		role GatekeeperRoleConfig
-		path string
-	}{
-		{role: GatekeeperRoleConfig{Trust: "merge-everything", Strategy: MergeStrategySquash}, path: "roles.gatekeeper.trust"},
-		{role: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto, Strategy: "octopus"}, path: "roles.gatekeeper.strategy"},
-	} {
-		issues := gatekeeperIssues(Config{Roles: RoleConfigs{Gatekeeper: test.role}})
-		if len(issues) != 1 || issues[0].Path != test.path {
-			t.Fatalf("role=%+v issues=%+v, want %s", test.role, issues, test.path)
+	for _, trust := range []GatekeeperTrustLevel{GatekeeperTrustObserve, GatekeeperTrustAdvise} {
+		cfg := Config{Roles: RoleConfigs{Gatekeeper: GatekeeperRoleConfig{Trust: trust}}}
+		if issues := gatekeeperIssues(cfg); len(issues) != 0 {
+			t.Fatalf("trust %q produced issues: %+v", trust, issues)
 		}
 	}
 }
 
-func TestReviewerAutoMergeEnabledProducesMigrationError(t *testing.T) {
+func TestGatekeeperTrustAcceptsAuto(t *testing.T) {
 	t.Parallel()
-	enabled := true
-	for _, partial := range []PartialConfig{
-		{Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{AutoMerge: &PartialReviewerAutoMergeConfig{Enabled: &enabled}}}},
-		{Projects: &[]PartialProjectRefConfig{{Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{AutoMerge: &PartialReviewerAutoMergeConfig{Enabled: &enabled}}}}}},
-	} {
-		cfg, err := Normalize(t.TempDir(), partial)
-		if err != nil {
-			t.Fatal(err)
-		}
-		err = Validate(cfg)
-		if err == nil || !strings.Contains(err.Error(), "roles.gatekeeper.trust") {
-			t.Fatalf("Validate() error = %v, want explicit Gatekeeper migration", err)
-		}
+
+	issues := gatekeeperIssues(Config{Roles: RoleConfigs{Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto}}})
+
+	if len(issues) != 0 {
+		t.Fatalf("issues = %+v, want auto accepted", issues)
 	}
 }
 
@@ -205,48 +168,27 @@ func TestGatekeeperRejectsNegativeProjectReviewThreshold(t *testing.T) {
 	t.Fatalf("issues = %+v, want negative project threshold rejected", issues)
 }
 
-func TestDisabledReviewerAutoMergeDefaultStrategyIsAcceptedButNonDefaultFails(t *testing.T) {
+func TestGatekeeperTrustRejectsAutoWithReviewerNativeAutoMerge(t *testing.T) {
 	t.Parallel()
-	disabled := false
-	defaultStrategy := MergeStrategySquash
-	cfg, err := Normalize(t.TempDir(), PartialConfig{Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{AutoMerge: &PartialReviewerAutoMergeConfig{Enabled: &disabled, Strategy: &defaultStrategy}}}})
-	if err != nil {
-		t.Fatal(err)
+	issues := gatekeeperIssues(Config{Roles: RoleConfigs{
+		Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto},
+		Reviewer:   ReviewerRoleConfig{AutoMerge: ReviewerAutoMergeConfig{Enabled: true}},
+	}})
+	if len(issues) != 1 || issues[0].Path != "roles.gatekeeper.trust" {
+		t.Fatalf("issues = %+v, want one merge-authority conflict", issues)
 	}
-	if err := Validate(cfg); err != nil {
-		t.Fatalf("disabled compatibility input rejected: %v", err)
-	}
-	raw := string(mustJSON(t, cfg.Roles.Reviewer))
-	if strings.Contains(raw, "autoMerge") {
-		t.Fatalf("deprecated autoMerge was projected: %s", raw)
-	}
-	for _, strategy := range []MergeStrategy{MergeStrategyRebase, MergeStrategyMerge} {
-		cfg, err := Normalize(t.TempDir(), PartialConfig{Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{AutoMerge: &PartialReviewerAutoMergeConfig{Enabled: &disabled, Strategy: &strategy}}}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "roles.reviewer.autoMerge.strategy") {
-			t.Fatalf("Validate(strategy=%q) error = %v, want explicit migration", strategy, err)
-		}
+}
+func TestGatekeeperTrustRejectsUnknownLevel(t *testing.T) {
+	t.Parallel()
+
+	issues := gatekeeperIssues(Config{Roles: RoleConfigs{Gatekeeper: GatekeeperRoleConfig{Trust: "merge-everything"}}})
+
+	if len(issues) != 1 || issues[0].Path != "roles.gatekeeper.trust" {
+		t.Fatalf("issues = %+v, want one rejecting the unknown level", issues)
 	}
 }
 
-func TestRedactProjectSecretsOmitsReviewerCompatibilityBlock(t *testing.T) {
-	t.Parallel()
-	projects := []ProjectRefConfig{{ID: "project_1", Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{AutoMerge: &PartialReviewerAutoMergeConfig{}}}}}
-	redacted := RedactProjectSecrets(projects)
-	if redacted[0].Roles == projects[0].Roles {
-		t.Fatal("redaction reused project roles pointer")
-	}
-	if redacted[0].Roles.Reviewer == nil || redacted[0].Roles.Reviewer.AutoMerge != nil {
-		t.Fatalf("redacted reviewer role = %#v, want compatibility block omitted", redacted[0].Roles.Reviewer)
-	}
-	if projects[0].Roles.Reviewer.AutoMerge == nil {
-		t.Fatal("redaction mutated source project")
-	}
-}
-
-func TestGatekeeperProjectOverrideSurvivesNormalizationAndClone(t *testing.T) {
+func TestGatekeeperTrustRejectsProjectAutoOverrideWithReviewerAutoMerge(t *testing.T) {
 	t.Parallel()
 	auto := GatekeeperTrustAuto
 	cfg := Config{
@@ -260,11 +202,40 @@ func TestGatekeeperProjectOverrideSurvivesNormalizationAndClone(t *testing.T) {
 	var issues []ValidationIssue
 	validateCoreConfig(cfg, &issues)
 
+	if len(issues) == 0 {
+		t.Fatal("project auto override with Reviewer native auto-merge was accepted")
+	}
+	found := false
 	for _, issue := range issues {
 		if issue.Path == "projects[0].roles.gatekeeper.trust" {
-			t.Fatalf("project auto override was rejected: %+v", issues)
+			found = true
 		}
 	}
+	if !found {
+		t.Fatalf("issues = %+v, want project merge-authority conflict", issues)
+	}
+}
+
+func TestGatekeeperTrustRejectsInheritedProjectReviewerAutoMerge(t *testing.T) {
+	t.Parallel()
+	auto := GatekeeperTrustAuto
+	enabled := true
+	cfg := Config{
+		Roles: RoleConfigs{Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto}},
+		Projects: []ProjectRefConfig{{
+			ID:    "looper",
+			Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{AutoMerge: &PartialReviewerAutoMergeConfig{Enabled: &enabled}}, Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto}},
+		}},
+	}
+
+	var issues []ValidationIssue
+	validateCoreConfig(cfg, &issues)
+	for _, issue := range issues {
+		if issue.Path == "projects[0].roles.reviewer.autoMerge.enabled" {
+			return
+		}
+	}
+	t.Fatalf("issues = %+v, want inherited project merge-authority conflict", issues)
 }
 
 func TestMergePartialGatekeeperTrust(t *testing.T) {
@@ -325,26 +296,19 @@ func TestClonePartialRoleConfigsPreservesGatekeeperTrust(t *testing.T) {
 // file must survive every normalization layer and reach Config.
 func TestProjectGatekeeperTrustSurvivesNormalization(t *testing.T) {
 	t.Parallel()
-	auto := GatekeeperTrustAuto
-	rebase := MergeStrategyRebase
-	partial := PartialConfig{Projects: &[]PartialProjectRefConfig{{Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto, Strategy: &rebase}}}}}
-	cloned := clonePartialConfig(partial)
-	role := (*cloned.Projects)[0].Roles.Gatekeeper
-	if role == nil || role.Trust == nil || *role.Trust != auto || role.Strategy == nil || *role.Strategy != rebase {
-		t.Fatalf("cloned role = %+v", role)
-	}
-	observe := GatekeeperTrustObserve
-	(*partial.Projects)[0].Roles.Gatekeeper.Trust = &observe
-	if *role.Trust != auto {
-		t.Fatal("clone aliases original trust pointer")
-	}
-}
+	advise := GatekeeperTrustAdvise
+	partial := PartialConfig{Projects: &[]PartialProjectRefConfig{{
+		Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &advise}},
+	}}}
 
-func mustJSON(t *testing.T, value any) []byte {
-	t.Helper()
-	raw, err := json.Marshal(value)
-	if err != nil {
-		t.Fatal(err)
+	cloned := clonePartialConfig(partial)
+
+	projects := cloned.Projects
+	if projects == nil || len(*projects) != 1 {
+		t.Fatalf("cloned projects = %v", projects)
 	}
-	return raw
+	roles := (*projects)[0].Roles
+	if roles == nil || roles.Gatekeeper == nil || roles.Gatekeeper.Trust == nil {
+		t.Fatal("project gatekeeper trust did not survive clonePartialConfig")
+	}
 }

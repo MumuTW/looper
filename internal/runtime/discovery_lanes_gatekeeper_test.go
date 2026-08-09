@@ -49,3 +49,7 @@ func (f *fakeGatekeeperScheduler) DiscoverPullRequests(_ context.Context, input 
 func (*fakeGatekeeperScheduler) EvaluatePullRequest(context.Context, gatekeeper.EvaluationInput) (gatekeeper.Report, error) {
 	return gatekeeper.Report{}, nil
 }
+
+func (*fakeGatekeeperScheduler) RevokeProjectRoutes(context.Context, string) error {
+	return nil
+}

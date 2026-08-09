@@ -800,7 +800,26 @@ The reviewer defaults above are intentionally aggressive: clean reviews publish 
 
 ### Removed Reviewer auto-merge
 
-Reviewer no longer holds merge authority and never calls `gh pr merge`. Legacy `roles.reviewer.autoMerge` input is accepted only so an upgraded daemon can report a precise migration error. Its old scope required both a Looper-owned label and a tracked-Issue link; Gatekeeper `auto` evaluates every eligible open PR, so migration is not a silent scope-preserving mapping. If its effective `enabled` value is `true`, startup fails and asks the operator to review that widened scope, cancel any pending GitHub auto-merge, then set `roles.gatekeeper.trust = "auto"` and `roles.gatekeeper.strategy`. A disabled legacy block is ignored only when it uses the old default `squash` strategy; `merge` or `rebase` fails startup so an upgrade cannot silently change merge behavior. Compatibility blocks are omitted from global and project config projections; delete them after upgrading. When Coordinator runs, its migration cleanup cancels Looper-owned pending native auto-merges; otherwise cancel them manually with `gh pr merge <number> --disable-auto --repo <owner>/<repo>` before promoting trust.
+Reviewer no longer holds merge authority and never calls `gh pr merge`. Legacy `roles.reviewer.autoMerge` input is accepted only so an upgraded daemon can report a precise migration error. Its old scope required both a Looper-owned label and a tracked-Issue link; Gatekeeper `auto` evaluates every eligible open PR, so migration is not a silent scope-preserving mapping. If its effective `enabled` value is `true`, startup fails and asks the operator to review that widened scope, cancel any pending GitHub auto-merge, set `roles.gatekeeper.trust = "auto"`, and configure the merge method in `.mergify.yml`. A disabled legacy block is ignored only when it uses the old default `squash` strategy; `merge` or `rebase` fails startup so an upgrade cannot silently change merge behavior. Compatibility blocks are omitted from global and project config projections; delete them after upgrading. When Coordinator runs, its migration cleanup cancels Looper-owned pending native auto-merges; otherwise cancel them manually with `gh pr merge <number> --disable-auto --repo <owner>/<repo>` before promoting trust.
+
+### Post-merge digest
+
+The optional `roles.coordinator.postMergeDigest` lane sends one timezone-aware
+daily audit from durable local merge, loop, and failure evidence. It is global-
+only and disabled by default; it never asks an agent to reconstruct history or
+uses a live GitHub read to fill missing evidence.
+
+| Path | Purpose | Default | Validation |
+| --- | --- | --- | --- |
+| `roles.coordinator.postMergeDigest.enabled` | Enable the daily digest lane | `false` | — |
+| `roles.coordinator.postMergeDigest.schedule` | Local `HH:MM` delivery time | — | required when enabled |
+| `roles.coordinator.postMergeDigest.timezone` | IANA timezone for day boundaries | — | required/known timezone when enabled |
+| `roles.coordinator.postMergeDigest.includeEmpty` | Send a quiet-day digest | `false` | — |
+| `roles.coordinator.postMergeDigest.maxItems` | Maximum entries per section | — | `1..200` when enabled |
+
+The digest reports merged, closed/regenerated, awaiting-human, and anomaly
+sections. Project-level `projects[].roles.coordinator.postMergeDigest` overrides
+are rejected because one process owns one global daily schedule.
 
 ## Telegram intake
 
@@ -885,31 +904,40 @@ decides what it may do with that judgement.
 | Level | Behaviour |
 | --- | --- |
 | `observe` (default) | Gate report only. Nothing is published, nothing is merged. |
-| `advise` | Additionally publishes the verdict and every blocking reason on the pull request, so the decision costs one read instead of a re-investigation. The human still merges. |
-| `auto` | Requires a completed Looper/Codex review for the current head, publishes the `Looper Gatekeeper` status for that exact **pull request head SHA**, then runs a confirming evaluation and performs one immediate merge. |
+| `advise` | Publishes the verdict and reconciles the human-review route. Escalations receive `needs-human-review`; eligible PRs do not receive the queue-activating `auto-merge` label, so a human still decides whether to queue them. |
+| `auto` | Publishes the `Looper Gatekeeper` status for the exact **pull request head SHA** and routes through the same Mergify labels without a daemon-side merge call. Gatekeeper publishes the required success status for the evaluated head; Mergify's serialized queue rechecks that status and branch protection before performing the merge. |
 
-`auto` has one required external gate: GitHub branch protection must require the
-`Looper Gatekeeper` status context on the target branch. That status keeps the
-forge's required-check policy aligned with the decision; the immediate merge
-mutation is still Gatekeeper's authority and is only attempted after the full
-confirming pass. If protection does not require that context, Gatekeeper
-publishes a failing status and marks the PR ineligible — an *unrequired* failing
-status cannot stop another actor from merging, so operators must add the
-required check before relying on `auto`.
+### How `auto` reaches the merge queue
 
 **Immediate-merge safety at `auto`:**
 
-At `auto`, Gatekeeper therefore **re-runs the complete evaluation** immediately
-before merging and proceeds only if it still passes against the same head. A
-cheaper head comparison would miss exactly the changes that invariant names. The
-merge itself passes `--match-head-commit`, so the forge refuses if anything was
-pushed in between — the decision cannot be applied to a commit it was not made
-about.
+At `auto`, Gatekeeper revalidates the observed head before each routing-label
+mutation. An eligible report gets `auto-merge`, which is the sole opt-in signal
+under `.mergify.yml`; the queue then re-tests the PR against the current `main`
+and GitHub branch protection before merging. If the head changes before the
+label projection, Gatekeeper skips the write and retries on the next evaluation.
+`needs-human-review` and `do-not-merge` are explicit Mergify vetoes, so an
+escalation removes `auto-merge` before applying the human-review route.
 
-Every attempt is recorded, refusals included, with the gates that blocked the
-confirming pass. The merge is immediate rather than handed to GitHub's
-auto-merge: auto-merge applies the decision later, by which time the evaluation
-behind it is stale.
+`auto` cannot be combined with `roles.reviewer.autoMerge.enabled`. Two merge
+authorities on one pull request is not a configuration anyone can reason about —
+whichever wins the race decides, and Reviewer's path checks a strictly narrower
+set of gates.
+
+At `auto`, Gatekeeper revalidates the observed head before each routing-label
+mutation. An eligible report gets `auto-merge` plus a `Looper Gatekeeper`
+success status attached to that exact head; `.mergify.yml` requires both for
+automatic queue entry. The queue then re-tests the PR against the current
+`main` and GitHub branch protection before merging. If the head changes before
+the label or status projection, Gatekeeper skips the write and retries on the
+next evaluation.
+`needs-human-review` and `do-not-merge` are explicit Mergify vetoes, so an
+escalation removes `auto-merge` before applying the human-review route.
+
+`auto` cannot be combined with `roles.reviewer.autoMerge.enabled`. Two merge
+authorities on one pull request is not a configuration anyone can reason about —
+whichever wins the race decides, and Reviewer's path checks a strictly narrower
+set of gates.
 
 ```toml
 [roles.gatekeeper]
@@ -932,11 +960,11 @@ markers, but it does not require a clean review to proceed. The counts and
 threshold are persisted as Gate evidence, and the provider's pull-request
 statistics plus merge-base SHA are the authority for the verdict.
 
-`strategy` accepts `squash`, `merge`, or `rebase` and is used only at `auto`.
+The merge method is owned by the Mergify queue contract in `.mergify.yml`, not
+by Gatekeeper configuration.
 
 Project overrides use `projects[].roles.gatekeeper.trust`,
-`projects[].roles.gatekeeper.requiredReviewChangedLines`,
-`projects[].roles.gatekeeper.strategy`, and
+`projects[].roles.gatekeeper.requiredReviewChangedLines`, and
 `projects[].roles.gatekeeper.protectedPaths`.
 
 Reviewer writes `pr.review.completed` only after it re-reads and verifies the
@@ -947,54 +975,18 @@ requests at or above the threshold with no completed/refused evidence. These
 events describe merged **pull requests**, not commits, and remain queryable
 through the existing event API.
 
-### Gatekeeper diff budget
+Routing labels are reconciled on every `advise`/`auto` evaluation (and removed
+when a published project is demoted to `observe`):
 
-The optional `roles.gatekeeper.diffBudget` gate bounds the change size observed
-against the current merge base. A zero bound is unlimited; the two bounds are
-independent, and a budget is disabled when both are zero. Enabling it makes
-that base commit part of the discovery fingerprint, so a base advance forces a
-fresh evaluation before an automatic merge.
+- `auto-merge` only for an eligible report;
+- `needs-human-review` for `protected_path_touched`, `diff_budget_exceeded`, or a
+  repeated `review_changes_requested` reason;
+- neither label for mechanical blockers such as pending checks or conflicts.
 
-| Path | Purpose | Default |
-| --- | --- | --- |
-| `roles.gatekeeper.diffBudget.maxChangedFiles` | Maximum changed files in one pull request | `0` (unlimited) |
-| `roles.gatekeeper.diffBudget.maxDeletions` | Maximum deleted lines in one pull request | `0` (unlimited) |
-
-Both fields accept project overrides under
-`projects[].roles.gatekeeper.diffBudget.*`. The provider's changed-file and
-deletion counts are evidence for the Gate report; missing or inconsistent base
-evidence blocks `auto` rather than being treated as zero.
-
-### Escalator digest
-
-Escalator is an agent-free, global digest of durable queue health. It never
-claims work or changes a pull request; it reports retry storms, unrouted work,
-and stale heads for operator follow-up. It is disabled by default.
-
-| Path | Purpose | Default |
-| --- | --- | --- |
-| `roles.escalator.enabled` | Enable the digest lane | `false` |
-| `roles.escalator.cadenceSeconds` | Minimum time between digest runs | `3600` |
-| `roles.escalator.retryAttemptThreshold` | Retry count that enters the digest | `2` |
-| `roles.escalator.unroutedAfterSeconds` | Age before unrouted work is reported | `3600` |
-| `roles.escalator.staleHeadAfterSeconds` | Age before a stale head is reported | `86400` |
-| `roles.escalator.maxItems` | Maximum items in one digest | `500` |
-
-Project overrides use `projects[].roles.escalator.*`; the effective values are
-validated at startup (`cadenceSeconds`, `unroutedAfterSeconds`, and
-`staleHeadAfterSeconds` are at least 60 seconds, and `maxItems` is `1..5000`).
-
-`protectedPaths` is empty by default. When it contains gitignore-style globs,
-Gatekeeper reads the pull request's changed files at the observed head and adds
-every matched path to the durable evidence with reason code
-`protected_path_touched`. A matched path blocks an eligible verdict, so an
-`auto` Gatekeeper never merges it; the confirming pass immediately before an
-`auto` merge performs the same file-and-head check again. The changed-file list
-is only read when `protectedPaths` is non-empty, so projects without a
-protected-path policy never pay for the paginated file-list request. Patterns
-with a slash are repository-relative; a pattern without a slash (for example
-`*.sql`) can match a file at any directory depth. Project overrides use
-`projects[].roles.gatekeeper.protectedPaths`.
+The labels are defined in `internal/labels` and are the exact host-repository
+contract consumed by Mergify. The `Looper Gatekeeper` commit status is bound by
+GitHub to one immutable commit, so a later push cannot inherit an old eligible
+decision. Gatekeeper never rewrites or removes unrelated labels.
 
 ### The owned comment and its lifecycle
 
@@ -1027,12 +1019,121 @@ report is audit evidence rather than merge authority.
 
 ### Migration from `roles.reviewer.autoMerge`
 
-Gatekeeper is the only Looper merge authority. Replace an enabled legacy block
-with an explicit Gatekeeper level and strategy; there is no silent mapping
-because `observe`, `advise`, and `auto` deliberately grant different authority.
-Reviewer continues to publish reviews, while Gatekeeper independently evaluates
-holds, requested changes, unresolved threads, checks, mergeability, policy, and
-the current head before acting.
+These are two different responsibilities. Reviewer can opt a PR into GitHub's
+native auto-merge, while `Gatekeeper = auto` supplies the externally enforced
+`Looper Gatekeeper` status that prevents GitHub or Mergify from completing a
+merge until the exact head has a completed Codex review and every other
+Gatekeeper condition passes, and routes the verdict through Mergify labels so
+the queue performs the merge. Reviewer approval alone is therefore insufficient
+once the status is required.
+[#116](https://github.com/MumuTW/looper/issues/116) consolidates both behind this
+ladder and retires `roles.reviewer.autoMerge`; do not enable both authorities on
+the same repository.
+
+## Merge Gatekeeper diff budget (`roles.gatekeeper.diffBudget`)
+
+The diff budget is an optional boolean change-size guard. When configured,
+Gatekeeper reads GitHub's provider-observed `changedFiles` and `deletions` for
+the exact pull-request head during evaluation and blocks the verdict when either
+count exceeds its configured bound. GitHub's provider metadata is the authority
+for the counts; the agent's output is not used. The gate runs during periodic
+Gatekeeper evaluation and fails closed (blocking with `provider_state_unavailable`)
+when the enabled stats cannot be read.
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.gatekeeper.diffBudget.maxChangedFiles` | Maximum number of changed files | `0` (unlimited) |
+| `roles.gatekeeper.diffBudget.maxDeletions` | Maximum number of deleted lines | `0` (unlimited) |
+
+A bound of `0` means **unlimited**: that dimension is not enforced. The two
+bounds are independent, so configuring only one leaves the other unlimited — for
+example, setting only `maxDeletions` still lets a very large purely-additive diff
+pass. Negative values are rejected at startup. The gate is boolean per bound, not
+a score: it records the observed counts and configured limits as evidence and
+does not model review effort or risk.
+
+```toml
+[roles.gatekeeper.diffBudget]
+maxChangedFiles = 20
+maxDeletions = 500
+```
+
+### Project overrides
+
+Project overrides use `projects[].roles.gatekeeper.diffBudget` and are
+**partial**: each bound is optional, and only the bounds present override the
+global value. A project that sets only `maxDeletions` keeps the global
+`maxChangedFiles`, and vice versa. Project IDs are matched exactly, the same as
+every other project lookup, so two IDs differing only by case or surrounding
+whitespace are distinct projects with distinct budgets.
+
+```toml
+[[projects]]
+id = "looper"
+repoPath = "/path/to/looper"
+
+[projects.roles.gatekeeper.diffBudget]
+maxDeletions = 100   # overrides the global bound; maxChangedFiles is inherited
+```
+
+### What this gate does not catch
+
+A cheap, deterministic, provider-authoritative guard is deliberately narrow.
+Reviewers should weigh these blind spots before relying on it:
+
+- Only changed-file count and deletion count are bounded. There is no
+  `maxAdditions` or total-line bound, so a massive purely-additive diff passes
+  whenever `maxDeletions` is the only configured bound.
+- Counts are whole-PR totals from GitHub, computed against the current merge
+  base. There is no per-file or per-path budget, so one very large file passes
+  whenever the file count is under limit, and generated or vendored files are not
+  excluded.
+- The counts move when the base branch is force-pushed or rewritten even though
+  the head does not. The discovery fingerprint includes the base SHA so a
+  rewritten merge base invalidates a reused verdict rather than serving a stale
+  one for up to the skip window.
+- At the `auto` trust level Gatekeeper publishes a route label and a
+  head-bound success status; it never merges. The diff-budget gate still runs
+  on each evaluation and fails closed when the enabled stats cannot be read or
+  the merge base advances between reads. Mergify performs the eventual merge
+  from its serialized queue. The base branch can advance after Gatekeeper's
+  evaluation and before Mergify evaluates the queued item, so the final merge
+  may use a recomputed diff that exceeds the observed budget. Mergify's queue
+  and branch-protection checks remain the merge authority; the Gatekeeper route
+  is evidence, not an atomic merge guarantee.
+
+## Pipeline digest (`roles.escalator`)
+
+Escalator is an agent-free, global Role that periodically derives one attention
+digest from durable loop, queue, Triage, Gatekeeper, and pull-request snapshot
+state. It uses the existing notification gateway; it does not start an agent,
+claim work, change forge state, or add another delivery transport.
+
+```toml
+[roles.escalator]
+enabled = true
+cadenceSeconds = 3600
+retryAttemptThreshold = 2
+unroutedAfterSeconds = 3600
+staleHeadAfterSeconds = 86400
+maxItems = 500
+```
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.escalator.enabled` | Enables the global digest | `false` |
+| `roles.escalator.cadenceSeconds` | Minimum interval between successful census attempts | `3600` |
+| `roles.escalator.retryAttemptThreshold` | Queue attempts at which an item is reported as repeatedly retrying | `2` |
+| `roles.escalator.unroutedAfterSeconds` | Age before an enrolled/unprojected Triage source is stuck | `3600` |
+| `roles.escalator.staleHeadAfterSeconds` | Age before current-head evidence is stale | `86400` |
+| `roles.escalator.maxItems` | Hard bound on one durable delta baseline | `500` |
+
+The role is global-only: `projects[].roles.escalator` is rejected because one
+digest intentionally aggregates all active projects. An unchanged digest is
+suppressed, an empty digest advances the baseline without sending a content-free
+notification, and a failed census retries on the next scheduler tick. A daemon
+restart may run an immediate census; durable delta comparison still prevents an
+unchanged notification.
 
 ## Deploy on merge (`roles.deployer`)
 
