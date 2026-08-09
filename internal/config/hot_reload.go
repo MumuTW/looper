@@ -67,6 +67,7 @@ var hotEditablePaths = map[string]struct{}{
 	"defaults.openPrStrategy":                       {},
 	"defaults.addSnapshotMode":                      {},
 	"instructions.enabled":                          {},
+	"roles.auditor.allowRevertProposals":            {},
 
 	"roles.planner.autoDiscovery":                                          {},
 	"roles.planner.triggers.labels":                                        {},

@@ -495,6 +495,12 @@ type CloseIssueInput struct {
 	CWD         string
 }
 
+type ReopenIssueInput struct {
+	Repo        string
+	IssueNumber int64
+	CWD         string
+}
+
 type ClosePullRequestInput struct {
 	Repo            string
 	PRNumber        int64
@@ -1709,6 +1715,30 @@ func (g *Gateway) CloseIssue(ctx context.Context, input CloseIssueInput) error {
 	return err
 }
 
+// ReopenIssue is idempotent so a retry after creating a revert PR can safely
+// finish the source-issue transition without changing an already-open issue.
+func (g *Gateway) ReopenIssue(ctx context.Context, input ReopenIssueInput) error {
+	if input.IssueNumber <= 0 {
+		return fmt.Errorf("reopen issue: positive issue number is required")
+	}
+	state, err := g.viewIssueState(ctx, input.Repo, input.IssueNumber, input.CWD)
+	if err != nil {
+		return err
+	}
+	if state == "open" {
+		return nil
+	}
+	_, err = g.runGh(ctx, input.CWD, "", "issue", "reopen", strconv.FormatInt(input.IssueNumber, 10), "--repo", input.Repo)
+	if err == nil {
+		return nil
+	}
+	state, stateErr := g.viewIssueState(ctx, input.Repo, input.IssueNumber, input.CWD)
+	if stateErr == nil && state == "open" {
+		return nil
+	}
+	return err
+}
+
 func (g *Gateway) AddIssueAssignees(ctx context.Context, input IssueAssigneesInput) error {
 	assignees := compactIssueAssignees(input.Assignees)
 	if len(assignees) == 0 {
@@ -1972,7 +2002,7 @@ func (g *Gateway) ViewPullRequestForGatekeeper(ctx context.Context, input ViewPu
 		// closingIssuesReferences is provenance enrichment, not merge authority.
 		// Older GitHub Enterprise APIs may reject the optional field; retry the
 		// authoritative gate read without it rather than blocking every evaluation.
-		if !isUnsupportedClosingIssuesFieldError(err) {
+		if !isUnsupportedClosingIssuesReferencesError(err) {
 			return PullRequestDetail{}, err
 		}
 		detail, err = g.viewPullRequestWithFields(ctx, input, withoutJSONField(prViewGatekeeperJSONFields, "closingIssuesReferences"), false, false)
@@ -2018,15 +2048,12 @@ func (g *Gateway) ViewPullRequestForGatekeeper(ctx context.Context, input ViewPu
 	return detail, nil
 }
 
-func isUnsupportedClosingIssuesFieldError(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(err.Error())
+func isUnsupportedClosingIssuesReferencesError(err error) bool {
+	message := strings.ToLower(ErrorMessage(err))
 	if !strings.Contains(message, "closingissuesreferences") {
 		return false
 	}
-	for _, marker := range []string{"unknown field", "unknown argument", "unsupported field", "doesn't exist", "does not exist", "cannot query field", "could not resolve to a field"} {
+	for _, marker := range []string{"unknown field", "unknown argument", "unsupported field", "doesn't exist", "does not exist", "invalid field", "cannot query field", "could not resolve to a field"} {
 		if strings.Contains(message, marker) {
 			return true
 		}
@@ -2079,7 +2106,9 @@ func (g *Gateway) viewPullRequestWithFields(ctx context.Context, input ViewPullR
 			return PullRequestDetail{}, err
 		}
 	}
-	return pullRequestDetailFromViewRow(row, threads, issueComments), nil
+	detail := pullRequestDetailFromViewRow(row, threads, issueComments)
+	detail.ClosingIssues = qualifyIssueReferences(input.Repo, detail.ClosingIssues)
+	return detail, nil
 }
 
 func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, issueComments []CommentInfo) PullRequestDetail {
@@ -2222,6 +2251,19 @@ func extractIssueReferences(value any) []IssueReference {
 	return references
 }
 
+func qualifyIssueReferences(projectRepo string, references []IssueReference) []IssueReference {
+	hostname, _ := splitRepoHostname(projectRepo)
+	if hostname == "" {
+		return references
+	}
+	qualified := append([]IssueReference(nil), references...)
+	for index := range qualified {
+		if referenceHostname, _ := splitRepoHostname(qualified[index].Repo); referenceHostname == "" {
+			qualified[index].Repo = hostname + "/" + qualified[index].Repo
+		}
+	}
+	return qualified
+}
 func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullRequestCheckRunsInput) (PullRequestCheckRuns, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
 	args := []string{"api", fmt.Sprintf("repos/%s/commits/%s/check-runs?filter=latest&per_page=100", repo, encodeURIComponent(input.Ref)), "-H", "Accept: application/vnd.github+json"}
