@@ -1296,38 +1296,45 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 		}
 	}
 	if partial.Gatekeeper != nil {
-		if partial.Gatekeeper.Trust != nil {
-			config.Gatekeeper.Trust = GatekeeperTrustLevel(strings.TrimSpace(string(*partial.Gatekeeper.Trust)))
-		}
-		if partial.Gatekeeper.DiffBudget != nil {
-			budget := config.Gatekeeper.DiffBudget
-			if budget == nil {
-				budget = &GatekeeperDiffBudget{}
-			} else {
-				cloned := *budget
-				budget = &cloned
-			}
-			if partial.Gatekeeper.DiffBudget.MaxChangedFiles != nil {
-				budget.MaxChangedFiles = *partial.Gatekeeper.DiffBudget.MaxChangedFiles
-			}
-			if partial.Gatekeeper.DiffBudget.MaxDeletions != nil {
-				budget.MaxDeletions = *partial.Gatekeeper.DiffBudget.MaxDeletions
-			}
-			config.Gatekeeper.DiffBudget = budget
-		}
-		if partial.Gatekeeper.Strategy != nil {
-			strategy := MergeStrategy(strings.TrimSpace(string(*partial.Gatekeeper.Strategy)))
-			if strategy == "" {
-				strategy = MergeStrategySquash
-			}
-			config.Gatekeeper.Strategy = strategy
-		}
-		if partial.Gatekeeper.RequiredReviewChangedLines != nil {
-			config.Gatekeeper.RequiredReviewChangedLines = *partial.Gatekeeper.RequiredReviewChangedLines
-		}
+		mergeGatekeeperRoleConfig(&config.Gatekeeper, *partial.Gatekeeper)
 	}
 	if partial.Escalator != nil {
 		mergeEscalatorRoleConfig(&config.Escalator, *partial.Escalator)
+	}
+}
+
+func mergeGatekeeperRoleConfig(config *GatekeeperRoleConfig, partial PartialGatekeeperRoleConfig) {
+	if partial.Trust != nil {
+		config.Trust = GatekeeperTrustLevel(strings.TrimSpace(string(*partial.Trust)))
+	}
+	if partial.ProtectedPaths != nil {
+		config.ProtectedPaths = cloneStrings(*partial.ProtectedPaths)
+	}
+	if partial.Strategy != nil {
+		strategy := MergeStrategy(strings.TrimSpace(string(*partial.Strategy)))
+		if strategy == "" {
+			strategy = MergeStrategySquash
+		}
+		config.Strategy = strategy
+	}
+	if partial.RequiredReviewChangedLines != nil {
+		config.RequiredReviewChangedLines = *partial.RequiredReviewChangedLines
+	}
+	if partial.DiffBudget != nil {
+		budget := config.DiffBudget
+		if budget == nil {
+			budget = &GatekeeperDiffBudget{}
+		} else {
+			cloned := *budget
+			budget = &cloned
+		}
+		if partial.DiffBudget.MaxChangedFiles != nil {
+			budget.MaxChangedFiles = *partial.DiffBudget.MaxChangedFiles
+		}
+		if partial.DiffBudget.MaxDeletions != nil {
+			budget.MaxDeletions = *partial.DiffBudget.MaxDeletions
+		}
+		config.DiffBudget = budget
 	}
 }
 
@@ -2247,6 +2254,10 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 		if configs.Gatekeeper.RequiredReviewChangedLines != nil {
 			threshold := *configs.Gatekeeper.RequiredReviewChangedLines
 			gatekeeper.RequiredReviewChangedLines = &threshold
+		}
+		if configs.Gatekeeper.ProtectedPaths != nil {
+			paths := cloneStrings(*configs.Gatekeeper.ProtectedPaths)
+			gatekeeper.ProtectedPaths = &paths
 		}
 		cloned.Gatekeeper = &gatekeeper
 	}

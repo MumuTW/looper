@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -304,6 +305,9 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 			continue
 		}
 		roles := ProjectRoleConfigs(config, project.ID)
+		validatePartialGatekeeperDiffBudget(
+			project.Roles.Gatekeeper.DiffBudget,
+			fmt.Sprintf("projects[%d].roles.gatekeeper.diffBudget", i), issues)
 		validateGatekeeperRoleConfig(
 			roles.Gatekeeper,
 			fmt.Sprintf("projects[%d].roles.gatekeeper", i), issues)
@@ -619,6 +623,46 @@ func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, 
 	if gatekeeper.Strategy != "" && !isValidMergeStrategy(gatekeeper.Strategy) {
 		*issues = append(*issues, ValidationIssue{Path: path + ".strategy", Message: fmt.Sprintf("must be one of: %s, %s, %s", MergeStrategySquash, MergeStrategyMerge, MergeStrategyRebase)})
 	}
+	validateProtectedPathPatterns(gatekeeper.ProtectedPaths, path+".protectedPaths", issues)
+}
+
+func validateProtectedPathPatterns(patterns []string, pathPrefix string, issues *[]ValidationIssue) {
+	for index, pattern := range patterns {
+		trimmed := strings.TrimSpace(pattern)
+		itemPath := fmt.Sprintf("%s[%d]", pathPrefix, index)
+		if trimmed == "" {
+			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must be a non-empty repository-relative glob"})
+			continue
+		}
+		if trimmed != pattern {
+			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must not contain leading or trailing whitespace"})
+		}
+		normalized := strings.TrimPrefix(strings.ReplaceAll(trimmed, "\\", "/"), "./")
+		cleaned := path.Clean(normalized)
+		if strings.HasPrefix(normalized, "/") || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must be repository-relative"})
+		}
+		if cleaned == "." || cleaned == "" {
+			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must contain a usable repository-relative path"})
+		}
+		// Reject any "." or ".." path component. path.Clean collapses them
+		// (foo/../bar -> bar), but matching uses the uncleaned pattern, so a
+		// provider path never contains that segment and the accepted pattern
+		// silently matches nothing.
+		for _, segment := range strings.Split(normalized, "/") {
+			if segment == "" {
+				*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must not contain empty path segments or trailing separators"})
+				break
+			}
+			if segment == "." || segment == ".." {
+				*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must not contain \".\" or \"..\" path segments"})
+				break
+			}
+		}
+		if _, err := path.Match(normalized, "example/path.go"); err != nil {
+			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must be a valid glob"})
+		}
+	}
 }
 
 func validateGatekeeperDiffBudget(budget *GatekeeperDiffBudget, path string, issues *[]ValidationIssue) {
@@ -629,6 +673,18 @@ func validateGatekeeperDiffBudget(budget *GatekeeperDiffBudget, path string, iss
 		*issues = append(*issues, ValidationIssue{Path: path + ".maxChangedFiles", Message: "must be zero or a positive integer"})
 	}
 	if budget.MaxDeletions < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxDeletions", Message: "must be zero or a positive integer"})
+	}
+}
+
+func validatePartialGatekeeperDiffBudget(budget *PartialGatekeeperDiffBudget, path string, issues *[]ValidationIssue) {
+	if budget == nil {
+		return
+	}
+	if budget.MaxChangedFiles != nil && *budget.MaxChangedFiles < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxChangedFiles", Message: "must be zero or a positive integer"})
+	}
+	if budget.MaxDeletions != nil && *budget.MaxDeletions < 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".maxDeletions", Message: "must be zero or a positive integer"})
 	}
 }

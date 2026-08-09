@@ -895,6 +895,9 @@ type GatekeeperRoleConfig struct {
 	RequiredReviewChangedLines int `json:"requiredReviewChangedLines,omitempty"`
 	// Strategy is used only at auto. Empty input normalizes to squash.
 	Strategy MergeStrategy `json:"strategy"`
+	// ProtectedPaths are repository-relative globs that require human review
+	// before an auto-trust merge. Empty preserves the provider-state-only gate.
+	ProtectedPaths []string `json:"protectedPaths,omitempty"`
 }
 
 // GatekeeperDiffBudget is a boolean change-size gate. A zero bound is
@@ -1568,6 +1571,7 @@ type PartialGatekeeperRoleConfig struct {
 	DiffBudget                 *PartialGatekeeperDiffBudget `json:"diffBudget,omitempty"`
 	RequiredReviewChangedLines *int                         `json:"requiredReviewChangedLines,omitempty"`
 	Strategy                   *MergeStrategy               `json:"strategy,omitempty"`
+	ProtectedPaths             *[]string                    `json:"protectedPaths,omitempty"`
 }
 
 type PartialGatekeeperDiffBudget struct {

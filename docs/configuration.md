@@ -907,6 +907,8 @@ trust = "auto"
 requiredReviewChangedLines = 200
 # squash, merge, or rebase; used only at auto
 strategy = "squash"
+# Optional repository-relative globs that always require human review.
+protectedPaths = [".github/workflows/*", "internal/migrations/**"]
 ```
 
 `requiredReviewChangedLines` is the additions-plus-deletions threshold for the
@@ -922,8 +924,9 @@ statistics plus merge-base SHA are the authority for the verdict.
 `strategy` accepts `squash`, `merge`, or `rebase` and is used only at `auto`.
 
 Project overrides use `projects[].roles.gatekeeper.trust`,
-`projects[].roles.gatekeeper.requiredReviewChangedLines`, and
-`projects[].roles.gatekeeper.strategy`.
+`projects[].roles.gatekeeper.requiredReviewChangedLines`,
+`projects[].roles.gatekeeper.strategy`, and
+`projects[].roles.gatekeeper.protectedPaths`.
 
 Reviewer writes `pr.review.completed` only after it re-reads and verifies the
 GitHub marker. A structured `type = "rate_limit"` completion writes
@@ -969,6 +972,18 @@ and stale heads for operator follow-up. It is disabled by default.
 Project overrides use `projects[].roles.escalator.*`; the effective values are
 validated at startup (`cadenceSeconds`, `unroutedAfterSeconds`, and
 `staleHeadAfterSeconds` are at least 60 seconds, and `maxItems` is `1..5000`).
+
+`protectedPaths` is empty by default. When it contains gitignore-style globs,
+Gatekeeper reads the pull request's changed files at the observed head and adds
+every matched path to the durable evidence with reason code
+`protected_path_touched`. A matched path blocks an eligible verdict, so an
+`auto` Gatekeeper never merges it; the confirming pass immediately before an
+`auto` merge performs the same file-and-head check again. The changed-file list
+is only read when `protectedPaths` is non-empty, so projects without a
+protected-path policy never pay for the paginated file-list request. Patterns
+with a slash are repository-relative; a pattern without a slash (for example
+`*.sql`) can match a file at any directory depth. Project overrides use
+`projects[].roles.gatekeeper.protectedPaths`.
 
 ### The owned comment and its lifecycle
 

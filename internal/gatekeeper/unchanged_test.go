@@ -219,6 +219,36 @@ func TestDiscoverPullRequestsReevaluatesWhenTheListPageChanges(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsReevaluatesWhenProtectedPathPolicyChanges(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	fixture.github.detail.ChangedFiles = []string{"internal/gatekeeper/runner.go"}
+	protectedPaths := []string(nil)
+	runner := New(Options{
+		Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now },
+		PolicyPermitsTarget: func(string, string, string) bool { return fixture.policyPermits },
+		ProtectedPathsForProject: func(string) []string {
+			return append([]string(nil), protectedPaths...)
+		},
+	})
+	discoverWith := func() DiscoveryResult {
+		result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+		if err != nil {
+			t.Fatalf("DiscoverPullRequests() error = %v", err)
+		}
+		return result
+	}
+	first := discoverWith()
+	if first.Evaluated != 1 || first.Skipped != 0 {
+		t.Fatalf("first tick = %#v, want one evaluation", first)
+	}
+	protectedPaths = []string{"internal/gatekeeper/**"}
+	second := discoverWith()
+	if second.Evaluated != 1 || second.Skipped != 0 || !hasReason(second.Reports[0], ReasonProtectedPathTouched) {
+		t.Fatalf("policy change result = %#v, want re-evaluation with protected-path blocker", second)
+	}
+}
+
 // A pending check resolves on its own: it turns green while every field the list
 // page can see stays identical, so it must never be skipped.
 func TestDiscoverPullRequestsNeverSkipsWhileACheckIsPending(t *testing.T) {
@@ -483,5 +513,26 @@ func TestDiscoverPullRequestsSkipsBlockedConvergenceUntilReviewerAdvances(t *tes
 	third := discover(t, fixture)
 	if third.Evaluated != 1 || third.Skipped != 0 || !third.Reports[0].Eligible {
 		t.Fatalf("third discovery = %#v, want reevaluated eligible report after convergence advanced", third)
+	}
+}
+
+// A comma inside a protected-path entry must not let two distinct policies
+// collide into the same fingerprint, or a reload between them could reuse a
+// report whose protected-path result no longer matches.
+func TestSourceFingerprintDistinguishesCommaContainingPolicies(t *testing.T) {
+	pr := openPullRequestFixture()
+	first := sourceFingerprint(pr, false, []string{"a,b", "c"})
+	second := sourceFingerprint(pr, false, []string{"a", "b,c"})
+	if first == second {
+		t.Fatalf("fingerprints collided for {a,b},{c} vs {a},{b,c}: %q", first)
+	}
+}
+
+func TestSourceFingerprintIsStableForSamePolicy(t *testing.T) {
+	pr := openPullRequestFixture()
+	a := sourceFingerprint(pr, false, []string{"internal/gatekeeper/**", ".github/workflows/*"})
+	b := sourceFingerprint(pr, false, []string{".github/workflows/*", "internal/gatekeeper/**"})
+	if a != b {
+		t.Fatalf("fingerprints differ for the same policy in different order: %q vs %q", a, b)
 	}
 }

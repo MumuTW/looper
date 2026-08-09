@@ -77,6 +77,7 @@ func previousPublished(report Report) bool {
 // deciding whether to merge.
 var reasonExplanations = map[ReasonCode]string{
 	ReasonHeadStale:                "the head commit moved while this was being evaluated",
+	ReasonBaseStale:                "the pull request base commit moved while this was being evaluated",
 	ReasonPullRequestNotOpen:       "the pull request is not open",
 	ReasonPullRequestDraft:         "the pull request is a draft",
 	ReasonMergeConflict:            "the branch conflicts with its base",
@@ -96,6 +97,7 @@ var reasonExplanations = map[ReasonCode]string{
 	ReasonDiffBudgetExceeded:       "the pull request exceeds the configured diff budget",
 	ReasonProviderStateUnavailable: "the forge did not return the state needed to judge this",
 	ReasonProviderStateAmbiguous:   "the forge returned ambiguous state for this",
+	ReasonProtectedPathTouched:     "the pull request changes a path protected from automatic merging",
 }
 
 // BuildVerdictComment renders a report as the comment published at advise.
@@ -140,13 +142,44 @@ func formatReasons(reasons []Reason) []string {
 			explanation = string(reason.Code)
 		}
 		if subject := strings.TrimSpace(reason.Subject); subject != "" {
-			lines = append(lines, fmt.Sprintf("%s — `%s`", explanation, subject))
+			lines = append(lines, fmt.Sprintf("%s — %s", explanation, formatCodeSpan(subject)))
 			continue
 		}
 		lines = append(lines, explanation)
 	}
 	sort.Strings(lines)
 	return lines
+}
+
+// formatCodeSpan renders an untrusted string as a CommonMark inline code span
+// that cannot be closed early by a backtick in the content. Backslash escapes
+// do not work inside code spans, so the delimiter is always one backtick longer
+// than the longest backtick run in the (control-char-stripped) content, with
+// space padding when the content begins or ends with a backtick.
+func formatCodeSpan(value string) string {
+	value = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' || r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, value)
+	longestRun := 0
+	current := 0
+	for _, r := range value {
+		if r == '`' {
+			current++
+			if current > longestRun {
+				longestRun = current
+			}
+		} else {
+			current = 0
+		}
+	}
+	delimiter := strings.Repeat("`", longestRun+1)
+	if strings.HasPrefix(value, "`") || strings.HasSuffix(value, "`") {
+		return delimiter + " " + value + " " + delimiter
+	}
+	return delimiter + value + delimiter
 }
 
 func shortSHA(sha string) string {

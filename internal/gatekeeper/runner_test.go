@@ -315,11 +315,12 @@ func TestEvaluatePullRequestBlocksEachSafetyCondition(t *testing.T) {
 }
 
 type gatekeeperFixture struct {
-	repos         *storage.Repositories
-	github        *fakeGatekeeperGitHub
-	now           time.Time
-	policyPermits bool
-	execSQL       func(string) error
+	repos          *storage.Repositories
+	github         *fakeGatekeeperGitHub
+	now            time.Time
+	policyPermits  bool
+	execSQL        func(string) error
+	protectedPaths []string
 	// closeDB closes the underlying SQLite coordinator so a test can force a
 	// persistence failure mid-discovery.
 	closeDB func() error
@@ -396,6 +397,9 @@ func (f *gatekeeperFixture) autoRunner() *Runner {
 		Repos: f.repos, GitHub: f.github, Now: func() time.Time { return f.now },
 		PolicyPermitsTarget: func(string, string, string) bool { return f.policyPermits },
 		TrustForProject:     func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+		ProtectedPathsForProject: func(string) []string {
+			return append([]string(nil), f.protectedPaths...)
+		},
 	})
 }
 
@@ -907,6 +911,10 @@ func (f *fakeGatekeeperGitHub) SetCommitStatus(_ context.Context, input githubin
 		return nil
 	}
 	return f.statusErr
+}
+
+func (f *fakeGatekeeperGitHub) GetPullRequestBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error) {
+	return f.finalBaseSHA, nil
 }
 
 func reasonCodes(reasons []Reason) []ReasonCode {
