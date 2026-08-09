@@ -321,27 +321,60 @@ If reviewer considers the spec review clean, it will:
 - there are no unresolved review threads
 - the review decision is not `CHANGES_REQUESTED`
 
-### Merge authority
+### Gatekeeper auto route
 
-Reviewer reviews; it never merges. Merge Gatekeeper owns the single graduated
-authority configured by `roles.gatekeeper.trust`: `observe` records only,
-`advise` publishes a verdict for a human, and `auto` re-runs every gate against
-the same head before merging immediately. Choose the merge method with
-`roles.gatekeeper.strategy` (`squash`, `merge`, or `rebase`).
+Gatekeeper is Looper's only merge authority. Set `roles.gatekeeper.trust =
+"auto"` when eligible pull requests should enter the repository's Mergify
+queue. Choose the merge method in the repository-owned `.mergify.yml`
+`queue_rules[].merge_method`; there is no `roles.gatekeeper.strategy` setting.
+Reviewer still publishes the Codex review; it never enables GitHub's native
+auto-merge path.
 
-An upgraded config with `roles.reviewer.autoMerge.enabled = true` fails startup
-with migration guidance instead of silently preserving or escalating authority.
-The old Reviewer scope required a Looper-owned label plus a tracked-Issue link;
-Gatekeeper `auto` evaluates every eligible open PR, so review that widened scope
-before promoting trust. Cancel any pending native auto-merge first with
-`gh pr merge <number> --disable-auto --repo <owner>/<repo>`; Coordinator performs
-the same cleanup for Looper-owned requests when it is running. Then move the
-intended level and strategy to Gatekeeper and delete the old block.
+The route is label-based with a head-bound status guard: Gatekeeper adds the
+exact `auto-merge` label and publishes a `Looper Gatekeeper` success status for
+the same commit only after a fresh current-head evaluation. Mergify requires
+both, so a later push cannot inherit the prior route decision. Gatekeeper
+removes the label whenever a hold, review change, unresolved thread, policy
+change, provider failure, or other blocker is observed. A queued PR also
+receives `needs-human-review` before the trigger is removed, so a partial label
+failure cannot leave an accepted queue entry without a veto. Mergify's
+repository-owned `.mergify.yml` and GitHub branch protection are the external
+authorities that serialize and perform the merge.
+
+The repository-root `.mergify.yml` is the complete reusable contract: its queue
+rule targets `main`, uses merge commits, rejects draft/conflicting PRs and both
+veto labels, while `merge_protections_settings.auto_merge_conditions` requires
+the `auto-merge` label plus a successful `Looper Gatekeeper` status. Configure
+GitHub branch protection for `main` with `Looper Gatekeeper` and the repository's
+CI checks as required checks; Mergify injects those branch-protection checks into
+its queue, so they must not be duplicated in the YAML.
+
+`roles.reviewer.autoMerge.*` remains parse-only migration input. An enabled
+legacy block cannot coexist with effective Gatekeeper `auto`; disable it and
+cancel any historical native auto-merge request before promoting the route.
+Auditor and the post-merge digest can consume the durable Coordinator/Gatekeeper
+merge events produced by the route (see [configuration](configuration.md#merge-gatekeeper-trust-level-rolesgatekeepertrust)).
+
+Reviewer still publishes its review outcome and never invokes `gh pr merge --auto`.
+
+Gatekeeper's current-head review and `Looper Gatekeeper` status are part of the
+route evaluation; a push must pass a new full evaluation before the label and
+status can be applied again.
 
 Review capacity defaults to 200 changed lines (additions plus deletions). Set
 `roles.gatekeeper.requiredReviewChangedLines` or the project override to tune
 it; an explicit `0` disables that requirement. Smaller changes still block on
 an explicit blocking review marker, but do not wait for a clean review.
+
+Comment markers used by this flow:
+
+- `<!-- looper:reviewer:criteria-fail -->` — legacy Reviewer evidence that at least one acceptance criterion was not satisfied; it does not authorize a merge
+- `<!-- looper:reviewer:automerge-refused -->` — legacy Reviewer migration marker; it is informational and does not control the Gatekeeper route
+- `<!-- looper:coordinator:merge-watch retries=N -->` — Coordinator is watching a merge-pending PR and carrying retry state on the linked Issue
+
+The Gatekeeper route has no native GitHub auto-merge toggle. Manual queue actions
+remain subject to Mergify's veto labels and the repository's branch-protection
+rules; the legacy Reviewer markers above never re-enable a route.
 
 ## 8. Fixer: repair a PR based on review feedback
 
@@ -427,6 +460,8 @@ These are the most important labels right now:
 | `looper:spec-reviewing` | PR | This PR is in the spec review phase |
 | `looper:spec-ready` | PR | The spec is approved and ready for worker |
 | `looper:needs-human` | PR | Reserved for manual intervention cases |
+| `auto-merge` | PR | Gatekeeper's eligible route into the Mergify queue |
+| `needs-human-review` | PR | Gatekeeper's escalation route; blocks the Mergify queue |
 | `looper:hold` | issue or PR | Block all automatic Looper activity on that item |
 | `looper:hold:worker` | issue or PR | Block automatic worker activity on that item |
 | `looper:hold:fixer` | issue or PR | Block automatic fixer activity on that item |

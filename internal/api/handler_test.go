@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -180,7 +181,8 @@ func TestHandlerLoopRetryWithoutExistingQueueReturnsUUIDQueueID(t *testing.T) {
 	}
 	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
 	queueID, ok := data["queueItemId"].(string)
-	if !ok || len(queueID) != 36 || strings.Count(queueID, "-") != 4 {
+	canonicalUUID := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	if !ok || !canonicalUUID.MatchString(queueID) {
 		t.Fatalf("queueItemId = %#v, want UUID", data["queueItemId"])
 	}
 	queue, err := services.Repositories.Queue.GetByID(context.Background(), queueID)
@@ -1476,7 +1478,7 @@ func TestHandlerStatusUsesLiveConfigForReviewPublishReadiness(t *testing.T) {
 
 func TestBuildConfigResponseExposesCanonicalCodingRoles(t *testing.T) {
 	_, cfg := startTestRuntime(t)
-	cfg.Roles.Gatekeeper = config.GatekeeperRoleConfig{Trust: config.GatekeeperTrustAuto, Strategy: config.MergeStrategyRebase}
+	cfg.Roles.Gatekeeper = config.GatekeeperRoleConfig{Trust: config.GatekeeperTrustAuto}
 	cfg.Roles.Escalator = config.EscalatorRoleConfig{Enabled: true, CadenceSeconds: 600, MaxItems: 42}
 	worker := config.EffectiveCodingRoles(cfg.Roles)[config.CodingRoleWorker]
 	worker.Priority = 7
@@ -1491,7 +1493,7 @@ func TestBuildConfigResponseExposesCanonicalCodingRoles(t *testing.T) {
 	if response.Roles.Worker.AutoDiscovery == got.Discovery.Enabled {
 		t.Fatal("test setup did not retain a divergent legacy worker field")
 	}
-	if response.Roles.Gatekeeper.Trust != config.GatekeeperTrustAuto || response.Roles.Gatekeeper.Strategy != config.MergeStrategyRebase {
+	if response.Roles.Gatekeeper.Trust != config.GatekeeperTrustAuto {
 		t.Fatalf("roles.gatekeeper = %#v, want inspectable auto/rebase authority", response.Roles.Gatekeeper)
 	}
 	if !response.Roles.Escalator.Enabled || response.Roles.Escalator.CadenceSeconds != 600 || response.Roles.Escalator.MaxItems != 42 {

@@ -30,13 +30,18 @@ func TestTargetedEvaluationAggregatesAllReportsForSharedHead(t *testing.T) {
 		seedGateReport(t, fixture, report)
 	}
 
-	if _, err := fixture.autoRunner().EvaluatePullRequest(context.Background(), EvaluationInput{
+	report, err := fixture.autoRunner().EvaluatePullRequest(context.Background(), EvaluationInput{
 		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: sharedSHA,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("EvaluatePullRequest() error = %v", err)
 	}
-	if len(fixture.github.statusCalls) != 1 || fixture.github.statusCalls[0].State != "failure" {
-		t.Fatalf("status calls = %#v, want shared-head failure from the older blocked report", fixture.github.statusCalls)
+	// The routing-label design evaluates each pull request independently: a
+	// blocked report on another PR with the same head no longer publishes a
+	// shared commit status that would block this PR. PR 42 passes all gates
+	// and is eligible.
+	if !report.Eligible || report.Status != StatusEligible {
+		t.Fatalf("report = %+v, want eligible (routing-label design evaluates PRs independently)", report)
 	}
 }
 

@@ -921,10 +921,9 @@ const (
 	// GatekeeperTrustAdvise additionally publishes the verdict and its reasons on
 	// the pull request, so a human can decide without redoing the judgement.
 	GatekeeperTrustAdvise GatekeeperTrustLevel = "advise"
-	// GatekeeperTrustAuto lets Gatekeeper merge what it judges eligible after a
-	// complete confirming evaluation. Legacy roles.reviewer.autoMerge.enabled
-	// configurations are rejected with an explicit migration error so Reviewer
-	// cannot remain a second merge authority.
+	// GatekeeperTrustAuto publishes the auto-merge route label after a fresh
+	// Gatekeeper evaluation. Mergify/GitHub remain the merge authorities; the
+	// daemon never performs a merge itself.
 	GatekeeperTrustAuto GatekeeperTrustLevel = "auto"
 )
 
@@ -937,8 +936,6 @@ type GatekeeperRoleConfig struct {
 	// triggers a review-capacity gate. The normalized default is 200; an explicit
 	// zero disables the threshold.
 	RequiredReviewChangedLines int `json:"requiredReviewChangedLines,omitempty"`
-	// Strategy is used only at auto. Empty input normalizes to squash.
-	Strategy MergeStrategy `json:"strategy"`
 	// ProtectedPaths are repository-relative globs that require human review
 	// before an auto-trust merge. Empty preserves the provider-state-only gate.
 	ProtectedPaths []string `json:"protectedPaths,omitempty"`
@@ -1633,7 +1630,6 @@ type PartialGatekeeperRoleConfig struct {
 	Trust                      *GatekeeperTrustLevel        `json:"trust,omitempty"`
 	DiffBudget                 *PartialGatekeeperDiffBudget `json:"diffBudget,omitempty"`
 	RequiredReviewChangedLines *int                         `json:"requiredReviewChangedLines,omitempty"`
-	Strategy                   *MergeStrategy               `json:"strategy,omitempty"`
 	ProtectedPaths             *[]string                    `json:"protectedPaths,omitempty"`
 }
 

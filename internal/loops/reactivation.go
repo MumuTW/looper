@@ -62,6 +62,13 @@ func ReactivateQueue(ctx context.Context, repos *storage.Repositories, input Que
 	if err != nil {
 		return QueueReactivationResult{}, fmt.Errorf("%w: %v", ErrInvalidQueueTarget, err)
 	}
+	queue, queueSupported, err := BuildQueuedLoopQueueRecord(*current, target, input.NowISO, current.MetadataJSON, input.MaxAttempts)
+	if err != nil {
+		return QueueReactivationResult{}, err
+	}
+	if !queueSupported {
+		return QueueReactivationResult{}, fmt.Errorf("%w: unsupported loop type %q", ErrInvalidQueueTarget, current.Type)
+	}
 
 	updated := *current
 	updated.Status = string(domain.LoopStatusRunning)
@@ -125,13 +132,8 @@ func ReactivateQueue(ctx context.Context, repos *storage.Repositories, input Que
 		return result, nil
 	}
 
-	queue, ok, err := BuildQueuedLoopQueueRecord(updated, target, input.NowISO, updated.MetadataJSON, input.MaxAttempts)
-	if err != nil {
-		return QueueReactivationResult{}, err
-	}
-	if !ok {
-		return result, nil
-	}
+	// queue was validated before the loop transitioned to running so every
+	// successful reactivation can uphold the claimable-item invariant.
 	_, _, err = repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queue)
 	if err != nil {
 		return QueueReactivationResult{}, err

@@ -10,9 +10,11 @@
 # against the current tip of `main` before it merges, so two PRs that are green
 # in isolation cannot land a broken `main` together.
 #
-# Auto-merge is opt-in per pull request via the `auto-merge` label. Without the
-# label Mergify does nothing on its own; `@mergifyio queue` still queues a pull
-# request manually.
+# Auto-merge is opt-in per pull request via the `auto-merge` label plus the
+# current-head `Looper Gatekeeper` success status. Without both signals Mergify
+# does nothing on its own; `@mergifyio queue` still queues a pull request
+# manually. Gatekeeper removes this route before applying `needs-human-review`;
+# `do-not-merge` remains a human/host veto.
 
 merge_queue:
   # One pull request checked at a time. This repository's CI fans out into
@@ -28,6 +30,8 @@ queue_rules:
       - base = main
       - -draft
       - -conflict
+      - label != needs-human-review
+      - label != do-not-merge
 
 # auto_merge_conditions only takes effect when at least one merge protection
 # rule exists. This rule deliberately asserts only what branch protection cannot
@@ -44,3 +48,6 @@ merge_protections:
 merge_protections_settings:
   auto_merge_conditions:
     - label = auto-merge
+    - check-success = "Looper Gatekeeper"
+    - label != needs-human-review
+    - label != do-not-merge

@@ -45,11 +45,20 @@ func TestEvaluatePullRequestPersistsEligibleReportBoundToHead(t *testing.T) {
 			gateReports = append(gateReports, event)
 		}
 	}
-	if len(gateReports) != 1 {
-		t.Fatalf("events = %#v, want one durable gate report", events)
+	// Persist writes a crash-boundary pending projection (empty discovery
+	// fingerprint) before the routing projection, then the final report with the
+	// real fingerprint after the projection succeeds. The final report is the
+	// newest record and must be the one latestGateReports resolves to.
+	// Persist writes a crash-boundary pending projection (empty discovery
+	// fingerprint) before the routing projection, then the final report after
+	// the projection succeeds. A direct EvaluatePullRequest carries no discovery
+	// fingerprint, so both records here have empty fingerprints; the contract
+	// under test is the two-append ordering, not the fingerprint value.
+	if len(gateReports) != 2 {
+		t.Fatalf("gate report events = %d, want 2 (pending projection plus final report)", len(gateReports))
 	}
 	var persisted Report
-	if err := json.Unmarshal([]byte(gateReports[0].PayloadJSON), &persisted); err != nil {
+	if err := json.Unmarshal([]byte(gateReports[len(gateReports)-1].PayloadJSON), &persisted); err != nil {
 		t.Fatalf("decode persisted report: %v", err)
 	}
 	if !persisted.Eligible || persisted.ObservedHeadSHA != "head-1" {
@@ -422,8 +431,8 @@ func TestAutoGatekeeperRequiresCurrentHeadCodexReviewAndPublishesPendingStatus(t
 	if report.Eligible || !slices.Contains(reasonCodes(report.Reasons), ReasonCodexReviewRequired) {
 		t.Fatalf("report = %#v, want current-head review required", report)
 	}
-	if got := fixture.github.statusCalls; len(got) != 1 || got[0].SHA != "head-1" || got[0].Context != RequiredStatusContext || got[0].State != "pending" {
-		t.Fatalf("status calls = %#v, want pending status for head-1", got)
+	if got := fixture.github.labelAdds; len(got) != 0 {
+		t.Fatalf("label adds = %#v, want no auto-merge route while review is required", got)
 	}
 	if got := fixture.github.reviewMarkerCalls; len(got) != 1 || got[0].Marker != "looper:review id_prefix=reviewer: head=head-1" || got[0].AuthorLogin != "looper-bot" {
 		t.Fatalf("review marker calls = %#v, want exact current-head marker and Looper author", got)
@@ -485,8 +494,8 @@ func TestAutoGatekeeperAllowsSmallChangeWithoutCleanReview(t *testing.T) {
 	if !report.Eligible || report.Evidence.ReviewRequiredByPolicy || report.Evidence.ChangedLines != DefaultRequiredReviewChangedLines-1 {
 		t.Fatalf("report = %#v, want eligible below threshold", report)
 	}
-	if len(fixture.github.reviewMarkerCalls) != 2 {
-		t.Fatalf("review marker calls = %#v, want primary + confirming marker checks", fixture.github.reviewMarkerCalls)
+	if len(fixture.github.reviewMarkerCalls) != 1 {
+		t.Fatalf("review marker calls = %#v, want one routing evaluation marker check", fixture.github.reviewMarkerCalls)
 	}
 	if got := fixture.github.statusCalls; len(got) != 1 || got[0].State != "success" {
 		t.Fatalf("status calls = %#v, want success", got)
@@ -688,10 +697,9 @@ func TestAutoGatekeeperRejectsStaleOrBlockingCodexReview(t *testing.T) {
 		name   string
 		marker githubinfra.ReviewMarkerResult
 		want   ReasonCode
-		state  string
 	}{
-		{name: "stale review is not found for new head", marker: githubinfra.ReviewMarkerResult{}, want: ReasonCodexReviewRequired, state: "pending"},
-		{name: "blocking review", marker: githubinfra.ReviewMarkerResult{Found: true, Outcome: "blocking", Event: "REQUEST_CHANGES", AuthorLogin: "looper-bot"}, want: ReasonCodexReviewBlocked, state: "failure"},
+		{name: "stale review is not found for new head", marker: githubinfra.ReviewMarkerResult{}, want: ReasonCodexReviewRequired},
+		{name: "blocking review", marker: githubinfra.ReviewMarkerResult{Found: true, Outcome: "blocking", Event: "REQUEST_CHANGES", AuthorLogin: "looper-bot"}, want: ReasonCodexReviewBlocked},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := newGatekeeperFixture(t)
@@ -706,8 +714,8 @@ func TestAutoGatekeeperRejectsStaleOrBlockingCodexReview(t *testing.T) {
 			if !slices.Contains(reasonCodes(report.Reasons), tc.want) {
 				t.Fatalf("report = %#v, want %s", report, tc.want)
 			}
-			if got := fixture.github.statusCalls; len(got) != 1 || got[0].State != tc.state {
-				t.Fatalf("status calls = %#v, want %s", got, tc.state)
+			if got := fixture.github.labelAdds; len(got) != 0 {
+				t.Fatalf("label adds = %#v, want no auto-merge route for rejected review", got)
 			}
 		})
 	}
@@ -727,8 +735,8 @@ func TestAutoGatekeeperRefusesToReportSuccessWithoutProtectedContext(t *testing.
 	if report.Eligible || !slices.Contains(reasonCodes(report.Reasons), ReasonGatekeeperCheckRequired) {
 		t.Fatalf("report = %#v, want missing protected context", report)
 	}
-	if got := fixture.github.statusCalls; len(got) != 1 || got[0].State != "error" {
-		t.Fatalf("status calls = %#v, want error", got)
+	if got := fixture.github.labelAdds; len(got) != 0 {
+		t.Fatalf("label adds = %#v, want no auto-merge route without protected context", got)
 	}
 }
 
@@ -738,27 +746,36 @@ type fakeGatekeeperGitHub struct {
 	mergedListCalls    int
 	detail             githubinfra.PullRequestDetail
 	mergeable          githubinfra.PullRequestDetail
-	protection         githubinfra.BranchProtection
-	checks             githubinfra.PullRequestCheckRuns
-	threads            []githubinfra.ReviewThread
-	reviews            []githubinfra.ReviewSummary
-	reviewsErr         error
-	finalHeadSHA       string
-	finalBaseSHA       string
-	protectionErr      error
-	commentsErr        error
+	// mergeWatch is returned by ViewPullRequestMergeWatch when its state or
+	// merge timestamp is set; the default detail keeps the pre-reconcile
+	// behavior of returning the mergeable view.
+	mergeWatch       githubinfra.PullRequestDetail
+	mergeWatchInputs []githubinfra.ViewPullRequestInput
+	protection       githubinfra.BranchProtection
+	checks           githubinfra.PullRequestCheckRuns
+	threads          []githubinfra.ReviewThread
+	reviews          []githubinfra.ReviewSummary
+	reviewsErr       error
+	finalHeadSHA     string
+	headSHAResponses []string
+	finalBaseSHA     string
+	protectionErr    error
+	commentsErr      error
 	// perPullRequestCalls counts the forge round trips that only a full evaluation
 	// makes, so a test can prove a pull request was skipped rather than evaluated.
 	perPullRequestCalls int
 
-	currentLogin string
-	commentErr   error
-	deletedIDs   []int64
-	merges       []githubinfra.PullRequestMergeInput
-	mergeErr     error
-	// beforeView, when set, runs before each pull-request read, so a test can
-	// change forge state between the primary and confirming evaluations.
-	beforeView            func(*fakeGatekeeperGitHub)
+	currentLogin          string
+	commentErr            error
+	deletedIDs            []int64
+	labelAdds             []githubinfra.PullRequestLabelsInput
+	labelRemoves          []githubinfra.PullRequestLabelsInput
+	labelErr              error
+	commitStatuses        []githubinfra.CommitStatusInput
+	statusErr             error
+	validateMergifyErr    error
+	validateMergifyCalls  int
+	validateMergifyInputs []githubinfra.ValidateMergifyRoutingInput
 	listCalls             int
 	loginCalls            int
 	comments              []githubinfra.CommentInfo
@@ -769,21 +786,23 @@ type fakeGatekeeperGitHub struct {
 	reviewMarkerCalls     []githubinfra.VerifyReviewMarkerInput
 	statusCalls           []githubinfra.CommitStatusInput
 	callSequence          []string
-	callOrder             []string
-	statusErr             error
-	statusErrState        string
 	viewErr               error
 	mergedPullRequestsErr error
 	listReviewThreadsHook func(*fakeGatekeeperGitHub) error
+	// beforeView, when set, runs before each pull-request read, so a test can
+	// inject a state change between the first evaluation and a later one.
+	beforeView    func(*fakeGatekeeperGitHub)
+	beforeThreads func(*fakeGatekeeperGitHub)
 }
 
-func (f *fakeGatekeeperGitHub) MergePullRequest(_ context.Context, input githubinfra.PullRequestMergeInput) error {
-	if f.mergeErr != nil {
-		return f.mergeErr
-	}
-	f.callOrder = append(f.callOrder, "merge")
-	f.merges = append(f.merges, input)
-	return nil
+type fingerprintGatekeeperGitHub struct {
+	*fakeGatekeeperGitHub
+	fingerprintRepo string
+}
+
+func (f *fingerprintGatekeeperGitHub) MergifyRoutingContractFingerprint(_ context.Context, input githubinfra.ValidateMergifyRoutingInput) (string, error) {
+	f.fingerprintRepo = input.Repo
+	return "contract-digest", nil
 }
 
 func (f *fakeGatekeeperGitHub) GetCurrentUserLoginForRepo(context.Context, string, string) (string, error) {
@@ -876,7 +895,11 @@ func (f *fakeGatekeeperGitHub) ViewPullRequestForGatekeeper(context.Context, git
 	}
 	return f.detail, nil
 }
-func (f *fakeGatekeeperGitHub) ViewPullRequestMergeWatch(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
+func (f *fakeGatekeeperGitHub) ViewPullRequestMergeWatch(_ context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
+	f.mergeWatchInputs = append(f.mergeWatchInputs, input)
+	if f.mergeWatch.State != "" || f.mergeWatch.MergedAt != "" {
+		return f.mergeWatch, nil
+	}
 	return f.mergeable, nil
 }
 func (f *fakeGatekeeperGitHub) GetBranchProtection(context.Context, githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
@@ -889,28 +912,63 @@ func (f *fakeGatekeeperGitHub) ListPullRequestCheckRuns(context.Context, githubi
 }
 func (f *fakeGatekeeperGitHub) ListReviewThreads(context.Context, githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error) {
 	f.perPullRequestCalls++
-	if f.listReviewThreadsHook != nil {
-		if err := f.listReviewThreadsHook(f); err != nil {
-			return nil, err
-		}
+	if f.beforeThreads != nil {
+		f.beforeThreads(f)
 	}
 	return f.threads, nil
 }
+func (f *fakeGatekeeperGitHub) GetPullRequestHeadSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error) {
+	if len(f.headSHAResponses) > 0 {
+		head := f.headSHAResponses[0]
+		f.headSHAResponses = f.headSHAResponses[1:]
+		return head, nil
+	}
+	return f.finalHeadSHA, nil
+}
+
 func (f *fakeGatekeeperGitHub) GetPullRequestHeadAndBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, string, error) {
+	if len(f.headSHAResponses) > 0 {
+		head := f.headSHAResponses[0]
+		f.headSHAResponses = f.headSHAResponses[1:]
+		return head, f.finalBaseSHA, nil
+	}
 	return f.finalHeadSHA, f.finalBaseSHA, nil
+}
+
+func (f *fakeGatekeeperGitHub) AddPullRequestLabels(_ context.Context, input githubinfra.PullRequestLabelsInput) error {
+	if f.labelErr != nil {
+		return f.labelErr
+	}
+	f.labelAdds = append(f.labelAdds, input)
+	return nil
+}
+
+func (f *fakeGatekeeperGitHub) RemovePullRequestLabels(_ context.Context, input githubinfra.PullRequestLabelsInput) error {
+	if f.labelErr != nil {
+		return f.labelErr
+	}
+	f.labelRemoves = append(f.labelRemoves, input)
+	return nil
 }
 func (f *fakeGatekeeperGitHub) FindReviewMarker(_ context.Context, input githubinfra.VerifyReviewMarkerInput) (githubinfra.ReviewMarkerResult, error) {
 	f.reviewMarkerCalls = append(f.reviewMarkerCalls, input)
 	return f.reviewMarker, f.reviewMarkerErr
 }
 func (f *fakeGatekeeperGitHub) SetCommitStatus(_ context.Context, input githubinfra.CommitStatusInput) error {
-	f.callOrder = append(f.callOrder, "status")
-	f.statusCalls = append(f.statusCalls, input)
-	f.callSequence = append(f.callSequence, "commit-status")
-	if f.statusErrState != "" && input.State != f.statusErrState {
-		return nil
+	if f.statusErr != nil {
+		f.callSequence = append(f.callSequence, "commit-status")
+		return f.statusErr
 	}
-	return f.statusErr
+	f.statusCalls = append(f.statusCalls, input)
+	f.commitStatuses = append(f.commitStatuses, input)
+	f.callSequence = append(f.callSequence, "commit-status")
+	return nil
+}
+
+func (f *fakeGatekeeperGitHub) ValidateMergifyRouting(_ context.Context, input githubinfra.ValidateMergifyRoutingInput) error {
+	f.validateMergifyCalls++
+	f.validateMergifyInputs = append(f.validateMergifyInputs, input)
+	return f.validateMergifyErr
 }
 
 func (f *fakeGatekeeperGitHub) GetPullRequestBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error) {

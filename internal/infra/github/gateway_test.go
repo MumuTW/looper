@@ -770,28 +770,6 @@ func TestGetPullRequestBaseSHA(t *testing.T) {
 	}
 }
 
-func TestGatewayMergePullRequestRevalidatesExpectedBaseSHA(t *testing.T) {
-	t.Parallel()
-	runner := &fakeGHRunner{t: t}
-	runner.respond = func(options shell.Options) (shell.Result, error) {
-		args := strings.Join(options.Args, " ")
-		switch args {
-		case "pr view 42 --repo acme/looper --json baseRefOid":
-			return shell.Result{Stdout: `{"baseRefOid":"base123"}`}, nil
-		case "api --paginate --slurp repos/acme/looper/rules/branches/main":
-			return shell.Result{Stdout: "[[]]"}, nil
-		case "api repos/acme/looper/pulls/42/merge --method PUT -f merge_method=squash -f sha=head123":
-			return shell.Result{}, nil
-		default:
-			t.Fatalf("unexpected gh args: %q", args)
-			return shell.Result{}, nil
-		}
-	}
-	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	if err := gateway.MergePullRequest(context.Background(), PullRequestMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.MergeStrategySquash, HeadSHA: "head123", BaseSHA: "base123", BaseBranch: "main"}); err != nil {
-		t.Fatalf("MergePullRequest() error = %v", err)
-	}
-}
 func TestGetRepositorySettings(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -3187,77 +3165,6 @@ func TestGatewayClosePullRequestIsIdempotent(t *testing.T) {
 	}
 	if strings.Contains(log, "pr close 42 --repo acme/looper --delete-branch") {
 		t.Fatalf("gh log unexpectedly included destructive flags for default close\n%s", log)
-	}
-}
-
-func TestGatewayMergePullRequest(t *testing.T) {
-	t.Parallel()
-	runner := &fakeGHRunner{t: t}
-	runner.respond = func(options shell.Options) (shell.Result, error) {
-		args := strings.Join(options.Args, " ")
-		switch args {
-		case "api --paginate --slurp repos/acme/looper/rules/branches/main":
-			return shell.Result{Stdout: "[[]]"}, nil
-		case "api repos/acme/looper/pulls/42/merge --method PUT -f merge_method=squash -f sha=abc123":
-			return shell.Result{}, nil
-		default:
-			t.Fatalf("unexpected gh args: %q", args)
-			return shell.Result{}, nil
-		}
-	}
-	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	if err := gateway.MergePullRequest(context.Background(), PullRequestMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.MergeStrategySquash, HeadSHA: "abc123", BaseBranch: "main"}); err != nil {
-		t.Fatalf("MergePullRequest() error = %v", err)
-	}
-}
-
-func TestGatewayMergePullRequestRejectsMergeQueueBranch(t *testing.T) {
-	t.Parallel()
-	runner := &fakeGHRunner{t: t}
-	runner.respond = func(options shell.Options) (shell.Result, error) {
-		args := strings.Join(options.Args, " ")
-		if args != "api --paginate --slurp repos/acme/looper/rules/branches/main" {
-			t.Fatalf("unexpected gh args: %q", args)
-		}
-		return shell.Result{Stdout: `[[{"type":"branch_protection"}],[{"type":"merge_queue"}]]`}, nil
-	}
-	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	err := gateway.MergePullRequest(context.Background(), PullRequestMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.MergeStrategySquash, HeadSHA: "abc123", BaseBranch: "main"})
-	if err == nil || !strings.Contains(err.Error(), "requires a merge queue") {
-		t.Fatalf("MergePullRequest() error = %v, want merge queue refusal", err)
-	}
-	if len(runner.calls) != 1 {
-		t.Fatalf("gh calls = %v, want rules preflight only", runner.calls)
-	}
-}
-
-func TestGatewayMergePullRequestRequiresHeadSHA(t *testing.T) {
-	t.Parallel()
-	runner := &fakeGHRunner{t: t}
-	runner.respond = func(options shell.Options) (shell.Result, error) {
-		t.Fatalf("unexpected gh args: %v", options.Args)
-		return shell.Result{}, nil
-	}
-	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	err := gateway.MergePullRequest(context.Background(), PullRequestMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.MergeStrategySquash})
-	if err == nil || err.Error() != "merge head SHA is required" {
-		t.Fatalf("MergePullRequest() error = %v, want missing head SHA error", err)
-	}
-}
-
-func TestGatewayMergePullRequestRejectsInvalidStrategy(t *testing.T) {
-	t.Parallel()
-	runner := &fakeGHRunner{t: t}
-	runner.respond = func(options shell.Options) (shell.Result, error) {
-		t.Fatalf("unexpected gh args: %v", options.Args)
-		return shell.Result{}, nil
-	}
-	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	err := gateway.MergePullRequest(context.Background(), PullRequestMergeInput{
-		Repo: "acme/looper", PRNumber: 42, Strategy: config.MergeStrategy("octopus"), HeadSHA: "abc123", BaseBranch: "main",
-	})
-	if err == nil || !strings.Contains(err.Error(), "invalid merge strategy") {
-		t.Fatalf("MergePullRequest() error = %v, want invalid strategy error", err)
 	}
 }
 

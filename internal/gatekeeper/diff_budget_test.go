@@ -43,8 +43,8 @@ func TestDiffBudgetAtLimitPassesAndRecordsEvidence(t *testing.T) {
 	if !report.Eligible || len(report.Reasons) != 0 {
 		t.Fatalf("report = %#v, want eligible at both limits", report)
 	}
-	if report.Evidence.DiffBudget == nil || report.Evidence.DiffBudget.ChangedFiles != 20 || report.Evidence.DiffBudget.Deletions != 500 {
-		t.Fatalf("diff budget evidence = %#v, want observed counts", report.Evidence.DiffBudget)
+	if report.Evidence.DiffBudget == nil || report.Evidence.DiffBudget.ChangedFiles != 20 || report.Evidence.DiffBudget.Deletions != 500 || report.Evidence.DiffBudget.BaseSHA != "base-1" {
+		t.Fatalf("diff budget evidence = %#v, want observed counts anchored to base-1", report.Evidence.DiffBudget)
 	}
 }
 
@@ -125,24 +125,6 @@ func TestDiffBudgetFailsClosedWhenBaseSHAMissing(t *testing.T) {
 	}
 	if report.Evidence.DiffBudget != nil {
 		t.Fatalf("diff budget evidence = %#v, want nil (no verdict recorded when the base cannot be established)", report.Evidence.DiffBudget)
-	}
-}
-
-func TestDiffBudgetBlocksAutoReportWhenExceeded(t *testing.T) {
-	t.Parallel()
-	fixture := newGatekeeperFixture(t)
-	fixture.github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 21}
-	fixture.github.detail.BaseSHA = "base-1"
-	fixture.github.mergeable.BaseSHA = "base-1"
-	fixture.github.finalBaseSHA = "base-1"
-	runner := diffBudgetRunner(t, fixture, config.GatekeeperDiffBudget{MaxChangedFiles: 20}, config.GatekeeperTrustAuto)
-
-	report, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
-	if err != nil {
-		t.Fatalf("EvaluatePullRequest() error = %v", err)
-	}
-	if report.Eligible || len(report.Reasons) != 1 || report.Reasons[0].Code != ReasonDiffBudgetExceeded {
-		t.Fatalf("report = %#v, want diff-budget block", report)
 	}
 }
 

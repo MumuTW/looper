@@ -29,47 +29,58 @@ func TestAuditorConfigRejectsNonPositiveEnabledWindow(t *testing.T) {
 	}
 }
 
+func TestAuditorAcceptsGatekeeperAutoTrust(t *testing.T) {
+	t.Parallel()
+	var issues []ValidationIssue
+	validateCoreConfig(Config{
+		Roles: RoleConfigs{
+			Auditor:    AuditorRoleConfig{Enabled: true, WindowMinutes: 60},
+			Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto},
+		},
+	}, &issues)
+	for _, issue := range issues {
+		if issue.Path == "roles.auditor.enabled" {
+			t.Fatalf("auditor/auto compatibility was rejected: %#v", issues)
+		}
+	}
+}
+
+func TestAuditorAcceptsProjectGatekeeperAutoOverride(t *testing.T) {
+	t.Parallel()
+	auto := GatekeeperTrustAuto
+	var issues []ValidationIssue
+	validateCoreConfig(Config{
+		Roles: RoleConfigs{Auditor: AuditorRoleConfig{Enabled: true, WindowMinutes: 60}},
+		Projects: []ProjectRefConfig{{
+			ID: "demo",
+			Roles: &PartialRoleConfigs{
+				Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto},
+				Auditor:    &PartialAuditorRoleConfig{Enabled: ptrBool(true)},
+			},
+		}},
+	}, &issues)
+	for _, issue := range issues {
+		if issue.Path == "projects[0].roles.gatekeeper.trust" {
+			t.Fatalf("project auditor/auto compatibility was rejected: %#v", issues)
+		}
+	}
+}
+
 func ptrBool(v bool) *bool { return &v }
 
-func TestAuditorAllowsGatekeeperAutoTrust(t *testing.T) {
-	cfg, err := DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	cfg.Roles.Auditor = AuditorRoleConfig{Enabled: true, WindowMinutes: 60}
-	cfg.Roles.Gatekeeper.Trust = GatekeeperTrustAuto
-	if err := Validate(cfg); err != nil {
-		t.Fatalf("Validate() error = %v, want auditor and merge-outcome auto to coexist", err)
-	}
-}
-
-func TestProjectAuditorAllowsGatekeeperAutoOverride(t *testing.T) {
-	cfg, err := DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	auto := GatekeeperTrustAuto
-	cfg.Projects = []ProjectRefConfig{{
-		ID: "demo", Name: "Demo", RepoPath: t.TempDir(),
-		Roles: &PartialRoleConfigs{
-			Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto},
-			Auditor:    &PartialAuditorRoleConfig{Enabled: ptrBool(true)},
+func TestPostMergeDigestAcceptsGatekeeperAutoTrust(t *testing.T) {
+	t.Parallel()
+	var issues []ValidationIssue
+	validateCoreConfig(Config{
+		Roles: RoleConfigs{
+			Gatekeeper:  GatekeeperRoleConfig{Trust: GatekeeperTrustAuto},
+			Coordinator: CoordinatorRoleConfig{PostMergeDigest: &CoordinatorPostMergeDigestConfig{Enabled: true, Schedule: "08:00", Timezone: "UTC", MaxItems: 20}},
 		},
-	}}
-	if err := Validate(cfg); err != nil {
-		t.Fatalf("Validate() error = %v, want project auditor and gatekeeper auto override to coexist", err)
-	}
-}
-
-func TestPostMergeDigestAllowsGatekeeperAutoTrust(t *testing.T) {
-	cfg, err := DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	cfg.Roles.Gatekeeper.Trust = GatekeeperTrustAuto
-	cfg.Roles.Coordinator.PostMergeDigest = &CoordinatorPostMergeDigestConfig{Enabled: true, Schedule: "08:00", Timezone: "UTC", MaxItems: 20}
-	if err := Validate(cfg); err != nil {
-		t.Fatalf("Validate() error = %v, want post-merge digest and merge-outcome auto to coexist", err)
+	}, &issues)
+	for _, issue := range issues {
+		if issue.Path == "roles.coordinator.postMergeDigest.enabled" {
+			t.Fatalf("post-merge digest/auto compatibility was rejected: %#v", issues)
+		}
 	}
 }
 
