@@ -1616,7 +1616,7 @@ Usage:
                                Compare local and running-daemon build identity
   looper upgrade preflight --target-looper <path> --target-looperd <path>
                                Report upgrade compatibility without changing the daemon
-  looper upgrade backup / verify / drain / stage-release / activate-release / verify-start
+  looper upgrade backup / verify / drain / stage-release / activate-release / verify-start / recover
                                Controlled cutover steps (see docs/installation.md)
 
 Global flags, accepted before or after the verb:

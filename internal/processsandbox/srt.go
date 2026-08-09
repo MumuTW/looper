@@ -33,7 +33,57 @@ func Available() error {
 	if err != nil {
 		return fmt.Errorf("process sandbox: resolve current directory: %w", err)
 	}
-	_, err = installedRuntime(cwd, nil)
+	return AvailableInDirectory(cwd)
+}
+
+// AvailableInDirectory is Available evaluated against cwd. Supervised daemons
+// start in daemon.workingDirectory; preflight/--check-config must use that
+// directory so sandbox trust matches real startup rather than the operator shell.
+func AvailableInDirectory(cwd string) error {
+	return availableInEnvironment(cwd, "")
+}
+
+// ServiceProbePATH is the historical alias for launchd-like defaults.
+const ServiceProbePATH = ServiceProbePATHLaunchd
+
+// ServiceProbePATHLaunchd approximates launchd's default PATH when the unit
+// injects no environment.
+const ServiceProbePATHLaunchd = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+// ServiceProbePATHSystemd approximates a systemd user unit default PATH
+// (includes /usr/local/bin commonly used for operator installs).
+const ServiceProbePATHSystemd = "/usr/local/bin:/usr/bin:/bin"
+
+// AvailableInServiceEnvironment probes sandbox readiness with the supervised
+// daemon's working directory and a manager-default PATH. Empty pathEnv falls
+// back to ServiceProbePATHLaunchd.
+func AvailableInServiceEnvironment(cwd string, pathEnv ...string) error {
+	path := ServiceProbePATHLaunchd
+	if len(pathEnv) > 0 && strings.TrimSpace(pathEnv[0]) != "" {
+		path = pathEnv[0]
+	}
+	return availableInEnvironment(cwd, path)
+}
+
+func availableInEnvironment(cwd, pathEnv string) error {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return fmt.Errorf("process sandbox: working directory is required")
+	}
+	if pathEnv != "" {
+		previous, had := os.LookupEnv("PATH")
+		if err := os.Setenv("PATH", pathEnv); err != nil {
+			return fmt.Errorf("process sandbox: set service PATH: %w", err)
+		}
+		defer func() {
+			if had {
+				_ = os.Setenv("PATH", previous)
+			} else {
+				_ = os.Unsetenv("PATH")
+			}
+		}()
+	}
+	_, err := installedRuntime(cwd, nil)
 	return err
 }
 

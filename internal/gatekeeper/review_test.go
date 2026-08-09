@@ -3,6 +3,7 @@ package gatekeeper
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,8 +58,8 @@ func TestEvaluatePullRequestRejectsBlockingCommentReview(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvaluatePullRequest() error = %v", err)
 	}
-	if report.Eligible || !hasReason(report, ReasonCodexReviewMissing) {
-		t.Fatalf("report = %#v, want blocking COMMENT excluded from merge-eligible review evidence", report)
+	if report.Eligible || !hasReason(report, ReasonCodexReviewBlocked) || report.Evidence.CodexReviewOutcome != "blocking" {
+		t.Fatalf("report = %#v, want blocking COMMENT preserved as blocking evidence", report)
 	}
 }
 
@@ -215,6 +216,16 @@ func seedReviewerReviewEventWithMarkerVerified(t *testing.T, fixture *gatekeeper
 
 func seedReviewerReviewEventWithProjectID(t *testing.T, fixture *gatekeeperFixture, projectID, headSHA, reviewEvent, actorID string, ordinal int, markerVerified bool) {
 	t.Helper()
+	outcome := "blocking"
+	switch strings.ToUpper(strings.TrimSpace(reviewEvent)) {
+	case "COMMENT", "APPROVE":
+		outcome = "clean"
+	}
+	seedReviewerReviewEventWithProjectIDAndOutcome(t, fixture, projectID, headSHA, reviewEvent, outcome, actorID, ordinal, markerVerified)
+}
+
+func seedReviewerReviewEventWithProjectIDAndOutcome(t *testing.T, fixture *gatekeeperFixture, projectID, headSHA, reviewEvent, outcome, actorID string, ordinal int, markerVerified bool) {
+	t.Helper()
 	entityType := "pull_request"
 	entityID := "acme/looper#42"
 	actorType := "system"
@@ -222,15 +233,19 @@ func seedReviewerReviewEventWithProjectID(t *testing.T, fixture *gatekeeperFixtu
 		ID: fmt.Sprintf("review-posted-%d", ordinal), EventType: reviewerReviewPostedEventType,
 		ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
 		ActorType: &actorType, ActorID: &actorID,
-		Payload:   map[string]any{"repo": "acme/looper", "prNumber": int64(42), "event": reviewEvent, "headSha": headSHA, "markerVerified": markerVerified},
+		Payload:   map[string]any{"repo": "acme/looper", "prNumber": int64(42), "event": reviewEvent, "outcome": outcome, "headSha": headSHA, "markerVerified": markerVerified},
 		CreatedAt: fixture.now.Add(time.Duration(ordinal) * time.Second),
 	}); err != nil {
 		t.Fatalf("append reviewer review event: %v", err)
 	}
 }
 
-func seedReviewerReviewEventWithOutcome(t *testing.T, fixture *gatekeeperFixture, headSHA, reviewEvent, outcome, actorID string, ordinal int) {
+func seedReviewerReviewEventWithOutcome(t *testing.T, fixture *gatekeeperFixture, headSHA, reviewEvent, outcome, actorID string, ordinal int, markerVerifiedValues ...bool) {
 	t.Helper()
+	markerVerified := true
+	if len(markerVerifiedValues) > 0 {
+		markerVerified = markerVerifiedValues[0]
+	}
 	projectID := "project_1"
 	entityType := "pull_request"
 	entityID := "acme/looper#42"
@@ -239,7 +254,7 @@ func seedReviewerReviewEventWithOutcome(t *testing.T, fixture *gatekeeperFixture
 		ID: fmt.Sprintf("review-posted-outcome-%d", ordinal), EventType: reviewerReviewPostedEventType,
 		ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
 		ActorType: &actorType, ActorID: &actorID,
-		Payload:   map[string]any{"repo": "acme/looper", "prNumber": int64(42), "event": reviewEvent, "outcome": outcome, "headSha": headSHA, "markerVerified": true},
+		Payload:   map[string]any{"repo": "acme/looper", "prNumber": int64(42), "event": reviewEvent, "outcome": outcome, "headSha": headSHA, "markerVerified": markerVerified},
 		CreatedAt: fixture.now.Add(time.Duration(ordinal) * time.Second),
 	}); err != nil {
 		t.Fatalf("append reviewer review event: %v", err)

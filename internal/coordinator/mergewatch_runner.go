@@ -27,6 +27,7 @@ const defaultConflictMaxRepairs = 2
 
 type mergeWatchComment struct {
 	ID      int64
+	Author  string
 	Summary string
 	Marker  mergewatch.PriorWatchMarker
 	Body    string
@@ -103,12 +104,25 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 			return false, r.deleteMergeWatchComment(ctx, repo, cwd, marker)
 		}
 	}
-	if marker != nil && marker.Marker.NextRetryAt != nil && r.now().UTC().Before(marker.Marker.NextRetryAt.UTC()) {
-		return false, nil
-	}
 	snapshot, tempErr, err := r.mergeWatchSnapshot(ctx, repo, cwd, issue.detail.Number, watchedPR, namespace, currentLogin)
 	if err != nil {
 		return false, err
+	}
+	// Reviewer no longer enables GitHub-native auto-merge. If a PR still carries
+	// a request created by the Looper identity, cancel it before normal watch
+	// classification. A durable marker is required as provenance; the forge
+	// identity alone cannot prove who created the request.
+	if r.cancelRetiredAutoMerge && marker != nil && snapshot.AutoMergeEnabled && snapshot.AutoMergeOwnedByLooper {
+		if err := r.github.DisablePullRequestAutoMerge(ctx, githubinfra.DisablePullRequestAutoMergeInput{Repo: repo, PRNumber: snapshot.PRNumber, CWD: cwd}); err != nil {
+			return false, err
+		}
+		return false, r.deleteMergeWatchComment(ctx, repo, cwd, marker)
+	}
+	if r.cancelRetiredAutoMerge && marker == nil && snapshot.AutoMergeEnabled && snapshot.AutoMergeOwnedByLooper {
+		return false, nil
+	}
+	if marker != nil && marker.Marker.NextRetryAt != nil && r.now().UTC().Before(marker.Marker.NextRetryAt.UTC()) {
+		return false, nil
 	}
 	if tempErr != nil {
 		snapshot.TemporaryError = tempErr
@@ -686,16 +700,25 @@ func pullRequestNumberFromURL(raw string) int64 {
 }
 
 func findMergeWatchComment(comments []githubinfra.CommentInfo, currentLogin string) *mergeWatchComment {
+	markers := mergeWatchComments(comments, currentLogin)
+	if len(markers) > 0 {
+		return &markers[0]
+	}
+	return nil
+}
+
+func mergeWatchComments(comments []githubinfra.CommentInfo, currentLogin string) []mergeWatchComment {
+	markers := make([]mergeWatchComment, 0, len(comments))
 	for i := len(comments) - 1; i >= 0; i-- {
-		if !strings.EqualFold(strings.TrimSpace(comments[i].Author), strings.TrimSpace(currentLogin)) {
+		if strings.TrimSpace(currentLogin) != "" && !strings.EqualFold(strings.TrimSpace(comments[i].Author), strings.TrimSpace(currentLogin)) {
 			continue
 		}
 		marker, ok := parseMergeWatchComment(comments[i])
 		if ok {
-			return &marker
+			markers = append(markers, marker)
 		}
 	}
-	return nil
+	return markers
 }
 
 func parseMergeWatchComment(comment githubinfra.CommentInfo) (mergeWatchComment, bool) {
@@ -742,7 +765,7 @@ func parseMergeWatchComment(comment githubinfra.CommentInfo) (mergeWatchComment,
 		if idx := strings.Index(comment.Body, line); idx > 0 {
 			summary = strings.TrimSpace(comment.Body[:idx])
 		}
-		return mergeWatchComment{ID: comment.ID, Summary: summary, Marker: marker, Body: comment.Body}, true
+		return mergeWatchComment{ID: comment.ID, Author: comment.Author, Summary: summary, Marker: marker, Body: comment.Body}, true
 	}
 	return mergeWatchComment{}, false
 }

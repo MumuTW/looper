@@ -93,6 +93,7 @@ var reasonExplanations = map[ReasonCode]string{
 	ReasonReviewerConvergence:      "reviewer convergence has not reached its configured severity floor",
 	ReasonProjectPolicyDenied:      "project policy does not permit merging this target",
 	ReasonHold:                     "a hold label is applied",
+	ReasonDoNotMerge:               "the do-not-merge human veto is applied",
 	ReasonDiffBudgetExceeded:       "the pull request exceeds the configured diff budget",
 	ReasonProviderStateUnavailable: "the forge did not return the state needed to judge this",
 	ReasonProviderStateAmbiguous:   "the forge returned ambiguous state for this",

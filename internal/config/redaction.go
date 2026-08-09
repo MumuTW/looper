@@ -1,7 +1,7 @@
 package config
 
-// RedactProjectSecrets copies projects with their deploy credentials removed,
-// leaving the configuration it was given untouched.
+// RedactProjectSecrets copies projects with their deploy credentials and
+// parse-only compatibility fields removed, leaving its input untouched.
 //
 // roles.deployer.environment holds the values a deploy authenticates with — the
 // same class of secret as daemon.environment. Every payload that leaves the
@@ -18,13 +18,26 @@ func RedactProjectSecrets(projects []ProjectRefConfig) []ProjectRefConfig {
 	redacted := append([]ProjectRefConfig{}, projects...)
 	for i := range redacted {
 		roles := redacted[i].Roles
-		if roles == nil || roles.Deployer == nil || roles.Deployer.Environment == nil {
+		if roles == nil {
 			continue
 		}
-		deployer := *roles.Deployer
-		deployer.Environment = nil
 		clonedRoles := *roles
-		clonedRoles.Deployer = &deployer
+		changed := false
+		if roles.Deployer != nil && roles.Deployer.Environment != nil {
+			deployer := *roles.Deployer
+			deployer.Environment = nil
+			clonedRoles.Deployer = &deployer
+			changed = true
+		}
+		if roles.Reviewer != nil && roles.Reviewer.AutoMerge != nil {
+			reviewer := *roles.Reviewer
+			reviewer.AutoMerge = nil
+			clonedRoles.Reviewer = &reviewer
+			changed = true
+		}
+		if !changed {
+			continue
+		}
 		redacted[i].Roles = &clonedRoles
 	}
 	return redacted

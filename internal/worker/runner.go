@@ -399,6 +399,7 @@ type AgentResult struct {
 	Stdout                       string
 	Stderr                       string
 	ParseStatus                  string
+	CompletionPayload            string
 	ChangedFiles                 []string
 	Commits                      []string
 	Lifecycle                    *lifecycle.State
@@ -673,6 +674,17 @@ type workerCheckpoint struct {
 	// execution (intentional worker-authored reproduction); pre-execution
 	// resume must not treat a mid-crash agent file as the contract.
 	ReproductionAbsent bool `json:"reproductionAbsent,omitempty"`
+	// ReproductionAuthored marks a reproduction adopted only after a completed
+	// Worker execution. Such a contract has no pre-agent red baseline by
+	// definition; post-agent validation must execute the named test but must
+	// not manufacture baseline evidence from the mutated checkout.
+	ReproductionAuthored bool `json:"reproductionAuthored,omitempty"`
+	// ReproductionHistorical preserves the exact manifest observed during the
+	// initial capture when it was scoped to another issue. It lets a completed
+	// retry distinguish unchanged already-fixed history from a newly authored
+	// wrong-scope manifest without treating the historical file as this task's
+	// reproduction authority.
+	ReproductionHistorical *reproducer.Manifest `json:"reproductionHistorical,omitempty"`
 	// ReproductionBaseline is the durable red evidence captured before the
 	// Worker agent is allowed to edit the worktree. It is separate from
 	// Validation because a non-zero reproduction test is expected here while
@@ -706,11 +718,16 @@ type checkpointPlan struct {
 }
 
 type checkpointExecution struct {
-	RunID                        string            `json:"runId,omitempty"`
-	ExecutionID                  string            `json:"executionId,omitempty"`
-	Status                       string            `json:"status,omitempty"`
-	Summary                      string            `json:"summary,omitempty"`
-	ParseStatus                  string            `json:"parseStatus,omitempty"`
+	RunID       string `json:"runId,omitempty"`
+	ExecutionID string `json:"executionId,omitempty"`
+	Status      string `json:"status,omitempty"`
+	Summary     string `json:"summary,omitempty"`
+	ParseStatus string `json:"parseStatus,omitempty"`
+	// CompletionPayload is the daemon-parsed final marker. It is persisted
+	// separately from stdout so authored reproduction authority survives
+	// adapters that return the structured payload without retaining the raw
+	// marker in their transcript.
+	CompletionPayload            string            `json:"completionPayload,omitempty"`
 	ChangedFiles                 []string          `json:"changedFiles,omitempty"`
 	Commits                      []string          `json:"commits,omitempty"`
 	Lifecycle                    *lifecycle.State  `json:"gitPrLifecycle,omitempty"`
@@ -837,6 +854,13 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 	}
 	manifest, err := reproducer.Load(worktreePath)
 	if err != nil {
+		if checkpoint.ReproductionAbsent && checkpoint.Execution != nil && checkpoint.Execution.Status != "completed" {
+			// A retry may observe a partially written or otherwise malformed
+			// manifest from the interrupted agent. The durable negative
+			// observation keeps it untrusted; let the retry remove or finish
+			// the file instead of converting transient dirt into MI.
+			return nil
+		}
 		return reproductionFailure(err)
 	}
 	if checkpoint.Work.Reproduction != nil {
@@ -852,21 +876,43 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 		return nil
 	}
 	if manifest != nil {
+		if checkpoint.ReproductionAbsent && checkpoint.ReproductionHistorical != nil && manifest.Equal(*checkpoint.ReproductionHistorical) {
+			// The unchanged out-of-scope manifest was already recorded as
+			// historical during initial capture. It remains ignored after a
+			// successful execution; only a changed file can be newly authored
+			// evidence that needs the scope/contract gate below.
+			return nil
+		}
+		if checkpoint.ReproductionAbsent && checkpoint.Execution != nil && checkpoint.Execution.Status == "completed" && !workerAuthoredManifestScopeMatchesTask(*manifest, *checkpoint.Work) {
+			return reproductionFailure(errors.New("worker-authored reproduction manifest does not match the current issue scope"))
+		}
 		if !workerReproductionManifestAppliesToTask(*manifest, *checkpoint.Work) {
 			// No applicable contract for this task (e.g. scoped to another
 			// issue). Record the negative observation so a later same-issue
 			// agent file is not adopted on pre-execution resume.
 			if checkpoint.Work.Reproduction == nil {
 				checkpoint.ReproductionAbsent = true
+				if checkpoint.ReproductionHistorical == nil {
+					historical := *manifest
+					checkpoint.ReproductionHistorical = &historical
+				}
 			}
 			return nil
 		}
 		if checkpoint.ReproductionAbsent {
 			// Negative observation was durable. Only a completed agent execution
 			// may introduce the reproduction contract (worker-authored test).
-			// Pre-execution resume must not adopt a mid-crash agent file.
-			if checkpoint.Execution == nil || checkpoint.Execution.Status != "completed" {
+			// Pre-execution resume must not adopt a mid-crash agent file. During a
+			// retryable, non-completed execution, ignore the untrusted file and let
+			// the agent resume; the next completed capture may adopt it if scoped.
+			if checkpoint.Execution == nil {
 				return reproductionFailure(errors.New("reproduction manifest appeared before agent execution completed"))
+			}
+			if checkpoint.Execution.Status != "completed" || checkpoint.Execution.ParseStatus != "parsed" {
+				return nil
+			}
+			if err := verifyWorkerAuthoredReproductionContract(checkpoint.Execution, *manifest); err != nil {
+				return reproductionFailure(err)
 			}
 		} else if checkpoint.Work.Reproduction == nil && workerPastInitialReproductionCapture(*checkpoint) {
 			// Legacy checkpoint without ReproductionAbsent after upgrade:
@@ -879,7 +925,11 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 			return reproductionFailure(err)
 		}
 		checkpoint.Work.Reproduction = manifest
+		if checkpoint.ReproductionAbsent {
+			checkpoint.ReproductionAuthored = true
+		}
 		checkpoint.ReproductionAbsent = false
+		checkpoint.ReproductionHistorical = nil
 		return nil
 	}
 	// Durable negative observation so crash-resume cannot treat a later
@@ -888,6 +938,62 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 		checkpoint.ReproductionAbsent = true
 	}
 	return nil
+}
+
+func verifyWorkerAuthoredReproductionContract(execution *checkpointExecution, manifest reproducer.Manifest) error {
+	if execution == nil || !strings.EqualFold(strings.TrimSpace(execution.Status), "completed") {
+		return errors.New("worker-authored reproduction has no completed execution evidence")
+	}
+	payload := strings.TrimSpace(execution.CompletionPayload)
+	if payload == "" {
+		payload = workerCompletionPayload(execution.Stdout)
+	}
+	if payload == "" {
+		return errors.New("worker-authored reproduction is missing a structured completion contract")
+	}
+	var envelope struct {
+		Reproduction json.RawMessage `json:"reproduction"`
+	}
+	if err := json.Unmarshal([]byte(payload), &envelope); err != nil {
+		return fmt.Errorf("decode worker reproduction completion contract: %w", err)
+	}
+	if len(envelope.Reproduction) == 0 || string(envelope.Reproduction) == "null" {
+		return errors.New("worker-authored reproduction completion contract is missing reproduction")
+	}
+	declared, err := reproducer.Parse(envelope.Reproduction)
+	if err != nil {
+		return fmt.Errorf("validate worker reproduction completion contract: %w", err)
+	}
+	if !declared.Equal(manifest) {
+		return errors.New("worker-authored reproduction does not match the structured completion contract")
+	}
+	return nil
+}
+
+func workerCompletionPayload(stdout string) string {
+	for _, payload := range agent.CompletionMarkerPayloads(stdout) {
+		if json.Valid([]byte(payload)) && !isWorkerCompletionTemplate(payload) {
+			return payload
+		}
+	}
+	if translated := agent.CombinedTextFromJSONL(stdout); translated != "" {
+		for _, payload := range agent.CompletionMarkerPayloads(translated) {
+			if json.Valid([]byte(payload)) && !isWorkerCompletionTemplate(payload) {
+				return payload
+			}
+		}
+	}
+	return ""
+}
+
+func isWorkerCompletionTemplate(payload string) bool {
+	var parsed struct {
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+		return false
+	}
+	return strings.TrimSpace(parsed.Summary) == "<one-sentence summary>"
 }
 
 // workerPastInitialReproductionCapture reports whether the run already advanced
@@ -909,6 +1015,14 @@ func workerPastInitialReproductionCapture(checkpoint workerCheckpoint) bool {
 // manifest scoped to a different issue is treated as already-fixed history.
 func workerReproductionManifestAppliesToTask(manifest reproducer.Manifest, work workerInput) bool {
 	return manifest.AppliesToIssue(work.IssueNumber, firstNonEmpty(work.IssueRepo, work.Repo))
+}
+
+func workerAuthoredManifestScopeMatchesTask(manifest reproducer.Manifest, work workerInput) bool {
+	if work.IssueNumber <= 0 {
+		return manifest.IssueNumber == 0
+	}
+	expectedRepo := strings.TrimSpace(firstNonEmpty(work.IssueRepo, work.Repo))
+	return manifest.IssueNumber == work.IssueNumber && expectedRepo != "" && strings.EqualFold(strings.TrimSpace(manifest.IssueRepo), expectedRepo)
 }
 
 func verifyWorkerReproduction(checkpoint workerCheckpoint, worktreePath string) error {
@@ -969,6 +1083,13 @@ func (r *Runner) ensureWorkerReproductionBaseline(ctx context.Context, checkpoin
 		// captured against a different checkout. Discard it so a retry
 		// re-derives instead of accepting rejected or stale evidence.
 		checkpoint.ReproductionBaseline = nil
+	}
+	if checkpoint.ReproductionAuthored {
+		// A Worker-authored contract was introduced after the agent started,
+		// so no red baseline can exist for its pre-agent state. Later retries
+		// and HITL turns must validate the manifest itself without trying to
+		// manufacture a baseline from the already-mutated checkout.
+		return nil
 	}
 	if scope == reproductionBaselineScopeReuseOnly {
 		return &runpipe.LoopError{Message: "Reproduction baseline evidence is absent after Worker execution; refusing to manufacture red evidence from a possibly mutated worktree. Resume the run from the prepare step so the baseline is captured before the agent edits the checkout.", Kind: runpipe.FailureManualIntervention}
@@ -1140,7 +1261,7 @@ func sanitizePublicPausedIssueClaimSummary(summary string) string {
 func checkpointExecutionFromAgentResult(result AgentResult, runID, executionID string) *checkpointExecution {
 	return &checkpointExecution{
 		RunID: runID, ExecutionID: executionID,
-		Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus,
+		Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus, CompletionPayload: result.CompletionPayload,
 		ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle, Stdout: result.Stdout,
 		TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds,
 		ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt,
@@ -2307,11 +2428,13 @@ func (r *Runner) runPlanStep(input stepInput) (workerCheckpoint, error) {
 
 func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
 	checkpoint := input.Checkpoint
-	executionCompleted := checkpoint.Execution != nil && checkpoint.Execution.Status == "completed"
-	if executionCompleted {
+	executionCompleted := checkpoint.Execution != nil && checkpoint.Execution.Status == "completed" && validateCompletedExecutionCheckpoint(checkpoint.Execution) == nil
+	if !executionCompleted && checkpoint.Work == nil && checkpoint.Execution != nil {
 		if err := validateCompletedExecutionCheckpoint(checkpoint.Execution); err != nil {
 			return checkpoint, err
 		}
+	}
+	if executionCompleted {
 		if checkpoint.Execution.GitReconciled {
 			return checkpoint, nil
 		}
@@ -2516,6 +2639,28 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if r.onAgentExecutionStarted != nil {
 			_ = r.onAgentExecutionStarted(ctx, AgentExecutionStartedInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Subtitle: work.Title, Body: "Worker started", DedupeKey: fmt.Sprintf("runtime.agent.started:worker:%s", input.Run.ID)})
 		}
+		// Persist the live execution boundary before waiting. The agent can write
+		// a reproduction manifest before Wait returns; without this marker a
+		// Wait error makes the retry look like a pre-execution run and the
+		// retained manifest is rejected instead of being left for the replacement
+		// agent to finish or remove.
+		progressMu.Lock()
+		status := ""
+		if checkpoint.Execution != nil {
+			status = strings.TrimSpace(checkpoint.Execution.Status)
+		}
+		preserveTimeout := strings.HasPrefix(strings.ToLower(status), "timeout")
+		if !preserveTimeout {
+			checkpoint.Execution = &checkpointExecution{RunID: input.Run.ID, ExecutionID: executionID, Status: "running"}
+		}
+		var persistRunningErr error
+		if !preserveTimeout {
+			persistRunningErr = r.persistCheckpoint(ctx, input.Run.ID, checkpoint)
+		}
+		progressMu.Unlock()
+		if persistRunningErr != nil {
+			return checkpoint, &runpipe.LoopError{Message: persistRunningErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		}
 		result, err := execution.Wait(ctx)
 		progressMu.Lock()
 		defer progressMu.Unlock()
@@ -2587,6 +2732,13 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		checkpoint.recordContinuationResumeMode(result)
 		checkpoint.Execution = checkpointExecutionFromAgentResult(result, input.Run.ID, executionID)
 		checkpoint.Execution.ProgressBeforeTimeout = preTimeoutProgress
+		// Persist the completed-turn evidence before the parse gate. A malformed
+		// result may still leave a manifest in the worktree; the durable
+		// execution boundary is what lets resume defer that file for a retry
+		// instead of treating it as pre-execution state.
+		if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		}
 		if err := validateCompletedExecutionCheckpoint(checkpoint.Execution); err != nil {
 			if persistErr := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); persistErr != nil {
 				return checkpoint, &runpipe.LoopError{Message: persistErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
@@ -3508,13 +3660,46 @@ func workerWorkForPullRequest(work workerInput, pr PullRequestSummary) workerInp
 func (r *Runner) finishHeldWorkerQueueItem(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint, summary string) (runpipe.ProcessResult, error) {
 	checkpoint.SkipReason = summary
 	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
-	if graphQueueItem(queueItem) && queueItem.LoopID != nil {
+	heldGraph := graphQueueItem(queueItem) && queueItem.LoopID != nil
+	if heldGraph {
 		if err := r.workGraphs.ReleaseWorkerNode(ctx, *queueItem.LoopID); err != nil {
 			return runpipe.ProcessResult{}, err
 		}
 	}
+	finishedAt := r.nowISO()
+	if heldGraph {
+		err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+			repos := storage.NewRepositories(tx)
+			if run != nil {
+				completed := completedRunRecord(*run, "success", summary, "", checkpoint, finishedAt)
+				if err := repos.Runs.Upsert(ctx, completed); err != nil {
+					return err
+				}
+			}
+			requeued, err := repos.Queue.RequeueRunningByLoop(ctx, loop.ID, finishedAt)
+			if err != nil {
+				return err
+			}
+			if requeued == 0 {
+				return fmt.Errorf("held graph worker queue item was not requeued")
+			}
+			loop.Status = "queued"
+			loop.LastRunAt = &finishedAt
+			loop.NextRunAt = &finishedAt
+			loop.UpdatedAt = finishedAt
+			return repos.Loops.Upsert(ctx, loop)
+		})
+		if err != nil {
+			return runpipe.ProcessResult{}, err
+		}
+		r.workGraphs.Wake()
+		result := runpipe.ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
+		if run != nil {
+			result.RunID = run.ID
+		}
+		return result, nil
+	}
 	if run != nil {
-		finishedAt := r.nowISO()
 		completed := completedRunRecord(*run, "success", summary, "", checkpoint, finishedAt)
 		if err := storage.FinalizeWorkerSuccess(ctx, r.db, storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "queued", FinishedAt: finishedAt}); err != nil {
 			return runpipe.ProcessResult{}, err
@@ -3687,7 +3872,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		resumedCheckpoint = rewindCheckpointForExecuteRetry(checkpoint)
 	}
 	nowISO := r.nowISO()
-	encoded := runpipe.MustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Continuation: resumedCheckpoint.Continuation, Lifecycle: resumedCheckpoint.Lifecycle, ReproductionBaseline: resumedCheckpoint.ReproductionBaseline, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
+	encoded := runpipe.MustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Continuation: resumedCheckpoint.Continuation, Lifecycle: resumedCheckpoint.Lifecycle, ReproductionAbsent: resumedCheckpoint.ReproductionAbsent, ReproductionAuthored: resumedCheckpoint.ReproductionAuthored, ReproductionHistorical: resumedCheckpoint.ReproductionHistorical, ReproductionBaseline: resumedCheckpoint.ReproductionBaseline, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	// replaysAgentStep must reflect whether an agent process will actually
 	// run under the gate, not just whether the workflow reaches execute. A
@@ -3936,6 +4121,12 @@ func (r *Runner) getLatestCheckpoint(ctx context.Context, run storage.RunRecord,
 	}
 	if fallback.ReproductionBaseline != nil {
 		checkpoint.ReproductionBaseline = fallback.ReproductionBaseline
+	}
+	if fallback.ReproductionAuthored {
+		checkpoint.ReproductionAuthored = true
+	}
+	if fallback.ReproductionHistorical != nil {
+		checkpoint.ReproductionHistorical = fallback.ReproductionHistorical
 	}
 	if fallback.PullRequest != nil {
 		checkpoint.PullRequest = fallback.PullRequest
@@ -4706,7 +4897,7 @@ func shouldReplayExecuteOnResume(status string, failedStep WorkerStep, checkpoin
 // the raw predecessor checkpoint, so a replay-execute rewind (Execution=nil)
 // correctly reports false.
 func executeStepAlreadyCompleted(checkpoint workerCheckpoint) bool {
-	return checkpoint.Execution != nil && checkpoint.Execution.Status == "completed"
+	return checkpoint.Execution != nil && checkpoint.Execution.Status == "completed" && validateCompletedExecutionCheckpoint(checkpoint.Execution) == nil
 }
 
 func rewindCheckpointForExecuteRetry(checkpoint workerCheckpoint) workerCheckpoint {
@@ -4714,10 +4905,12 @@ func rewindCheckpointForExecuteRetry(checkpoint workerCheckpoint) workerCheckpoi
 	// daemon can crash after the observation intent is persisted but before the
 	// executor returns; clearing that marker would let the replacement bypass
 	// verifyTimeoutProgressBeforeReplacement's fail-closed containment gate.
+	// Invalid completion evidence is also preserved so it can be replayed in a
+	// fresh execute turn rather than silently discarded.
 	execution := checkpoint.Execution
 	preserveTimeoutObservation := execution != nil && execution.Status == "timeout_observing"
 	preserveTimeout := execution != nil && execution.Status == "timeout" && execution.ProgressBeforeTimeout != nil
-	if !preserveTimeoutObservation && !preserveTimeout {
+	if !preserveTimeoutObservation && !preserveTimeout && validateCompletedExecutionCheckpoint(checkpoint.Execution) == nil {
 		checkpoint.Execution = nil
 	}
 	checkpoint.Validation = nil
@@ -5005,7 +5198,7 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 		parts = append(parts, "Make the necessary code changes, validate them, and leave the branch ready for PR creation.")
 		parts = append(parts, noRemoteLifecyclePromptInstruction("worker", work.Branch, work.BaseBranch, disclosureCfg, agentRuntime, agentModel))
 	}
-	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock, nil
+	return agent.AppendWorkerCompletionInstruction(strings.Join(parts, "\n\n"), work.Reproduction == nil), instructionBlock, nil
 }
 
 func customInstructionConfig(value *config.Config) config.Config {

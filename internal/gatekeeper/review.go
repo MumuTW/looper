@@ -70,7 +70,7 @@ func latestCodexReviewForHead(ctx context.Context, repos *storage.Repositories, 
 			// blocking finding. Only the former is a merge-eligible review
 			// signal; preserve acceptance of legacy events that predate outcome.
 			outcome := strings.ToLower(strings.TrimSpace(payload.Outcome))
-			if outcome != "" && outcome != "clean" && outcome != "non_blocking" && outcome != "actionable" {
+			if outcome != "" && outcome != "clean" && outcome != "non_blocking" && outcome != "actionable" && outcome != "blocking" {
 				continue
 			}
 		case "APPROVE":
@@ -88,7 +88,7 @@ func latestCodexReviewForHead(ctx context.Context, repos *storage.Repositories, 
 		}
 		evidence.ReviewedHeadSHA = reviewedHead
 		evidence.Event = reviewEvent
-		evidence.Outcome = strings.TrimSpace(payload.Outcome)
+		evidence.Outcome = strings.ToLower(strings.TrimSpace(payload.Outcome))
 		evidence.RecordedAt = event.CreatedAt
 	}
 	evidence.CurrentHeadValid = evidence.ReviewedHeadSHA != "" && strings.EqualFold(evidence.ReviewedHeadSHA, evidence.RequiredHeadSHA)

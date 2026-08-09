@@ -2,7 +2,6 @@ package config
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 )
 
@@ -25,7 +24,7 @@ func TestGatekeeperProtectedPathsNormalizeAndClone(t *testing.T) {
 
 func TestGatekeeperProtectedPathsValidation(t *testing.T) {
 	issues := []ValidationIssue{}
-	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"", " ../secret", "/absolute/*", "[bad"}}, "roles.gatekeeper", false, &issues)
+	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"", " ../secret", "/absolute/*", "[bad"}}, "roles.gatekeeper", &issues)
 	want := []string{"roles.gatekeeper.protectedPaths[0]", "roles.gatekeeper.protectedPaths[1]", "roles.gatekeeper.protectedPaths[2]", "roles.gatekeeper.protectedPaths[3]"}
 	for _, path := range want {
 		found := false
@@ -43,7 +42,7 @@ func TestGatekeeperProtectedPathsValidation(t *testing.T) {
 
 func TestGatekeeperProtectedPathsRejectNoOpPatterns(t *testing.T) {
 	issues := []ValidationIssue{}
-	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"./", ".", "foo/.."}}, "roles.gatekeeper", false, &issues)
+	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"./", ".", "foo/.."}}, "roles.gatekeeper", &issues)
 	for _, index := range []int{0, 1, 2} {
 		want := fmt.Sprintf("roles.gatekeeper.protectedPaths[%d]", index)
 		found := false
@@ -61,7 +60,7 @@ func TestGatekeeperProtectedPathsRejectNoOpPatterns(t *testing.T) {
 
 func TestGatekeeperProtectedPathsRejectDotSegments(t *testing.T) {
 	issues := []ValidationIssue{}
-	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"foo/../bar", "a/./b", "x/.."}}, "roles.gatekeeper", false, &issues)
+	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"foo/../bar", "a/./b", "x/.."}}, "roles.gatekeeper", &issues)
 	for _, index := range []int{0, 1, 2} {
 		want := fmt.Sprintf("roles.gatekeeper.protectedPaths[%d]", index)
 		found := false
@@ -77,57 +76,9 @@ func TestGatekeeperProtectedPathsRejectDotSegments(t *testing.T) {
 	}
 }
 
-func TestGatekeeperProtectedPathsRejectReviewerAutoMerge(t *testing.T) {
-	for _, trust := range []GatekeeperTrustLevel{"", GatekeeperTrustObserve, GatekeeperTrustAdvise, GatekeeperTrustAuto} {
-		issues := []ValidationIssue{}
-		validateGatekeeperRoleConfig(GatekeeperRoleConfig{Trust: trust, ProtectedPaths: []string{"internal/gatekeeper/**"}}, "roles.gatekeeper", true, &issues)
-		found := false
-		for _, issue := range issues {
-			if issue.Path == "roles.gatekeeper.protectedPaths" && strings.Contains(issue.Message, "roles.reviewer.autoMerge.enabled") {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Fatalf("trust=%q issues = %#v, want protectedPaths/reviewer auto-merge conflict", trust, issues)
-		}
-	}
-}
-
-func TestGatekeeperProtectedPathsAllowReviewerAutoMergeWithoutPolicy(t *testing.T) {
-	issues := []ValidationIssue{}
-	validateGatekeeperRoleConfig(GatekeeperRoleConfig{Trust: GatekeeperTrustAdvise, ProtectedPaths: nil}, "roles.gatekeeper", true, &issues)
-	for _, issue := range issues {
-		if issue.Path == "roles.gatekeeper.protectedPaths" {
-			t.Fatalf("issues = %#v, want no protectedPaths conflict when policy is empty", issues)
-		}
-	}
-}
-
-func TestGatekeeperInheritedProtectedPathsRejectProjectReviewerAutoMerge(t *testing.T) {
-	auto := GatekeeperTrustAuto
-	enabled := true
-	cfg := Config{
-		Roles: RoleConfigs{Gatekeeper: GatekeeperRoleConfig{Trust: auto, ProtectedPaths: []string{"internal/**"}}},
-		Projects: []ProjectRefConfig{{
-			ID:    "looper",
-			Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{AutoMerge: &PartialReviewerAutoMergeConfig{Enabled: &enabled}}},
-		}},
-	}
-
-	var issues []ValidationIssue
-	validateCoreConfig(cfg, &issues)
-	for _, issue := range issues {
-		if issue.Path == "projects[0].roles.gatekeeper.protectedPaths" {
-			return
-		}
-	}
-	t.Fatalf("issues = %#v, want inherited protected-path merge-authority conflict", issues)
-}
-
 func TestGatekeeperProtectedPathsRejectEmptySegments(t *testing.T) {
 	issues := []ValidationIssue{}
-	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"internal/migrations/", "internal//generated/**"}}, "roles.gatekeeper", false, &issues)
+	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"internal/migrations/", "internal//generated/**"}}, "roles.gatekeeper", &issues)
 	if len(issues) != 2 {
 		t.Fatalf("issues = %#v, want one issue per empty-segment pattern", issues)
 	}

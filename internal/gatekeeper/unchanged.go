@@ -99,7 +99,7 @@ func SourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled
 // itself: it changes on a re-run, and a re-run that accompanies a push moves the
 // head SHA and is caught by the fingerprint anyway. The only missed case is a
 // manual re-run with no push, which the maxSkipAge ceiling bounds — a cheap price
-// on an observe-only report.
+// on a previous gate report.
 var checkReasonCodes = map[ReasonCode]struct{}{
 	ReasonCheckMissing: {},
 	ReasonCheckPending: {},

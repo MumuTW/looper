@@ -149,6 +149,45 @@ func TestWebhookRuntimeStartFailsWhenTunnelListenerCannotBind(t *testing.T) {
 	defer rt.Stop()
 }
 
+func TestWebhookRuntimeValidateStartupChecksTunnelListener(t *testing.T) {
+	t.Parallel()
+
+	_, _, cfg := setupWebhookTunnelTestRepos(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v", err)
+	}
+	defer listener.Close()
+	cfg.Webhook.ListenPort = listener.Addr().(*net.TCPAddr).Port
+	cfg.Projects = webhookRuntimeTestConfig("acme/looper").Projects
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	defer rt.Stop()
+
+	err = rt.ValidateStartup()
+	if err == nil || !strings.Contains(err.Error(), "webhook tunnel listener failed") {
+		t.Fatalf("ValidateStartup() error = %v, want tunnel listener failure", err)
+	}
+	if rt.tunnelServer != nil {
+		t.Fatal("tunnel server started despite validation bind failure")
+	}
+}
+
+func TestWebhookRuntimeValidateStartupRetainsTunnelListener(t *testing.T) {
+	t.Parallel()
+
+	_, _, cfg := setupWebhookTunnelTestRepos(t)
+	cfg.Projects = webhookRuntimeTestConfig("acme/looper").Projects
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	defer rt.Stop()
+
+	if err := rt.ValidateStartup(); err != nil {
+		t.Fatalf("ValidateStartup() error = %v", err)
+	}
+	if rt.tunnelServer == nil {
+		t.Fatal("ValidateStartup() did not retain tunnel listener")
+	}
+}
+
 func TestWebhookRuntimeRunForwarderClearsRecoveredForwarderReason(t *testing.T) {
 	testBin, err := os.Executable()
 	if err != nil {

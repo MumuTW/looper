@@ -510,13 +510,6 @@
                   "requireCurrentReviewRequest": true,
                   "maxThreadsPerRun": 10
                 }
-              },
-              "autoMerge": {
-                "enabled": false,
-                "strategy": "squash",
-                "requireBranchProtection": true,
-                "transientRetries": 3,
-                "scope": "looper-only"
               }
             },
             "fixer": {
@@ -579,6 +572,10 @@
                 "enabled": false,
                 "scope": "looper-only"
               }
+            },
+            "gatekeeper": {
+              "requiredReviewChangedLines": 200,
+              "strategy": "squash"
             },
             "escalator": {
               "enabled": false,
@@ -868,13 +865,6 @@
                   "requireCurrentReviewRequest": true,
                   "maxThreadsPerRun": 10
                 }
-              },
-              "autoMerge": {
-                "enabled": false,
-                "strategy": "squash",
-                "requireBranchProtection": true,
-                "transientRetries": 3,
-                "scope": "looper-only"
               }
             },
             "fixer": {
@@ -937,6 +927,10 @@
                 "enabled": false,
                 "scope": "looper-only"
               }
+            },
+            "gatekeeper": {
+              "requiredReviewChangedLines": 200,
+              "strategy": "squash"
             },
             "escalator": {
               "enabled": false,

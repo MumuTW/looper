@@ -3,6 +3,7 @@ package gatekeeper
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,6 +53,22 @@ func TestAutoGatekeeperAcceptsMarkerlessCleanReviewFromDurableEvidence(t *testin
 	}
 }
 
+func TestAutoGatekeeperRejectsMarkerlessBlockingReviewFromDurableEvidence(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	seedReviewerReviewEventWithOutcome(t, fixture, "head-1", "COMMENT", "blocking", "reviewer-loop", 1, true)
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{}
+
+	report, err := fixture.autoRunner().EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !hasReason(report, ReasonCodexReviewBlocked) || report.Evidence.CodexReviewOutcome != "blocking" {
+		t.Fatalf("report = %#v, want markerless blocking review to remain blocking", report)
+	}
+}
+
 func TestAutoGatekeeperPublishesErrorStatusWhenPullRequestReadFails(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	fixture.github.viewErr = errors.New("provider unavailable")
@@ -86,11 +103,11 @@ func TestAutoGatekeeperDoesNotCacheReportAfterStatusPublishFailure(t *testing.T)
 	runner := fixture.autoRunner()
 
 	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
-	if err != nil {
-		t.Fatalf("first DiscoverPullRequests() error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "publish confirming eligible status") {
+		t.Fatalf("first DiscoverPullRequests() error = %v, want retryable confirming-status failure", err)
 	}
-	if first.Evaluated != 1 {
-		t.Fatalf("first discovery = %#v, want one evaluated pull request", first)
+	if first.Evaluated != 0 {
+		t.Fatalf("first discovery = %#v, want no completed evaluation after confirming-status failure", first)
 	}
 
 	fixture.github.statusErr = nil
@@ -267,8 +284,8 @@ func TestDiscoverPullRequestsSkipsUnchangedCommitStatusPublication(t *testing.T)
 	if err != nil {
 		t.Fatalf("second DiscoverPullRequests() error = %v", err)
 	}
-	if second.Skipped != 1 || len(fixture.github.statusCalls) != 1 {
-		t.Fatalf("second discovery = %#v status calls = %d, want skip without another status write", second, len(fixture.github.statusCalls))
+	if second.Evaluated != 1 || second.Skipped != 0 || len(fixture.github.statusCalls) != 1 {
+		t.Fatalf("second discovery = %#v status calls = %d, want auto re-evaluation without another status write", second, len(fixture.github.statusCalls))
 	}
 }
 

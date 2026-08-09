@@ -503,13 +503,25 @@ type ClosePullRequestInput struct {
 	CWD             string
 }
 
-type EnableAutoMergeInput struct {
+// DisablePullRequestAutoMerge cancels a pending native auto-merge request
+// during migration from the retired Reviewer authority.
+type DisablePullRequestAutoMergeInput struct {
 	Repo     string
 	PRNumber int64
-	Strategy config.ReviewerAutoMergeStrategy
-	HeadSHA  string
-	BaseSHA  string
 	CWD      string
+}
+
+// PullRequestMergeInput is the input for an immediate merge. It is deliberately
+// separate from the retired native auto-merge request: Gatekeeper owns the
+// decision and crosses the forge boundary only after its confirming pass.
+type PullRequestMergeInput struct {
+	Repo       string
+	PRNumber   int64
+	Strategy   config.MergeStrategy
+	HeadSHA    string
+	BaseSHA    string
+	BaseBranch string
+	CWD        string
 }
 
 type MarkPullRequestReadyInput struct {
@@ -747,6 +759,14 @@ type ListOpenIssuesInput struct {
 	Label    string
 	Labels   []string
 	Search   string
+}
+
+// ListMergeWatchIssuesInput selects all issues carrying a durable Coordinator
+// merge-watch marker, including closed issues.
+type ListMergeWatchIssuesInput struct {
+	Repo  string
+	CWD   string
+	Limit int
 }
 
 type ViewIssueInput struct {
@@ -1120,6 +1140,35 @@ func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput)
 		return snapshot.listOpenIssues(ctx, input)
 	}
 	return g.listOpenIssuesRaw(ctx, input)
+}
+
+// ListMergeWatchIssues lists all issues whose comments contain a durable
+// Coordinator merge-watch marker, including closed issues.
+func (g *Gateway) ListMergeWatchIssues(ctx context.Context, input ListMergeWatchIssuesInput) ([]IssueSummary, error) {
+	args := []string{
+		"issue", "list", "--repo", strings.TrimSpace(input.Repo), "--state", "all",
+		"--search", "looper:coordinator:merge-watch in:comments",
+		"--limit", fmt.Sprintf("%d", defaultLimit(input.Limit)),
+	}
+	args = append(args, "--json", "number")
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArray(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]IssueSummary, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, IssueSummary{
+			Number: asInt64(row["number"]), Title: asString(row["title"]), Body: asString(row["body"]), URL: asString(row["url"]),
+			State: asString(row["state"]), UpdatedAt: asString(row["updatedAt"]), Author: extractAuthor(row["author"]),
+			AuthorAssociation: asString(row["authorAssociation"]), Assignees: extractActorLogins(row["assignees"]),
+			AssigneeUsers: extractActorUsers(row["assignees"]), Labels: extractLabelNames(row["labels"]),
+		})
+	}
+	return out, nil
 }
 
 func (g *Gateway) listOpenIssuesRaw(ctx context.Context, input ListOpenIssuesInput) ([]IssueSummary, error) {
@@ -2386,16 +2435,13 @@ func (g *Gateway) ClosePullRequest(ctx context.Context, input ClosePullRequestIn
 	return err
 }
 
-func (g *Gateway) EnableAutoMerge(ctx context.Context, input EnableAutoMergeInput) error {
-	strategy := strings.TrimSpace(string(input.Strategy))
-	if strategy == "" {
-		return fmt.Errorf("auto-merge strategy is required")
+// DisablePullRequestAutoMerge cancels a native auto-merge request left by the
+// retired Reviewer authority. It cannot merge the pull request.
+func (g *Gateway) DisablePullRequestAutoMerge(ctx context.Context, input DisablePullRequestAutoMergeInput) error {
+	if input.PRNumber <= 0 {
+		return fmt.Errorf("pull request number is required")
 	}
-	headSHA := strings.TrimSpace(input.HeadSHA)
-	if headSHA == "" {
-		return fmt.Errorf("auto-merge head SHA is required")
-	}
-	_, err := g.runGh(ctx, input.CWD, "", "pr", "merge", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--auto", "--"+strategy, "--match-head-commit", headSHA)
+	_, err := g.runGh(ctx, input.CWD, "", "pr", "merge", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--disable-auto")
 	return err
 }
 
@@ -2410,22 +2456,31 @@ func (g *Gateway) EnableAutoMerge(ctx context.Context, input EnableAutoMergeInpu
 // GitHub to apply later, by which time the evaluation behind it is stale — the
 // opposite of the guarantee an immediate merge makes.
 //
-// Only the head is bound here: GitHub's merge API (and `gh pr merge`) accepts no
-// parameter that atomically pins the base. A diff-budget verdict depends on the
+// Only the head is bound here: GitHub's merge API accepts no parameter that
+// atomically pins the base. A diff-budget verdict depends on the
 // merge base, so when the base branch advances between the confirming pass's
 // final revalidation read and this call, the merge can still proceed against a
 // new base whose recomputed diff exceeds the budget. The confirming pass narrows
 // that window to the calls between the final read and the merge, but it cannot
 // close it; this is a documented blind spot of the diff-budget gate, not a
 // property this command can enforce.
-func (g *Gateway) MergePullRequest(ctx context.Context, input EnableAutoMergeInput) error {
+func (g *Gateway) MergePullRequest(ctx context.Context, input PullRequestMergeInput) error {
 	strategy := strings.TrimSpace(string(input.Strategy))
 	if strategy == "" {
 		return fmt.Errorf("merge strategy is required")
 	}
+	switch config.MergeStrategy(strategy) {
+	case config.MergeStrategySquash, config.MergeStrategyMerge, config.MergeStrategyRebase:
+	default:
+		return fmt.Errorf("invalid merge strategy %q", strategy)
+	}
 	headSHA := strings.TrimSpace(input.HeadSHA)
 	if headSHA == "" {
 		return fmt.Errorf("merge head SHA is required")
+	}
+	baseBranch := strings.TrimSpace(input.BaseBranch)
+	if baseBranch == "" {
+		return fmt.Errorf("merge base branch is required")
 	}
 	if expectedBase := strings.TrimSpace(input.BaseSHA); expectedBase != "" {
 		actualBase, err := g.GetPullRequestBaseSHA(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
@@ -2436,7 +2491,33 @@ func (g *Gateway) MergePullRequest(ctx context.Context, input EnableAutoMergeInp
 			return fmt.Errorf("pull request base SHA moved: expected %s, got %s", expectedBase, actualBase)
 		}
 	}
-	_, err := g.runGh(ctx, input.CWD, "", "pr", "merge", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--"+strategy, "--match-head-commit", headSHA)
+	hostname, repo := splitRepoHostname(input.Repo)
+	rulesArgs := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/rules/branches/%s", repo, url.PathEscape(baseBranch))}
+	if hostname != "" {
+		rulesArgs = append(rulesArgs, "--hostname", hostname)
+	}
+	rulesResult, err := g.runGh(ctx, input.CWD, "", rulesArgs...)
+	if err != nil {
+		return fmt.Errorf("inspect base branch rules before merge: %w", err)
+	}
+	rules, err := decodeJSONArrayOrPages(rulesResult.Stdout)
+	if err != nil {
+		return fmt.Errorf("decode base branch rules before merge: %w", err)
+	}
+	for _, rule := range rules {
+		if strings.EqualFold(asString(rule["type"]), "merge_queue") {
+			return fmt.Errorf("base branch %q requires a merge queue; Gatekeeper only performs immediate merges", baseBranch)
+		}
+	}
+	// Use the REST merge endpoint rather than `gh pr merge`: the CLI can turn a
+	// queue-required branch into a deferred auto-merge request when a ruleset
+	// changes after the preflight. The API mutation is an immediate merge
+	// attempt, and the head SHA is part of the same forge request.
+	mergeArgs := []string{"api", fmt.Sprintf("repos/%s/pulls/%d/merge", repo, input.PRNumber), "--method", "PUT", "-f", "merge_method=" + strategy, "-f", "sha=" + headSHA}
+	if hostname != "" {
+		mergeArgs = append(mergeArgs, "--hostname", hostname)
+	}
+	_, err = g.runGh(ctx, input.CWD, "", mergeArgs...)
 	return err
 }
 
