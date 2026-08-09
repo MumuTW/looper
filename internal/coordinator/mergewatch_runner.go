@@ -527,16 +527,25 @@ func pullRequestNumberFromURL(raw string) int64 {
 }
 
 func findMergeWatchComment(comments []githubinfra.CommentInfo, currentLogin string) *mergeWatchComment {
+	markers := mergeWatchComments(comments, currentLogin)
+	if len(markers) > 0 {
+		return &markers[0]
+	}
+	return nil
+}
+
+func mergeWatchComments(comments []githubinfra.CommentInfo, currentLogin string) []mergeWatchComment {
+	markers := make([]mergeWatchComment, 0, len(comments))
 	for i := len(comments) - 1; i >= 0; i-- {
 		if strings.TrimSpace(currentLogin) != "" && !strings.EqualFold(strings.TrimSpace(comments[i].Author), strings.TrimSpace(currentLogin)) {
 			continue
 		}
 		marker, ok := parseMergeWatchComment(comments[i])
 		if ok {
-			return &marker
+			markers = append(markers, marker)
 		}
 	}
-	return nil
+	return markers
 }
 
 func parseMergeWatchComment(comment githubinfra.CommentInfo) (mergeWatchComment, bool) {

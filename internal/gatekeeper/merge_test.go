@@ -252,6 +252,52 @@ func TestAutoPropagatesTransientMergeFailureWithoutPersistingRefusal(t *testing.
 	}
 }
 
+func TestAutoPropagatesAuthorizationMergeFailureWithoutPersistingRefusal(t *testing.T) {
+	t.Parallel()
+	fixture := newGatekeeperFixture(t)
+	fixture.github.mergeErr = errors.New("HTTP 403: Resource not accessible by integration")
+	runner := autoRunner(t, fixture)
+	if _, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	}); err == nil || !githubinfra.IsAuthorizationError(err) {
+		t.Fatalf("EvaluatePullRequest() error = %v, want authorization error", err)
+	}
+	if outcomes := mergeOutcomes(t, fixture.repos); len(outcomes) != 0 {
+		t.Fatalf("outcomes = %+v, want no durable refusal for credential failure", outcomes)
+	}
+	if outcomes := pendingMergeOutcomes(t, fixture.repos); len(outcomes) != 1 || outcomes[0].Reason != MergeOutcomePendingReason {
+		t.Fatalf("pending outcomes = %+v, want one retryable attempt", outcomes)
+	}
+}
+
+func TestAutoDoesNotPublishSuccessWhenPendingMergeOutcomeCannotPersist(t *testing.T) {
+	t.Parallel()
+	fixture := newGatekeeperFixture(t)
+	if err := fixture.execSQL(`
+		CREATE TRIGGER fail_merge_outcome
+		BEFORE INSERT ON event_logs
+		WHEN NEW.event_type = 'pull_request.merge_gate.merge_attempted'
+		BEGIN
+			SELECT RAISE(FAIL, 'forced merge outcome failure');
+		END
+	`); err != nil {
+		t.Fatalf("create merge outcome failure trigger: %v", err)
+	}
+
+	_, err := autoRunner(t, fixture).EvaluatePullRequest(withDeferCommitStatus(context.Background()), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err == nil || !strings.Contains(err.Error(), "persist merge outcome") {
+		t.Fatalf("EvaluatePullRequest() error = %v, want persistence failure", err)
+	}
+	if len(fixture.github.statusCalls) != 0 {
+		t.Fatalf("status calls = %+v, want no green status without durable reservation", fixture.github.statusCalls)
+	}
+	if len(fixture.github.merges) != 0 {
+		t.Fatalf("merges = %+v, want no forge mutation without durable reservation", fixture.github.merges)
+	}
+}
+
 // A successful forge mutation can outlive the process that was supposed to
 // append its final outcome.  Discovery must settle the durable pending marker
 // from the forge's merged state even though the PR is no longer open.

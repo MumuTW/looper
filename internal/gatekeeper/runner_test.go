@@ -319,6 +319,7 @@ type gatekeeperFixture struct {
 	github        *fakeGatekeeperGitHub
 	now           time.Time
 	policyPermits bool
+	execSQL       func(string) error
 	// closeDB closes the underlying SQLite coordinator so a test can force a
 	// persistence failure mid-discovery.
 	closeDB func() error
@@ -354,6 +355,10 @@ func newGatekeeperFixtureWithReview(t *testing.T, seedReview bool) *gatekeeperFi
 	fixture := &gatekeeperFixture{
 		repos: repos,
 		now:   now,
+		execSQL: func(query string) error {
+			_, err := coordinator.DB().ExecContext(context.Background(), query)
+			return err
+		},
 		github: &fakeGatekeeperGitHub{
 			detail:    githubinfra.PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-1", BaseRefName: "main", BaseSHA: "base-1", ReviewDecision: "APPROVED", AdditionsKnown: true, DeletionsKnown: true},
 			mergeable: githubinfra.PullRequestDetail{Number: 42, HeadSHA: "head-1", BaseSHA: "base-1", MergeCommitSHA: "merge-commit-1", Mergeable: &mergeable, MergeableState: "clean", AdditionsKnown: true, DeletionsKnown: true},

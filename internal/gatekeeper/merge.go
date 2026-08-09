@@ -120,6 +120,18 @@ func (r *Runner) confirmAndMerge(ctx context.Context, input EvaluationInput, rep
 		}
 		return confirmation, nil
 	}
+	// Record the attempt before crossing the forge boundary.  If the process
+	// loses the post-merge append, this pending record gives the next discovery
+	// tick a durable entity and head to reconcile without retrying blindly. It
+	// must also precede the green status so persistence failure cannot leave a
+	// success signal visible without a durable reservation.
+	attempt := outcome
+	attempt.Pending = true
+	attempt.Reason = MergeOutcomePendingReason
+	if err := r.persistMergeOutcome(ctx, attempt); err != nil {
+		return Report{}, err
+	}
+
 	// Discovery defers the primary status until all pull requests sharing a head
 	// have been aggregated. The confirming pass is the final authority for an
 	// auto merge, so publish its eligible status before crossing the forge merge
@@ -129,16 +141,6 @@ func (r *Runner) confirmAndMerge(ctx context.Context, input EvaluationInput, rep
 		return Report{}, fmt.Errorf("publish confirming eligible status: %w", err)
 	}
 
-	// Record the attempt before crossing the forge boundary.  If the process
-	// loses the post-merge append, this pending record gives the next discovery
-	// tick a durable entity and head to reconcile without retrying blindly.
-	attempt := outcome
-	attempt.Pending = true
-	attempt.Reason = MergeOutcomePendingReason
-	if err := r.persistMergeOutcome(ctx, attempt); err != nil {
-		return Report{}, err
-	}
-
 	cwd := r.projectCWD(ctx, report.ProjectID)
 	if err := r.github.MergePullRequest(ctx, githubinfra.PullRequestMergeInput{
 		Repo: report.Repo, PRNumber: report.PRNumber,
@@ -146,7 +148,7 @@ func (r *Runner) confirmAndMerge(ctx context.Context, input EvaluationInput, rep
 		BaseBranch: confirmation.Evidence.BaseRefName,
 		CWD:        cwd,
 	}); err != nil {
-		if githubinfra.IsTransientError(err) {
+		if githubinfra.IsTransientError(err) || githubinfra.IsAuthorizationError(err) {
 			return Report{}, err
 		}
 		// The forge has its own view — branch protection, a race with another

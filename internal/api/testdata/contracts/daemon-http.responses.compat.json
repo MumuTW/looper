@@ -574,8 +574,8 @@
               }
             },
             "gatekeeper": {
-              "strategy": "squash",
-              "requiredReviewChangedLines": 200
+              "requiredReviewChangedLines": 200,
+              "strategy": "squash"
             },
             "escalator": {
               "enabled": false,
@@ -929,8 +929,8 @@
               }
             },
             "gatekeeper": {
-              "strategy": "squash",
-              "requiredReviewChangedLines": 200
+              "requiredReviewChangedLines": 200,
+              "strategy": "squash"
             },
             "escalator": {
               "enabled": false,

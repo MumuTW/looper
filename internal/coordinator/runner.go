@@ -464,31 +464,36 @@ func (r *Runner) ReconcileRetiredAutoMerge(ctx context.Context, input RetiredAut
 		// the old bot login. The marker's author is the provenance for the
 		// native auto-merge request; the current login is only the identity used
 		// for the provider calls below.
-		marker := findMergeWatchComment(comments, "")
-		if marker == nil || marker.Marker.PRNumber <= 0 {
-			continue
-		}
-		detail, err := r.github.ViewPullRequestMergeWatch(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: marker.Marker.PRNumber, CWD: input.CWD})
-		if err != nil {
-			return fmt.Errorf("inspect retired merge-watch PR #%d: %w", marker.Marker.PRNumber, err)
-		}
-		if detail.Number != marker.Marker.PRNumber {
-			// A zero or mismatched projection is not evidence that the request is
-			// gone. Preserve the marker for a later authoritative read.
-			continue
-		}
-		markerAuthor := strings.TrimSpace(marker.Author)
-		owned := markerAuthor != "" && detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), markerAuthor)
-		if owned && !strings.EqualFold(strings.TrimSpace(detail.State), "merged") && strings.TrimSpace(detail.MergedAt) == "" {
-			if err := r.github.DisablePullRequestAutoMerge(ctx, githubinfra.DisablePullRequestAutoMergeInput{Repo: input.Repo, PRNumber: marker.Marker.PRNumber, CWD: input.CWD}); err != nil {
-				return fmt.Errorf("disable retired auto-merge for PR #%d: %w", marker.Marker.PRNumber, err)
+		disabledPRs := map[int64]struct{}{}
+		for _, marker := range mergeWatchComments(comments, "") {
+			if marker.Marker.PRNumber <= 0 {
+				continue
 			}
-		}
-		// Once migration has observed the PR, the marker has served its provenance
-		// purpose.  Removing it prevents a later tick from treating the same
-		// historical request as live, including when a human disabled auto-merge.
-		if err := r.deleteMergeWatchComment(ctx, input.Repo, input.CWD, marker); err != nil {
-			return fmt.Errorf("delete retired merge-watch marker for issue #%d: %w", summary.Number, err)
+			detail, err := r.github.ViewPullRequestMergeWatch(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: marker.Marker.PRNumber, CWD: input.CWD})
+			if err != nil {
+				return fmt.Errorf("inspect retired merge-watch PR #%d: %w", marker.Marker.PRNumber, err)
+			}
+			if detail.Number != marker.Marker.PRNumber {
+				// A zero or mismatched projection is not evidence that the request is
+				// gone. Preserve the marker and fail the cleanup barrier so the
+				// scheduler retries instead of caching incomplete cleanup as ready.
+				return fmt.Errorf("inspect retired merge-watch PR #%d: provider returned PR #%d", marker.Marker.PRNumber, detail.Number)
+			}
+			markerAuthor := strings.TrimSpace(marker.Author)
+			owned := markerAuthor != "" && detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), markerAuthor)
+			_, alreadyDisabled := disabledPRs[marker.Marker.PRNumber]
+			if owned && !alreadyDisabled && !strings.EqualFold(strings.TrimSpace(detail.State), "merged") && strings.TrimSpace(detail.MergedAt) == "" {
+				if err := r.github.DisablePullRequestAutoMerge(ctx, githubinfra.DisablePullRequestAutoMergeInput{Repo: input.Repo, PRNumber: marker.Marker.PRNumber, CWD: input.CWD}); err != nil {
+					return fmt.Errorf("disable retired auto-merge for PR #%d: %w", marker.Marker.PRNumber, err)
+				}
+				disabledPRs[marker.Marker.PRNumber] = struct{}{}
+			}
+			// Once migration has observed the PR, the marker has served its provenance
+			// purpose. Removing every historical marker prevents a newer marker from
+			// hiding an older request authored by the identity that enabled auto-merge.
+			if err := r.deleteMergeWatchComment(ctx, input.Repo, input.CWD, &marker); err != nil {
+				return fmt.Errorf("delete retired merge-watch marker for issue #%d: %w", summary.Number, err)
+			}
 		}
 	}
 	return nil

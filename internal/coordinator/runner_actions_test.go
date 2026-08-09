@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1649,6 +1650,7 @@ type stubCoordinatorGitHub struct {
 	mergeWatchIssues              []githubinfra.IssueSummary
 	disabledAutoMerges            []githubinfra.DisablePullRequestAutoMergeInput
 	disableAutoMergeErr           error
+	deletedCommentIDs             []int64
 }
 
 func (s *stubCoordinatorGitHub) ListOpenIssues(_ context.Context, input githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
@@ -1833,6 +1835,7 @@ func (s *stubCoordinatorGitHub) UpdateIssueComment(_ context.Context, input gith
 }
 func (s *stubCoordinatorGitHub) DeleteIssueComment(_ context.Context, input githubinfra.DeleteIssueCommentInput) error {
 	s.ops = append(s.ops, "delete-comment")
+	s.deletedCommentIDs = append(s.deletedCommentIDs, input.CommentID)
 	return nil
 }
 func (s *stubCoordinatorGitHub) AddPullRequestReviewers(_ context.Context, input githubinfra.PullRequestReviewersInput) error {
@@ -2146,6 +2149,61 @@ func TestRunnerRetiredAutoMergeReconciliationUsesMarkerAuthorAfterCredentialRota
 	assertOrderedOps(t, fixture.github.ops, []string{"disable-auto", "delete-comment"})
 	if len(fixture.github.disabledAutoMerges) != 1 || fixture.github.disabledAutoMerges[0].PRNumber != 77 {
 		t.Fatalf("disabledAutoMerges = %#v, want PR #77 after credential rotation", fixture.github.disabledAutoMerges)
+	}
+}
+
+func TestRunnerRetiredAutoMergeReconciliationInspectsAllHistoricalMarkers(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = false })
+	fixture.runner.cancelRetiredAutoMerge = true
+	fixture.github.mergeWatchIssues = []githubinfra.IssueSummary{{Number: 1, State: "closed"}}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{
+		{
+			ID: 44, Author: "old-looper",
+			Body: mergeWatchCommentBody(fixture.cfg, 77, "abc123", 2, nil, nil, "watching"),
+		},
+		{
+			ID: 45, Author: "another-bot",
+			Body: mergeWatchCommentBody(fixture.cfg, 77, "abc123", 0, nil, nil, "newer marker"),
+		},
+	}}
+	fixture.github.prDetails[77] = githubinfra.PullRequestDetail{
+		Number: 77, State: "open", HeadSHA: "abc123", BaseRefName: "main",
+		AutoMerge: &githubinfra.PullRequestAutoMerge{EnabledBy: "old-looper"},
+	}
+
+	if err := fixture.runner.ReconcileRetiredAutoMerge(context.Background(), RetiredAutoMergeInput{
+		ProjectID: fixture.projectID, Repo: "acme/looper", CWD: "repo",
+	}); err != nil {
+		t.Fatalf("ReconcileRetiredAutoMerge() error = %v", err)
+	}
+	if len(fixture.github.disabledAutoMerges) != 1 || fixture.github.disabledAutoMerges[0].PRNumber != 77 {
+		t.Fatalf("disabledAutoMerges = %#v, want historical owner marker to disable PR #77 once", fixture.github.disabledAutoMerges)
+	}
+	if got := fixture.github.deletedCommentIDs; !slices.Equal(got, []int64{45, 44}) {
+		t.Fatalf("deleted comment IDs = %v, want every marker settled newest-first", got)
+	}
+}
+
+func TestRunnerRetiredAutoMergeReconciliationRejectsIndeterminatePRProjection(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = false })
+	fixture.runner.cancelRetiredAutoMerge = true
+	fixture.github.mergeWatchIssues = []githubinfra.IssueSummary{{Number: 1, State: "closed"}}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{
+		ID: 44, Author: "looper",
+		Body: mergeWatchCommentBody(fixture.cfg, 77, "abc123", 2, nil, nil, "watching"),
+	}}}
+	fixture.github.prDetails[77] = githubinfra.PullRequestDetail{Number: 0}
+
+	err := fixture.runner.ReconcileRetiredAutoMerge(context.Background(), RetiredAutoMergeInput{
+		ProjectID: fixture.projectID, Repo: "acme/looper", CWD: "repo",
+	})
+	if err == nil || !strings.Contains(err.Error(), "provider returned PR #0") {
+		t.Fatalf("ReconcileRetiredAutoMerge() error = %v, want incomplete cleanup error", err)
+	}
+	if len(fixture.github.disabledAutoMerges) != 0 || len(fixture.github.deletedCommentIDs) != 0 {
+		t.Fatalf("cleanup mutations = disables %#v deletes %v, want marker preserved", fixture.github.disabledAutoMerges, fixture.github.deletedCommentIDs)
 	}
 }
 
