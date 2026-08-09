@@ -284,7 +284,10 @@ func classifyAdviceOutcome(verdict, terminal Report) (AdviceOutcome, bool) {
 
 func terminalHasNonTerminalBlockers(terminal Report) bool {
 	for _, reason := range terminal.Reasons {
-		if reason.Code != ReasonPullRequestNotOpen {
+		switch reason.Code {
+		case ReasonPullRequestNotOpen, ReasonProviderStateAmbiguous, ReasonProviderStateUnavailable, ReasonMergeabilityNotClean, ReasonMergeConflict:
+			continue
+		default:
 			return true
 		}
 	}

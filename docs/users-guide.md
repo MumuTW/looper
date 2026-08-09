@@ -341,6 +341,14 @@ failure cannot leave an accepted queue entry without a veto. Mergify's
 repository-owned `.mergify.yml` and GitHub branch protection are the external
 authorities that serialize and perform the merge.
 
+The repository-root `.mergify.yml` is the complete reusable contract: its queue
+rule targets `main`, uses merge commits, rejects draft/conflicting PRs and both
+veto labels, while `merge_protections_settings.auto_merge_conditions` requires
+the `auto-merge` label plus a successful `Looper Gatekeeper` status. Configure
+GitHub branch protection for `main` with `Looper Gatekeeper` and the repository's
+CI checks as required checks; Mergify injects those branch-protection checks into
+its queue, so they must not be duplicated in the YAML.
+
 `roles.reviewer.autoMerge.*` remains parse-only migration input. An enabled
 legacy block cannot coexist with effective Gatekeeper `auto`; disable it and
 cancel any historical native auto-merge request before promoting the route.

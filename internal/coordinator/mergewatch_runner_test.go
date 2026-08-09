@@ -76,7 +76,7 @@ func TestLinkedPullRequestNumbersReadsProjectedCrossReference(t *testing.T) {
 func TestRecordPostMergeEventPreservesForgeMergedAtAndIsIdempotent(t *testing.T) {
 	fixture := newCoordinatorFixture(t)
 	forgeMergedAt := "2026-05-14T11:58:07.000Z"
-	snapshot := mergewatch.PRSnapshot{Repo: "acme/looper", PRNumber: 42, HeadSHA: "head-42", MergedAt: forgeMergedAt, Merged: true}
+	snapshot := mergewatch.PRSnapshot{Repo: "acme/looper", PRNumber: 42, HeadSHA: "head-42", MergeCommitSHA: "merge-42", MergeStrategy: "merge", SourceIssueRepo: "acme/looper", MergedAt: forgeMergedAt, Merged: true}
 	if err := fixture.runner.recordPostMergeEvent(context.Background(), fixture.projectID, snapshot.Repo, 7, snapshot); err != nil {
 		t.Fatalf("recordPostMergeEvent() error = %v", err)
 	}
@@ -90,8 +90,8 @@ func TestRecordPostMergeEventPreservesForgeMergedAtAndIsIdempotent(t *testing.T)
 	if events[0].EventType != eventlog.CoordinatorPullRequestMergedEventType || events[0].CreatedAt != "2026-05-14T12:00:00.000Z" {
 		t.Fatalf("event = %#v, want durable coordinator observation", events[0])
 	}
-	if !containsAll(events[0].PayloadJSON, `"mergedAt":"`+forgeMergedAt+`"`, `"headSha":"head-42"`) {
-		t.Fatalf("payload = %s, want forge mergedAt and head", events[0].PayloadJSON)
+	if !containsAll(events[0].PayloadJSON, `"mergedAt":"`+forgeMergedAt+`"`, `"headSha":"head-42"`, `"mergeCommitSha":"merge-42"`, `"mergeStrategy":"merge"`, `"sourceIssue":{"number":7,"repo":"acme/looper"}`) {
+		t.Fatalf("payload = %s, want complete forge merge provenance", events[0].PayloadJSON)
 	}
 }
 

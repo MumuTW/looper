@@ -30,7 +30,8 @@ func TestCandidatesFromMergeOutcomesUsesOnlySuccessfulGatekeeperEvents(t *testin
 
 func TestCandidatesFromMergeOutcomesUsesCoordinatorMergeWatchTimestamp(t *testing.T) {
 	payload, err := json.Marshal(eventlog.CoordinatorPullRequestMerged{
-		Version: 1, ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, HeadSHA: "abc", MergedAt: "2026-07-31T09:58:00.000Z",
+		Version: 2, ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, HeadSHA: "abc", MergeCommitSHA: "merge-abc", MergeStrategy: "merge",
+		SourceIssue: eventlog.IssueReference{Number: 118, Repo: "acme/looper"}, MergedAt: "2026-07-31T09:58:00.000Z",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -43,6 +44,9 @@ func TestCandidatesFromMergeOutcomesUsesCoordinatorMergeWatchTimestamp(t *testin
 	}
 	if got := candidates[0].MergedAt.Format("2006-01-02T15:04:05.000Z"); got != "2026-07-31T09:58:00.000Z" {
 		t.Fatalf("candidate merge time = %q, want forge MergedAt", got)
+	}
+	if candidate := candidates[0]; candidate.MergeCommitSHA != "merge-abc" || candidate.MergeStrategy != "merge" || candidate.SourceIssue == nil || candidate.SourceIssue.Number != 118 || candidate.SourceIssue.Repo != "acme/looper" {
+		t.Fatalf("candidate provenance = %#v, want complete coordinator merge provenance", candidate)
 	}
 }
 

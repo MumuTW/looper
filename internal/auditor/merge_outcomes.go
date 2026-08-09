@@ -8,6 +8,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/eventlog"
 	"github.com/MumuTW/looper/internal/gatekeeper"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -43,7 +44,11 @@ func CandidatesFromMergeOutcomes(events []storage.EventLogRecord) ([]MergeCandid
 			if err := json.Unmarshal([]byte(event.PayloadJSON), &outcome); err != nil {
 				return nil, fmt.Errorf("decode coordinator merge event %s: %w", event.ID, err)
 			}
-			candidate = MergeCandidate{ProjectID: outcome.ProjectID, Repo: outcome.Repo, PRNumber: outcome.PRNumber, HeadSHA: outcome.HeadSHA}
+			candidate = MergeCandidate{ProjectID: outcome.ProjectID, Repo: outcome.Repo, PRNumber: outcome.PRNumber, HeadSHA: outcome.HeadSHA, MergeCommitSHA: outcome.MergeCommitSHA, MergeStrategy: outcome.MergeStrategy}
+			if outcome.SourceIssue.Number > 0 && strings.TrimSpace(outcome.SourceIssue.Repo) != "" {
+				sourceIssue := githubinfra.IssueReference{Number: outcome.SourceIssue.Number, Repo: outcome.SourceIssue.Repo}
+				candidate.SourceIssue = &sourceIssue
+			}
 			mergedAtText = outcome.MergedAt
 			if strings.TrimSpace(candidate.ProjectID) == "" && event.ProjectID != nil {
 				// Legacy coordinator payloads stored the project only on the

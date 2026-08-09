@@ -64,6 +64,9 @@ type PRSnapshot struct {
 	PRNumber               int64
 	IssueNumber            int64
 	HeadSHA                string
+	MergeCommitSHA         string
+	MergeStrategy          string
+	SourceIssueRepo        string
 	MergedAt               string
 	MergedBy               string
 	Merged                 bool

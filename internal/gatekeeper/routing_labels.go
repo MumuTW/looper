@@ -133,6 +133,11 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 			return r.retireRoutingLabels(ctx, report, previous, err)
 		}
 	}
+	if plan.autoMerge {
+		if err := r.revalidateCodexReview(ctx, report, expectedHead); err != nil {
+			return r.retireRoutingLabels(ctx, report, previous, err)
+		}
+	}
 	// The final head (and, when applicable, merge-base) read must happen after
 	// thread revalidation. A push during that provider call otherwise leaves the
 	// label write bound to a head that Gatekeeper never confirmed at the end of
@@ -142,18 +147,30 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 	viewInput := githubinfra.ViewPullRequestInput{
 		Repo: reportRepositoryTarget(report), PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID),
 	}
-	if report.Evidence.DiffBudget != nil {
-		expectedBase := strings.TrimSpace(report.Evidence.DiffBudget.BaseSHA)
+	baseSensitive := report.Evidence.DiffBudget != nil || r.requiredReviewChangedLinesFor(report.ProjectID) > 0 || len(r.protectedPaths(report.ProjectID)) > 0
+	if baseSensitive {
+		expectedBase := strings.TrimSpace(report.Evidence.FinalObservedBaseSHA)
 		if expectedBase == "" {
-			return fmt.Errorf("skip routing labels because diff-budget evidence has no base SHA")
+			expectedBase = strings.TrimSpace(report.Evidence.BaseSHA)
 		}
-		var err error
-		currentHead, currentBase, err = r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
-		if err != nil {
-			return r.retireRoutingLabels(ctx, report, previous, fmt.Errorf("revalidate head and diff-budget base before routing labels: %w", err))
+		if report.Evidence.DiffBudget != nil && strings.TrimSpace(report.Evidence.DiffBudget.BaseSHA) != "" {
+			expectedBase = strings.TrimSpace(report.Evidence.DiffBudget.BaseSHA)
 		}
-		if strings.TrimSpace(currentBase) != expectedBase {
-			return r.retireRoutingLabels(ctx, report, previous, fmt.Errorf("skip routing labels because diff-budget base moved from %s to %s", expectedBase, strings.TrimSpace(currentBase)))
+		if expectedBase != "" {
+			var err error
+			currentHead, currentBase, err = r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
+			if err != nil {
+				return r.retireRoutingLabels(ctx, report, previous, fmt.Errorf("revalidate head and policy base before routing labels: %w", err))
+			}
+			if strings.TrimSpace(currentBase) != expectedBase {
+				return r.retireRoutingLabels(ctx, report, previous, fmt.Errorf("skip routing labels because policy base moved from %s to %s", expectedBase, strings.TrimSpace(currentBase)))
+			}
+		} else {
+			var err error
+			currentHead, err = r.github.GetPullRequestHeadSHA(ctx, viewInput)
+			if err != nil {
+				return r.retireRoutingLabels(ctx, report, previous, fmt.Errorf("revalidate head before routing labels: %w", err))
+			}
 		}
 	} else {
 		var err error
@@ -183,6 +200,28 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 		}
 	}
 	return r.applyRoutingLabelPlan(ctx, report, plan)
+}
+
+func (r *Runner) revalidateCodexReview(ctx context.Context, report Report, expectedHead string) error {
+	current, err := latestCodexReviewForHead(ctx, r.repos, report.ProjectID, report.Repo, report.PRNumber, expectedHead)
+	if err != nil {
+		return fmt.Errorf("revalidate Codex review before routing labels: %w", err)
+	}
+	previous := report.Evidence.CodexReview
+	if previous == nil {
+		if current.CurrentHeadValid && strings.TrimSpace(report.EvaluatedAt) != "" && strings.TrimSpace(current.RecordedAt) > strings.TrimSpace(report.EvaluatedAt) {
+			return fmt.Errorf("skip routing labels because Codex review evidence appeared after evaluation")
+		}
+		return nil
+	}
+	if current.CurrentHeadValid != previous.CurrentHeadValid ||
+		!strings.EqualFold(current.ReviewedHeadSHA, previous.ReviewedHeadSHA) ||
+		!strings.EqualFold(current.Event, previous.Event) ||
+		!strings.EqualFold(current.Outcome, previous.Outcome) ||
+		strings.TrimSpace(current.RecordedAt) != strings.TrimSpace(previous.RecordedAt) {
+		return fmt.Errorf("skip routing labels because Codex review evidence advanced")
+	}
+	return nil
 }
 
 func (r *Runner) revalidateReviewerConvergence(ctx context.Context, report Report, expectedHead string) error {
@@ -332,6 +371,12 @@ func (r *Runner) applyRoutingLabelPlan(ctx context.Context, report Report, plan 
 		// becoming an unvetoed stale authorization between mutations.
 		input.Labels = []string{labels.NeedsHumanReview}
 		if err := r.github.AddPullRequestLabels(ctx, input); err != nil {
+			// Best-effort trigger removal still closes the stale-route path when
+			// the veto label write fails (including another PR sharing this head).
+			removeErr := r.github.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Labels: []string{labels.AutoMerge}})
+			if removeErr != nil {
+				return fmt.Errorf("add %s label: %w (remove stale %s label: %v)", labels.NeedsHumanReview, err, labels.AutoMerge, removeErr)
+			}
 			return fmt.Errorf("add %s label: %w", labels.NeedsHumanReview, err)
 		}
 		if err := r.github.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Labels: []string{labels.AutoMerge}}); err != nil {

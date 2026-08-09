@@ -205,8 +205,8 @@ func TestBlockedEstablishedRouteRevokesStatusBeforeQueueVeto(t *testing.T) {
 		t.Fatal("blocked persist() succeeded despite queue-veto label failure")
 	}
 
-	if len(github.operations) < 4 || !slices.Equal(github.operations[len(github.operations)-2:], []string{"status:failure", "add:needs-human-review"}) {
-		t.Fatalf("blocked projection operations = %#v, want status failure before veto add", github.operations)
+	if len(github.operations) < 5 || !slices.Equal(github.operations[len(github.operations)-3:], []string{"status:failure", "add:needs-human-review", "remove:auto-merge"}) {
+		t.Fatalf("blocked projection operations = %#v, want status failure and stale-trigger removal around failed veto add", github.operations)
 	}
 	if got := fixture.github.commitStatuses[len(fixture.github.commitStatuses)-1]; got.State != "failure" || got.SHA != "head-1" || got.Context != RequiredStatusContext {
 		t.Fatalf("last commit status = %#v, want failure for current head", got)

@@ -87,7 +87,8 @@ func (r *Runner) reconcileRoutedReportsOutsideDiscoveryPage(ctx context.Context,
 		if _, inPage := pageEntityIDs[entityID]; inPage {
 			continue
 		}
-		if !reportRouteEstablished(previous) && !reportNeedsRouteRecovery(previous) && !reportNeedsOutOfPageRouteRecheck(previous) {
+		wasRouted := reportRouteEstablished(previous) || reportNeedsRouteRecovery(previous)
+		if !wasRouted && !previousPublished(previous) && !reportNeedsOutOfPageRouteRecheck(previous) {
 			continue
 		}
 		if hasReasonCode(previous.Reasons, ReasonRouteRevoked) {
@@ -152,7 +153,7 @@ func (r *Runner) reconcileRoutedReportsOutsideDiscoveryPage(ctx context.Context,
 			// Mergify label remains present. Attribute the outcome only when
 			// the forge reports a recognized Mergify actor, matching
 			// Coordinator's route-authority check.
-			if githubinfra.IsMergifyMergeActor(detail.MergedBy) {
+			if wasRouted && githubinfra.IsMergifyMergeActor(detail.MergedBy) {
 				if err := r.recordMergeEvidence(ctx, previous, mergedAt); err != nil {
 					errs = append(errs, fmt.Errorf("record merge evidence %s: %w", entityID, err))
 					continue

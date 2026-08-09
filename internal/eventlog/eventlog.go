@@ -31,13 +31,21 @@ const (
 // observation. It carries the identity needed by downstream audit consumers
 // without requiring another forge read.
 type CoordinatorPullRequestMerged struct {
-	Version     int    `json:"version"`
-	ProjectID   string `json:"projectId"`
-	Repo        string `json:"repo"`
-	PRNumber    int64  `json:"prNumber"`
-	IssueNumber int64  `json:"issueNumber,omitempty"`
-	HeadSHA     string `json:"headSha"`
-	MergedAt    string `json:"mergedAt"`
+	Version        int            `json:"version"`
+	ProjectID      string         `json:"projectId"`
+	Repo           string         `json:"repo"`
+	PRNumber       int64          `json:"prNumber"`
+	IssueNumber    int64          `json:"issueNumber,omitempty"`
+	HeadSHA        string         `json:"headSha"`
+	MergeCommitSHA string         `json:"mergeCommitSha,omitempty"`
+	MergeStrategy  string         `json:"mergeStrategy,omitempty"`
+	SourceIssue    IssueReference `json:"sourceIssue,omitempty"`
+	MergedAt       string         `json:"mergedAt"`
+}
+
+type IssueReference struct {
+	Number int64  `json:"number"`
+	Repo   string `json:"repo"`
 }
 
 // CoordinatorRoutedMergeWatchEventType records that a routed pull request (one

@@ -339,6 +339,7 @@ func (r *Runner) applyRoutedMergeWatch(ctx context.Context, projectID, repo, cwd
 			if err := r.upsertRoutedMergeWatch(ctx, projectID, repo, prNumber, headSHA, true); err != nil {
 				return err
 			}
+			r.forgetRoutedMergeWatchCheck(projectID, repo, prNumber)
 			continue
 		}
 		if checksThisTick >= maxRoutedMergeWatchChecksPerTick || !r.claimRoutedMergeWatchCheck(projectID, repo, prNumber) {
@@ -364,6 +365,7 @@ func (r *Runner) applyRoutedMergeWatch(ctx context.Context, projectID, repo, cwd
 			if err := r.upsertRoutedMergeWatch(ctx, projectID, repo, prNumber, headSHA, true); err != nil {
 				return err
 			}
+			r.forgetRoutedMergeWatchCheck(projectID, repo, prNumber)
 			continue
 		}
 		merged := strings.TrimSpace(detail.MergedAt) != "" || state == "MERGED"
@@ -380,6 +382,7 @@ func (r *Runner) applyRoutedMergeWatch(ctx context.Context, projectID, repo, cwd
 			if !humanOwned && active && (detail.AutoMerge != nil || githubinfra.IsMergifyMergeActor(detail.MergedBy)) {
 				if err := r.recordPostMergeEvent(ctx, projectID, repo, 0, mergewatch.PRSnapshot{
 					Repo: repo, PRNumber: prNumber, HeadSHA: firstNonEmpty(detail.HeadSHA, headSHA),
+					MergeCommitSHA: detail.MergeCommitSHA, MergeStrategy: "merge",
 					MergedAt: detail.MergedAt, MergedBy: detail.MergedBy, Merged: true,
 				}); err != nil {
 					return err
@@ -389,6 +392,7 @@ func (r *Runner) applyRoutedMergeWatch(ctx context.Context, projectID, repo, cwd
 		if err := r.upsertRoutedMergeWatch(ctx, projectID, repo, prNumber, headSHA, true); err != nil {
 			return err
 		}
+		r.forgetRoutedMergeWatchCheck(projectID, repo, prNumber)
 	}
 	return nil
 }
@@ -419,6 +423,16 @@ func (r *Runner) routedMergeWatchLastCheck(projectID, repo string, prNumber int6
 	r.state.mu.Lock()
 	defer r.state.mu.Unlock()
 	return r.state.lastRoutedWatchCheckByID[key]
+}
+
+func (r *Runner) forgetRoutedMergeWatchCheck(projectID, repo string, prNumber int64) {
+	if r == nil || r.state == nil {
+		return
+	}
+	key := strings.Join([]string{strings.TrimSpace(projectID), strings.TrimSpace(repo), strconv.FormatInt(prNumber, 10)}, "\x00")
+	r.state.mu.Lock()
+	defer r.state.mu.Unlock()
+	delete(r.state.lastRoutedWatchCheckByID, key)
 }
 
 // upsertRoutedMergeWatch writes a routed-PR merge-watch registration. Settled
@@ -559,13 +573,13 @@ func routedGatekeeperRoute(ctx context.Context, repos *storage.Repositories, pro
 			// A closed webhook can append a newer blocked report after the route
 			// was accepted. Preserve the pre-terminal route authority by scanning
 			// older reports; an open blocked report remains an immediate veto.
-			if strings.EqualFold(strings.TrimSpace(report.Evidence.PullRequestState), "CLOSED") {
+			if routedReportIsTerminal(report) {
 				continue
 			}
 			return false, "", nil
 		}
 		if report.RouteEstablished != nil && !*report.RouteEstablished {
-			if strings.EqualFold(strings.TrimSpace(report.Evidence.PullRequestState), "CLOSED") {
+			if routedReportIsTerminal(report) {
 				continue
 			}
 			return false, "", nil
@@ -586,6 +600,11 @@ func routedGatekeeperRoute(ctx context.Context, repos *storage.Repositories, pro
 		return true, reportedHead, nil
 	}
 	return false, "", nil
+}
+
+func routedReportIsTerminal(report routedGateReport) bool {
+	state := strings.ToUpper(strings.TrimSpace(report.Evidence.PullRequestState))
+	return state == "CLOSED" || state == "MERGED"
 }
 
 // recordPostMergeEvent turns the merge-watch observation into durable local
@@ -611,8 +630,11 @@ func (r *Runner) recordPostMergeEvent(ctx context.Context, projectID, repo strin
 		mergedAt = r.now().UTC().Format(time.RFC3339Nano)
 	}
 	payload := eventlog.CoordinatorPullRequestMerged{
-		Version: 1, ProjectID: projectID, Repo: strings.TrimSpace(repo),
-		PRNumber: snapshot.PRNumber, IssueNumber: issueNumber, HeadSHA: strings.TrimSpace(snapshot.HeadSHA), MergedAt: mergedAt,
+		Version: 2, ProjectID: projectID, Repo: strings.TrimSpace(repo),
+		PRNumber: snapshot.PRNumber, IssueNumber: issueNumber, HeadSHA: strings.TrimSpace(snapshot.HeadSHA),
+		MergeCommitSHA: strings.TrimSpace(snapshot.MergeCommitSHA), MergeStrategy: strings.TrimSpace(snapshot.MergeStrategy),
+		SourceIssue: eventlog.IssueReference{Number: issueNumber, Repo: firstNonEmpty(strings.TrimSpace(snapshot.SourceIssueRepo), strings.TrimSpace(repo))},
+		MergedAt:    mergedAt,
 	}
 	if strings.TrimSpace(payload.ProjectID) == "" || payload.Repo == "" || payload.PRNumber <= 0 || payload.HeadSHA == "" {
 		return fmt.Errorf("post-merge observation is missing pull-request identity")
@@ -786,7 +808,8 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 	if strings.TrimSpace(detail.MergedAt) != "" || strings.EqualFold(strings.TrimSpace(detail.State), "merged") {
 		return mergewatch.PRSnapshot{
 			Repo: repo, PRNumber: prNumber, IssueNumber: issueNumber,
-			HeadSHA: detail.HeadSHA, MergedAt: detail.MergedAt, MergedBy: detail.MergedBy, Merged: true,
+			HeadSHA: detail.HeadSHA, MergeCommitSHA: detail.MergeCommitSHA, MergeStrategy: "merge", SourceIssueRepo: repo,
+			MergedAt: detail.MergedAt, MergedBy: detail.MergedBy, Merged: true,
 			AutoMergeEnabled:       detail.AutoMerge != nil,
 			AutoMergeOwnedByLooper: autoMergeOwnedByLooper,
 			AutoMergeRouteEnabled:  autoMergeOwnedByLooper || labels.Has(detail.Labels, labels.AutoMerge),
