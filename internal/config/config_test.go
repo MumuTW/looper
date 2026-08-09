@@ -4159,7 +4159,7 @@ id = "forgejo-main"
 kind = "forgejo"
 baseUrl = "https://code.example.com"
 auth = "tea"
-teaLogin = "powerformer-code"
+teaLogin = "example-code"
 teaPath = "/opt/homebrew/bin/tea"
 
 [[projects]]

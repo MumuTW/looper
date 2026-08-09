@@ -122,6 +122,7 @@ type PullRequestSummary struct {
 type PullRequestDetail struct {
 	Number         int64
 	State          string
+	MergedAt       string
 	IsDraft        bool
 	Labels         []string
 	HeadSHA        string
@@ -293,6 +294,26 @@ type RegenerateIssueFunc func(context.Context, RegenerateIssueInput) error
 // closing it when the downstream Planner authority is unavailable.
 type RegenerationAvailabilityFunc func(projectID string) string
 
+// ConflictRegenerationInput is the coordinator handoff for a PR that has
+// repeatedly conflicted with its base branch. Unlike ordinary Fixer
+// exhaustion it has no agent run or queue row; the durable authority is the
+// merge-watch marker, while this method reuses the same close-and-regenerate
+// side-effect contract.
+type ConflictRegenerationInput struct {
+	ProjectID       string
+	Repo            string
+	IssueRepo       string
+	IssueNumber     int64
+	PRNumber        int64
+	ConflictRepairs int
+	CWD             string
+}
+
+type ConflictRegenerationResult struct {
+	Completed bool
+	Escalated bool
+}
+
 // RegenerationGateway is deliberately separate from GitHubGateway.  Existing
 // fixer fakes and integrations remain source-compatible while terminal
 // exhaustion opts into the stronger close-and-regenerate capability.
@@ -317,8 +338,9 @@ type IssueDetail struct {
 }
 
 type IssueComment struct {
-	ID   int64
-	Body string
+	ID     int64
+	Author string
+	Body   string
 }
 
 type IssueLabelsInput struct {
@@ -329,10 +351,11 @@ type IssueLabelsInput struct {
 }
 
 type ClosePullRequestInput struct {
-	Repo         string
-	PRNumber     int64
-	DeleteBranch bool
-	CWD          string
+	Repo            string
+	PRNumber        int64
+	DeleteBranch    bool
+	ExpectedHeadSHA string
+	CWD             string
 }
 
 type PullRequestCommit struct {
@@ -340,7 +363,6 @@ type PullRequestCommit struct {
 	AuthorLogin    string
 	CommitterLogin string
 }
-
 type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	GetCurrentUserLogin(context.Context, string, string) (string, error)
@@ -578,6 +600,11 @@ type Options struct {
 	RetryBaseDelay              time.Duration
 	RetryMaxAttempts            int64
 	MaxConsecutiveFixerFailures int
+	// PlannerRegenerationAvailable is nil for standalone/test runners, which
+	// retain the historical assumption that their callback is authoritative. A
+	// daemon passes the resolved Planner availability explicitly so an
+	// unconfigured Planner cannot be reached after a destructive PR close.
+	PlannerRegenerationAvailable *bool
 	// MaxFixerRoundsPerPullRequest bounds how many pushes this fixer may draw
 	// review on for one pull request before the loop is parked for a human.
 	MaxFixerRoundsPerPullRequest int
@@ -599,42 +626,43 @@ type DiscoveryPolicy struct {
 // Runner is the Fixer: a reactive Role that addresses review feedback on a
 // Pull Request. Stateful: it persists runs in the local SQLite database.
 type Runner struct {
-	db                          *sql.DB
-	repos                       *storage.Repositories
-	github                      GitHubGateway
-	git                         GitGateway
-	agentExecutor               AgentExecutor
-	logger                      bootstrap.Logger
-	now                         func() time.Time
-	agentTimeout                time.Duration
-	agentIdleTimeout            time.Duration
-	claimTTL                    time.Duration
-	validationCommands          []string
-	validationCommandsByProject map[string][]string
-	validationRunner            ValidationRunner
-	containmentTracker          processcontainment.LiveTracker
-	allowAutoCommit             bool
-	allowAutoPush               bool
-	allowRiskyFixes             bool
-	fixAllPullRequests          bool
-	discoveryPolicy             DiscoveryPolicy
-	disclosure                  config.DisclosureConfig
-	agentRuntime                string
-	agentProfileID              string
-	agentReasoningEffort        *config.ReasoningEffort
-	customInstructions          config.Config
-	projectRoleConfig           *config.Config
-	agentModel                  *string
-	sleep                       func(time.Duration)
-	retryBaseDelay              time.Duration
-	retryMaxAttempts            int64
-	consecutiveFailureThreshold int
-	maxFixerRounds              int
-	onAgentExecutionStarted     AgentExecutionStartedFunc
-	onQueueItemEnqueued         func()
-	onRegenerateIssue           RegenerateIssueFunc
-	regenerationAvailability    RegenerationAvailabilityFunc
-	deleteBranchOnRegeneration  func(projectID string) bool
+	db                           *sql.DB
+	repos                        *storage.Repositories
+	github                       GitHubGateway
+	git                          GitGateway
+	agentExecutor                AgentExecutor
+	logger                       bootstrap.Logger
+	now                          func() time.Time
+	agentTimeout                 time.Duration
+	agentIdleTimeout             time.Duration
+	claimTTL                     time.Duration
+	validationCommands           []string
+	validationCommandsByProject  map[string][]string
+	validationRunner             ValidationRunner
+	containmentTracker           processcontainment.LiveTracker
+	allowAutoCommit              bool
+	allowAutoPush                bool
+	allowRiskyFixes              bool
+	fixAllPullRequests           bool
+	discoveryPolicy              DiscoveryPolicy
+	disclosure                   config.DisclosureConfig
+	agentRuntime                 string
+	agentProfileID               string
+	agentReasoningEffort         *config.ReasoningEffort
+	customInstructions           config.Config
+	projectRoleConfig            *config.Config
+	agentModel                   *string
+	sleep                        func(time.Duration)
+	retryBaseDelay               time.Duration
+	retryMaxAttempts             int64
+	consecutiveFailureThreshold  int
+	maxFixerRounds               int
+	onAgentExecutionStarted      AgentExecutionStartedFunc
+	onQueueItemEnqueued          func()
+	onRegenerateIssue            RegenerateIssueFunc
+	regenerationAvailability     RegenerationAvailabilityFunc
+	deleteBranchOnRegeneration   func(projectID string) bool
+	plannerRegenerationAvailable bool
 }
 
 type DiscoveryInput struct {
@@ -1907,42 +1935,43 @@ func New(options Options) *Runner {
 		}
 	}
 	return &Runner{
-		db:                          options.DB,
-		repos:                       options.Repos,
-		github:                      options.GitHub,
-		git:                         options.Git,
-		agentExecutor:               options.AgentExecutor,
-		logger:                      options.Logger,
-		now:                         now,
-		agentTimeout:                agentTimeout,
-		agentIdleTimeout:            agentIdleTimeout,
-		claimTTL:                    claimTTL,
-		validationCommands:          append([]string(nil), options.ValidationCommands...),
-		validationCommandsByProject: cloneValidationCommandsByProject(options.ValidationCommandsByProject),
-		validationRunner:            options.ValidationRunner,
-		containmentTracker:          options.ContainmentTracker,
-		allowAutoCommit:             options.AllowAutoCommit,
-		allowAutoPush:               options.AllowAutoPush,
-		allowRiskyFixes:             options.AllowRiskyFixes,
-		fixAllPullRequests:          options.FixAllPullRequests,
-		discoveryPolicy:             policy,
-		disclosure:                  disclosureCfg,
-		agentRuntime:                strings.TrimSpace(options.AgentRuntime),
-		agentProfileID:              strings.TrimSpace(options.AgentProfileID),
-		agentReasoningEffort:        cloneReasoningEffortPtr(options.AgentReasoningEffort),
-		customInstructions:          customInstructionConfig(options.CustomInstructions),
-		projectRoleConfig:           options.CustomInstructions,
-		agentModel:                  cloneStringPtr(options.AgentModel),
-		sleep:                       sleep,
-		retryBaseDelay:              retryBaseDelay,
-		retryMaxAttempts:            retryMax,
-		consecutiveFailureThreshold: consecutiveFailureThreshold,
-		maxFixerRounds:              maxFixerRounds,
-		onAgentExecutionStarted:     options.OnAgentExecutionStarted,
-		onQueueItemEnqueued:         options.OnQueueItemEnqueued,
-		onRegenerateIssue:           options.OnRegenerateIssue,
-		regenerationAvailability:    options.RegenerationAvailability,
-		deleteBranchOnRegeneration:  options.DeleteBranchOnRegeneration,
+		db:                           options.DB,
+		repos:                        options.Repos,
+		github:                       options.GitHub,
+		git:                          options.Git,
+		agentExecutor:                options.AgentExecutor,
+		logger:                       options.Logger,
+		now:                          now,
+		agentTimeout:                 agentTimeout,
+		agentIdleTimeout:             agentIdleTimeout,
+		claimTTL:                     claimTTL,
+		validationCommands:           append([]string(nil), options.ValidationCommands...),
+		validationCommandsByProject:  cloneValidationCommandsByProject(options.ValidationCommandsByProject),
+		validationRunner:             options.ValidationRunner,
+		containmentTracker:           options.ContainmentTracker,
+		allowAutoCommit:              options.AllowAutoCommit,
+		allowAutoPush:                options.AllowAutoPush,
+		allowRiskyFixes:              options.AllowRiskyFixes,
+		fixAllPullRequests:           options.FixAllPullRequests,
+		discoveryPolicy:              policy,
+		disclosure:                   disclosureCfg,
+		agentRuntime:                 strings.TrimSpace(options.AgentRuntime),
+		agentProfileID:               strings.TrimSpace(options.AgentProfileID),
+		agentReasoningEffort:         cloneReasoningEffortPtr(options.AgentReasoningEffort),
+		customInstructions:           customInstructionConfig(options.CustomInstructions),
+		projectRoleConfig:            options.CustomInstructions,
+		agentModel:                   cloneStringPtr(options.AgentModel),
+		sleep:                        sleep,
+		retryBaseDelay:               retryBaseDelay,
+		retryMaxAttempts:             retryMax,
+		consecutiveFailureThreshold:  consecutiveFailureThreshold,
+		maxFixerRounds:               maxFixerRounds,
+		onAgentExecutionStarted:      options.OnAgentExecutionStarted,
+		onQueueItemEnqueued:          options.OnQueueItemEnqueued,
+		onRegenerateIssue:            options.OnRegenerateIssue,
+		regenerationAvailability:     options.RegenerationAvailability,
+		deleteBranchOnRegeneration:   options.DeleteBranchOnRegeneration,
+		plannerRegenerationAvailable: options.PlannerRegenerationAvailable == nil || *options.PlannerRegenerationAvailable,
 	}
 }
 
@@ -2552,10 +2581,10 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 			if project == nil {
 				return nil, fmt.Errorf("project not found: %s", loop.ProjectID)
 			}
-			resumed := false
 			if runFailure != nil {
 				if breakerStreak > 0 && breakerPause != nil {
 					var resumeErr error
+					var resumed bool
 					resumed, resumeErr = r.finishFailureStreakBreaker(ctx, *project, *breakerPause, queueItem, runFailure.runID, &runFailure.checkpoint)
 					if resumeErr != nil {
 						return nil, resumeErr
@@ -2564,9 +2593,7 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 						return &runpipe.ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.Message, FailureKind: failure.Kind}, nil
 					}
 				}
-				if !resumed {
-					r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, runFailure.runID, &runFailure.checkpoint)
-				}
+				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, runFailure.runID, &runFailure.checkpoint)
 			}
 			scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber)
 			if err != nil {
@@ -2668,6 +2695,29 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				if err := r.completeRegenerationReplayClaim(ctx, *loop, queueItem, *project); err != nil {
 					return runpipe.ProcessResult{}, err
 				}
+				return runpipe.ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: replayFailure.Message, FailureKind: replayFailure.Kind}, nil
+			}
+		}
+	}
+	// A terminal handoff is itself durable work. If the daemon was restarted
+	// after the PR comment/close but before Planner accepted the route, replay
+	// that suffix instead of treating the paused/failed loop as an ordinary
+	// fixer item (which would strand the closed PR forever).
+	if r.onRegenerateIssue != nil {
+		if state, ok := parseRegenerationState(parseJSONObject(loop.MetadataJSON)); ok && !state.Routed {
+			project, projectErr := r.repos.Projects.GetByID(ctx, loop.ProjectID)
+			if projectErr != nil {
+				return runpipe.ProcessResult{}, projectErr
+			}
+			if project == nil {
+				return runpipe.ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+			}
+			replayFailure := regenerationFailureFromState(state)
+			_, action, replayErr := r.applyTerminalRegeneration(ctx, *project, *loop, queueItem, fixerCheckpoint{}, replayFailure)
+			if replayErr != nil {
+				return runpipe.ProcessResult{}, replayErr
+			}
+			if action == regenerationCompleted || action == regenerationEscalated {
 				return runpipe.ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: replayFailure.Message, FailureKind: replayFailure.Kind}, nil
 			}
 		}
@@ -2868,6 +2918,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				return runpipe.ProcessResult{}, err
 			}
 		}
+		if failedQueue != nil && failedQueue.Status == "failed" {
+			if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
+				return runpipe.ProcessResult{}, err
+			}
+		}
 		if queueResultIsTerminalForCleanup(failedQueue) {
 			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &latest)
 		}
@@ -3016,6 +3071,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				}
 			}
 			if queueResultAllowsRegeneration(failedQueue, failure) {
+				if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
+					return runpipe.ProcessResult{}, err
+				}
+			}
+			if failedQueue != nil && failedQueue.Status == "failed" {
 				if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
 					return runpipe.ProcessResult{}, err
 				}
@@ -5788,15 +5848,19 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 	if r.db == nil {
 		return loopUpsertResult{}, fmt.Errorf("fixer runner database is not configured")
 	}
-	var metadataJSON *string
-	if sourceWorkerID := fixerSourceWorkerIDForPullRequest(existingLoops, project.ID, repo, prNumber); sourceWorkerID != "" {
-		metadata, err := json.Marshal(map[string]any{"sourceWorkerId": sourceWorkerID})
-		if err != nil {
-			return loopUpsertResult{}, err
-		}
-		text := string(metadata)
-		metadataJSON = &text
+	metadata := map[string]any{}
+	if seededHead := strings.TrimSpace(headSHA); seededHead != "" {
+		metadata["fixerRoundBudget"] = roundBudgetState{Rounds: 0, LastHeadSHA: seededHead, FirstRoundAt: nowISO, RecordedAt: nowISO}
+		metadata["fixerRoundBudgetSeeded"] = true
 	}
+	if sourceWorkerID := fixerSourceWorkerIDForPullRequest(existingLoops, project.ID, repo, prNumber); sourceWorkerID != "" {
+		metadata["sourceWorkerId"] = sourceWorkerID
+	}
+	metadataEncoded, err := json.Marshal(metadata)
+	if err != nil {
+		return loopUpsertResult{}, err
+	}
+	metadataJSON := runpipe.StringPtr(string(metadataEncoded))
 	var loop storage.LoopRecord
 	if err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
 		repos := storage.NewRepositories(tx)

@@ -111,6 +111,27 @@ type RepositoryInspector interface {
 	Inspect(context.Context, string, triage.Issue) (triage.RepoContext, error)
 }
 
+// ConflictRegenerationInput is the coordinator-to-fixer handoff used when a
+// PR has lost the race with the base branch too many times. The fixer owns the
+// close-and-regenerate side effects; Coordinator owns the observed PR and the
+// durable conflict count.
+type ConflictRegenerationInput struct {
+	ProjectID       string
+	Repo            string
+	IssueRepo       string
+	IssueNumber     int64
+	PRNumber        int64
+	ConflictRepairs int
+	CWD             string
+}
+
+type ConflictRegenerationResult struct {
+	Completed bool
+	Escalated bool
+}
+
+type ConflictRegenerationFunc func(context.Context, ConflictRegenerationInput) (ConflictRegenerationResult, error)
+
 type Options struct {
 	Repos                  *storage.Repositories
 	GitHub                 GitHubGateway
@@ -123,6 +144,7 @@ type Options struct {
 	Network                NetworkGateway
 	State                  *RuntimeState
 	CancelRetiredAutoMerge bool
+	RegenerateConflict     ConflictRegenerationFunc
 }
 
 // RuntimeState contains coordinator lifecycle state that must outlive one
@@ -200,6 +222,7 @@ type Runner struct {
 	network                NetworkGateway
 	state                  *RuntimeState
 	cancelRetiredAutoMerge bool
+	regenerateConflict     ConflictRegenerationFunc
 }
 
 type loadedIssue struct {
@@ -259,6 +282,7 @@ func New(options Options) *Runner {
 		disclosure:             options.Disclosure,
 		state:                  state,
 		cancelRetiredAutoMerge: options.CancelRetiredAutoMerge,
+		regenerateConflict:     options.RegenerateConflict,
 	}
 	runner.warnMarkReadyReviewerUnreachable()
 	return runner

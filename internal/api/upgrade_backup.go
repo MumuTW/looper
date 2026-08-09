@@ -14,6 +14,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/daemonbinary"
+	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/upgradebackup"
 	"github.com/MumuTW/looper/internal/version"
@@ -26,6 +27,10 @@ const cliIdentityTimeout = 15 * time.Second
 func (h *Handler) createUpgradeBackup(ctx context.Context) (upgradebackup.Result, error) {
 	if h == nil || h.context.Runtime == nil {
 		return upgradebackup.Result{}, fmt.Errorf("runtime is unavailable")
+	}
+	drainRuntime, ok := any(h.context.Runtime).(upgradeDrainRuntime)
+	if !ok || drainRuntime.AdmissionState() != looperdruntime.AdmissionDraining || !drainRuntime.DrainSnapshot().Drained() {
+		return upgradebackup.Result{}, fmt.Errorf("upgrade backup requires a drained daemon")
 	}
 	cfg, metadata := h.upgradeConfigAndMetadata()
 	if cfg.Tools.LooperPath == nil || strings.TrimSpace(*cfg.Tools.LooperPath) == "" {

@@ -258,6 +258,34 @@ func Verify(rootDir, releaseID string) (StageResult, error) {
 	return StageResult{RootDir: root, ReleaseID: releaseID, Directory: directory, Manifest: manifest}, nil
 }
 
+// Remove discards an unpublished staged release after a caller's post-copy
+// verification fails. The exact release ID is validated before deletion so a
+// failed stage cannot broaden cleanup to an arbitrary path.
+func Remove(rootDir, releaseID string) error {
+	root, err := normalizedRoot(rootDir)
+	if err != nil {
+		return err
+	}
+	if err := validateReleaseID(releaseID); err != nil {
+		return err
+	}
+	directory := filepath.Join(root, "releases", releaseID)
+	info, err := os.Lstat(directory)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect release for removal: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("release path %s is not a directory", releaseID)
+	}
+	if err := os.RemoveAll(directory); err != nil {
+		return fmt.Errorf("remove failed staged release: %w", err)
+	}
+	return syncDirectory(filepath.Join(root, "releases"))
+}
+
 // Activate switches root/current to a verified release through one atomic
 // rename of a relative symlink. It never starts, stops, or signals looperd.
 // The returned ServiceExecutable is root/current/looperd — the path supervised

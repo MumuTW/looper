@@ -10,13 +10,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/MumuTW/looper/internal/version"
 )
 
 func TestCreateBundlesOneSnapshotWithManifestedInputs(t *testing.T) {
 	root := t.TempDir()
 	config := writeBundleFile(t, root, "config.toml", "[server]\n")
-	cli := writeBundleFile(t, root, "looper-bin", "cli")
-	daemon := writeBundleFile(t, root, "looperd-bin", "daemon")
+	cli := writeIdentityExecutable(t, root, "looper-bin", "release-a")
+	daemon := writeIdentityExecutable(t, root, "looperd-bin", "release-a")
 	snapshots := 0
 	database := filepath.Join(root, "looper.sqlite")
 	result, err := Create(context.Background(), Input{RootDir: filepath.Join(root, "backups"), ConfigPath: config, DatabasePath: database, CLIBinaryPath: cli, DaemonBinaryPath: daemon, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 2, 3, 0, time.UTC) }, Snapshot: func(context.Context) (string, error) {
@@ -54,8 +56,8 @@ func TestCreateSyncsNewBackupRootParent(t *testing.T) {
 	root := t.TempDir()
 	backupRoot := filepath.Join(root, "new-parent", "backups")
 	config := writeBundleFile(t, root, "config.toml", "[server]\n")
-	cli := writeBundleFile(t, root, "looper-bin", "cli")
-	daemon := writeBundleFile(t, root, "looperd-bin", "daemon")
+	cli := writeIdentityExecutable(t, root, "looper-bin", "release-a")
+	daemon := writeIdentityExecutable(t, root, "looperd-bin", "release-a")
 	originalSyncDirectory := syncDirectory
 	t.Cleanup(func() { syncDirectory = originalSyncDirectory })
 	calls := map[string]int{}
@@ -82,8 +84,8 @@ func TestCreatePinsConfigContentsAcrossSnapshotWindow(t *testing.T) {
 	// bundle even if ConfigPath is rewritten while Snapshot runs.
 	root := t.TempDir()
 	configPath := writeBundleFile(t, root, "config.toml", "revision-checked\n")
-	cli := writeBundleFile(t, root, "looper-bin", "cli")
-	daemon := writeBundleFile(t, root, "looperd-bin", "daemon")
+	cli := writeIdentityExecutable(t, root, "looper-bin", "release-a")
+	daemon := writeIdentityExecutable(t, root, "looperd-bin", "release-a")
 	pinned := []byte("revision-checked\n")
 	result, err := Create(context.Background(), Input{
 		RootDir:          filepath.Join(root, "backups"),
@@ -118,10 +120,16 @@ func TestCreatePinsBinaryContentsAcrossSnapshotWindow(t *testing.T) {
 	// executable images verified before the snapshot began.
 	root := t.TempDir()
 	config := writeBundleFile(t, root, "config.toml", "[server]\n")
-	cli := writeBundleFile(t, root, "looper-bin", "candidate-cli")
-	daemon := writeBundleFile(t, root, "looperd-bin", "candidate-daemon")
-	pinnedCLI := []byte("verified-cli")
-	pinnedDaemon := []byte("verified-daemon")
+	cli := writeIdentityExecutable(t, root, "looper-bin", "release-a")
+	daemon := writeIdentityExecutable(t, root, "looperd-bin", "release-a")
+	pinnedCLI, err := os.ReadFile(cli)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedDaemon, err := os.ReadFile(daemon)
+	if err != nil {
+		t.Fatal(err)
+	}
 	result, err := Create(context.Background(), Input{
 		RootDir:              filepath.Join(root, "backups"),
 		ConfigPath:           config,
@@ -172,8 +180,8 @@ func TestCreateUsesUniqueBundleWhenTimestampDirectoryAlreadyExists(t *testing.T)
 		t.Fatal(err)
 	}
 	config := writeBundleFile(t, root, "config.toml", "[server]\n")
-	cli := writeBundleFile(t, root, "looper-bin", "cli")
-	daemon := writeBundleFile(t, root, "looperd-bin", "daemon")
+	cli := writeIdentityExecutable(t, root, "looper-bin", "release-a")
+	daemon := writeIdentityExecutable(t, root, "looperd-bin", "release-a")
 	result, err := Create(context.Background(), Input{
 		RootDir: backupRoot, ConfigPath: config, DatabasePath: filepath.Join(root, "looper.sqlite"),
 		CLIBinaryPath: cli, DaemonBinaryPath: daemon, Now: func() time.Time { return now },
@@ -208,8 +216,8 @@ func TestCreateRemovesPartialBundleOnCopyFailure(t *testing.T) {
 func TestVerifyAcceptsCreatedBundleAndRejectsChangedLayoutOrContent(t *testing.T) {
 	root := t.TempDir()
 	config := writeBundleFile(t, root, "config.toml", "[server]\n")
-	cli := writeBundleFile(t, root, "looper-bin", "cli")
-	daemon := writeBundleFile(t, root, "looperd-bin", "daemon")
+	cli := writeIdentityExecutable(t, root, "looper-bin", "release-a")
+	daemon := writeIdentityExecutable(t, root, "looperd-bin", "release-a")
 	result, err := Create(context.Background(), Input{RootDir: filepath.Join(root, "backups"), ConfigPath: config, DatabasePath: filepath.Join(root, "looper.sqlite"), CLIBinaryPath: cli, DaemonBinaryPath: daemon, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 2, 3, 0, time.UTC) }, Snapshot: func(context.Context) (string, error) {
 		return writeBundleFile(t, root, "snapshot.sqlite", "sqlite-consistent"), nil
 	}})
@@ -234,11 +242,25 @@ func TestVerifyAcceptsCreatedBundleAndRejectsChangedLayoutOrContent(t *testing.T
 	}
 }
 
+func TestCreateRejectsVersionSkewedBinaryPair(t *testing.T) {
+	root := t.TempDir()
+	config := writeBundleFile(t, root, "config.toml", "[server]\n")
+	cli := writeIdentityExecutable(t, root, "looper-bin", "release-a")
+	daemon := writeIdentityExecutable(t, root, "looperd-bin", "release-b")
+	snapshot := writeBundleFile(t, root, "snapshot.sqlite", "sqlite")
+	if _, err := Create(context.Background(), Input{RootDir: filepath.Join(root, "backups"), ConfigPath: config, DatabasePath: filepath.Join(root, "looper.sqlite"), CLIBinaryPath: cli, DaemonBinaryPath: daemon, Now: time.Now, Snapshot: func(context.Context) (string, error) { return snapshot, nil }}); err == nil {
+		t.Fatal("Create() error = nil for version-skewed binary pair")
+	}
+	if _, err := os.Stat(snapshot); err != nil {
+		t.Fatalf("snapshot = %v, want source snapshot preserved after pair rejection", err)
+	}
+}
+
 func TestCreateAcceptsEmptyConfigContents(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "config.toml")
-	cli := writeBundleFile(t, root, "looper-bin", "cli")
-	daemon := writeBundleFile(t, root, "looperd-bin", "daemon")
+	cli := writeIdentityExecutable(t, root, "looper-bin", "release-a")
+	daemon := writeIdentityExecutable(t, root, "looperd-bin", "release-a")
 	result, err := Create(context.Background(), Input{
 		RootDir: filepath.Join(root, "backups"), ConfigPath: configPath, ConfigContents: []byte{},
 		DatabasePath: filepath.Join(root, "looper.sqlite"), CLIBinaryPath: cli, DaemonBinaryPath: daemon,
@@ -267,8 +289,8 @@ func TestRestoreSourceRejectsLegacyManifest(t *testing.T) {
 func TestVerifyAcceptsLegacyManifestButRejectsRelativeV2RestorePaths(t *testing.T) {
 	root := t.TempDir()
 	config := writeBundleFile(t, root, "config.toml", "[server]\n")
-	cli := writeBundleFile(t, root, "looper-bin", "cli")
-	daemon := writeBundleFile(t, root, "looperd-bin", "daemon")
+	cli := writeIdentityExecutable(t, root, "looper-bin", "release-a")
+	daemon := writeIdentityExecutable(t, root, "looperd-bin", "release-a")
 	result, err := Create(context.Background(), Input{RootDir: filepath.Join(root, "backups"), ConfigPath: config, DatabasePath: filepath.Join(root, "looper.sqlite"), CLIBinaryPath: cli, DaemonBinaryPath: daemon, Snapshot: func(context.Context) (string, error) {
 		return writeBundleFile(t, root, "snapshot.sqlite", "sqlite"), nil
 	}})
@@ -304,6 +326,21 @@ func writeBundleFile(t *testing.T, dir, name, contents string) string {
 	t.Helper()
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+func writeIdentityExecutable(t *testing.T, dir, name, commit string) string {
+	t.Helper()
+	dirty := false
+	ts := "2026-07-31T01:02:03Z"
+	identity := version.Info{Version: "1.2.3", Metadata: version.BuildMetadata{VersionSource: "test", Channel: "release", APIVersion: "v1", GitCommitSHA: &commit, BuildTimestamp: &ts, Dirty: &dirty}}
+	encoded, err := json.Marshal(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf '%s\\n' '"+string(encoded)+"'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return path

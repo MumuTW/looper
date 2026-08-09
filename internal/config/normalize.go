@@ -1428,6 +1428,12 @@ func mergeCoordinatorRoleConfig(config *CoordinatorRoleConfig, partial PartialCo
 	if partial.PostMergeDigest != nil {
 		mergeCoordinatorPostMergeDigestConfig(&config.PostMergeDigest, *partial.PostMergeDigest)
 	}
+	if partial.ConflictPolicy != nil && partial.ConflictPolicy.MaxRepairs != nil {
+		if config.ConflictPolicy == nil {
+			config.ConflictPolicy = &CoordinatorConflictPolicyConfig{}
+		}
+		config.ConflictPolicy.MaxRepairs = *partial.ConflictPolicy.MaxRepairs
+	}
 }
 
 func mergeCoordinatorPostMergeDigestConfig(config **CoordinatorPostMergeDigestConfig, partial PartialCoordinatorPostMergeDigestConfig) {

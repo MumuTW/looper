@@ -283,7 +283,7 @@ func splitGlobalFlags(args []string) (parsedArgs, error) {
 			parsed.Verb = arg
 			continue
 		}
-		if strings.HasPrefix(arg, "-") && arg != "-" && parsed.Verb != "review" && parsed.Verb != "retry" && parsed.Verb != "version" && parsed.Verb != "--version" && parsed.Verb != "provider" && parsed.Verb != "upgrade" {
+		if strings.HasPrefix(arg, "-") && arg != "-" && parsed.Verb != "review" && parsed.Verb != "retry" && parsed.Verb != "upgrade" && parsed.Verb != "version" && parsed.Verb != "--version" && parsed.Verb != "provider" {
 			return parsedArgs{}, fmt.Errorf("unknown flag %q", name)
 		}
 		if parsed.Verb == "" {

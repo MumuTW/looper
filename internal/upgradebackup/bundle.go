@@ -23,12 +23,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/version"
 )
 
 const (
@@ -160,9 +162,6 @@ func Create(ctx context.Context, input Input) (Result, error) {
 	}
 	fail := func(err error) (Result, error) { _ = os.RemoveAll(bundle); return Result{}, err }
 	files := map[string]File{}
-	if err := moveAndRecord(snapshot, filepath.Join(bundle, "database.sqlite"), files, "database.sqlite"); err != nil {
-		return fail(err)
-	}
 	configName := "config.toml"
 	if input.ConfigContents != nil {
 		if ext := filepath.Ext(configPath); ext != "" {
@@ -194,6 +193,17 @@ func Create(ctx context.Context, input Input) (Result, error) {
 		if copyErr != nil {
 			return fail(copyErr)
 		}
+	}
+	// Check the exact copied/pinned pair before publishing the manifest. A stale
+	// CLI beside the current daemon would make a self-consistent but unusable
+	// rollback bundle.
+	if err := verifyBinaryPair(ctx, filepath.Join(bundle, "looper"), filepath.Join(bundle, "looperd")); err != nil {
+		return fail(err)
+	}
+	// Keep the source snapshot recoverable until the binary pair has passed
+	// validation. A rejected release must not consume the daemon's snapshot.
+	if err := moveAndRecord(snapshot, filepath.Join(bundle, "database.sqlite"), files, "database.sqlite"); err != nil {
+		return fail(err)
 	}
 	// Restore requires absolute source paths. Materialized-only configs leave
 	// ConfigPath empty so RestoreSource refuses rather than inventing a path.
@@ -227,6 +237,36 @@ func Create(ctx context.Context, input Input) (Result, error) {
 		}
 	}
 	return Result{Directory: bundle, Manifest: manifest}, nil
+}
+
+func verifyBinaryPair(ctx context.Context, cliPath, daemonPath string) error {
+	cli, err := readBuildIdentity(ctx, cliPath, "version", "--json")
+	if err != nil {
+		return fmt.Errorf("verify backup CLI identity: %w", err)
+	}
+	daemon, err := readBuildIdentity(ctx, daemonPath, "--version-json")
+	if err != nil {
+		return fmt.Errorf("verify backup daemon identity: %w", err)
+	}
+	if !cli.SameBuild(daemon) {
+		return fmt.Errorf("backup CLI and daemon build identities differ")
+	}
+	return nil
+}
+
+func readBuildIdentity(ctx context.Context, binary string, args ...string) (version.Info, error) {
+	output, err := exec.CommandContext(ctx, binary, args...).Output()
+	if err != nil {
+		return version.Info{}, err
+	}
+	var identity version.Info
+	if err := json.Unmarshal(output, &identity); err != nil {
+		return version.Info{}, fmt.Errorf("decode build identity: %w", err)
+	}
+	if !identity.Complete() {
+		return version.Info{}, fmt.Errorf("build identity is incomplete")
+	}
+	return identity, nil
 }
 
 // ensureBackupRoot creates the backup root and returns every newly-created

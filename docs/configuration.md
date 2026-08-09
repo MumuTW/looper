@@ -99,7 +99,7 @@ The hot-safe surface is an explicit allowlist (see [ADR-0014](adr/0014-config-fi
 - the current `disclosure.*` fields
 - `defaults.allowAutoCommit`, `defaults.allowAutoPush`, `defaults.allowRiskyFixes`, `defaults.openPrStrategy`, and `defaults.addSnapshotMode`; `defaults.baseBranch` is restart-bound because configured project records materialize it
 - `instructions.enabled` only
-- the current Planner discovery/trigger/instruction fields; all current Worker and Fixer discovery/trigger/instruction fields; Reviewer discovery, most behavior, and instructions; and Coordinator polling, triage, dispatch, and merge-watch policy except `mergeWatch.transientRetries`
+- the current Planner discovery/trigger/instruction fields; all current Worker and Fixer discovery/trigger/instruction fields; Reviewer discovery, most behavior, and instructions; and Coordinator polling, triage, dispatch, merge-watch, and conflict-policy fields except `mergeWatch.transientRetries`
 - `tools.looperPath` and `tools.osascriptPath`
 
 Profile and role agent vendor/model/reasoning-effort fields are hot-safe curated identity fields: a claim made after publication resolves against the new config; an already active run keeps the frozen agent snapshot it started with (resume/retry lineages copy that predecessor snapshot rather than re-resolving live config).
@@ -588,6 +588,14 @@ Coordinator triage lives under `roles.coordinator.triage.*`:
 
 Coordinator clears and rewrites its own label namespace on each successful triage pass: `kind/*`, `area/*`, `complexity/*`, `<namespace>dispatch:*`, `wontfix`, and `needs-info`. Bare `dispatch/*` labels are foreign host state and are never removed. It then posts or edits the marker comment and writes the project-scoped completion marker last.
 
+### Conflict-repair policy
+
+Coordinator carries the conflict count in the durable merge-watch comment, so it survives daemon restarts and continues across new PR head SHAs. When the limit is reached, the existing Fixer close-and-regenerate authority closes a Looper-authored PR and sends its originating Issue back to Planner. PRs with human commits are escalated with `looper:needs-human` instead.
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.coordinator.conflictPolicy.maxRepairs` | Number of merge-conflict repairs allowed for one PR before close-and-regenerate | `2` |
+
 ### Dispatch settings
 
 Coordinator dispatch lives under `roles.coordinator.dispatch.*`:
@@ -711,6 +719,9 @@ maxPerTick = 5
 outOfScopeLabel = "wontfix"
 unclearLabel = "needs-info"
 reTriageOnAuthorReply = true
+
+[roles.coordinator.conflictPolicy]
+maxRepairs = 2
 
 [roles.coordinator.dispatch]
 mode = "human-gated"

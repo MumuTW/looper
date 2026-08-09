@@ -68,6 +68,14 @@ type OperationLease interface {
 	Owns(queueItemID string) bool
 }
 
+// DetachedOperationLease is the Supervisor ownership token for a detached
+// operation that has no durable queue claim. It is bound at admission and must
+// be released only after the operation's complete lifecycle has finished.
+type DetachedOperationLease interface {
+	Context() context.Context
+	Release()
+}
+
 // operationLease implements OperationLease under ActiveExecutionRegistry.
 //
 // Lock order when both are needed: registry.mu (r.mu) before lease.mu (l.mu).
@@ -281,6 +289,63 @@ func (r *ActiveExecutionRegistry) AdmitOperation(ctx context.Context, meta Opera
 	}
 	r.pendingOps[id] = lease
 	r.mu.Unlock()
+	return lease, nil
+}
+
+// AdmitDetachedOperation acquires a Supervisor operation lease for work that
+// runs outside a scheduler tick but is not represented by a queue claim. The
+// returned lease is already bound, so shutdown sees the operation immediately
+// and cancels its context before waiting for Release.
+func (r *ActiveExecutionRegistry) AdmitDetachedOperation(ctx context.Context, meta OperationMeta) (DetachedOperationLease, error) {
+	if r == nil {
+		return nil, ErrOperationAdmissionClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	r.mu.Lock()
+	allow := r.allowSpawn
+	closed := r.admissionClosed
+	r.mu.Unlock()
+	if allow != nil {
+		if err := allow(); err != nil {
+			return nil, errors.Join(ErrOperationAdmissionClosed, err)
+		}
+	}
+	if closed {
+		return nil, ErrOperationAdmissionClosed
+	}
+
+	r.mu.Lock()
+	if r.admissionClosed {
+		r.mu.Unlock()
+		return nil, ErrOperationAdmissionClosed
+	}
+	if r.boundOps == nil {
+		r.boundOps = make(map[uint64]*operationLease)
+	}
+	if r.boundByQueueItem == nil {
+		r.boundByQueueItem = make(map[string]uint64)
+	}
+	r.nextOpLeaseID++
+	id := r.nextOpLeaseID
+	leaseCtx, cancel := context.WithCancelCause(ctx)
+	lease := &operationLease{
+		registry:    r,
+		id:          id,
+		meta:        meta,
+		ctx:         leaseCtx,
+		cancel:      cancel,
+		bound:       true,
+		pendingDone: make(chan struct{}),
+	}
+	r.boundOps[id] = lease
+	r.mu.Unlock()
+	lease.closePendingDone()
 	return lease, nil
 }
 

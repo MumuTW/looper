@@ -38,7 +38,7 @@ func TestWebhookForwardersRepositoryCRUD(t *testing.T) {
 	if err := repo.Delete(context.Background(), "MumuTW/looper"); err != nil {
 		t.Fatalf("Delete() error = %v", err)
 	}
-	if err := repo.Delete(context.Background(), "nexu-io/missing"); err != nil {
+	if err := repo.Delete(context.Background(), "MumuTW/missing"); err != nil {
 		t.Fatalf("Delete(missing) error = %v", err)
 	}
 	records, err = repo.List(context.Background())

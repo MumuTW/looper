@@ -129,6 +129,64 @@ func TestRoundBudgetParksProductiveNonConvergingLoop(t *testing.T) {
 	}
 }
 
+func TestRoundBudgetSeedsFirstFixerPushAndIgnoresHumanHead(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(506)
+	loop := seedRoundBudgetLoop(t, fixture, "loop_round_budget_authorship", repo, prNumber)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, MaxFixerRoundsPerPullRequest: 3, Logger: fixture.logger, Now: fixture.now})
+	seeded, err := runner.mergeLoopMetadata(context.Background(), loop, map[string]any{
+		"fixerRoundBudget": roundBudgetState{Rounds: 0, LastHeadSHA: "head-initial", FirstRoundAt: fixture.nowISO(), RecordedAt: fixture.nowISO()},
+		"lastFixHeadSha":   "head-initial",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, parked, err := runner.chargeFixerRound(context.Background(), seeded, "head-human")
+	if err != nil || parked {
+		t.Fatalf("human head charge = (%#v, %v, %v), want no park", updated, parked, err)
+	}
+	state, ok := parseRoundBudgetState(parseJSONObject(updated.MetadataJSON))
+	if !ok || state.Rounds != 0 || state.LastHeadSHA != "head-human" {
+		t.Fatalf("human head budget = (%#v, %v), want rounds 0 at human head", state, ok)
+	}
+	fixerHead := *updated.MetadataJSON
+	fixerMetadata := parseJSONObject(&fixerHead)
+	fixerMetadata["lastFixHeadSha"] = "head-fixer"
+	encoded := runpipe.MustMarshalJSON(fixerMetadata)
+	updated.MetadataJSON = &encoded
+	updated, parked, err = runner.chargeFixerRound(context.Background(), updated, "head-fixer")
+	if err != nil || parked {
+		t.Fatalf("first authored head charge = (%#v, %v, %v), want one charged round", updated, parked, err)
+	}
+	state, ok = parseRoundBudgetState(parseJSONObject(updated.MetadataJSON))
+	if !ok || state.Rounds != 1 || state.LastHeadSHA != "head-fixer" {
+		t.Fatalf("first authored head budget = (%#v, %v), want rounds 1", state, ok)
+	}
+}
+
+func TestRoundBudgetMigratesPersistedFixerHeadWithoutState(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(507)
+	loop := seedRoundBudgetLoop(t, fixture, "loop_round_budget_migrate", repo, prNumber)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, MaxFixerRoundsPerPullRequest: 3, Logger: fixture.logger, Now: fixture.now})
+	updated, err := runner.mergeLoopMetadata(context.Background(), loop, map[string]any{"lastFixHeadSha": "head-first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, parked, err := runner.chargeFixerRound(context.Background(), updated, "head-first")
+	if err != nil || parked {
+		t.Fatalf("migrated charge = (%#v, %v, %v), want first round without park", updated, parked, err)
+	}
+	state, ok := parseRoundBudgetState(parseJSONObject(updated.MetadataJSON))
+	if !ok || state.Rounds != 1 || state.LastHeadSHA != "head-first" {
+		t.Fatalf("migrated budget = (%#v, %v), want rounds 1", state, ok)
+	}
+}
+
 // TestRoundBudgetPauseSurvivesNewFeedback pins the asymmetry against the sibling
 // gates: a new head resumes a zero-progress or failure-streak pause because it is
 // new evidence, but here a steady supply of new heads is the condition being

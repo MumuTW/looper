@@ -1217,7 +1217,7 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 	if err != nil {
 		return fixer.PullRequestDetail{}, err
 	}
-	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, MergedAt: detail.MergedAt, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
 }
 
 // ViewPullRequestForDiscovery is the lightweight metadata tier: no
@@ -1261,7 +1261,7 @@ func (a fixerGitHubAdapter) ListIssueComments(ctx context.Context, input fixer.V
 	}
 	out := make([]fixer.IssueComment, 0, len(comments))
 	for _, comment := range comments {
-		out = append(out, fixer.IssueComment{ID: comment.ID, Body: comment.Body})
+		out = append(out, fixer.IssueComment{ID: comment.ID, Author: comment.Author, Body: comment.Body})
 	}
 	return out, nil
 }
@@ -1271,7 +1271,7 @@ func (a fixerGitHubAdapter) ClosePullRequest(ctx context.Context, input fixer.Cl
 	if err != nil {
 		return err
 	}
-	return a.gateway.ClosePullRequest(ctx, githubinfra.ClosePullRequestInput{Repo: repo, PRNumber: input.PRNumber, DeleteBranch: input.DeleteBranch, CWD: input.CWD})
+	return a.gateway.ClosePullRequest(ctx, githubinfra.ClosePullRequestInput{Repo: repo, PRNumber: input.PRNumber, DeleteBranch: input.DeleteBranch, ExpectedHeadSHA: input.ExpectedHeadSHA, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) AddIssueLabels(ctx context.Context, input fixer.IssueLabelsInput) error {
@@ -2222,6 +2222,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	var coordinatorRunner coordinatorScheduler
 	var reviewerRunner reviewerScheduler
 	var fixerRunner fixerScheduler
+	var fixerRoleRunner *fixer.Runner
 	var workerRunner workerScheduler
 
 	looperCLIPath := resolveTrustedLooperCLIPath(cfg, logger)
@@ -2371,13 +2372,23 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	// Coordinator triage LLM uses the global agent only; missing global vendor
 	// must not disable coding roles that resolve via role/profile bindings.
 	coordinatorOpts := coordinatorrole.Options{
-		Repos:                  repos,
-		GitHub:                 githubGateway,
-		Config:                 &cfg,
-		Logger:                 logger,
-		Now:                    now,
-		State:                  coordinatorState,
-		Network:                coordinatorrole.NewLoopernetGateway(networkclient.DefaultStatePath(runtimeHomeDirOrEmpty())),
+		Repos:   repos,
+		GitHub:  githubGateway,
+		Config:  &cfg,
+		Logger:  logger,
+		Now:     now,
+		State:   coordinatorState,
+		Network: coordinatorrole.NewLoopernetGateway(networkclient.DefaultStatePath(runtimeHomeDirOrEmpty())),
+		RegenerateConflict: func(ctx context.Context, input coordinatorrole.ConflictRegenerationInput) (coordinatorrole.ConflictRegenerationResult, error) {
+			if fixerRoleRunner == nil {
+				return coordinatorrole.ConflictRegenerationResult{}, fmt.Errorf("fixer runner is not configured for coordinator conflict regeneration")
+			}
+			result, err := fixerRoleRunner.RegenerateConflict(ctx, fixer.ConflictRegenerationInput{
+				ProjectID: input.ProjectID, Repo: input.Repo, IssueRepo: input.IssueRepo, IssueNumber: input.IssueNumber,
+				PRNumber: input.PRNumber, ConflictRepairs: input.ConflictRepairs, CWD: input.CWD,
+			})
+			return coordinatorrole.ConflictRegenerationResult{Completed: result.Completed, Escalated: result.Escalated}, err
+		},
 		CancelRetiredAutoMerge: true,
 	}
 	if cfg.Agent.Vendor != nil {
@@ -2493,7 +2504,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		if !fixerConfigured {
 			fixerAutoDiscovery = false
 		}
-		fixerRunner = fixer.New(fixer.Options{
+		fixerRoleRunner = fixer.New(fixer.Options{
 			DB:                          coordinator.DB(),
 			Repos:                       repos,
 			GitHub:                      fixerGitHubAdapter{gateway: githubGateway, stamper: fixerStamper, config: &cfg},
@@ -2567,6 +2578,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 			},
 		})
+		fixerRunner = fixerRoleRunner
 	}
 	notifyHITLAsk := func(ctx context.Context, ask worker.HITLAskNotification) error {
 		return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{

@@ -153,9 +153,12 @@ looper upgrade preflight --target-looper /path/to/candidate/looper --target-loop
 
 Preflight only calls `GET /api/v1/version` and `GET /api/v1/status` on the running daemon and executes the candidate binaries' identity (and optional `--check-config`) commands. It does not start a second production daemon or mutate the production database. Incomplete build identities never count as a matching CLI/daemon pair.
 
-After a clean preflight, create an explicit rollback bundle (daemon-owned SQLite online backup + config + matching binaries + checksums):
+After a clean preflight, close work admission and wait for the Supervisor to report
+that all owned work has drained before taking the rollback snapshot. This ordering
+keeps the SQLite backup aligned with the final quiescent runtime state:
 
 ```bash
+looper upgrade drain --deadline 10m
 looper upgrade backup
 looper upgrade verify --bundle <directory>
 ```

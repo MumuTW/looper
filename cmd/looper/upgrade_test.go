@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -111,6 +112,12 @@ func TestUpgradePreflightReportsTargetConfigFailure(t *testing.T) {
 	}
 	if report.TargetConfigCompatible || report.TargetConfigError != "configuration schema rejected" {
 		t.Fatalf("config result = (%v, %q)", report.TargetConfigCompatible, report.TargetConfigError)
+	}
+}
+
+func TestTargetConfigFlagsExcludeClientEndpointOverrides(t *testing.T) {
+	if got, want := targetConfigFlags([]string{"--host", "127.0.0.1", "--config", "/etc/looper.toml", "--port=9443"}), []string{"--config", "/etc/looper.toml"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("targetConfigFlags() = %#v, want %#v", got, want)
 	}
 }
 
@@ -564,8 +571,9 @@ func createUpgradeRestoreBundleWithSource(t *testing.T) (bundleDir, databasePath
 	t.Helper()
 	root := t.TempDir()
 	configPath = writeUpgradeBundleFile(t, root, "config.toml", "[server]\n")
-	cli := writeUpgradeBundleFile(t, root, "looper", "cli")
-	daemon := writeUpgradeBundleFile(t, root, "looperd", "daemon")
+	identity := completeUpgradeIdentity("rollback-release")
+	cli := writeIdentityProgram(t, identity)
+	daemon := writeIdentityProgram(t, identity)
 	databasePath = filepath.Join(root, "looper.sqlite")
 	bundle, err := upgradebackup.Create(context.Background(), upgradebackup.Input{RootDir: filepath.Join(root, "backups"), ConfigPath: configPath, DatabasePath: databasePath, CLIBinaryPath: cli, DaemonBinaryPath: daemon, Snapshot: func(context.Context) (string, error) {
 		return writeUpgradeBundleFile(t, root, "snapshot.sqlite", "sqlite"), nil

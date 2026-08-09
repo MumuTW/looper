@@ -277,6 +277,28 @@ func TestStageRejectsConflictingExistingReleaseAndNonExecutableInput(t *testing.
 	}
 }
 
+func TestRemoveDiscardsOnlyTheNamedRelease(t *testing.T) {
+	root := t.TempDir()
+	sources := t.TempDir()
+	first, err := Stage(StageInput{RootDir: root, ReleaseID: "1.2.3-stable-aaaaaaa", CLIBinaryPath: writeExecutable(t, sources, "looper", "cli"), DaemonBinaryPath: writeExecutable(t, sources, "looperd", "daemon"), Build: testBuild("1.2.3", "aaaaaaa"), Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := Stage(StageInput{RootDir: root, ReleaseID: "1.2.4-stable-bbbbbbb", CLIBinaryPath: writeExecutable(t, sources, "looper-2", "cli2"), DaemonBinaryPath: writeExecutable(t, sources, "looperd-2", "daemon2"), Build: testBuild("1.2.4", "bbbbbbb"), Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Remove(root, first.ReleaseID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(first.Directory); !os.IsNotExist(err) {
+		t.Fatalf("removed release stat = %v, want not exist", err)
+	}
+	if _, err := os.Stat(second.Directory); err != nil {
+		t.Fatalf("sibling release removed: %v", err)
+	}
+}
+
 func writeExecutable(t *testing.T, directory, name, contents string) string {
 	t.Helper()
 	path := filepath.Join(directory, name)

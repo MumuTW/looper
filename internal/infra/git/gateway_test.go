@@ -1757,7 +1757,7 @@ count=$((count + 1))
 printf '%s' "$count" > "$count_file"
 if [ "$count" -eq 1 ]; then
 	cat >&2 <<'EOF'
-From github.com:nexu-io/open-design
+From github.com:MumuTW/open-design
  * branch                main       -> FETCH_HEAD
 error: cannot lock ref 'refs/remotes/origin/main': is at e64f1d8497409e76387cce3afcd5c51406a4174d but expected 6bf865a43beb8149c8f64a0af297c09c313f9a4a
  ! 6bf865a43..e64f1d849  main       -> origin/main  (unable to update local ref)

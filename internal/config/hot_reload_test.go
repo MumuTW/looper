@@ -48,6 +48,7 @@ func TestIsHotEditablePathUsesExplicitAllowlist(t *testing.T) {
 		"roles.reviewer.behavior.convergence.maxFixerAttemptsPerItem",
 		"roles.reviewer.behavior.convergence.maxTotalRounds",
 		"roles.reviewer.behavior.convergence.severityFloor",
+		"roles.coordinator.conflictPolicy.maxRepairs",
 		"tools.looperPath",
 		"tools.osascriptPath",
 	}

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/MumuTW/looper/internal/upgradebackup"
+	"github.com/MumuTW/looper/internal/version"
 )
 
 func copyFileExclusive(source, dest string) error {
@@ -94,8 +95,16 @@ func TestRestoreRefusesBundleMutatedAfterVerify(t *testing.T) {
 	cli := filepath.Join(root, "looper")
 	daemon := filepath.Join(root, "looperd")
 	writeTestFile(t, configPath, "[server]\n", 0o600)
-	writeTestFile(t, cli, "cli", 0o755)
-	writeTestFile(t, daemon, "daemon", 0o755)
+	commit, timestamp, dirty := "rollback-release", "2026-08-09T00:00:00Z", false
+	identity, err := json.Marshal(version.Info{Version: "1.2.3", Metadata: version.BuildMetadata{
+		VersionSource: "test", Channel: "release", APIVersion: "v1", GitCommitSHA: &commit, BuildTimestamp: &timestamp, Dirty: &dirty,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	program := "#!/bin/sh\nprintf '%s\\n' '" + string(identity) + "'\n"
+	writeTestFile(t, cli, program, 0o755)
+	writeTestFile(t, daemon, program, 0o755)
 	result, err := upgradebackup.Create(context.Background(), upgradebackup.Input{
 		RootDir: filepath.Join(root, "backups"), ConfigPath: configPath, DatabasePath: filepath.Join(root, "db.sqlite"),
 		CLIBinaryPath: cli, DaemonBinaryPath: daemon,

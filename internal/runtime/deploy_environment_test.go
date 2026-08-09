@@ -10,6 +10,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/deployer"
+	"github.com/MumuTW/looper/internal/processcontainment"
 )
 
 // This test runs a real /bin/sh on purpose.
@@ -29,7 +30,7 @@ func TestDeployCommandInheritsTheDaemonEnvironment(t *testing.T) {
 		Environment: map[string]string{"LOOPER_DEPLOY_OVERRIDE": "override-value"},
 	}
 
-	exitCode, logPath, err := runDeployCommand(context.Background(), dir, logDir, role, 30*time.Second, nil)
+	exitCode, logPath, err := runDeployCommand(context.Background(), dir, logDir, role, 30*time.Second, nil, nil)
 	if err != nil {
 		t.Fatalf("runDeployCommand() error = %v", err)
 	}
@@ -52,6 +53,35 @@ func TestDeployCommandInheritsTheDaemonEnvironment(t *testing.T) {
 	}
 	if strings.TrimSpace(parts[2]) == "" {
 		t.Fatal("PATH was empty — the configured environment replaced the inherited one")
+	}
+}
+
+type deployTestTracker struct {
+	tracked  chan struct{}
+	released chan struct{}
+}
+
+func (t *deployTestTracker) Track(*processcontainment.Handle) func() {
+	close(t.tracked)
+	return func() { close(t.released) }
+}
+
+func (t *deployTestTracker) ReportDrainFailure(error) {}
+
+func TestDeployCommandRegistersContainmentWithSupervisor(t *testing.T) {
+	tracker := &deployTestTracker{tracked: make(chan struct{}), released: make(chan struct{})}
+	if _, _, err := runDeployCommand(context.Background(), t.TempDir(), t.TempDir(), config.DeployerRoleConfig{Command: "printf deploy"}, 30*time.Second, nil, tracker); err != nil {
+		t.Fatalf("runDeployCommand() error = %v", err)
+	}
+	select {
+	case <-tracker.tracked:
+	case <-time.After(time.Second):
+		t.Fatal("deploy command did not register its containment handle")
+	}
+	select {
+	case <-tracker.released:
+	case <-time.After(time.Second):
+		t.Fatal("deploy command did not release its containment handle")
 	}
 }
 
@@ -89,7 +119,7 @@ func TestUnstartableCommandIsNotAFailedDeploy(t *testing.T) {
 	role := config.DeployerRoleConfig{Command: "true"}
 
 	// A working directory that does not exist prevents the process from starting.
-	_, _, err := runDeployCommand(context.Background(), filepath.Join(t.TempDir(), "missing"), logDir, role, 30*time.Second, nil)
+	_, _, err := runDeployCommand(context.Background(), filepath.Join(t.TempDir(), "missing"), logDir, role, 30*time.Second, nil, nil)
 
 	if err == nil {
 		t.Fatal("runDeployCommand() succeeded with an unusable working directory")

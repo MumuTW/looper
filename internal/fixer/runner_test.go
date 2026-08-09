@@ -6966,32 +6966,33 @@ func (f *runnerFixture) nowISO() string {
 }
 
 type fakeGitHubGateway struct {
-	currentUser           string
-	currentUserErr        error
-	listOpen              []PullRequestSummary
-	listOpenByLabel       map[string][]PullRequestSummary
-	listCalls             []ListOpenPullRequestsInput
-	viewResponses         []PullRequestDetail
-	threads               []ReviewThread
-	viewThreadCalls       []ViewReviewThreadInput
-	viewIndex             int
-	resolveCalls          []ResolveReviewThreadInput
-	addLabelCalls         []PullRequestLabelsInput
-	removeLabelCalls      []PullRequestLabelsInput
-	reviewerRequests      []PullRequestReviewersInput
-	reviews               []ReviewSummary
-	dismissedReviews      []DismissReviewInput
-	replyCalls            []AddReviewThreadReplyInput
-	replyErr              error
-	resolveErr            error
-	createIssueComments   []IssueCommentInput
-	updateIssueComments   []UpdateIssueCommentInput
-	createIssueCommentErr error
-	updateIssueCommentErr error
-	nextIssueCommentID    int64
-	compareCalls          []CompareCommitsInput
-	compareStatus         string
-	compareErr            error
+	currentUser            string
+	currentUserErr         error
+	listOpen               []PullRequestSummary
+	listOpenByLabel        map[string][]PullRequestSummary
+	listCalls              []ListOpenPullRequestsInput
+	viewResponses          []PullRequestDetail
+	threads                []ReviewThread
+	viewThreadCalls        []ViewReviewThreadInput
+	viewIndex              int
+	resolveCalls           []ResolveReviewThreadInput
+	addLabelCalls          []PullRequestLabelsInput
+	removeLabelCalls       []PullRequestLabelsInput
+	reviewerRequests       []PullRequestReviewersInput
+	reviews                []ReviewSummary
+	dismissedReviews       []DismissReviewInput
+	replyCalls             []AddReviewThreadReplyInput
+	replyErr               error
+	resolveErr             error
+	createIssueComments    []IssueCommentInput
+	updateIssueComments    []UpdateIssueCommentInput
+	createIssueCommentErr  error
+	updateIssueCommentErr  error
+	addPullRequestLabelErr error
+	nextIssueCommentID     int64
+	compareCalls           []CompareCommitsInput
+	compareStatus          string
+	compareErr             error
 }
 
 func (f *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -7135,7 +7136,7 @@ func (f *fakeGitHubGateway) UpdateIssueComment(_ context.Context, input UpdateIs
 
 func (f *fakeGitHubGateway) AddPullRequestLabels(_ context.Context, input PullRequestLabelsInput) error {
 	f.addLabelCalls = append(f.addLabelCalls, input)
-	return nil
+	return f.addPullRequestLabelErr
 }
 
 func (f *fakeGitHubGateway) RemovePullRequestLabels(_ context.Context, input PullRequestLabelsInput) error {

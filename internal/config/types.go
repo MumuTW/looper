@@ -754,6 +754,13 @@ type CoordinatorPostMergeDigestConfig struct {
 	MaxItems     int    `json:"maxItems"`
 }
 
+// CoordinatorConflictPolicyConfig bounds repeated merge-conflict repairs for
+// one pull request. The count is carried by the durable merge-watch marker so
+// a moving base branch cannot make the same stale branch loop forever.
+type CoordinatorConflictPolicyConfig struct {
+	MaxRepairs int `json:"maxRepairs"`
+}
+
 type CoordinatorRoleConfig struct {
 	Enabled         bool                              `json:"enabled"`
 	PollInterval    string                            `json:"pollInterval"`
@@ -763,6 +770,10 @@ type CoordinatorRoleConfig struct {
 	MergeWatch      CoordinatorMergeWatchConfig       `json:"mergeWatch"`
 	MarkReady       CoordinatorMarkReadyConfig        `json:"markReady"`
 	PostMergeDigest *CoordinatorPostMergeDigestConfig `json:"postMergeDigest,omitempty"`
+	// Nil means the built-in two-repair policy. Keeping the default implicit
+	// preserves the frozen config representation while still allowing an
+	// explicit project/operator override.
+	ConflictPolicy *CoordinatorConflictPolicyConfig `json:"conflictPolicy,omitempty"`
 }
 
 type RoleConfigs struct {
@@ -1550,6 +1561,10 @@ type PartialCoordinatorPostMergeDigestConfig struct {
 	MaxItems     *int    `json:"maxItems,omitempty"`
 }
 
+type PartialCoordinatorConflictPolicyConfig struct {
+	MaxRepairs *int `json:"maxRepairs,omitempty"`
+}
+
 type PartialCoordinatorRoleConfig struct {
 	Enabled         *bool                                    `json:"enabled,omitempty"`
 	PollInterval    *string                                  `json:"pollInterval,omitempty"`
@@ -1559,6 +1574,7 @@ type PartialCoordinatorRoleConfig struct {
 	MergeWatch      *PartialCoordinatorMergeWatchConfig      `json:"mergeWatch,omitempty"`
 	MarkReady       *PartialCoordinatorMarkReadyConfig       `json:"markReady,omitempty"`
 	PostMergeDigest *PartialCoordinatorPostMergeDigestConfig `json:"postMergeDigest,omitempty"`
+	ConflictPolicy  *PartialCoordinatorConflictPolicyConfig  `json:"conflictPolicy,omitempty"`
 }
 
 type PartialDeployerRoleConfig struct {
