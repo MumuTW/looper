@@ -158,7 +158,7 @@ func TestAuditorConfirmationEscalatesWhenCandidateLacksRevertProvenance(t *testi
 			t.Fatal(err)
 		}
 	}
-	decision, err := auditorConfirmationDecision(context.Background(), repos.Events, "project_1", "acme/looper", observation, confirmation, nil, 60)
+	decision, err := auditorConfirmationDecisionWithGateway(context.Background(), repos.Events, nil, "", "project_1", "acme/looper", observation, confirmation, nil, 60)
 	if err != nil || decision.Action != auditor.ActionEscalate || decision.Reason != "missing_merge_commit_provenance" {
 		t.Fatalf("auditorConfirmationDecision() = %#v, %v", decision, err)
 	}
@@ -186,7 +186,7 @@ func TestAuditorConfirmationRejectsRebaseCandidate(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	decision, err := auditorConfirmationDecision(context.Background(), repos.Events, "project_1", "acme/looper", observation, confirmation, nil, 60)
+	decision, err := auditorConfirmationDecisionWithGateway(context.Background(), repos.Events, nil, "", "project_1", "acme/looper", observation, confirmation, nil, 60)
 	if err != nil || decision.Action != auditor.ActionEscalate || decision.Reason != "rebase_merge_not_revertable" {
 		t.Fatalf("auditorConfirmationDecision() = %#v, %v; want explicit rebase refusal", decision, err)
 	}

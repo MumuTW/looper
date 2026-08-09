@@ -183,11 +183,6 @@ func failedAuditorCheckPathEvidence(ctx context.Context, gateway auditorGateway,
 	return result, byCheck, complete
 }
 
-func failedAuditorCheckEvidenceWithPaths(ctx context.Context, gateway auditorGateway, repo, cwd string, checks githubinfra.PullRequestCheckRuns) ([]string, []auditor.FailurePathSignature, bool) {
-	paths, byCheck, complete := failedAuditorCheckPathEvidence(ctx, gateway, repo, cwd, checks)
-	return paths, failureSignaturesFromPathMap(byCheck), complete
-}
-
 func recordAuditorBaseline(ctx context.Context, repos *storage.Repositories, project storage.ProjectRecord, repo, headSHA string, observedAt time.Time) error {
 	entityType, entityID := "branch_head", repo+"@"+headSHA
 	existing, err := repos.Events.ListByEntity(ctx, entityType, entityID)

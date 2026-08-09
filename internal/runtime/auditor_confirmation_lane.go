@@ -292,11 +292,6 @@ func failedAuditorRerunPathEvidence(ctx context.Context, gateway auditorGateway,
 	return paths, pathsByCheck, complete
 }
 
-func failedAuditorRerunEvidence(ctx context.Context, gateway auditorGateway, repo, cwd string, checks githubinfra.PullRequestCheckRuns, requests map[int64]time.Time) ([]string, []auditor.FailurePathSignature, bool) {
-	paths, byCheck, complete := failedAuditorRerunPathEvidence(ctx, gateway, repo, cwd, checks, requests)
-	return paths, failureSignaturesFromPathMap(byCheck), complete
-}
-
 func failureSignaturesFromPathMap(pathsByCheck map[string][]string) []auditor.FailurePathSignature {
 	if len(pathsByCheck) == 0 {
 		return nil
@@ -319,10 +314,6 @@ func checkRunStartedAfter(check githubinfra.PullRequestCheckRun, requestedAt tim
 		return !completedAt.UTC().Before(requestedAt.UTC())
 	}
 	return false
-}
-
-func auditorConfirmationDecision(ctx context.Context, events *storage.EventsRepository, projectID, repo string, observation auditor.FailureObservation, confirmation auditor.ConfirmationResult, confirmedPathsByCheck map[string][]string, windowMinutes int) (auditor.Decision, error) {
-	return auditorConfirmationDecisionWithGateway(ctx, events, nil, "", projectID, repo, observation, confirmation, confirmedPathsByCheck, windowMinutes)
 }
 
 func auditorConfirmationDecisionWithGateway(ctx context.Context, events *storage.EventsRepository, gateway auditorGateway, cwd, projectID, repo string, observation auditor.FailureObservation, confirmation auditor.ConfirmationResult, confirmedPathsByCheck map[string][]string, windowMinutes int) (auditor.Decision, error) {
