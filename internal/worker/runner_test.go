@@ -1568,6 +1568,60 @@ func TestRunExecuteStepPersistsPendingExecutionWhenWaitFails(t *testing.T) {
 	}
 }
 
+func TestRunExecuteStepDoesNotDowngradeTimeoutObservedDuringStart(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	project := fixture.project(t)
+	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	worktreePath := fixture.usableWorktree(t, "timeout-during-start")
+	run := storage.RunRecord{ID: "run_worker_timeout_during_start", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{
+		HeadSHA: "timeout-head", Branch: "looper/feature", ChangedFiles: []string{"changed.go"},
+		DiffFingerprint: "timeout-status", ContentFingerprint: "timeout-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "timeout-index",
+	}}
+	agent := &timeoutDuringStartAgentExecutor{
+		observation: agent.TimeoutObservation{TimeoutType: "idle", LastProgressAt: "2026-04-11T12:00:01.000Z"},
+		waitErr:     errors.New("daemon exited after timeout observation"),
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+
+	checkpoint, err := runner.runExecuteStep(ctx, stepInput{
+		Project: project, Loop: *loop, Run: run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "wt_timeout_start", Path: worktreePath, Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "daemon exited after timeout observation") {
+		t.Fatalf("runExecuteStep() error = %v, want Wait error after timeout observation", err)
+	}
+	if agent.observationErr != nil {
+		t.Fatalf("OnBeforeTimeout() error = %v", agent.observationErr)
+	}
+	if checkpoint.Execution == nil || checkpoint.Execution.Status != "timeout_observing" || checkpoint.Execution.ProgressBeforeTimeout == nil {
+		t.Fatalf("checkpoint.Execution = %#v, want timeout evidence retained", checkpoint.Execution)
+	}
+	storedRun, err := fixture.repos.Runs.GetByID(ctx, run.ID)
+	if err != nil || storedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want stored run", storedRun, err)
+	}
+	storedCheckpoint, err := parseCheckpoint(storedRun.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint() error = %v", err)
+	}
+	if storedCheckpoint.Execution == nil || storedCheckpoint.Execution.Status != "timeout_observing" || storedCheckpoint.Execution.ProgressBeforeTimeout == nil {
+		t.Fatalf("stored checkpoint.Execution = %#v, want timeout evidence not running", storedCheckpoint.Execution)
+	}
+}
+
 func TestRunExecuteStepRetainsHumanContextWhenCompletedResultIsInvalid(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -6638,6 +6692,19 @@ func (f fakeAgentExecution) Wait(ctx context.Context) (AgentResult, error) {
 }
 
 func (f fakeAgentExecution) Kill(string) error { return nil }
+
+type timeoutDuringStartAgentExecutor struct {
+	observation    agent.TimeoutObservation
+	waitErr        error
+	observationErr error
+}
+
+func (f *timeoutDuringStartAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
+	if input.OnBeforeTimeout != nil {
+		f.observationErr = input.OnBeforeTimeout(context.Background(), f.observation)
+	}
+	return fakeAgentExecution{waitErr: f.waitErr}, nil
+}
 
 type timeoutObservingAgentExecutor struct {
 	starts           []AgentRunInput

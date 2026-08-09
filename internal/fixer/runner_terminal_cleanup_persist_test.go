@@ -3,6 +3,7 @@ package fixer
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -226,6 +227,46 @@ func TestTerminalCleanupSkipsDetachedSiblingWorkerTakeover(t *testing.T) {
 	}
 	if checkpoint.Outcome == nil || len(checkpoint.Outcome.SecondaryIssues) != 1 || !strings.Contains(checkpoint.Outcome.SecondaryIssues[0].Message, "sibling Worker") {
 		t.Fatalf("Outcome = %#v, want detached Worker ownership skip", checkpoint.Outcome)
+	}
+}
+
+func TestTerminalCleanupRecognizesSymlinkedDetachedWorkerPath(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	realPath := filepath.Join(t.TempDir(), "wt-worker-detached")
+	if err := os.MkdirAll(realPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(real path) error = %v", err)
+	}
+	aliasPath := filepath.Join(t.TempDir(), "wt-worker-alias")
+	if err := os.Symlink(realPath, aliasPath); err != nil {
+		t.Fatalf("Symlink() error = %v", err)
+	}
+	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_worker_symlink", realPath)
+
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	target := "pr:acme/looper:42"
+	if err := fixture.repos.Loops.UpsertChangingHumanHold(context.Background(), storage.LoopRecord{
+		ID: "loop_worker_symlink_takeover", Seq: 99, ProjectID: "project_1", Type: "worker",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+		Status: "human_takeover", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(sibling) error = %v", err)
+	}
+	seedSiblingWorkerCheckpoint(t, fixture, "loop_worker_symlink_takeover", "run_worker_symlink_takeover", aliasPath, "detached")
+
+	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
+	}, "run_cleanup_worker_symlink", &checkpoint)
+
+	if len(git.cleanupCalls) != 0 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 0 for filesystem-identical takeover path", len(git.cleanupCalls))
+	}
+	if checkpoint.Outcome == nil || len(checkpoint.Outcome.SecondaryIssues) != 1 || !strings.Contains(checkpoint.Outcome.SecondaryIssues[0].Message, "sibling Worker") {
+		t.Fatalf("Outcome = %#v, want symlinked detached Worker ownership skip", checkpoint.Outcome)
 	}
 }
 

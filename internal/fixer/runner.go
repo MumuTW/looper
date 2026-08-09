@@ -7524,7 +7524,7 @@ func (r *Runner) siblingWorkerOwnsWorktree(ctx context.Context, sibling storage.
 		// for cleanup rather than infer branch-mode ownership from loop type.
 		return true, nil
 	}
-	if filepath.Clean(checkpoint.Worktree.Path) != filepath.Clean(worktreePath) {
+	if !sameManagedWorktreePath(checkpoint.Worktree.Path, worktreePath) {
 		return false, nil
 	}
 	mode := strings.TrimSpace(checkpoint.Worktree.CheckoutMode)

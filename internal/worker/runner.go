@@ -2644,9 +2644,22 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// Wait error makes the retry look like a pre-execution run and the
 		// retained manifest is rejected instead of being left for the replacement
 		// agent to finish or remove.
-		checkpoint.Execution = &checkpointExecution{RunID: input.Run.ID, ExecutionID: executionID, Status: "running"}
-		if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
-			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		progressMu.Lock()
+		status := ""
+		if checkpoint.Execution != nil {
+			status = strings.TrimSpace(checkpoint.Execution.Status)
+		}
+		preserveTimeout := strings.HasPrefix(strings.ToLower(status), "timeout")
+		if !preserveTimeout {
+			checkpoint.Execution = &checkpointExecution{RunID: input.Run.ID, ExecutionID: executionID, Status: "running"}
+		}
+		var persistRunningErr error
+		if !preserveTimeout {
+			persistRunningErr = r.persistCheckpoint(ctx, input.Run.ID, checkpoint)
+		}
+		progressMu.Unlock()
+		if persistRunningErr != nil {
+			return checkpoint, &runpipe.LoopError{Message: persistRunningErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 		result, err := execution.Wait(ctx)
 		progressMu.Lock()
