@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"github.com/MumuTW/looper/internal/fixer"
 	"github.com/MumuTW/looper/internal/reviewer/convergence"

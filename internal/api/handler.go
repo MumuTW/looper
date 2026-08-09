@@ -4412,19 +4412,3 @@ func looperdArtifactName(target string) *string {
 	value := "looperd-" + target
 	return &value
 }
-
-func issueCollisionError(issueNumber int64, loopID, loopType string) apiError {
-	return apiError{
-		code:    pkgapi.ErrorCodeLoopConflict,
-		status:  http.StatusConflict,
-		message: fmt.Sprintf("Issue #%d is occupied by active %s loop %s", issueNumber, loopType, loopID),
-		details: map[string]any{"occupiedBy": map[string]any{"loopId": loopID, "loopType": loopType}},
-	}
-}
-
-func mapIssueClaimAdmissionError(err error) error {
-	if conflict, ok := storage.IsIssueClaimConflictError(err); ok {
-		return issueCollisionError(conflict.IssueNumber, conflict.LoopID, conflict.LoopType)
-	}
-	return err
-}

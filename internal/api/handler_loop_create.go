@@ -825,33 +825,6 @@ func derefBool(value *bool) bool {
 	return value != nil && *value
 }
 
-func manualWorkerMetadataJSONCompat(metadataJSON *string, target domain.LoopTarget, force bool) (*string, error) {
-	metadata := parseJSONObject(metadataJSON)
-	worker, _ := metadata["worker"].(map[string]any)
-	if worker == nil {
-		worker = map[string]any{}
-	}
-	worker["repo"] = target.Repo
-	switch target.TargetType {
-	case domain.LoopTargetTypeIssue:
-		worker["issueNumber"] = target.IssueNumber
-	case domain.LoopTargetTypePullRequest:
-		worker["prNumber"] = target.PRNumber
-	}
-	if force && target.TargetType == domain.LoopTargetTypeIssue {
-		worker["issueClaimOverride"] = true
-	} else {
-		delete(worker, "issueClaimOverride")
-	}
-	metadata["worker"] = worker
-	encoded, err := json.Marshal(metadata)
-	if err != nil {
-		return nil, fmt.Errorf("encode worker metadata: %w", err)
-	}
-	text := string(encoded)
-	return &text, nil
-}
-
 func reusableWorkerLoopForIssueRequestCompat(existing []storage.LoopRecord, projectID string, issueTarget, effectiveTarget domain.LoopTarget) (storage.LoopRecord, domain.LoopTarget, bool, error) {
 	for _, loop := range existing {
 		if loop.ProjectID != projectID || loop.Type != string(domain.LoopTypeWorker) {

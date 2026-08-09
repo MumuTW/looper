@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/MumuTW/looper/internal/config"
-	"github.com/MumuTW/looper/internal/domain"
 	"github.com/MumuTW/looper/internal/eventlog"
 	"github.com/MumuTW/looper/internal/gatekeeper"
 	"github.com/MumuTW/looper/internal/infra/notify"
@@ -377,50 +376,10 @@ func assembleForDate(ctx context.Context, repos *storage.Repositories, cfg Confi
 	if err != nil {
 		return Digest{}, err
 	}
-	gateAwaiting := latestGatekeeperHumanBlocks(allEvents)
-	loopByTarget := make(map[string][]storage.LoopRecord)
 	for _, loop := range awaiting {
-		repo, prNumber := stringValue(loop.Repo), intValue(loop.PRNumber)
-		if repo != "" && prNumber > 0 {
-			loopByTarget[awaitingTargetKey(loop.ProjectID, repo, prNumber)] = append(loopByTarget[awaitingTargetKey(loop.ProjectID, repo, prNumber)], loop)
-		}
-		// A project-targeted worker or an ordinary manual pause is not evidence
-		// that a pull request is awaiting a human. Human-takeover/awaiting-HITL
-		// loops remain explicit human work; paused PR loops are retained only when
-		// the latest Gatekeeper report names the same PR as actionable.
-		if repo == "" || prNumber <= 0 || loop.Status == "paused" && gateAwaiting[awaitingTargetKey(loop.ProjectID, repo, prNumber)] == nil {
-			if loop.Status == "awaiting_human" || loop.Status == "human_takeover" {
-				// Keep explicit HITL ownership even before a Gatekeeper report exists.
-			} else {
-				continue
-			}
-		}
-		item := AwaitingHumanItem{LoopID: loop.ID, ProjectID: loop.ProjectID, Status: loop.Status, Repo: repo, PRNumber: prNumber, UpdatedAt: loop.UpdatedAt}
+		item := AwaitingHumanItem{LoopID: loop.ID, ProjectID: loop.ProjectID, Status: loop.Status, Repo: stringValue(loop.Repo), PRNumber: intValue(loop.PRNumber), UpdatedAt: loop.UpdatedAt}
 		item.Reason, item.ReasonCode = loopReason(loop.MetadataJSON)
 		if updated, ok := parseEventTime(loop.UpdatedAt); ok {
-			age := now.UTC().Sub(updated)
-			if age > 0 {
-				item.AgeSeconds = int64(age / time.Second)
-			}
-		}
-		digest.AwaitingHuman = append(digest.AwaitingHuman, item)
-	}
-	for key, candidate := range gateAwaiting {
-		if candidate == nil || gatekeeperBlockHandledByAutomation(loopByTarget[key]) {
-			continue
-		}
-		alreadyListed := false
-		for _, item := range digest.AwaitingHuman {
-			if item.ProjectID == candidate.ProjectID && item.Repo == candidate.Repo && item.PRNumber == candidate.PRNumber {
-				alreadyListed = true
-				break
-			}
-		}
-		if alreadyListed {
-			continue
-		}
-		item := AwaitingHumanItem{ProjectID: candidate.ProjectID, Repo: candidate.Repo, PRNumber: candidate.PRNumber, Status: "gatekeeper_blocked", Reason: candidate.Reason, ReasonCode: candidate.ReasonCode, UpdatedAt: candidate.UpdatedAt}
-		if updated, ok := parseEventTime(candidate.UpdatedAt); ok {
 			age := now.UTC().Sub(updated)
 			if age > 0 {
 				item.AgeSeconds = int64(age / time.Second)
@@ -453,72 +412,6 @@ func isMergedEvent(event storage.EventLogRecord) bool {
 type gateReportObservation struct {
 	payload   map[string]any
 	createdAt string
-}
-
-type gatekeeperHumanBlock struct {
-	ProjectID  string
-	Repo       string
-	PRNumber   int64
-	Reason     string
-	ReasonCode string
-	UpdatedAt  string
-}
-
-func awaitingTargetKey(projectID, repo string, prNumber int64) string {
-	return strings.TrimSpace(projectID) + ":" + strings.TrimSpace(repo) + "#" + strconv.FormatInt(prNumber, 10)
-}
-
-func latestGatekeeperHumanBlocks(events []storage.EventLogRecord) map[string]*gatekeeperHumanBlock {
-	latest := make(map[string]*gatekeeperHumanBlock)
-	for _, event := range events {
-		if event.EventType != gatekeeper.GateReportEventType {
-			continue
-		}
-		var report gatekeeper.Report
-		if json.Unmarshal([]byte(event.PayloadJSON), &report) != nil || report.Status != gatekeeper.StatusBlocked || report.PRNumber <= 0 || strings.TrimSpace(report.Repo) == "" {
-			continue
-		}
-		reason, ok := firstHumanActionableGateReason(report.Reasons)
-		if !ok {
-			continue
-		}
-		projectID := strings.TrimSpace(report.ProjectID)
-		if projectID == "" && event.ProjectID != nil {
-			projectID = strings.TrimSpace(*event.ProjectID)
-		}
-		updatedAt := strings.TrimSpace(report.EvaluatedAt)
-		if updatedAt == "" {
-			updatedAt = event.CreatedAt
-		}
-		candidate := &gatekeeperHumanBlock{ProjectID: projectID, Repo: strings.TrimSpace(report.Repo), PRNumber: report.PRNumber, Reason: reason.Subject, ReasonCode: string(reason.Code), UpdatedAt: updatedAt}
-		key := awaitingTargetKey(candidate.ProjectID, candidate.Repo, candidate.PRNumber)
-		if prior := latest[key]; prior == nil || prior.UpdatedAt <= candidate.UpdatedAt {
-			latest[key] = candidate
-		}
-	}
-	return latest
-}
-
-func firstHumanActionableGateReason(reasons []gatekeeper.Reason) (gatekeeper.Reason, bool) {
-	for _, reason := range reasons {
-		switch reason.Code {
-		case gatekeeper.ReasonHold, gatekeeper.ReasonReviewRequired, gatekeeper.ReasonReviewChangesRequested, gatekeeper.ReasonCodexReviewMissing, gatekeeper.ReasonCodexReviewRequired, gatekeeper.ReasonReviewerConvergence, gatekeeper.ReasonUnresolvedReviewThread:
-			return reason, true
-		}
-	}
-	return gatekeeper.Reason{}, false
-}
-
-func gatekeeperBlockHandledByAutomation(loops []storage.LoopRecord) bool {
-	for _, loop := range loops {
-		if loop.Type != string(domain.LoopTypeReviewer) && loop.Type != string(domain.LoopTypeFixer) {
-			continue
-		}
-		if loop.Status == string(domain.LoopStatusQueued) || loop.Status == string(domain.LoopStatusRunning) {
-			return true
-		}
-	}
-	return false
 }
 
 func latestGateReports(events []storage.EventLogRecord) map[string][]gateReportObservation {

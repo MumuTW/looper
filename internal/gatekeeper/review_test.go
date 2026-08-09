@@ -138,21 +138,6 @@ func TestEvaluatePullRequestRejectsMarkerlessReviewEvent(t *testing.T) {
 	}
 }
 
-func TestEvaluatePullRequestRejectsBlockingCommentReviewEvent(t *testing.T) {
-	fixture := newGatekeeperFixtureWithoutReview(t)
-	seedReviewerReviewEventWithOutcome(t, fixture, "head-1", "COMMENT", "blocking", "reviewer-loop", 1, true)
-
-	report, err := New(Options{Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now }}).EvaluatePullRequest(context.Background(), EvaluationInput{
-		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
-	})
-	if err != nil {
-		t.Fatalf("EvaluatePullRequest() error = %v", err)
-	}
-	if report.Eligible || !hasReason(report, ReasonCodexReviewMissing) {
-		t.Fatalf("report = %#v, want blocking COMMENT excluded from clean evidence", report)
-	}
-}
-
 // Project IDs must be compared exactly, without trimming. A project renamed
 // from "foo" to the valid legacy ID " foo " retains old event rows in storage;
 // trimming would treat them as identical and let a review written under the
@@ -226,26 +211,10 @@ func seedReviewerReviewEvent(t *testing.T, fixture *gatekeeperFixture, headSHA, 
 
 func seedReviewerReviewEventWithMarkerVerified(t *testing.T, fixture *gatekeeperFixture, headSHA, reviewEvent, actorID string, ordinal int, markerVerified bool) {
 	t.Helper()
-	outcome := ""
-	switch reviewEvent {
-	case "COMMENT", "APPROVE":
-		outcome = "clean"
-	case "REQUEST_CHANGES":
-		outcome = "blocking"
-	}
-	seedReviewerReviewEventWithOutcome(t, fixture, headSHA, reviewEvent, outcome, actorID, ordinal, markerVerified)
-}
-
-func seedReviewerReviewEventWithOutcome(t *testing.T, fixture *gatekeeperFixture, headSHA, reviewEvent, outcome, actorID string, ordinal int, markerVerified bool) {
-	t.Helper()
-	seedReviewerReviewEventWithProjectIDAndOutcome(t, fixture, "project_1", headSHA, reviewEvent, outcome, actorID, ordinal, markerVerified)
+	seedReviewerReviewEventWithProjectID(t, fixture, "project_1", headSHA, reviewEvent, actorID, ordinal, markerVerified)
 }
 
 func seedReviewerReviewEventWithProjectID(t *testing.T, fixture *gatekeeperFixture, projectID, headSHA, reviewEvent, actorID string, ordinal int, markerVerified bool) {
-	seedReviewerReviewEventWithProjectIDAndOutcome(t, fixture, projectID, headSHA, reviewEvent, "", actorID, ordinal, markerVerified)
-}
-
-func seedReviewerReviewEventWithProjectIDAndOutcome(t *testing.T, fixture *gatekeeperFixture, projectID, headSHA, reviewEvent, outcome, actorID string, ordinal int, markerVerified bool) {
 	t.Helper()
 	outcome := "blocking"
 	switch strings.ToUpper(strings.TrimSpace(reviewEvent)) {

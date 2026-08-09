@@ -256,10 +256,6 @@ type AgentRunInput struct {
 	HeartbeatTimeout time.Duration
 	Metadata         map[string]any
 	IdempotencyKey   string
-	// Assessment selects the daemon-owned read-only pre-authorization profile.
-	// It is only set for the suitability assessment step; normal Planner work
-	// remains a writable coding-agent execution.
-	Assessment bool
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
 	UseSnapshot             bool
