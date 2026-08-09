@@ -15,6 +15,10 @@ type FailureObservation struct {
 	HeadSHA      string   `json:"headSha"`
 	FailedChecks []string `json:"failedChecks"`
 	FailingPaths []string `json:"failingPaths"`
+	// FailingPathsByCheck keeps attribution evidence tied to the provider check
+	// that emitted it; an aggregate list alone cannot exclude paths from a
+	// check that later flakes away.
+	FailingPathsByCheck map[string][]string `json:"failingPathsByCheck,omitempty"`
 	// FailureSignatures keep each check name paired with the paths it reported.
 	// A global path set is insufficient when two checks fail on different files:
 	// confirmation must repeat one check's own signature.

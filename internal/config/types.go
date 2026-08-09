@@ -168,22 +168,30 @@ const (
 	ReviewerReviewEventRequestChanges ReviewerReviewEvent = "REQUEST_CHANGES"
 )
 
-type ReviewerAutoMergeStrategy string
+// MergeStrategy selects the forge merge method used by Merge Gatekeeper at
+// the auto trust level.
+type MergeStrategy string
 
 const (
-	ReviewerAutoMergeStrategySquash ReviewerAutoMergeStrategy = "squash"
-	ReviewerAutoMergeStrategyMerge  ReviewerAutoMergeStrategy = "merge"
-	ReviewerAutoMergeStrategyRebase ReviewerAutoMergeStrategy = "rebase"
+	MergeStrategySquash MergeStrategy = "squash"
+	MergeStrategyMerge  MergeStrategy = "merge"
+	MergeStrategyRebase MergeStrategy = "rebase"
+)
+
+// Deprecated reviewer auto-merge types remain only so old config snapshots and
+// source-compatible callers can be decoded long enough to receive the explicit
+// migration error. Runtime has no consumer for this policy.
+type ReviewerAutoMergeStrategy = MergeStrategy
+
+const (
+	ReviewerAutoMergeStrategySquash = MergeStrategySquash
+	ReviewerAutoMergeStrategyMerge  = MergeStrategyMerge
+	ReviewerAutoMergeStrategyRebase = MergeStrategyRebase
 )
 
 type ReviewerAutoMergeScope string
 
-const (
-	// ReviewerAutoMergeScopeLooperOnly is the Auto-merge scope: the
-	// Looper-only constraint identifying which PRs Looper may opt into
-	// auto-merge — the looper: label AND a tracked-Issue link, both required.
-	ReviewerAutoMergeScopeLooperOnly ReviewerAutoMergeScope = "looper-only"
-)
+const ReviewerAutoMergeScopeLooperOnly ReviewerAutoMergeScope = "looper-only"
 
 type CoordinatorMarkReadyScope string
 
@@ -617,12 +625,14 @@ type ReviewerThreadResolutionConfig struct {
 	MaxThreadsPerRun            int                                 `json:"maxThreadsPerRun"`
 }
 
+// ReviewerAutoMergeConfig is parse-only compatibility state. It is excluded
+// from projections and rejected when enabled.
 type ReviewerAutoMergeConfig struct {
-	Enabled                 bool                      `json:"enabled"`
-	Strategy                ReviewerAutoMergeStrategy `json:"strategy"`
-	RequireBranchProtection bool                      `json:"requireBranchProtection"`
-	TransientRetries        int                       `json:"transientRetries"`
-	Scope                   ReviewerAutoMergeScope    `json:"scope"`
+	Enabled                 bool
+	Strategy                MergeStrategy
+	RequireBranchProtection bool
+	TransientRetries        int
+	Scope                   ReviewerAutoMergeScope
 }
 
 type IssueRoleTriggersConfig struct {
@@ -695,7 +705,7 @@ type WorkerRoleConfig struct {
 type ReviewerRoleConfig struct {
 	Discovery    ReviewerRoleDiscoveryConfig `json:"discovery"`
 	Behavior     ReviewerConfig              `json:"behavior"`
-	AutoMerge    ReviewerAutoMergeConfig     `json:"autoMerge"`
+	AutoMerge    ReviewerAutoMergeConfig     `json:"-"`
 	Instructions string                      `json:"instructions,omitempty"`
 	Agent        *RoleAgentConfig            `json:"agent,omitempty"`
 }
@@ -777,6 +787,13 @@ type CoordinatorPostMergeDigestConfig struct {
 	MaxItems     int    `json:"maxItems"`
 }
 
+// CoordinatorConflictPolicyConfig bounds repeated merge-conflict repairs for
+// one pull request. The count is carried by the durable merge-watch marker so
+// a moving base branch cannot make the same stale branch loop forever.
+type CoordinatorConflictPolicyConfig struct {
+	MaxRepairs int `json:"maxRepairs"`
+}
+
 type CoordinatorRoleConfig struct {
 	Enabled         bool                              `json:"enabled"`
 	PollInterval    string                            `json:"pollInterval"`
@@ -786,6 +803,10 @@ type CoordinatorRoleConfig struct {
 	MergeWatch      CoordinatorMergeWatchConfig       `json:"mergeWatch"`
 	MarkReady       CoordinatorMarkReadyConfig        `json:"markReady"`
 	PostMergeDigest *CoordinatorPostMergeDigestConfig `json:"postMergeDigest,omitempty"`
+	// Nil means the built-in two-repair policy. Keeping the default implicit
+	// preserves the frozen config representation while still allowing an
+	// explicit project/operator override.
+	ConflictPolicy *CoordinatorConflictPolicyConfig `json:"conflictPolicy,omitempty"`
 }
 
 type RoleConfigs struct {
@@ -900,11 +921,10 @@ const (
 	// GatekeeperTrustAdvise additionally publishes the verdict and its reasons on
 	// the pull request, so a human can decide without redoing the judgement.
 	GatekeeperTrustAdvise GatekeeperTrustLevel = "advise"
-	// GatekeeperTrustAuto publishes the required current-head status for GitHub
-	// branch protection on the pull request head SHA only. It never performs a
-	// merge itself: GitHub remains the merge authority. It does not publish
-	// status for GitHub native merge-queue merge-group SHAs; branch protection
-	// that requires Looper Gatekeeper on merge-group commits is unsupported.
+	// GatekeeperTrustAuto lets Gatekeeper merge what it judges eligible after a
+	// complete confirming evaluation. Legacy roles.reviewer.autoMerge.enabled
+	// configurations are rejected with an explicit migration error so Reviewer
+	// cannot remain a second merge authority.
 	GatekeeperTrustAuto GatekeeperTrustLevel = "auto"
 )
 
@@ -917,6 +937,11 @@ type GatekeeperRoleConfig struct {
 	// triggers a review-capacity gate. The normalized default is 200; an explicit
 	// zero disables the threshold.
 	RequiredReviewChangedLines int `json:"requiredReviewChangedLines,omitempty"`
+	// Strategy is used only at auto. Empty input normalizes to squash.
+	Strategy MergeStrategy `json:"strategy"`
+	// ProtectedPaths are repository-relative globs that require human review
+	// before an auto-trust merge. Empty preserves the provider-state-only gate.
+	ProtectedPaths []string `json:"protectedPaths,omitempty"`
 }
 
 // GatekeeperDiffBudget is a boolean change-size gate. A zero bound is
@@ -946,10 +971,12 @@ type GatekeeperDiffBudget struct {
 
 // AuditorRoleConfig configures the opt-in Post-merge Auditor. It remains
 // disabled by default because watching default-branch checks changes operator
-// workload even though the Auditor never merges or pushes a revert itself.
+// workload. Revert proposals are a separate, default-disabled mutation opt-in:
+// observing failures must never silently gain authority to push or reopen.
 type AuditorRoleConfig struct {
-	Enabled       bool `json:"enabled"`
-	WindowMinutes int  `json:"windowMinutes"`
+	Enabled              bool `json:"enabled"`
+	WindowMinutes        int  `json:"windowMinutes"`
+	AllowRevertProposals bool `json:"allowRevertProposals"`
 }
 
 type ProjectRefConfig struct {
@@ -1348,11 +1375,11 @@ type PartialReviewerThreadResolutionConfig struct {
 }
 
 type PartialReviewerAutoMergeConfig struct {
-	Enabled                 *bool                      `json:"enabled,omitempty"`
-	Strategy                *ReviewerAutoMergeStrategy `json:"strategy,omitempty"`
-	RequireBranchProtection *bool                      `json:"requireBranchProtection,omitempty"`
-	TransientRetries        *int                       `json:"transientRetries,omitempty"`
-	Scope                   *ReviewerAutoMergeScope    `json:"scope,omitempty"`
+	Enabled                 *bool          `json:"enabled,omitempty"`
+	Strategy                *MergeStrategy `json:"strategy,omitempty"`
+	RequireBranchProtection *bool          `json:"requireBranchProtection,omitempty"`
+	TransientRetries        *int           `json:"transientRetries,omitempty"`
+	Scope                   *string        `json:"scope,omitempty"`
 }
 
 type PartialInstructionsConfig struct {
@@ -1579,6 +1606,10 @@ type PartialCoordinatorPostMergeDigestConfig struct {
 	MaxItems     *int    `json:"maxItems,omitempty"`
 }
 
+type PartialCoordinatorConflictPolicyConfig struct {
+	MaxRepairs *int `json:"maxRepairs,omitempty"`
+}
+
 type PartialCoordinatorRoleConfig struct {
 	Enabled         *bool                                    `json:"enabled,omitempty"`
 	PollInterval    *string                                  `json:"pollInterval,omitempty"`
@@ -1588,6 +1619,7 @@ type PartialCoordinatorRoleConfig struct {
 	MergeWatch      *PartialCoordinatorMergeWatchConfig      `json:"mergeWatch,omitempty"`
 	MarkReady       *PartialCoordinatorMarkReadyConfig       `json:"markReady,omitempty"`
 	PostMergeDigest *PartialCoordinatorPostMergeDigestConfig `json:"postMergeDigest,omitempty"`
+	ConflictPolicy  *PartialCoordinatorConflictPolicyConfig  `json:"conflictPolicy,omitempty"`
 }
 
 type PartialDeployerRoleConfig struct {
@@ -1601,6 +1633,8 @@ type PartialGatekeeperRoleConfig struct {
 	Trust                      *GatekeeperTrustLevel        `json:"trust,omitempty"`
 	DiffBudget                 *PartialGatekeeperDiffBudget `json:"diffBudget,omitempty"`
 	RequiredReviewChangedLines *int                         `json:"requiredReviewChangedLines,omitempty"`
+	Strategy                   *MergeStrategy               `json:"strategy,omitempty"`
+	ProtectedPaths             *[]string                    `json:"protectedPaths,omitempty"`
 }
 
 type PartialGatekeeperDiffBudget struct {
@@ -1618,8 +1652,9 @@ type PartialEscalatorRoleConfig struct {
 }
 
 type PartialAuditorRoleConfig struct {
-	Enabled       *bool `json:"enabled,omitempty"`
-	WindowMinutes *int  `json:"windowMinutes,omitempty"`
+	Enabled              *bool `json:"enabled,omitempty"`
+	WindowMinutes        *int  `json:"windowMinutes,omitempty"`
+	AllowRevertProposals *bool `json:"allowRevertProposals,omitempty"`
 }
 
 type PartialRoleConfigs struct {

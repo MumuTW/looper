@@ -107,6 +107,10 @@ func legalAdmissionTransition(from, to AdmissionState) bool {
 	}
 	switch from {
 	case AdmissionStarting:
+		// Public drain must not run during startup (would latch draining and
+		// then fail MarkReady). starting → draining is only applied by the
+		// internal verify-hold path via Transition, not via BeginDrain's
+		// ready-only graph; keep BeginDrain ready→draining only.
 		return to == AdmissionReady || to == AdmissionStopping || to == AdmissionDegraded
 	case AdmissionReady:
 		return to == AdmissionDraining || to == AdmissionStopping || to == AdmissionDegraded
@@ -126,6 +130,7 @@ func legalAdmissionTransition(from, to AdmissionState) bool {
 // existing work. It is intentionally one-way: resuming a partially drained
 // daemon would need to recreate producer contexts and re-establish ownership,
 // so recovery is an explicit restart rather than a hidden reopen.
+// Public HTTP drain uses this path and only allows ready → draining.
 func (a *Admission) BeginDrain(reason string) error {
 	if a == nil {
 		return ErrAdmissionStopping
@@ -140,6 +145,31 @@ func (a *Admission) BeginDrain(reason string) error {
 	}
 	if !legalAdmissionTransition(a.state, AdmissionDraining) {
 		return fmt.Errorf("%w: %s → %s", ErrAdmissionIllegalMove, a.state, AdmissionDraining)
+	}
+	a.state = AdmissionDraining
+	if reason != "" {
+		a.reason = reason
+	}
+	return nil
+}
+
+// BeginVerifyHold is the only legal starting → draining transition: used by
+// LOOPER_UPGRADE_VERIFY_HOLD so cutover can skip the ready window without
+// exposing public /upgrade/drain during incomplete startup.
+func (a *Admission) BeginVerifyHold(reason string) error {
+	if a == nil {
+		return ErrAdmissionStopping
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.state == AdmissionDraining {
+		if reason != "" {
+			a.reason = reason
+		}
+		return nil
+	}
+	if a.state != AdmissionStarting {
+		return fmt.Errorf("%w: %s → draining (verify-hold requires starting)", ErrAdmissionIllegalMove, a.state)
 	}
 	a.state = AdmissionDraining
 	if reason != "" {
@@ -289,6 +319,22 @@ func (a *Admission) WithAllowWork(fn func()) error {
 		fn()
 	}
 	return nil
+}
+
+// WithState runs fn under the admission mutex with the current state. Callers
+// that combine a custom state gate with a side effect (e.g. backup lease) use
+// this so transitions cannot interleave between the decision and the effect.
+// fn must not call back into Admission methods that take a.mu (would deadlock).
+func (a *Admission) WithState(fn func(state AdmissionState) error) error {
+	if a == nil {
+		return ErrAdmissionStopping
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if fn == nil {
+		return nil
+	}
+	return fn(a.state)
 }
 
 func (a *Admission) allowWork() error {

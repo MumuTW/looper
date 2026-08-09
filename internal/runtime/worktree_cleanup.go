@@ -406,7 +406,7 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 	if budget <= 0 {
 		return status
 	}
-	if err := r.AllowClaim(); err != nil {
+	if err := r.AllowLifecycleWork(); err != nil {
 		status.LastError = err.Error()
 		return status
 	}

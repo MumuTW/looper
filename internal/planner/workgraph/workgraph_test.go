@@ -30,6 +30,16 @@ func TestBuildRejectsMissingNodesAndCycles(t *testing.T) {
 	}
 }
 
+func TestBuildRejectsInvalidGitRefComponents(t *testing.T) {
+	t.Parallel()
+	for _, key := range []string{"api.", "api..db"} {
+		_, err := Build([]Node{{Key: key, Goal: "API", AcceptanceCriteria: []string{"endpoint"}, ExpectedPRScope: "api"}})
+		if err == nil || !strings.Contains(err.Error(), "git ref component") {
+			t.Fatalf("Build(%q) error = %v, want invalid git ref component", key, err)
+		}
+	}
+}
+
 func TestBuildRejectsMultipleDependencies(t *testing.T) {
 	t.Parallel()
 	_, err := Build([]Node{

@@ -42,7 +42,7 @@ retry budget/base delay, Reviewer quiet/minimum-publish timing, and Reviewer
 retry-delay cap—remain restart-bound, as do the persisted Coordinator transient
 retry budget and the materialized default base branch. The allowlist deliberately excludes
 `agent.nativeResume`, `agent.params`, notification webhooks and Feishu, HITL,
-`instructions.maxBytes`, Reviewer auto-merge, and Coordinator dependencies, in
+`instructions.maxBytes`, Gatekeeper trust/strategy, and Coordinator dependencies, in
 addition to Coordinator activation and other resource-owning settings. New
 fields are restart-bound until they are classified explicitly.
 

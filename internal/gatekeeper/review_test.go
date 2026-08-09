@@ -3,6 +3,7 @@ package gatekeeper
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,6 +45,21 @@ func TestEvaluatePullRequestAcceptsDurableCodexReviewForCurrentHead(t *testing.T
 	evidence := report.Evidence.CodexReview
 	if evidence == nil || !evidence.CurrentHeadValid || evidence.Event != "APPROVE" || evidence.ReviewedHeadSHA != "head-1" {
 		t.Fatalf("Codex review evidence = %#v, want verified current-head review", evidence)
+	}
+}
+
+func TestEvaluatePullRequestRejectsBlockingCommentReview(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	seedReviewerReviewEventWithOutcome(t, fixture, "head-1", "COMMENT", "blocking", "reviewer-loop", 1)
+
+	report, err := New(Options{Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now }}).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !hasReason(report, ReasonCodexReviewBlocked) || report.Evidence.CodexReviewOutcome != "blocking" {
+		t.Fatalf("report = %#v, want blocking COMMENT preserved as blocking evidence", report)
 	}
 }
 
@@ -200,6 +216,16 @@ func seedReviewerReviewEventWithMarkerVerified(t *testing.T, fixture *gatekeeper
 
 func seedReviewerReviewEventWithProjectID(t *testing.T, fixture *gatekeeperFixture, projectID, headSHA, reviewEvent, actorID string, ordinal int, markerVerified bool) {
 	t.Helper()
+	outcome := "blocking"
+	switch strings.ToUpper(strings.TrimSpace(reviewEvent)) {
+	case "COMMENT", "APPROVE":
+		outcome = "clean"
+	}
+	seedReviewerReviewEventWithProjectIDAndOutcome(t, fixture, projectID, headSHA, reviewEvent, outcome, actorID, ordinal, markerVerified)
+}
+
+func seedReviewerReviewEventWithProjectIDAndOutcome(t *testing.T, fixture *gatekeeperFixture, projectID, headSHA, reviewEvent, outcome, actorID string, ordinal int, markerVerified bool) {
+	t.Helper()
 	entityType := "pull_request"
 	entityID := "acme/looper#42"
 	actorType := "system"
@@ -207,7 +233,28 @@ func seedReviewerReviewEventWithProjectID(t *testing.T, fixture *gatekeeperFixtu
 		ID: fmt.Sprintf("review-posted-%d", ordinal), EventType: reviewerReviewPostedEventType,
 		ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
 		ActorType: &actorType, ActorID: &actorID,
-		Payload:   map[string]any{"repo": "acme/looper", "prNumber": int64(42), "event": reviewEvent, "headSha": headSHA, "markerVerified": markerVerified},
+		Payload:   map[string]any{"repo": "acme/looper", "prNumber": int64(42), "event": reviewEvent, "outcome": outcome, "headSha": headSHA, "markerVerified": markerVerified},
+		CreatedAt: fixture.now.Add(time.Duration(ordinal) * time.Second),
+	}); err != nil {
+		t.Fatalf("append reviewer review event: %v", err)
+	}
+}
+
+func seedReviewerReviewEventWithOutcome(t *testing.T, fixture *gatekeeperFixture, headSHA, reviewEvent, outcome, actorID string, ordinal int, markerVerifiedValues ...bool) {
+	t.Helper()
+	markerVerified := true
+	if len(markerVerifiedValues) > 0 {
+		markerVerified = markerVerifiedValues[0]
+	}
+	projectID := "project_1"
+	entityType := "pull_request"
+	entityID := "acme/looper#42"
+	actorType := "system"
+	if err := eventlog.Append(context.Background(), fixture.repos, eventlog.AppendInput{
+		ID: fmt.Sprintf("review-posted-outcome-%d", ordinal), EventType: reviewerReviewPostedEventType,
+		ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+		ActorType: &actorType, ActorID: &actorID,
+		Payload:   map[string]any{"repo": "acme/looper", "prNumber": int64(42), "event": reviewEvent, "outcome": outcome, "headSha": headSHA, "markerVerified": markerVerified},
 		CreatedAt: fixture.now.Add(time.Duration(ordinal) * time.Second),
 	}); err != nil {
 		t.Fatalf("append reviewer review event: %v", err)
@@ -245,7 +292,7 @@ func TestDiscoverPullRequestsReevaluatesAfterCodexReviewProviderBlock(t *testing
 	// Seed a provider-block report matching the shape EvaluatePullRequest now
 	// produces when the codex_review read fails: the provider reason plus an
 	// invalid CodexReview placeholder (CurrentHeadValid=false).
-	fingerprint := sourceFingerprint(pr, false) + "\x1fdiff-budget=0,0" + "\x1fgatekeeper-trust=observe" + "\x1fconfigured-target=" + "\x1fpolicy-permits=true" + "\x1freview-threshold=200"
+	fingerprint := sourceFingerprint(pr, false, nil) + "\x1fdiff-budget=0,0" + "\x1fgatekeeper-trust=observe" + "\x1fconfigured-target=" + "\x1fpolicy-permits=true" + "\x1freview-threshold=200"
 	seedGateReport(t, fixture, Report{
 		Version: reportVersion, Status: StatusBlocked, ProjectID: "project_1",
 		Mode: string(config.GatekeeperTrustObserve),

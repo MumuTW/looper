@@ -27,6 +27,10 @@ func ProjectRoleConfigs(cfg Config, projectID string) RoleConfigs {
 		cloned := *roles.Coordinator.PostMergeDigest
 		roles.Coordinator.PostMergeDigest = &cloned
 	}
+	if roles.Coordinator.ConflictPolicy != nil {
+		cloned := *roles.Coordinator.ConflictPolicy
+		roles.Coordinator.ConflictPolicy = &cloned
+	}
 	project := findConfiguredProject(cfg.Projects, projectID)
 	if project == nil {
 		return roles

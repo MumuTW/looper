@@ -222,8 +222,15 @@ func mergeHITLCorrelation(delivered loops.HITLAsk, currentMetadata *string) loop
 		return delivered
 	}
 	merged := delivered
-	// Preserve human answer authority.
-	if strings.TrimSpace(existing.Answer) != "" {
+	// Preserve human answer authority, but only onto the same question. A
+	// resumed agent can consume an answered ask and emit a different ask in
+	// the same turn while the old one is still stored as answered; carrying
+	// that answer onto the new question would park the loop with a question
+	// that already appears answered by the previous decision. An empty
+	// delivered question is a correlation-only update of the stored ask.
+	sameQuestion := strings.TrimSpace(delivered.Question) == "" ||
+		strings.TrimSpace(existing.Question) == strings.TrimSpace(delivered.Question)
+	if sameQuestion && strings.TrimSpace(existing.Answer) != "" {
 		merged.Answer = existing.Answer
 		merged.AnsweredAt = existing.AnsweredAt
 		if existing.Status == "answered" || existing.Status == "consumed" {
@@ -231,7 +238,7 @@ func mergeHITLCorrelation(delivered loops.HITLAsk, currentMetadata *string) loop
 		} else if merged.Status == "" || merged.Status == "awaiting" {
 			merged.Status = "answered"
 		}
-	} else if existing.Status == "answered" || existing.Status == "consumed" {
+	} else if sameQuestion && (existing.Status == "answered" || existing.Status == "consumed") {
 		merged.Status = existing.Status
 		merged.AnsweredAt = existing.AnsweredAt
 	}

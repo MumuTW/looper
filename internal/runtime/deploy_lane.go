@@ -15,6 +15,7 @@ import (
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/processcontainment"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -107,7 +108,7 @@ func runDeployLane(ctx context.Context, input defaultSchedulerTickInput, project
 			}, nil
 		},
 		RunCommand: func(ctx context.Context, dir string) (int, string, error) {
-			return runDeployCommand(ctx, dir, logDir, role, timeout, input.Logger)
+			return runDeployCommand(ctx, dir, logDir, role, timeout, input.Logger, input.OperationOwner)
 		},
 	}
 	if input.Logger != nil {
@@ -152,7 +153,7 @@ func runDeployLane(ctx context.Context, input defaultSchedulerTickInput, project
 //
 // Unlike validation commands this runs with network access: a deploy that cannot
 // reach anything is not a deploy.
-func runDeployCommand(ctx context.Context, dir, logDir string, role config.DeployerRoleConfig, timeout time.Duration, logger bootstrap.Logger) (int, string, error) {
+func runDeployCommand(ctx context.Context, dir, logDir string, role config.DeployerRoleConfig, timeout time.Duration, logger bootstrap.Logger, tracker processcontainment.LiveTracker) (int, string, error) {
 	result, runErr := shell.Run(ctx, shell.Options{
 		Command:          "/bin/sh",
 		Args:             []string{"-c", role.Command},
@@ -160,6 +161,7 @@ func runDeployCommand(ctx context.Context, dir, logDir string, role config.Deplo
 		Env:              deployEnvironment(role.Environment),
 		Timeout:          timeout,
 		MaxCapturedBytes: deployLogCaptureBytes,
+		Tracker:          tracker,
 	})
 
 	if runErr != nil && result.ExitCode == 0 {
@@ -349,7 +351,21 @@ func startDeployLane(ctx context.Context, input defaultSchedulerTickInput, proje
 		}
 		return
 	}
+	var operation DetachedOperationLease
+	if input.OperationOwner != nil {
+		admitted, err := input.OperationOwner.AdmitDetachedOperation(context.WithoutCancel(ctx), OperationMeta{ClaimedBy: "deployer"})
+		if err != nil {
+			if input.Logger != nil {
+				input.Logger.Debug("deployer: operation admission refused", map[string]any{"projectId": project.ID, "repo": repo, "error": err.Error()})
+			}
+			return
+		}
+		operation = admitted
+	}
 	if _, running := deployInFlight.LoadOrStore(project.ID, struct{}{}); running {
+		if operation != nil {
+			operation.Release()
+		}
 		if input.Logger != nil {
 			input.Logger.Debug("deployer: a deploy is already running for this project", map[string]any{"projectId": project.ID})
 		}
@@ -358,8 +374,17 @@ func startDeployLane(ctx context.Context, input defaultSchedulerTickInput, proje
 	// Detached from the tick's context so a finished tick does not cancel a deploy
 	// mid-flight; the command's own timeout is what bounds it.
 	deployCtx := context.WithoutCancel(ctx)
+	if operation != nil {
+		deployCtx = operation.Context()
+	}
 	go func() {
 		defer deployInFlight.Delete(project.ID)
+		if operation != nil {
+			defer operation.Release()
+		}
+		if deployCtx.Err() != nil {
+			return
+		}
 		runDeployLane(deployCtx, input, project, repo)
 	}()
 }

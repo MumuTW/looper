@@ -66,6 +66,12 @@ func TestSplitGlobalFlags(t *testing.T) {
 			wantOperands: []string{"12", "--not-a-flag"},
 		},
 		{
+			name:         "upgrade-owned flags are preserved",
+			args:         []string{"upgrade", "drain", "--deadline", "30s"},
+			wantVerb:     "upgrade",
+			wantOperands: []string{"drain", "--deadline", "30s"},
+		},
+		{
 			// A swallowed flag would be read as the selector and stop the wrong
 			// loop, so an unknown one is refused rather than passed through.
 			name:    "an unknown flag is refused rather than treated as a selector",

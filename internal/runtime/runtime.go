@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops"
 	"github.com/MumuTW/looper/internal/loops/brownout"
+	networkclient "github.com/MumuTW/looper/internal/network/client"
 	"github.com/MumuTW/looper/internal/processidentity"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/storage"
@@ -207,6 +209,10 @@ type Runtime struct {
 	notificationCancel    context.CancelFunc
 	notificationWG        sync.WaitGroup
 	notificationsStopping bool
+	// agentSpawnConfigMu closes the interval between provider admission and
+	// publication of the pending spawn lease. Config reload and sticky-reference
+	// refresh take the same boundary before sampling live leases.
+	agentSpawnConfigMu sync.Mutex
 	// brownoutIncidentID scopes notification dedupe keys to this daemon
 	// lifetime. Breaker trip counters restart at zero after a process restart,
 	// so a provider.open.1 key must not collide with the previous daemon's
@@ -219,6 +225,7 @@ type Runtime struct {
 	schedulerClaimWake          chan struct{}
 	schedulerCancel             context.CancelFunc
 	schedulerTasks              *schedulerTaskTracker
+	hostAdmission               *hostAdmissionGate
 	worktreeCleanupStop         chan struct{}
 	worktreeCleanupDone         chan struct{}
 	worktreeCleanupWake         chan struct{}
@@ -227,21 +234,38 @@ type Runtime struct {
 	worktreeCleanupInitialDelay time.Duration
 	worktreeCleanupStatus       WorktreeCleanupStatus
 	worktreeCleanupSweepCursor  int
-	hostAdmission               *hostAdmissionGate
-	projectDiscovery            *projectDiscoveryRunner
-	resumeProjectDiscoveries    func(context.Context, *projects.Service) error
-	recoveryCancel              context.CancelFunc
-	recoveryDone                chan struct{}
-	activeExecutions            *ActiveExecutionRegistry
-	projectCatalog              *projects.Catalog
-	githubGateway               *githubinfra.Gateway
-	webhook                     *webhookRuntime
-	databaseDaemonLock          *storage.DatabaseLock
-	webhookForwarder            WebhookForwarder
-	notificationGateways        *schedulerNotificationGatewayFactory
-	schedulerDisabled           bool
-	startupReadyOnce            sync.Once
-	startupReadyErr             error
+	// workProducerJoinStarted latches the first BeginDrain producer join for
+	// the process lifetime (under mu with workProducerJoinDone). Never clear:
+	// a second POST must not overwrite residual done-channels.
+	workProducerJoinStarted bool
+	// workProducerJoinActive is true only while the join goroutine is inside stop*.
+	workProducerJoinActive atomic.Bool
+	// workProducerJoinDone is closed when the drain join goroutine finishes
+	// stop* and registers residual done-channels. Published under the same mu
+	// critical section as workProducerJoinStarted.
+	workProducerJoinDone chan struct{}
+	// drainResidualDones holds producer done-channels still open after a
+	// bounded stop* timeout so DrainSnapshot keeps WorkProducersActive>0.
+	drainResidualDones []<-chan struct{}
+	// admittedHTTPMutations counts mutating API handlers that already passed
+	// AllowMutations and have not finished. Drain must wait for them so a
+	// final backup cannot race a commit that started before BeginDrain.
+	admittedHTTPMutations    atomic.Int64
+	projectDiscovery         *projectDiscoveryRunner
+	resumeProjectDiscoveries func(context.Context, *projects.Service) error
+	recoveryCancel           context.CancelFunc
+	recoveryDone             chan struct{}
+	activeExecutions         *ActiveExecutionRegistry
+	projectCatalog           *projects.Catalog
+	githubGateway            *githubinfra.Gateway
+	webhook                  *webhookRuntime
+	databaseDaemonLock       *storage.DatabaseLock
+	webhookForwarder         WebhookForwarder
+	notificationGateways     *schedulerNotificationGatewayFactory
+	networkManager           runtimeNetworkManager
+	schedulerDisabled        bool
+	startupReadyOnce         sync.Once
+	startupReadyErr          error
 	// ownershipAcquired remains true after CompleteStartup succeeds so stop
 	// still writes looperd.stopped. Admission is the sole ready Authority;
 	// this flag is not a mutation/claim gate.
@@ -262,6 +286,13 @@ type Runtime struct {
 	// storageRetained is true when Stop skipped coordinator.Close after a
 	// drain failure so undrained ownership is not closed under SQLite.
 	storageRetained bool
+}
+
+type runtimeNetworkManager interface {
+	Start(context.Context) error
+	Stop()
+	Status() networkclient.Status
+	UpdateConfig(config.Config)
 }
 
 const reviewerRecoveryLoginTimeout = 3 * time.Second
@@ -376,6 +407,7 @@ func New(options Options) *Runtime {
 	// Project daemon Admission onto agent spawn leases so cmd.Start is refused
 	// while starting/stopping/degraded (#576 + #575).
 	rt.activeExecutions.SetAllowSpawn(rt.allowAgentSpawn)
+	rt.activeExecutions.SetAllowDetachedOperation(rt.AllowClaim)
 	// Hard agent_executions observation failures close admission until process
 	// restart (#578 / ADR-0015 R5). Prefer split-brain stop over silent continue.
 	rt.activeExecutions.SetOnHardPersistFailure(func(err error) {
@@ -458,11 +490,17 @@ func (r *Runtime) Stop(reason string) {
 			r.logger.Info("looperd runtime stopping", map[string]any{"reason": reason})
 		}
 
-		// Close admission and cancel work-producing contexts before draining
-		// producers (ADR-0015 shutdown order). Use BeginShutdown so direct
-		// Runtime.Stop matches the daemon path: scheduler, deferred recovery,
-		// and in-flight webhook discovery are canceled before any waits.
+		// Close admission before waiting on a drain join so a concurrent
+		// BeginDrain cannot publish started=true after we observe false and
+		// then race stop* / SQLite close. BeginShutdown makes late BeginDrain
+		// fail and roll back its latch; an already-published join is waited.
 		r.BeginShutdown(reason)
+		r.waitForDrainProducerJoin()
+		// HTTP Server.Shutdown normally waits for handlers, but it can return
+		// its deadline error while an already-admitted mutation is still using
+		// the coordinator. Join that lease before deciding whether SQLite can
+		// close; a timeout is retained as a drain failure below.
+		r.waitForAdmittedHTTPMutations()
 		// Brownout notifications are best-effort side effects. Stop accepting
 		// new ones and cancel/drain the bounded in-flight deliveries before
 		// repositories are closed, so an async notification cannot write into
@@ -671,21 +709,337 @@ func (r *Runtime) AdmissionState() AdmissionState {
 
 // AllowMutations is the HTTP mutation readiness projection of admission.
 
-// BeginDrain closes new-work admission without canceling existing producers or
-// active agent processes. Controlled cutover waits on DrainSnapshot.
+// BeginDrain closes new-work admission without canceling active agent
+// processes. Scheduler/recovery/cleanup/project-discovery producers are
+// stopped and joined in the background so DrainSnapshot stays non-empty until
+// they can no longer mutate storage; agents and tracked non-agent shells remain
+// owned by DrainSnapshot until they exit. Accepted webhook deliveries keep
+// running (no CancelExecute) but count toward WorkProducersActive via Queued/InFlight.
 func (r *Runtime) BeginDrain(reason string) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionNotReady
 	}
-	return r.admission.BeginDrain(reason)
+	// Reserve join visibility under r.mu, transition admission, then either
+	// launch the join or roll the latch back. Holding r.mu across the
+	// transition prevents waitForDrainProducerJoin from observing
+	// started=true with a never-closed Done when BeginDrain is rejected
+	// (stopping/degraded). On success, active is set before unlock so a
+	// concurrent DrainSnapshot cannot see draining with WorkProducersActive=0.
+	r.mu.Lock()
+	startJoin := false
+	if !r.workProducerJoinStarted {
+		r.workProducerJoinStarted = true
+		r.workProducerJoinDone = make(chan struct{})
+		startJoin = true
+	}
+	err := r.admission.BeginDrain(reason)
+	if err != nil {
+		if startJoin {
+			r.workProducerJoinStarted = false
+			r.workProducerJoinDone = nil
+		}
+		r.mu.Unlock()
+		return err
+	}
+	if startJoin {
+		r.workProducerJoinActive.Store(true)
+	}
+	r.mu.Unlock()
+	if startJoin {
+		go r.joinWorkProducersForDrain()
+	}
+	return nil
+}
+
+// joinWorkProducersForDrain stops the same producer set sticky degrade cancels,
+// then waits for each loop to exit. Timed-out producers remain visible via
+// drainResidualDones so DrainSnapshot does not report drained early.
+func (r *Runtime) joinWorkProducersForDrain() {
+	if r == nil {
+		return
+	}
+	// Snapshot done channels before stop* nils the runtime fields, so a
+	// shutdownTimeout still leaves residual producers countable.
+	r.mu.RLock()
+	residual := make([]<-chan struct{}, 0, 3)
+	for _, done := range []<-chan struct{}{r.schedulerDone, r.recoveryDone, r.worktreeCleanupDone} {
+		if done != nil {
+			residual = append(residual, done)
+		}
+	}
+	r.mu.RUnlock()
+
+	// stop* helpers cancel contexts, close stop channels, and wait (bounded by
+	// shutdownTimeout) so in-flight producer work is joined, not only canceled.
+	r.stopSchedulerLoop()
+	r.stopDeferredReviewerRecovery()
+	r.stopWorktreeCleanupLoop()
+	// Cancel scheduled webhook reconcile retries and wait for in-flight
+	// reconcile work so drained:true cannot race a late Reconcile that mutates
+	// forwarder/tunnel state after the final backup.
+	r.joinWebhookReconcileForDrain()
+	// Forwarder monitors can delete and respawn durable forwarder records after
+	// their child exits. Stop and join them before publishing drained:true; the
+	// delivery queue itself remains owned by webhookForwarder and is still
+	// counted until its accepted work completes.
+	r.stopWebhookRuntime()
+	// Drain join must not record discovery wait timeouts on shutdownDrainErr;
+	// that flag retains SQLite on later Stop even after discovery eventually exits.
+	r.waitProjectDiscoveryForDrain()
+
+	stillOpen := make([]<-chan struct{}, 0, len(residual))
+	for _, done := range residual {
+		if channelStillOpen(done) {
+			stillOpen = append(stillOpen, done)
+		}
+	}
+	r.mu.Lock()
+	r.drainResidualDones = stillOpen
+	joinDone := r.workProducerJoinDone
+	r.mu.Unlock()
+	r.workProducerJoinActive.Store(false)
+	if joinDone != nil {
+		close(joinDone)
+	}
+	// Keep watching residual producers so WorkProducersActive clears when they exit.
+	for _, done := range stillOpen {
+		go r.watchResidualProducerDone(done)
+	}
+}
+
+func (r *Runtime) watchResidualProducerDone(done <-chan struct{}) {
+	if r == nil || done == nil {
+		return
+	}
+	<-done
+	r.mu.Lock()
+	next := r.drainResidualDones[:0]
+	for _, ch := range r.drainResidualDones {
+		if ch != done && channelStillOpen(ch) {
+			next = append(next, ch)
+		}
+	}
+	r.drainResidualDones = next
+	r.mu.Unlock()
+}
+
+func (r *Runtime) waitForDrainProducerJoin() {
+	if r == nil {
+		return
+	}
+	// Started and Done are published atomically under mu; wait for Done if join
+	// started. Do not time out this publication gap (that would race SQLite close).
+	for {
+		r.mu.RLock()
+		started := r.workProducerJoinStarted
+		joinDone := r.workProducerJoinDone
+		r.mu.RUnlock()
+		if !started {
+			return
+		}
+		if joinDone != nil {
+			<-joinDone
+			break
+		}
+		// Should be unreachable given atomic publish; yield until visible.
+		time.Sleep(time.Millisecond)
+	}
+	// Join finished registering residuals; wait a bounded time for residuals
+	// that stop* already timed out on, without blocking forever.
+	deadline := time.Now().Add(r.shutdownTimeout)
+	if r.shutdownTimeout <= 0 {
+		deadline = time.Now().Add(20 * time.Second)
+	}
+	for time.Now().Before(deadline) {
+		r.mu.RLock()
+		n := len(r.drainResidualDones)
+		r.mu.RUnlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Residuals still live after the bounded wait: retain storage on Stop so
+	// SQLite is not closed under those producers (first join already nilled
+	// the stop* fields, so a second wait cannot join them).
+	r.mu.Lock()
+	if len(r.drainResidualDones) > 0 {
+		r.shutdownDrainErr = errors.Join(r.shutdownDrainErr, fmt.Errorf("upgrade drain residual work producers still running after shutdown wait (%d)", len(r.drainResidualDones)))
+	}
+	r.mu.Unlock()
+}
+
+// waitForAdmittedHTTPMutations waits for handlers that passed the admission
+// gate before shutdown. net/http may return a Shutdown deadline while such a
+// handler is still executing; closing SQLite in that window would race its
+// coordinator access. A timeout is a containment failure, so Stop retains the
+// storage instead of reporting a graceful close.
+func (r *Runtime) waitForAdmittedHTTPMutations() {
+	if r == nil || r.admittedHTTPMutations.Load() <= 0 {
+		return
+	}
+	timeout := r.shutdownTimeout
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for r.admittedHTTPMutations.Load() > 0 {
+		if !time.Now().Before(deadline) {
+			r.mu.Lock()
+			r.shutdownDrainErr = errors.Join(r.shutdownDrainErr, fmt.Errorf("admitted HTTP mutations still running after shutdown wait (%d)", r.admittedHTTPMutations.Load()))
+			r.mu.Unlock()
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // DrainSnapshot reports Supervisor-owned work still in flight after BeginDrain.
+// It includes work producers still being joined so cutover cannot proceed while
+// discovery/scheduler/recovery/accepted-webhook work still mutate storage.
 func (r *Runtime) DrainSnapshot() DrainSnapshot {
-	if r == nil || r.activeExecutions == nil {
+	if r == nil {
 		return DrainSnapshot{}
 	}
-	return r.activeExecutions.DrainSnapshot()
+	snapshot := DrainSnapshot{}
+	if r.activeExecutions != nil {
+		snapshot = r.activeExecutions.DrainSnapshot()
+	}
+	snapshot.WorkProducersActive = r.countActiveWorkProducers()
+	return snapshot
+}
+
+func (r *Runtime) countActiveWorkProducers() int {
+	if r == nil {
+		return 0
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.countActiveWorkProducersLocked()
+}
+
+// countActiveWorkProducersLocked counts producers while the caller already holds
+// r.mu for reading (or writing). Do not call DrainSnapshot from under r.mu —
+// use this helper instead to avoid recursive RWMutex RLock deadlocks when a
+// writer is pending.
+func (r *Runtime) countActiveWorkProducersLocked() int {
+	if r == nil {
+		return 0
+	}
+	active := 0
+	if r.workProducerJoinActive.Load() {
+		active++
+	}
+	active += len(r.drainResidualDones)
+	discovery := r.projectDiscovery
+	forwarder := r.webhookForwarder
+	webhook := r.webhook
+	if discovery != nil && discovery.Busy() {
+		active++
+	}
+	// Accepted webhook deliveries deliberately keep running after drain; count
+	// their outstanding work so final backup cannot race their storage writes.
+	if forwarder != nil {
+		stats := forwarder.Stats()
+		active += stats.Queued + stats.InFlight
+	}
+	if webhook != nil && webhook.ReconcileWorkActive() {
+		active++
+	}
+	active += int(r.admittedHTTPMutations.Load())
+	return active
+}
+
+// BeginAdmittedMutation registers a mutating HTTP request that already passed
+// AllowMutations. The returned release must run when the handler returns.
+func (r *Runtime) BeginAdmittedMutation() func() {
+	if r == nil {
+		return func() {}
+	}
+	r.admittedHTTPMutations.Add(1)
+	return func() { r.admittedHTTPMutations.Add(-1) }
+}
+
+// BeginAdmittedMutationIfAllowed checks AllowMutations and increments the
+// admitted-mutation lease under one admission critical section so drain cannot
+// observe a gap between the gate and the counter.
+func (r *Runtime) BeginAdmittedMutationIfAllowed() (func(), error) {
+	if r == nil || r.admission == nil {
+		return nil, ErrAdmissionStopping
+	}
+	var release func()
+	err := r.admission.WithAllowWork(func() {
+		r.admittedHTTPMutations.Add(1)
+		release = func() { r.admittedHTTPMutations.Add(-1) }
+	})
+	if err != nil {
+		return nil, err
+	}
+	if release == nil {
+		release = func() {}
+	}
+	return release, nil
+}
+
+// BeginBackupMutationIfAllowed grants a mutation lease when online backup is
+// legal: ready admission, or a completed drain under draining/stopping.
+// Gate decision and lease acquisition share the admission mutex so drain
+// cannot observe empty admitted mutations between the two steps.
+//
+// Lock order is r.mu then admission.mu (same as BeginDrain) so a concurrent
+// final-backup and repeat-drain cannot deadlock.
+func (r *Runtime) BeginBackupMutationIfAllowed() (func(), error) {
+	if r == nil || r.admission == nil {
+		return nil, ErrAdmissionStopping
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var release func()
+	err := r.admission.WithState(func(state AdmissionState) error {
+		switch state {
+		case AdmissionReady:
+			// online pre-cutover backup
+		case AdmissionDraining:
+			// Final cutover backup: require the supervisor work set drained.
+			// Snapshot under the outer r.mu.RLock without re-locking (a pending
+			// BeginDrain writer would otherwise deadlock recursive RLock).
+			// Do not admit new backups once shutdown has moved to stopping —
+			// Stop does not join backup leases and may race a 15m CLI timeout.
+			snapshot := DrainSnapshot{}
+			if r.activeExecutions != nil {
+				snapshot = r.activeExecutions.DrainSnapshot()
+			}
+			snapshot.WorkProducersActive = r.countActiveWorkProducersLocked()
+			if !snapshot.Drained() {
+				return fmt.Errorf("Upgrade backup after drain requires a drained supervisor work set")
+			}
+		default:
+			return fmt.Errorf("Upgrade backup requires ready admission or a completed drain")
+		}
+		r.admittedHTTPMutations.Add(1)
+		release = func() { r.admittedHTTPMutations.Add(-1) }
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if release == nil {
+		release = func() {}
+	}
+	return release, nil
+}
+
+// channelStillOpen reports whether a done channel has not yet been closed.
+func channelStillOpen(done <-chan struct{}) bool {
+	if done == nil {
+		return false
+	}
+	select {
+	case <-done:
+		return false
+	default:
+		return true
+	}
 }
 
 // WaitForDrain blocks until DrainSnapshot reports no in-flight work or ctx ends.
@@ -759,18 +1113,21 @@ func (r *Runtime) ClaimCapacityForVendor(vendor string, snapshot bool) int {
 	return r.agentHealth.ClaimCapacity(vendor, snapshot)
 }
 
-func (r *Runtime) allowAgentSpawn(meta *agent.SpawnMeta) error {
+func (r *Runtime) allowAgentSpawn(meta *agent.SpawnMeta) (func(), error) {
 	if r == nil || r.admission == nil {
-		return ErrAdmissionStopping
+		return nil, ErrAdmissionStopping
 	}
 	// Operation leases already run inside the scheduler's lifecycle admission
 	// section. Re-entering Admission here would deadlock that critical section;
 	// provider health is only meaningful for the execution spawn metadata.
 	if meta == nil {
-		return nil
+		return nil, nil
 	}
+	r.agentSpawnConfigMu.Lock()
+	release := func() { r.agentSpawnConfigMu.Unlock() }
 	if err := r.admission.AllowClaim(); err != nil {
-		return err
+		release()
+		return nil, err
 	}
 	var probe bool
 	var generation uint64
@@ -781,7 +1138,8 @@ func (r *Runtime) allowAgentSpawn(meta *agent.SpawnMeta) error {
 		probe, generation, err = r.agentHealth.AllowAdmissionWithGeneration(meta.Vendor)
 	}
 	if err != nil && errors.Is(err, brownout.ErrOpen) {
-		return errors.Join(agent.ErrProviderBrownout, err)
+		release()
+		return nil, errors.Join(agent.ErrProviderBrownout, err)
 	}
 	meta.BrownoutProbe = probe
 	meta.BrownoutProbeGeneration = generation
@@ -789,7 +1147,11 @@ func (r *Runtime) allowAgentSpawn(meta *agent.SpawnMeta) error {
 		vendor := meta.Vendor
 		meta.BrownoutProbeRelease = func() { r.agentHealth.ReleaseAdmission(vendor, generation) }
 	}
-	return err
+	if err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
 }
 
 // AllowLifecycleWork is claim admission without the agent-health gate, for work
@@ -1311,6 +1673,18 @@ func (r *Runtime) stopWebhookRuntime() {
 	}
 }
 
+// joinWebhookReconcileForDrain cancels pending reconcile retries and waits for
+// in-flight webhook reconcile work without tearing down live forwarders (those
+// remain visible via DrainSnapshot until they exit).
+func (r *Runtime) joinWebhookReconcileForDrain() {
+	r.mu.RLock()
+	webhook := r.webhook
+	r.mu.RUnlock()
+	if webhook != nil {
+		webhook.JoinReconcileForDrain()
+	}
+}
+
 func (r *Runtime) releaseDatabaseDaemonLock() {
 	r.mu.RLock()
 	lock := r.databaseDaemonLock
@@ -1415,18 +1789,6 @@ func (r *Runtime) start(ctx context.Context) error {
 		DetectRepo: func(ctx context.Context, repoPath string) (projects.DetectedRepo, error) {
 			return detectProjectRepo(ctx, gitGateway, r.projectCatalog.View(), repoPath)
 		},
-		GetRepositorySettings: func(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
-			if githubGateway == nil {
-				return githubinfra.RepositorySettings{}, fmt.Errorf("github gateway is not configured")
-			}
-			return githubGateway.GetRepositorySettings(ctx, input)
-		},
-		GetBranchProtection: func(ctx context.Context, input githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
-			if githubGateway == nil {
-				return githubinfra.BranchProtection{}, fmt.Errorf("github gateway is not configured")
-			}
-			return githubGateway.GetBranchProtection(ctx, input)
-		},
 		ListWorktrees: func(ctx context.Context, repoPath string) ([]projects.WorktreeListEntry, error) {
 			worktrees, err := gitGateway.ListWorktrees(ctx, repoPath)
 			if err != nil {
@@ -1471,11 +1833,21 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	loopService := &loops.Service{DB: coordinator.DB(), Repos: repositories, Now: r.now}
 	startedAt := r.now().UTC()
-	if err := r.syncConfiguredProjects(ctx, projectService, r.config, startedAt); err != nil {
-		return err
+	upgradeHold := upgradeVerifyHoldEnabled()
+	if !upgradeHold {
+		if err := r.syncConfiguredProjects(ctx, projectService, r.config, startedAt); err != nil {
+			return err
+		}
+	} else if r.logger != nil {
+		r.logger.Info("looperd upgrade verify hold defers configured project sync", map[string]any{
+			"env": "LOOPER_UPGRADE_VERIFY_HOLD=1",
+		})
 	}
 	// Project import is already committed. Materialize that durable state even
 	// when the startup request is canceled; CompleteStartup still observes ctx.
+	// This is a read-only catalog projection. Under verify hold the mutating
+	// configured-project sync above is intentionally deferred until the unheld
+	// restart so the candidate cannot change rollback state before verification.
 	if err := r.reloadProjectCatalog(context.Background(), repositories); err != nil {
 		return err
 	}
@@ -1543,6 +1915,12 @@ func (r *Runtime) start(ctx context.Context) error {
 	resourcesPublished = true
 
 	if r.deferRecovery {
+		// The supervised daemon calls CompleteStartup after its API is assembled.
+		// Do not start heartbeat/lease work before that hold selects draining.
+		if r.networkManager != nil && !upgradeVerifyHoldEnabled() {
+			_ = r.networkManager.Start(context.Background())
+		}
+
 		started = true
 		return nil
 	}
@@ -1581,6 +1959,43 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 			r.startupReadyErr = err
 			return
 		}
+		upgradeHold := upgradeVerifyHoldEnabled()
+		if upgradeHold {
+			// Select the held admission before any startup recovery. Recovery
+			// reconciles durable runs/queues and writes events; those mutations must
+			// wait until the operator has verified the candidate and restarts it
+			// without LOOPER_UPGRADE_VERIFY_HOLD.
+			if err := r.admission.BeginVerifyHold("upgrade-verify-hold"); err != nil {
+				r.startupReadyErr = err
+				if r.logger != nil {
+					r.logger.Error("looperd upgrade verify hold failed", map[string]any{"error": err.Error()})
+				}
+				return
+			}
+			// Still exercise the local webhook startup gate so a candidate that
+			// cannot bind its configured tunnel fails under hold. Validation does
+			// not reconcile GitHub hooks or publish delivery state.
+			if r.webhook != nil {
+				if err := r.webhook.ValidateStartup(); err != nil {
+					r.startupReadyErr = err
+					return
+				}
+			}
+			r.mu.Lock()
+			// CompleteStartup succeeded as a lifecycle operation, but recovery is
+			// intentionally still the empty pre-recovery projection under hold.
+			r.recovery = createEmptyRecoverySummary()
+			r.ownershipAcquired = true
+			r.mu.Unlock()
+			if r.logger != nil {
+				r.logger.Info("looperd upgrade verify hold active", map[string]any{
+					"env":    "LOOPER_UPGRADE_VERIFY_HOLD=1",
+					"action": "run verify-start then restart without this env",
+					"note":   "startup recovery, network/webhook reconcile, scheduler, and discovery deferred until unheld restart",
+				})
+			}
+			return
+		}
 		recoverySummary, err := r.runRecoveryPipeline(ctx, repositories, githubGateway, *startedAt)
 		if err != nil {
 			r.startupReadyErr = err
@@ -1595,6 +2010,14 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		r.recovery = recoverySummary
 		r.ownershipAcquired = true
 		r.mu.Unlock()
+
+		if r.networkManager != nil {
+			if err := r.networkManager.Start(ctx); err != nil {
+				r.startupReadyErr = err
+				return
+			}
+		}
+
 		if r.webhook != nil {
 			if err := r.webhook.Start(repositories); err != nil {
 				r.startupReadyErr = err
@@ -1621,7 +2044,7 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		}
 		// Persisted discovery is runtime-owned work. Launch it only after
 		// dependency validation, recovery, ownership, producer assembly, and
-		// admission readiness have all succeeded.
+		// admission readiness have all succeeded — not under verify-hold.
 		if projectService != nil {
 			resume := r.resumeProjectDiscoveries
 			if resume == nil {
@@ -1667,6 +2090,10 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		r.Stop("runtime startup failed: " + r.startupReadyErr.Error())
 	}
 	return r.startupReadyErr
+}
+
+func upgradeVerifyHoldEnabled() bool {
+	return strings.TrimSpace(os.Getenv("LOOPER_UPGRADE_VERIFY_HOLD")) == "1"
 }
 
 func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, repositories *storage.Repositories, githubGateway *githubinfra.Gateway) error {
@@ -1849,7 +2276,10 @@ func (r *Runtime) refreshAgentHealthStickyReferences() {
 	if r == nil || r.agentHealth == nil {
 		return
 	}
-	if err := r.agentHealth.RefreshStickyVendorReferences(r.collectAgentHealthStickyReferences); err != nil && r.logger != nil {
+	r.agentSpawnConfigMu.Lock()
+	err := r.agentHealth.RefreshStickyVendorReferences(r.collectAgentHealthStickyReferences)
+	r.agentSpawnConfigMu.Unlock()
+	if err != nil && r.logger != nil {
 		r.logger.Warn("agent health sticky-vendor reference refresh deferred", map[string]any{"error": err.Error()})
 	}
 }
@@ -1858,6 +2288,8 @@ func (r *Runtime) refreshAgentHealthStickyReferencesAndConfig(next config.Config
 	if r == nil || r.agentHealth == nil {
 		return nil
 	}
+	r.agentSpawnConfigMu.Lock()
+	defer r.agentSpawnConfigMu.Unlock()
 	return r.agentHealth.RefreshStickyVendorReferencesAndConfig(r.collectAgentHealthStickyReferences, agentBrownoutConfig(next), next)
 }
 

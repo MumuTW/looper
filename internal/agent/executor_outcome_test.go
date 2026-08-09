@@ -241,6 +241,12 @@ func TestReportOutcomeAcceptsReviewerOutcomes(t *testing.T) {
 	if len(outcomes) != 1 || outcomes[0].Succeeded {
 		t.Fatalf("invalid reviewer outcome = %#v, want one failed outcome", outcomes)
 	}
+
+	outcomes = outcomes[:0]
+	exec.reportOutcome("completed", "parsed", `{"type":"rate_limit","message":"quota exhausted"}`, "")
+	if len(outcomes) != 1 || outcomes[0].Succeeded {
+		t.Fatalf("reviewer rate-limit outcome = %#v, want one failed outcome", outcomes)
+	}
 }
 
 func TestReportOutcomeAcceptsVerifiedReviewerPublicationAfterIncompleteProcessResult(t *testing.T) {
@@ -283,5 +289,12 @@ func TestReportOutcomeAcceptsWorkerHITLAskAfterMarkerlessTurn(t *testing.T) {
 	exec.reportOutcome("failed", "missing", "", "")
 	if len(outcomes) != 1 || outcomes[0].Succeeded {
 		t.Fatalf("failed non-HITL worker outcome = %#v, want one failed provider outcome", outcomes)
+	}
+
+	outcomes = outcomes[:0]
+	exec.input.CompletionOutcomeValidator = nil
+	exec.reportOutcome("completed", "parsed", `{"outcome":"blocked","failure_kind":"retryable_transient"}`, "")
+	if len(outcomes) != 1 || !outcomes[0].Succeeded {
+		t.Fatalf("accepted worker retryable block = %#v, want one successful provider outcome", outcomes)
 	}
 }

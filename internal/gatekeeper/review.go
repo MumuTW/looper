@@ -16,6 +16,7 @@ type reviewerReviewPostedPayload struct {
 	Repo           string `json:"repo"`
 	PRNumber       int64  `json:"prNumber"`
 	Event          string `json:"event"`
+	Outcome        string `json:"outcome,omitempty"`
 	HeadSHA        string `json:"headSha"`
 	MarkerVerified bool   `json:"markerVerified"`
 }
@@ -64,12 +65,30 @@ func latestCodexReviewForHead(ctx context.Context, repos *storage.Repositories, 
 		}
 		reviewEvent := strings.ToUpper(strings.TrimSpace(payload.Event))
 		switch reviewEvent {
-		case "COMMENT", "APPROVE", "REQUEST_CHANGES":
+		case "COMMENT":
+			// A COMMENT can carry either a clean/non-blocking result or a
+			// blocking finding. Only the former is a merge-eligible review
+			// signal; preserve acceptance of legacy events that predate outcome.
+			outcome := strings.ToLower(strings.TrimSpace(payload.Outcome))
+			if outcome != "" && outcome != "clean" && outcome != "non_blocking" && outcome != "actionable" && outcome != "blocking" {
+				continue
+			}
+		case "APPROVE":
+			outcome := strings.ToLower(strings.TrimSpace(payload.Outcome))
+			if outcome != "" && outcome != "clean" {
+				continue
+			}
+		case "REQUEST_CHANGES":
+			outcome := strings.ToLower(strings.TrimSpace(payload.Outcome))
+			if outcome != "" && outcome != "blocking" {
+				continue
+			}
 		default:
 			continue
 		}
 		evidence.ReviewedHeadSHA = reviewedHead
 		evidence.Event = reviewEvent
+		evidence.Outcome = strings.ToLower(strings.TrimSpace(payload.Outcome))
 		evidence.RecordedAt = event.CreatedAt
 	}
 	evidence.CurrentHeadValid = evidence.ReviewedHeadSHA != "" && strings.EqualFold(evidence.ReviewedHeadSHA, evidence.RequiredHeadSHA)

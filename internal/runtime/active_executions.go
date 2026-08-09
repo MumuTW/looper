@@ -104,7 +104,8 @@ type ActiveExecutionRegistry struct {
 	// allowSpawn, when set, projects daemon Admission.AllowClaim so spawns
 	// refuse while starting/stopping/degraded. Nil means registry-local only
 	// (tests that do not wire Runtime admission).
-	allowSpawn func(*agent.SpawnMeta) error
+	allowSpawn             func(*agent.SpawnMeta) (release func(), err error)
+	allowDetachedOperation func() error
 
 	// onHardPersistFailure maps hard agent_executions write failures into the
 	// single sticky admission degraded state (ADR-0015 R5 / #578). Also used
@@ -128,10 +129,19 @@ type DrainSnapshot struct {
 	PendingSpawns     int `json:"pendingSpawns"`
 	BoundOperations   int `json:"boundOperations"`
 	PendingOperations int `json:"pendingOperations"`
+	// NonAgentHandles counts Supervisor-owned validation/trusted-review shells
+	// tracked via processcontainment.LiveTracker. They are live cutover blockers
+	// even though they are not agent executions or operation leases.
+	NonAgentHandles int `json:"nonAgentHandles"`
+	// WorkProducersActive counts scheduler/recovery/cleanup/project-discovery
+	// producers that have not yet exited after BeginDrain canceled them. Empty
+	// agent/lease sets are not enough to cut over while a producer still mutates
+	// storage or enqueues work.
+	WorkProducersActive int `json:"workProducersActive"`
 }
 
 func (s DrainSnapshot) Drained() bool {
-	return s.LiveExecutions == 0 && s.PendingSpawns == 0 && s.BoundOperations == 0 && s.PendingOperations == 0
+	return s.LiveExecutions == 0 && s.PendingSpawns == 0 && s.BoundOperations == 0 && s.PendingOperations == 0 && s.NonAgentHandles == 0 && s.WorkProducersActive == 0
 }
 
 func (r *ActiveExecutionRegistry) DrainSnapshot() DrainSnapshot {
@@ -140,7 +150,13 @@ func (r *ActiveExecutionRegistry) DrainSnapshot() DrainSnapshot {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return DrainSnapshot{LiveExecutions: len(r.executions), PendingSpawns: len(r.pending), BoundOperations: len(r.boundOps), PendingOperations: len(r.pendingOps)}
+	return DrainSnapshot{
+		LiveExecutions:    len(r.executions),
+		PendingSpawns:     len(r.pending),
+		BoundOperations:   len(r.boundOps),
+		PendingOperations: len(r.pendingOps),
+		NonAgentHandles:   len(r.nonAgentHandles),
+	}
 }
 
 // AgentVendors returns providers held by pending spawn leases or live
@@ -202,12 +218,23 @@ func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
 }
 
 // SetAllowSpawn wires the daemon Admission projection for spawn decisions.
-func (r *ActiveExecutionRegistry) SetAllowSpawn(fn func(*agent.SpawnMeta) error) {
+func (r *ActiveExecutionRegistry) SetAllowSpawn(fn func(*agent.SpawnMeta) (func(), error)) {
 	if r == nil {
 		return
 	}
 	r.mu.Lock()
 	r.allowSpawn = fn
+	r.mu.Unlock()
+}
+
+// SetAllowDetachedOperation wires lifecycle admission for operations that do
+// not run inside the scheduler's existing claim boundary.
+func (r *ActiveExecutionRegistry) SetAllowDetachedOperation(fn func() error) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.allowDetachedOperation = fn
 	r.mu.Unlock()
 }
 
@@ -648,17 +675,28 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 		release()
 	}
 
+	var releaseAdmissionBoundary func()
 	if allow != nil {
-		if err := allow(&meta); err != nil {
+		var err error
+		releaseAdmissionBoundary, err = allow(&meta)
+		if err != nil {
 			releaseBrownoutProbe()
 			return nil, errors.Join(agent.ErrSpawnAdmissionClosed, err)
 		}
 	}
+	releaseBoundary := func() {
+		if releaseAdmissionBoundary != nil {
+			releaseAdmissionBoundary()
+			releaseAdmissionBoundary = nil
+		}
+	}
 	if closed {
+		releaseBoundary()
 		releaseBrownoutProbe()
 		return nil, agent.ErrSpawnAdmissionClosed
 	}
 	if stopping {
+		releaseBoundary()
 		releaseBrownoutProbe()
 		return nil, agent.ErrSpawnLoopStopping
 	}
@@ -667,11 +705,13 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 	// Re-check under lock after allowSpawn (which may have raced with shutdown).
 	if r.admissionClosed {
 		r.mu.Unlock()
+		releaseBoundary()
 		releaseBrownoutProbe()
 		return nil, agent.ErrSpawnAdmissionClosed
 	}
 	if meta.LoopID != "" && r.stoppingLoops[meta.LoopID] != nil {
 		r.mu.Unlock()
+		releaseBoundary()
 		releaseBrownoutProbe()
 		return nil, agent.ErrSpawnLoopStopping
 	}
@@ -689,6 +729,7 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 	}
 	r.pending[id] = lease
 	r.mu.Unlock()
+	releaseBoundary()
 	return lease, nil
 }
 

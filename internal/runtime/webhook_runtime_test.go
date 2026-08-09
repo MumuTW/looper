@@ -149,6 +149,45 @@ func TestWebhookRuntimeStartFailsWhenTunnelListenerCannotBind(t *testing.T) {
 	defer rt.Stop()
 }
 
+func TestWebhookRuntimeValidateStartupChecksTunnelListener(t *testing.T) {
+	t.Parallel()
+
+	_, _, cfg := setupWebhookTunnelTestRepos(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v", err)
+	}
+	defer listener.Close()
+	cfg.Webhook.ListenPort = listener.Addr().(*net.TCPAddr).Port
+	cfg.Projects = webhookRuntimeTestConfig("acme/looper").Projects
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	defer rt.Stop()
+
+	err = rt.ValidateStartup()
+	if err == nil || !strings.Contains(err.Error(), "webhook tunnel listener failed") {
+		t.Fatalf("ValidateStartup() error = %v, want tunnel listener failure", err)
+	}
+	if rt.tunnelServer != nil {
+		t.Fatal("tunnel server started despite validation bind failure")
+	}
+}
+
+func TestWebhookRuntimeValidateStartupRetainsTunnelListener(t *testing.T) {
+	t.Parallel()
+
+	_, _, cfg := setupWebhookTunnelTestRepos(t)
+	cfg.Projects = webhookRuntimeTestConfig("acme/looper").Projects
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	defer rt.Stop()
+
+	if err := rt.ValidateStartup(); err != nil {
+		t.Fatalf("ValidateStartup() error = %v", err)
+	}
+	if rt.tunnelServer == nil {
+		t.Fatal("ValidateStartup() did not retain tunnel listener")
+	}
+}
+
 func TestWebhookRuntimeRunForwarderClearsRecoveredForwarderReason(t *testing.T) {
 	testBin, err := os.Executable()
 	if err != nil {
@@ -326,7 +365,7 @@ func TestWebhookRuntimeReconcileAddsMissingForwardersWithoutDuplicates(t *testin
 	repositories := openWebhookRuntimeTestRepositories(t)
 	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
 	metadataOne := `{"repo":"MumuTW/looper"}`
-	metadataTwo := `{"repo":"nexu-io/other"}`
+	metadataTwo := `{"repo":"MumuTW/other"}`
 	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", MetadataJSON: &metadataOne, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
 	}
@@ -335,7 +374,7 @@ func TestWebhookRuntimeReconcileAddsMissingForwardersWithoutDuplicates(t *testin
 	}
 
 	rt := &webhookRuntime{
-		cfg:    webhookRuntimeTestConfig("MumuTW/looper", "nexu-io/other"),
+		cfg:    webhookRuntimeTestConfig("MumuTW/looper", "MumuTW/other"),
 		ghPath: "/usr/bin/gh",
 		status: WebhookStatus{
 			Enabled:         true,
@@ -364,8 +403,8 @@ func TestWebhookRuntimeReconcileAddsMissingForwardersWithoutDuplicates(t *testin
 	if status.Forwarders[0].Repo != "MumuTW/looper" {
 		t.Fatalf("Status().Forwarders[0].Repo = %q, want MumuTW/looper", status.Forwarders[0].Repo)
 	}
-	if status.Forwarders[1].Repo != "nexu-io/other" {
-		t.Fatalf("Status().Forwarders[1].Repo = %q, want nexu-io/other", status.Forwarders[1].Repo)
+	if status.Forwarders[1].Repo != "MumuTW/other" {
+		t.Fatalf("Status().Forwarders[1].Repo = %q, want MumuTW/other", status.Forwarders[1].Repo)
 	}
 
 	rt.Reconcile(repositories)
@@ -517,7 +556,7 @@ func TestWebhookRuntimeReconcileLaunchesNewForwarderDespiteExistingForwarderDegr
 	repositories := openWebhookRuntimeTestRepositories(t)
 	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
 	metadataOne := `{"repo":"MumuTW/looper"}`
-	metadataTwo := `{"repo":"nexu-io/other"}`
+	metadataTwo := `{"repo":"MumuTW/other"}`
 	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", MetadataJSON: &metadataOne, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
 	}
@@ -526,7 +565,7 @@ func TestWebhookRuntimeReconcileLaunchesNewForwarderDespiteExistingForwarderDegr
 	}
 
 	rt := &webhookRuntime{
-		cfg:    webhookRuntimeTestConfig("MumuTW/looper", "nexu-io/other"),
+		cfg:    webhookRuntimeTestConfig("MumuTW/looper", "MumuTW/other"),
 		ghPath: "/usr/bin/gh",
 		status: WebhookStatus{
 			Enabled:     true,
@@ -562,7 +601,7 @@ func TestWebhookRuntimeReconcileLaunchesNewForwarderDespiteExistingForwarderDegr
 	for time.Now().Before(deadline) {
 		status = rt.Status()
 		for i := range status.Forwarders {
-			if status.Forwarders[i].Repo == "nexu-io/other" {
+			if status.Forwarders[i].Repo == "MumuTW/other" {
 				launched = &status.Forwarders[i]
 				break
 			}
@@ -576,10 +615,10 @@ func TestWebhookRuntimeReconcileLaunchesNewForwarderDespiteExistingForwarderDegr
 		t.Fatalf("len(Status().Forwarders) = %d, want 2", len(status.Forwarders))
 	}
 	if launched == nil {
-		t.Fatalf("Status().Forwarders = %v, want launched forwarder for nexu-io/other", status.Forwarders)
+		t.Fatalf("Status().Forwarders = %v, want launched forwarder for MumuTW/other", status.Forwarders)
 	}
 	if !launched.Running {
-		t.Fatal("Status().Forwarders[nexu-io/other].Running = false, want true after launching new repo forwarder")
+		t.Fatal("Status().Forwarders[MumuTW/other].Running = false, want true after launching new repo forwarder")
 	}
 	if !status.Degraded {
 		t.Fatal("Status().Degraded = false, want true while existing forwarder degradation remains")
@@ -859,7 +898,7 @@ func TestWebhookRuntimeTunnelDegradedReasonsDoNotBlockForwarderLaunch(t *testing
 	t.Parallel()
 
 	rt := &webhookRuntime{ghPath: "/usr/bin/gh", status: WebhookStatus{Enabled: true, Degraded: true, DegradedReasons: []string{
-		"tunnel hook for nexu-io/tunnel degraded: latched; polling fallback continues every 300 seconds",
+		"tunnel hook for MumuTW/tunnel degraded: latched; polling fallback continues every 300 seconds",
 		"webhook tunnel hooks require gh to create or reconcile repository webhooks",
 		"forwarder for MumuTW/looper exited: temporary network error",
 	}}}
@@ -948,7 +987,7 @@ func TestWebhookRuntimeBootstrapRetryDoesNotDuplicateAdoptedForwarders(t *testin
 	repositories := openWebhookRuntimeTestRepositories(t)
 	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
 	metadata1 := `{"repo":"MumuTW/looper"}`
-	metadata2 := `{"repo":"nexu-io/other"}`
+	metadata2 := `{"repo":"MumuTW/other"}`
 	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", MetadataJSON: &metadata1, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
 	}
@@ -959,9 +998,9 @@ func TestWebhookRuntimeBootstrapRetryDoesNotDuplicateAdoptedForwarders(t *testin
 	ghPath := "/usr/bin/gh"
 	endpoint := "http://127.0.0.1:7777/webhook/forward"
 	fingerprint1, events1 := commandFingerprint(ghPath, "MumuTW/looper", webhookForwardEvents, endpoint)
-	fingerprint2, events2 := commandFingerprint(ghPath, "nexu-io/other", webhookForwardEvents, endpoint)
+	fingerprint2, events2 := commandFingerprint(ghPath, "MumuTW/other", webhookForwardEvents, endpoint)
 	record1 := storage.WebhookForwarderRecord{Repo: "MumuTW/looper", PID: 4242, ProcessStart: 99, Fingerprint: fingerprint1, Endpoint: endpoint, Events: events1, GHPath: ghPath, DaemonID: "old", SpawnedAt: 1, UpdatedAt: 1}
-	record2 := storage.WebhookForwarderRecord{Repo: "nexu-io/other", PID: 4343, ProcessStart: 101, Fingerprint: fingerprint2, Endpoint: endpoint, Events: events2, GHPath: ghPath, DaemonID: "old", SpawnedAt: 1, UpdatedAt: 1}
+	record2 := storage.WebhookForwarderRecord{Repo: "MumuTW/other", PID: 4343, ProcessStart: 101, Fingerprint: fingerprint2, Endpoint: endpoint, Events: events2, GHPath: ghPath, DaemonID: "old", SpawnedAt: 1, UpdatedAt: 1}
 	if err := repositories.WebhookForwarders.Upsert(context.Background(), record1); err != nil {
 		t.Fatalf("WebhookForwarders.Upsert(record1) error = %v", err)
 	}
@@ -974,7 +1013,7 @@ func TestWebhookRuntimeBootstrapRetryDoesNotDuplicateAdoptedForwarders(t *testin
 		4343: {alive: true, startErr: errors.New("probe failed")},
 	}}
 	rt := &webhookRuntime{
-		cfg:             webhookRuntimeTestConfig("MumuTW/looper", "nexu-io/other"),
+		cfg:             webhookRuntimeTestConfig("MumuTW/looper", "MumuTW/other"),
 		ghPath:          ghPath,
 		status:          WebhookStatus{Enabled: true, EndpointURL: endpoint, FallbackPollIntervalSeconds: 300},
 		stopCh:          make(chan struct{}),
@@ -994,7 +1033,7 @@ func TestWebhookRuntimeBootstrapRetryDoesNotDuplicateAdoptedForwarders(t *testin
 	if !status.Forwarders[0].Adopted || status.Forwarders[0].Repo != record1.Repo {
 		t.Fatalf("Status().Forwarders = %#v, want single adopted forwarder for %q", status.Forwarders, record1.Repo)
 	}
-	if !status.Degraded || len(status.DegradedReasons) != 1 || !strings.Contains(status.DegradedReasons[0], "webhook forwarder bootstrap is incomplete: adoption probe for nexu-io/other failed") {
+	if !status.Degraded || len(status.DegradedReasons) != 1 || !strings.Contains(status.DegradedReasons[0], "webhook forwarder bootstrap is incomplete: adoption probe for MumuTW/other failed") {
 		t.Fatalf("Status() = %#v, want transient bootstrap degradation for inconclusive record", status)
 	}
 	if rt.bootstrapCompleted() {
@@ -1066,20 +1105,20 @@ func TestWebhookRuntimeReconcilePrunesForwardersForRemovedRepos(t *testing.T) {
 
 	repositories := openWebhookRuntimeTestRepositories(t)
 	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
-	metadata := `{"repo":"nexu-io/other"}`
+	metadata := `{"repo":"MumuTW/other"}`
 	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_2", Name: "Other", RepoPath: "/tmp/other", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert(project_2) error = %v", err)
 	}
 
 	rt := &webhookRuntime{
-		cfg:    webhookRuntimeTestConfig("nexu-io/other"),
+		cfg:    webhookRuntimeTestConfig("MumuTW/other"),
 		ghPath: "/usr/bin/gh",
 		status: WebhookStatus{
 			Enabled:     true,
 			EndpointURL: "http://127.0.0.1:7777/webhook/forward",
 			Forwarders: []WebhookForwarderState{
 				{Repo: "MumuTW/looper", Command: []string{"/usr/bin/gh", "webhook", "forward", "--repo", "MumuTW/looper", "--events", strings.Join(webhookForwardEvents, ","), "--url", "http://127.0.0.1:7777/webhook/forward"}},
-				{Repo: "nexu-io/other", Command: []string{"/usr/bin/gh", "webhook", "forward", "--repo", "nexu-io/other", "--events", strings.Join(webhookForwardEvents, ","), "--url", "http://127.0.0.1:7777/webhook/forward"}},
+				{Repo: "MumuTW/other", Command: []string{"/usr/bin/gh", "webhook", "forward", "--repo", "MumuTW/other", "--events", strings.Join(webhookForwardEvents, ","), "--url", "http://127.0.0.1:7777/webhook/forward"}},
 			},
 			Degraded: true,
 			DegradedReasons: []string{
@@ -1089,7 +1128,7 @@ func TestWebhookRuntimeReconcilePrunesForwardersForRemovedRepos(t *testing.T) {
 		stopCh: make(chan struct{}),
 		forwarderStopCh: map[string]chan struct{}{
 			"MumuTW/looper": make(chan struct{}),
-			"nexu-io/other": make(chan struct{}),
+			"MumuTW/other":  make(chan struct{}),
 		},
 		now: time.Now,
 	}
@@ -1100,8 +1139,8 @@ func TestWebhookRuntimeReconcilePrunesForwardersForRemovedRepos(t *testing.T) {
 	if len(status.Forwarders) != 1 {
 		t.Fatalf("len(Status().Forwarders) = %d, want 1 after prune", len(status.Forwarders))
 	}
-	if status.Forwarders[0].Repo != "nexu-io/other" {
-		t.Fatalf("Status().Forwarders[0].Repo = %q, want nexu-io/other", status.Forwarders[0].Repo)
+	if status.Forwarders[0].Repo != "MumuTW/other" {
+		t.Fatalf("Status().Forwarders[0].Repo = %q, want MumuTW/other", status.Forwarders[0].Repo)
 	}
 	if status.Degraded {
 		t.Fatalf("Status().Degraded = true, want false after pruning stale repo; reasons=%v", status.DegradedReasons)

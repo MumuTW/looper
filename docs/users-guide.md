@@ -198,7 +198,10 @@ Autonomous dispatch stops immediately when any veto signal is present:
 
 `looper:hold` is the operator-facing global hold contract for Coordinator dispatch.
 
-`looper:hold` blocks Coordinator's autonomous Dispatch, but it does not directly block Reviewer's `gh pr merge --auto` call once a PR is already open. If `looper:hold` causes the linked Issue to skip re-Triage, merge-watch's `BranchProtectionChanged` re-Triage action becomes a silent no-op, which is the intended hold semantic.
+`looper:hold` blocks Coordinator's autonomous Dispatch. Gatekeeper also treats
+the hold as a merge gate during its fresh evaluation, so an open PR cannot be
+merged at `auto` while the hold is present. A legacy GitHub-native auto-merge
+request is cancelled by the migration cleanup before merge-watch continues.
 
 ## 6. Planner: from issue to spec PR
 
@@ -318,49 +321,27 @@ If reviewer considers the spec review clean, it will:
 - there are no unresolved review threads
 - the review decision is not `CHANGES_REQUESTED`
 
-### Reviewer auto-merge
+### Merge authority
 
-Reviewer can close a Looper code Issue end-to-end without a human pressing Merge.
+Reviewer reviews; it never merges. Merge Gatekeeper owns the single graduated
+authority configured by `roles.gatekeeper.trust`: `observe` records only,
+`advise` publishes a verdict for a human, and `auto` re-runs every gate against
+the same head before merging immediately. Choose the merge method with
+`roles.gatekeeper.strategy` (`squash`, `merge`, or `rebase`).
 
-Prerequisites:
-
-- branch protection on the base branch with required checks
-- repo-level **Allow auto-merge** enabled
-- repo-level merge strategy enabled for the configured strategy (`squash`, `merge`, or `rebase`)
-- linked Issue body includes a `## Acceptance criteria` section
-
-Configuration lives under `roles.reviewer.autoMerge.*`, with the usual `projects[].roles.reviewer.autoMerge.*` overrides for project-specific repos.
-
-When auto-merge is enabled and the PR is in scope, Reviewer verifies every acceptance-criteria checkbox against the diff before it submits APPROVE. The approval body includes a per-criterion evidence section pointing at files and lines. If every criterion passes, Reviewer calls `gh pr merge --auto`; GitHub branch protection remains the authority for whether the PR actually merges.
-
-For current-head Codex-review enforcement, set `roles.gatekeeper.trust = "auto"`
-and require the `Looper Gatekeeper` status in the target branch's protection
-rule. Gatekeeper binds the status to the current commit: a push has no inherited
-success status, so GitHub and Mergify wait until Codex reviews that new head.
-
-**Caveats:** status publishes on the pull request head SHA only — not on GitHub
-native merge-queue merge-group commits. Branch protection must require
-`Looper Gatekeeper`; a failing optional status does not block merge. Do not
-enable `roles.auditor` on the same project while gatekeeper trust is `auto`;
-Auditor requires merge-outcome evidence that status-only auto does not emit
-(see [configuration](configuration.md#merge-gatekeeper-trust-level-rolescatekeepertrust)).
-Post-merge digest likewise only sees Coordinator merge-watch merges (and
-historical Gatekeeper merge-outcome rows) while `auto` is status-only.
+An upgraded config with `roles.reviewer.autoMerge.enabled = true` fails startup
+with migration guidance instead of silently preserving or escalating authority.
+The old Reviewer scope required a Looper-owned label plus a tracked-Issue link;
+Gatekeeper `auto` evaluates every eligible open PR, so review that widened scope
+before promoting trust. Cancel any pending native auto-merge first with
+`gh pr merge <number> --disable-auto --repo <owner>/<repo>`; Coordinator performs
+the same cleanup for Looper-owned requests when it is running. Then move the
+intended level and strategy to Gatekeeper and delete the old block.
 
 Review capacity defaults to 200 changed lines (additions plus deletions). Set
 `roles.gatekeeper.requiredReviewChangedLines` or the project override to tune
 it; an explicit `0` disables that requirement. Smaller changes still block on
 an explicit blocking review marker, but do not wait for a clean review.
-
-Comment markers used by this flow:
-
-- `<!-- looper:reviewer:criteria-fail -->` — Reviewer found at least one acceptance criterion without satisfying evidence in the diff and returned the linked Issue to re-Triage
-- `<!-- looper:reviewer:automerge-refused -->` — Reviewer approved the PR, but GitHub repo settings or branch protection refused the auto-merge opt-in
-- `<!-- looper:coordinator:merge-watch retries=N -->` — Coordinator is watching a merge-pending PR and carrying retry state on the linked Issue
-
-Human override is silent: if someone clicks **Disable auto-merge** on the PR, Looper respects it and does not re-enable auto-merge just because an earlier Reviewer pass opted in.
-
-Auto-merge is not engaged for Spec PRs, PRs whose linked Issue has no `## Acceptance criteria` section, or PRs outside the configured auto-merge scope.
 
 ## 8. Fixer: repair a PR based on review feedback
 

@@ -90,6 +90,10 @@ type coordinatorScheduler interface {
 	DiscoverIssues(context.Context, coordinatorrole.DiscoveryInput) (coordinatorrole.DiscoveryResult, error)
 }
 
+type coordinatorRetiredAutoMergeScheduler interface {
+	ReconcileRetiredAutoMerge(context.Context, coordinatorrole.RetiredAutoMergeInput) error
+}
+
 type reviewerScheduler interface {
 	DiscoverPullRequests(context.Context, reviewer.DiscoveryInput) (reviewer.DiscoveryResult, error)
 	DiscoverPullRequest(context.Context, reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error)
@@ -129,6 +133,9 @@ type schedulerAsyncRunner interface {
 
 type defaultSchedulerTickInput struct {
 	Repos *storage.Repositories
+	// CoordinatorState carries process-local maintenance readiness across tick
+	// snapshots and into the webhook targeted-evaluation adapter.
+	CoordinatorState *coordinatorrole.RuntimeState
 	// CapturedProjects is the project-table snapshot already validated by the
 	// catalog pass immediately before an independent claim pass. Keeping it on
 	// the claim input lets the quarantine scope reuse that read instead of
@@ -257,10 +264,14 @@ type catalogWebhookFixer struct {
 }
 
 type catalogWebhookGatekeeper struct {
-	snapshot func() gatekeeperScheduler
+	snapshot                func() gatekeeperScheduler
+	maintenanceCleanupReady func(projectID, repo string) bool
 }
 
 func (g catalogWebhookGatekeeper) EvaluatePullRequest(ctx context.Context, input gatekeeper.EvaluationInput) (gatekeeper.Report, error) {
+	if g.maintenanceCleanupReady != nil && !g.maintenanceCleanupReady(input.ProjectID, input.Repo) {
+		return gatekeeper.Report{}, fmt.Errorf("gatekeeper blocked until retired auto-merge cleanup succeeds")
+	}
 	if g.snapshot == nil {
 		return gatekeeper.Report{}, fmt.Errorf("gatekeeper is not configured")
 	}
@@ -849,10 +860,6 @@ func (a reviewerGitHubAdapter) SubmitReview(ctx context.Context, input githubinf
 	return a.gateway.SubmitReview(ctx, input)
 }
 
-func (a reviewerGitHubAdapter) EnableAutoMerge(ctx context.Context, input githubinfra.EnableAutoMergeInput) error {
-	return a.gateway.EnableAutoMerge(ctx, input)
-}
-
 func (a reviewerGitHubAdapter) AddPullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
 	return a.gateway.AddPullRequestReaction(ctx, githubinfra.PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: input.Content, CWD: input.CWD})
 }
@@ -1246,7 +1253,7 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 	if err != nil {
 		return fixer.PullRequestDetail{}, err
 	}
-	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, MergedAt: detail.MergedAt, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
 }
 
 // ViewPullRequestForDiscovery is the lightweight metadata tier: no
@@ -1290,7 +1297,7 @@ func (a fixerGitHubAdapter) ListIssueComments(ctx context.Context, input fixer.V
 	}
 	out := make([]fixer.IssueComment, 0, len(comments))
 	for _, comment := range comments {
-		out = append(out, fixer.IssueComment{ID: comment.ID, Body: comment.Body})
+		out = append(out, fixer.IssueComment{ID: comment.ID, Author: comment.Author, Body: comment.Body})
 	}
 	return out, nil
 }
@@ -1300,7 +1307,7 @@ func (a fixerGitHubAdapter) ClosePullRequest(ctx context.Context, input fixer.Cl
 	if err != nil {
 		return err
 	}
-	return a.gateway.ClosePullRequest(ctx, githubinfra.ClosePullRequestInput{Repo: repo, PRNumber: input.PRNumber, DeleteBranch: input.DeleteBranch, CWD: input.CWD})
+	return a.gateway.ClosePullRequest(ctx, githubinfra.ClosePullRequestInput{Repo: repo, PRNumber: input.PRNumber, DeleteBranch: input.DeleteBranch, ExpectedHeadSHA: input.ExpectedHeadSHA, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) AddIssueLabels(ctx context.Context, input fixer.IssueLabelsInput) error {
@@ -1562,7 +1569,7 @@ func (a fixerGitAdapter) InspectHead(ctx context.Context, input fixer.InspectHea
 	if err != nil {
 		return fixer.InspectHeadResult{}, err
 	}
-	return fixer.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles}, nil
+	return fixer.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles, HasUnresolvedConflicts: result.HasUnresolvedConflicts, UnresolvedConflictFiles: result.UnresolvedConflictFiles}, nil
 }
 
 func (a fixerGitAdapter) Commit(ctx context.Context, input fixer.CommitInput) (fixer.CommitResult, error) {
@@ -1917,7 +1924,7 @@ func (a workerAgentExecutionAdapter) Wait(ctx context.Context) (worker.AgentResu
 	if err != nil {
 		return worker.AgentResult{}, err
 	}
-	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt, PreTimeoutError: result.PreTimeoutError, NativeResumeMode: result.NativeResumeMode, NativeResumeStatus: result.NativeResumeStatus}, nil
+	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, CompletionPayload: result.CompletionPayload, ChangedFiles: result.ChangedFiles, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt, PreTimeoutError: result.PreTimeoutError, NativeResumeMode: result.NativeResumeMode, NativeResumeStatus: result.NativeResumeStatus}, nil
 }
 
 func (a workerAgentExecutionAdapter) Kill(reason string) error {
@@ -2022,6 +2029,8 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			}},
 			Gatekeeper: catalogWebhookGatekeeper{snapshot: func() gatekeeperScheduler {
 				return handlers.snapshot().gatekeeper
+			}, maintenanceCleanupReady: func(projectID, repo string) bool {
+				return coordinatorState == nil || coordinatorState.RetiredAutoMergeCleanupReady(projectID, repo)
 			}},
 			Logger: logger,
 			Now:    now,
@@ -2183,8 +2192,14 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			DiffBudgetForProject: func(projectID string) config.GatekeeperDiffBudget {
 				return gatekeeperDiffBudgetForProject(cfg, projectID)
 			},
+			MergeStrategyForProject: func(projectID string) config.MergeStrategy {
+				return gatekeeperRoleConfigForProject(cfg, projectID).Strategy
+			},
 			RequiredReviewChangedLinesForProject: func(projectID string) int {
 				return gatekeeperRequiredReviewChangedLinesForProject(cfg, projectID)
+			},
+			ProtectedPathsForProject: func(projectID string) []string {
+				return append([]string(nil), config.ProjectRoleConfigs(cfg, projectID).Gatekeeper.ProtectedPaths...)
 			},
 			LogWarn: func(msg string, fields map[string]any) {
 				if logger != nil {
@@ -2203,7 +2218,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				if project.BaseBranch != nil && strings.TrimSpace(*project.BaseBranch) != "" {
 					configuredBase = strings.TrimSpace(*project.BaseBranch)
 				}
-				return strings.EqualFold(strings.TrimSpace(configuredBase), strings.TrimSpace(baseRefName))
+				return gatekeeperTargetBranchMatches(configuredBase, baseRefName)
 			},
 			ConfiguredTargetBranch: func(projectID string) string {
 				project, ok := runtimeProjectBinding(cfg, projectID)
@@ -2315,6 +2330,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	var coordinatorRunner coordinatorScheduler
 	var reviewerRunner reviewerScheduler
 	var fixerRunner fixerScheduler
+	var fixerRoleRunner *fixer.Runner
 	var workerRunner workerScheduler
 
 	looperCLIPath := resolveTrustedLooperCLIPath(cfg, logger)
@@ -2439,6 +2455,13 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			RetryBaseDelay:      retryBaseDelay,
 			RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
 			OnQueueItemEnqueued: requestWake,
+			StopWorkGraphLoop: func(ctx context.Context, loopID, reason string) error {
+				if activeExecutions == nil {
+					return nil
+				}
+				_, err := activeExecutions.BeginLoopStop(loopID, reason)
+				return err
+			},
 			OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 			},
@@ -2473,6 +2496,17 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Now:     now,
 		State:   coordinatorState,
 		Network: coordinatorrole.NewLoopernetGateway(networkclient.DefaultStatePath(runtimeHomeDirOrEmpty())),
+		RegenerateConflict: func(ctx context.Context, input coordinatorrole.ConflictRegenerationInput) (coordinatorrole.ConflictRegenerationResult, error) {
+			if fixerRoleRunner == nil {
+				return coordinatorrole.ConflictRegenerationResult{}, fmt.Errorf("fixer runner is not configured for coordinator conflict regeneration")
+			}
+			result, err := fixerRoleRunner.RegenerateConflict(ctx, fixer.ConflictRegenerationInput{
+				ProjectID: input.ProjectID, Repo: input.Repo, IssueRepo: input.IssueRepo, IssueNumber: input.IssueNumber,
+				PRNumber: input.PRNumber, ConflictRepairs: input.ConflictRepairs, CWD: input.CWD,
+			})
+			return coordinatorrole.ConflictRegenerationResult{Completed: result.Completed, Escalated: result.Escalated}, err
+		},
+		CancelRetiredAutoMerge: true,
 	}
 	if cfg.Agent.Vendor != nil {
 		// Same ParamsOwnerVendor as coding-role executors: agent.params.command/args
@@ -2588,7 +2622,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		if !fixerConfigured {
 			fixerAutoDiscovery = false
 		}
-		fixerRunner = fixer.New(fixer.Options{
+		fixerRoleRunner = fixer.New(fixer.Options{
 			DB:                          coordinator.DB(),
 			Repos:                       repos,
 			GitHub:                      fixerGitHubAdapter{gateway: githubGateway, stamper: fixerStamper, config: &cfg},
@@ -2662,6 +2696,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 			},
 		})
+		fixerRunner = fixerRoleRunner
 	}
 	notifyHITLAsk := func(ctx context.Context, ask worker.HITLAskNotification) error {
 		return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{
@@ -2753,6 +2788,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		}
 		return defaultSchedulerTickInput{
 			Repos:                services.Repositories,
+			CoordinatorState:     coordinatorState,
 			GitHubGateway:        githubGateway,
 			GitGateway:           gitGateway,
 			Logger:               logger,
@@ -2842,12 +2878,21 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ConfigSource: configSource,
 			Reviewer:     webhookReviewer,
 			Fixer:        webhookFixer,
-			Gatekeeper:   gatekeeperRunner,
-			Logger:       logger,
-			Now:          now,
+			Gatekeeper: catalogWebhookGatekeeper{
+				snapshot: func() gatekeeperScheduler { return gatekeeperRunner },
+				maintenanceCleanupReady: func(projectID, repo string) bool {
+					return coordinatorState == nil || coordinatorState.RetiredAutoMergeCleanupReady(projectID, repo)
+				},
+			},
+			Logger: logger,
+			Now:    now,
 		})
 	}
 	return handlers
+}
+
+func gatekeeperTargetBranchMatches(configuredBase, observedBase string) bool {
+	return strings.TrimSpace(configuredBase) == strings.TrimSpace(observedBase)
 }
 
 // fixerRegenerationUnavailableReason is checked before Fixer closes an
@@ -2976,7 +3021,41 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		retErr = errors.Join(errs...)
 		return retErr
 	}
+	maintenanceFailures := make(map[string]bool)
+	if maintenance, ok := input.Coordinator.(coordinatorRetiredAutoMergeScheduler); ok {
+		for _, project := range projectsList {
+			maintenanceRepo := schedulerMaintenanceRepo(input, project)
+			if maintenanceRepo == "" {
+				continue
+			}
+			if input.CoordinatorState != nil && input.CoordinatorState.RetiredAutoMergeCleanupReady(project.ID, maintenanceRepo) {
+				continue
+			}
+			if err := admissionRefuseWork(input); err != nil {
+				return nil
+			}
+			maintenanceErr := runSchedulerLane(input, "coordinator migration cleanup", project.ID, maintenanceRepo, func() error {
+				return maintenance.ReconcileRetiredAutoMerge(ctx, coordinatorrole.RetiredAutoMergeInput{
+					ProjectID: project.ID,
+					Repo:      maintenanceRepo,
+					CWD:       schedulerMaintenanceCWD(input),
+				})
+			})
+			if maintenanceErr != nil {
+				if input.CoordinatorState != nil {
+					input.CoordinatorState.SetRetiredAutoMergeCleanupReady(project.ID, maintenanceRepo, false)
+				}
+				maintenanceFailures[project.ID] = true
+				appendErr(maintenanceErr)
+			} else if input.CoordinatorState != nil {
+				input.CoordinatorState.SetRetiredAutoMergeCleanupReady(project.ID, maintenanceRepo, true)
+			}
+		}
+	}
 	if !catalogCurrent {
+		if len(errs) > 0 {
+			return errors.Join(errs...)
+		}
 		return nil
 	}
 
@@ -3033,6 +3112,10 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			}
 			break
 		}
+		// Migration cleanup is maintenance authority, not policy-gated
+		// Coordinator discovery. Run it even when Coordinator is disabled or its
+		// normal retry path is deferred, so a retired native auto-merge request
+		// cannot outlive the Reviewer authority.
 		if project.Archived {
 			continue
 		}
@@ -3053,6 +3136,12 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		admissionClosed := false
 		for _, lane := range lanes {
 			if !lane.Present {
+				continue
+			}
+			if maintenanceFailures[project.ID] && lane.Name == config.RoleGatekeeper {
+				if input.Logger != nil {
+					input.Logger.Warn("scheduler blocked Gatekeeper after migration cleanup failure", map[string]any{"projectId": project.ID, "repo": repo})
+				}
 				continue
 			}
 			if !lane.Enabled(project.ID) {
@@ -3230,6 +3319,48 @@ func schedulerProjectRepo(input defaultSchedulerTickInput, project storage.Proje
 		repo = strings.TrimSpace(binding.Repo)
 	}
 	return repo, true
+}
+
+// schedulerMaintenanceRepo keeps migration cleanup routable after a project is
+// archived or removed from the current config catalog. The stored project
+// metadata is the historical repository binding; a live catalog binding is the
+// fallback for older records that predate that metadata.
+func schedulerMaintenanceRepo(input defaultSchedulerTickInput, project storage.ProjectRecord) string {
+	if input.Config != nil {
+		if binding, ok := runtimeProjectBinding(*input.Config, project.ID); ok {
+			if !project.Archived {
+				return strings.TrimSpace(binding.Repo)
+			}
+		}
+	}
+	if repo := repoFromProjectMetadata(project.MetadataJSON); repo != "" {
+		return repo
+	}
+	if input.Config != nil {
+		if binding, ok := runtimeProjectBinding(*input.Config, project.ID); ok {
+			return strings.TrimSpace(binding.Repo)
+		}
+	}
+	return ""
+}
+
+// schedulerMaintenanceCWD is deliberately independent of a project's
+// checkout. Retired cleanup is repo-qualified and may need to run after an
+// archived project's local checkout has been removed; the daemon working
+// directory (or the process directory) is the valid command launch boundary.
+func schedulerMaintenanceCWD(input defaultSchedulerTickInput) string {
+	if input.Config != nil {
+		cwd := strings.TrimSpace(input.Config.Daemon.WorkingDirectory)
+		if cwd != "" {
+			if info, err := os.Stat(cwd); err == nil && info.IsDir() {
+				return cwd
+			}
+		}
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		return cwd
+	}
+	return ""
 }
 
 func projectDiscoverySnapshotOptions(input defaultSchedulerTickInput, projectID string) githubinfra.DiscoverySnapshotOptions {

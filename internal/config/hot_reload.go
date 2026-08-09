@@ -75,6 +75,7 @@ var hotEditablePaths = map[string]struct{}{
 	"defaults.openPrStrategy":                       {},
 	"defaults.addSnapshotMode":                      {},
 	"instructions.enabled":                          {},
+	"roles.auditor.allowRevertProposals":            {},
 
 	"roles.planner.autoDiscovery":                                          {},
 	"roles.planner.triggers.labels":                                        {},
@@ -147,6 +148,7 @@ var hotEditablePaths = map[string]struct{}{
 	"roles.coordinator.dispatch.autonomous.holdLabel":                      {},
 	"roles.coordinator.dispatch.assignTo":                                  {},
 	"roles.coordinator.mergeWatch.maxIndeterminateDuration":                {},
+	"roles.coordinator.conflictPolicy.maxRepairs":                          {},
 
 	"tools.looperPath":    {},
 	"tools.osascriptPath": {},

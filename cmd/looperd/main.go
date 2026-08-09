@@ -1360,7 +1360,8 @@ func runConfigCheck(args []string, stdout, stderr io.Writer, deps runDeps) int {
 			filtered = append(filtered, arg)
 		}
 	}
-	if _, err := config.LoadFile(config.LoadFileOptions{CWD: cwd, Args: filtered, LookupEnv: lookupEnv}); err != nil {
+	loaded, err := config.LoadFile(config.LoadFileOptions{CWD: cwd, Args: filtered, LookupEnv: lookupEnv})
+	if err != nil {
 		var validationErr *config.ConfigValidationError
 		if errors.As(err, &validationErr) {
 			_, _ = fmt.Fprintln(stderr, "looperd configuration is incompatible:")
@@ -1372,8 +1373,33 @@ func runConfigCheck(args []string, stdout, stderr io.Writer, deps runDeps) int {
 		_, _ = fmt.Fprintf(stderr, "looperd: validate configuration: %v\n", err)
 		return 1
 	}
+	// Reuse the non-destructive Bootstrap prerequisites that fail closed when
+	// an explicitly configured tool path is missing or the sandbox runtime is
+	// required but unavailable. Without this, preflight can report
+	// targetConfigCompatible while real startup fails in Bootstrap.
+	if err := bootstrap.ValidateConfiguredToolPaths(loaded.Config, loaded.Metadata.ToolDetection); err != nil {
+		return writeConfigCheckError(stderr, err)
+	}
+	// Probe sandbox readiness in daemon.workingDirectory so preflight matches
+	// the supervised service environment rather than the operator shell cwd.
+	if err := bootstrap.ValidateSandboxRuntimeForConfig(loaded.Config); err != nil {
+		return writeConfigCheckError(stderr, err)
+	}
 	_, _ = fmt.Fprintln(stdout, "configuration is compatible")
 	return 0
+}
+
+func writeConfigCheckError(stderr io.Writer, err error) int {
+	var validationErr *config.ConfigValidationError
+	if errors.As(err, &validationErr) {
+		_, _ = fmt.Fprintln(stderr, "looperd configuration is incompatible:")
+		for _, issue := range validationErr.Issues {
+			_, _ = fmt.Fprintf(stderr, "- %s: %s\n", issue.Path, issue.Message)
+		}
+		return 1
+	}
+	_, _ = fmt.Fprintf(stderr, "looperd: validate configuration: %v\n", err)
+	return 1
 }
 
 func hasCheckConfigArg(args []string) bool {

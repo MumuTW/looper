@@ -286,6 +286,12 @@ func validReviewerMarkerOutcome(payload string) bool {
 	if strings.TrimSpace(payload) == "" || json.Unmarshal([]byte(payload), &raw) != nil {
 		return false
 	}
+	if encoded, ok := raw["type"]; ok {
+		var resultType string
+		if json.Unmarshal(encoded, &resultType) != nil || strings.EqualFold(strings.TrimSpace(resultType), "rate_limit") {
+			return false
+		}
+	}
 	encoded, ok := raw["outcome"]
 	if !ok {
 		return true
@@ -1496,7 +1502,7 @@ func (x *execution) reportOutcome(status, parseStatus, completionPayload, stdout
 	// retryable-block classification to that caller-owned contract. Other role
 	// runners replay retryable blocks, so those remain provider-health failures.
 	healthSucceeded := succeeded
-	if x.input.CompletionContract != CompletionContractPlannerMarker {
+	if x.input.CompletionContract != CompletionContractPlannerMarker && x.input.CompletionContract != CompletionContractWorkerHITL {
 		healthSucceeded = healthSucceeded && !declaresRetryableBlock(completionPayload)
 	}
 	x.executor.onOutcome(Outcome{

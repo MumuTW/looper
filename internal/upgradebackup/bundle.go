@@ -1,5 +1,18 @@
 // Package upgradebackup creates self-describing rollback bundles from a
 // daemon-owned SQLite snapshot and explicitly supplied installation files.
+//
+// # Why Source metadata and a multi-phase restore journal exist
+//
+// A simpler design would copy files into a directory and let operators copy
+// them back by hand. That fails closed on crash mid-restore: half-moved
+// databases leave no durable record of which path is the original versus the
+// candidate. Manifest Source records the exact restore destinations so restore
+// cannot invent paths; the upgraderestore journal records phase transitions so
+// Recover can finish or undo without guessing.
+//
+// Deleting Source or the journal breaks re-entry after interruption. Failures
+// still outside this design: concurrent writers that ignore the database lock,
+// operators deleting staged/undo files by hand, and non-filesystem SQLite URIs.
 package upgradebackup
 
 import (
@@ -10,21 +23,38 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/version"
 )
 
-const ManifestVersion = 1
+const (
+	LegacyManifestVersion = 1
+	ManifestVersion       = 2
+)
 
 type Input struct {
-	RootDir          string
-	ConfigPath       string
-	CLIBinaryPath    string
-	DaemonBinaryPath string
-	Now              func() time.Time
-	Snapshot         func(context.Context) (string, error)
+	RootDir    string
+	ConfigPath string
+	// ConfigContents, when non-nil, is written into the bundle as the config
+	// artifact instead of copying ConfigPath. Used when the daemon runs from
+	// defaults/env with no on-disk config file.
+	ConfigContents []byte
+	DatabasePath   string
+	CLIBinaryPath  string
+	// CLIBinaryContents, when non-nil, is the already-pinned executable image
+	// to place in the bundle. Source metadata still records CLIBinaryPath.
+	CLIBinaryContents []byte
+	DaemonBinaryPath  string
+	// DaemonBinaryContents has the same snapshot-window guarantee for looperd.
+	DaemonBinaryContents []byte
+	Now                  func() time.Time
+	Snapshot             func(context.Context) (string, error)
 }
 
 type File struct {
@@ -35,6 +65,18 @@ type Manifest struct {
 	Version   int             `json:"version"`
 	CreatedAt string          `json:"createdAt"`
 	Files     map[string]File `json:"files"`
+	Source    *Source         `json:"source,omitempty"`
+}
+
+// Source records the exact pre-cutover destinations a v2 bundle can restore.
+// The bundle directory is 0700 and manifest.json is 0600 because these paths
+// can expose an operator's installation layout. A v1 manifest has no Source:
+// it remains verifiable but restore must fail closed instead of guessing.
+type Source struct {
+	ConfigPath       string `json:"configPath"`
+	DatabasePath     string `json:"databasePath"`
+	CLIBinaryPath    string `json:"cliBinaryPath"`
+	DaemonBinaryPath string `json:"daemonBinaryPath"`
 }
 type Result struct {
 	Directory string   `json:"directory"`
@@ -55,35 +97,117 @@ func Create(ctx context.Context, input Input) (Result, error) {
 	if strings.TrimSpace(input.RootDir) == "" || input.Snapshot == nil {
 		return Result{}, fmt.Errorf("backup root and snapshot operation are required")
 	}
-	if strings.TrimSpace(input.ConfigPath) == "" || strings.TrimSpace(input.CLIBinaryPath) == "" || strings.TrimSpace(input.DaemonBinaryPath) == "" {
-		return Result{}, fmt.Errorf("config, CLI binary, and daemon binary paths are required")
+	if strings.TrimSpace(input.DatabasePath) == "" || strings.TrimSpace(input.CLIBinaryPath) == "" || strings.TrimSpace(input.DaemonBinaryPath) == "" {
+		return Result{}, fmt.Errorf("database, CLI binary, and daemon binary paths are required")
+	}
+	if input.ConfigContents == nil && strings.TrimSpace(input.ConfigPath) == "" {
+		return Result{}, fmt.Errorf("config path or materialized config contents are required")
+	}
+	backupRoot, err := filepath.Abs(input.RootDir)
+	if err != nil {
+		return Result{}, fmt.Errorf("resolve backup root: %w", err)
+	}
+	backupRoot = filepath.Clean(backupRoot)
+	var backupRootParentSyncs []string
+	var configPath string
+	if input.ConfigContents == nil {
+		configPath, err = absolutePath(input.ConfigPath, "config")
+		if err != nil {
+			return Result{}, err
+		}
+	} else if strings.TrimSpace(input.ConfigPath) != "" {
+		configPath, err = absolutePath(input.ConfigPath, "config")
+		if err != nil {
+			return Result{}, err
+		}
+	} else {
+		// ConfigContents without a restore destination cannot produce a usable
+		// v2 Source.ConfigPath; refuse rather than writing a pathless bundle.
+		return Result{}, fmt.Errorf("config path is required when recording restore source metadata")
+	}
+	databasePath, err := absoluteFilesystemDatabasePath(input.DatabasePath)
+	if err != nil {
+		return Result{}, err
+	}
+	cliBinaryPath, err := absolutePath(input.CLIBinaryPath, "CLI binary")
+	if err != nil {
+		return Result{}, err
+	}
+	daemonBinaryPath, err := absolutePath(input.DaemonBinaryPath, "daemon binary")
+	if err != nil {
+		return Result{}, err
 	}
 	now := time.Now
 	if input.Now != nil {
 		now = input.Now
 	}
-	if err := os.MkdirAll(input.RootDir, 0o755); err != nil {
-		return Result{}, fmt.Errorf("create backup root: %w", err)
+	backupRootParentSyncs, err = ensureBackupRoot(backupRoot)
+	if err != nil {
+		return Result{}, err
 	}
 	snapshot, err := input.Snapshot(ctx)
 	if err != nil {
 		return Result{}, fmt.Errorf("create sqlite snapshot: %w", err)
 	}
-	bundle := filepath.Join(input.RootDir, "upgrade-"+strings.ReplaceAll(now().UTC().Format("20060102T150405.000Z"), ":", "-"))
+	bundlePrefix := "upgrade-" + strings.ReplaceAll(now().UTC().Format("20060102T150405.000Z"), ":", "-")
+	bundle := filepath.Join(backupRoot, bundlePrefix)
 	if err := os.Mkdir(bundle, 0o700); err != nil {
-		return Result{}, fmt.Errorf("create backup bundle: %w", err)
+		if !os.IsExist(err) {
+			return Result{}, fmt.Errorf("create backup bundle: %w", err)
+		}
+		bundle, err = os.MkdirTemp(backupRoot, bundlePrefix+"-")
+		if err != nil {
+			return Result{}, fmt.Errorf("create unique backup bundle: %w", err)
+		}
 	}
 	fail := func(err error) (Result, error) { _ = os.RemoveAll(bundle); return Result{}, err }
 	files := map[string]File{}
-	if err := moveAndRecord(snapshot, filepath.Join(bundle, "database.sqlite"), files, "database.sqlite"); err != nil {
-		return fail(err)
-	}
-	for _, item := range []struct{ source, name string }{{input.ConfigPath, "config" + filepath.Ext(input.ConfigPath)}, {input.CLIBinaryPath, "looper"}, {input.DaemonBinaryPath, "looperd"}} {
-		if err := copyAndRecord(item.source, filepath.Join(bundle, item.name), files, item.name); err != nil {
+	configName := "config.toml"
+	if input.ConfigContents != nil {
+		if ext := filepath.Ext(configPath); ext != "" {
+			configName = "config" + ext
+		}
+		if err := writeAndRecord(input.ConfigContents, filepath.Join(bundle, configName), files, configName); err != nil {
+			return fail(err)
+		}
+	} else {
+		configName = "config" + filepath.Ext(configPath)
+		if configName == "config" {
+			configName = "config.toml"
+		}
+		if err := copyAndRecord(configPath, filepath.Join(bundle, configName), files, configName); err != nil {
 			return fail(err)
 		}
 	}
-	manifest := Manifest{Version: ManifestVersion, CreatedAt: now().UTC().Format(time.RFC3339Nano), Files: files}
+	for _, item := range []struct {
+		source   string
+		name     string
+		contents []byte
+	}{{cliBinaryPath, "looper", input.CLIBinaryContents}, {daemonBinaryPath, "looperd", input.DaemonBinaryContents}} {
+		var copyErr error
+		if item.contents != nil {
+			copyErr = writeAndRecordMode(item.contents, filepath.Join(bundle, item.name), files, item.name, 0o700)
+		} else {
+			copyErr = copyAndRecord(item.source, filepath.Join(bundle, item.name), files, item.name)
+		}
+		if copyErr != nil {
+			return fail(copyErr)
+		}
+	}
+	// Check the exact copied/pinned pair before publishing the manifest. A stale
+	// CLI beside the current daemon would make a self-consistent but unusable
+	// rollback bundle.
+	if err := verifyBinaryPair(ctx, filepath.Join(bundle, "looper"), filepath.Join(bundle, "looperd")); err != nil {
+		return fail(err)
+	}
+	// Keep the source snapshot recoverable until the binary pair has passed
+	// validation. A rejected release must not consume the daemon's snapshot.
+	if err := moveAndRecord(snapshot, filepath.Join(bundle, "database.sqlite"), files, "database.sqlite"); err != nil {
+		return fail(err)
+	}
+	// Restore requires absolute source paths. Materialized-only configs leave
+	// ConfigPath empty so RestoreSource refuses rather than inventing a path.
+	manifest := Manifest{Version: ManifestVersion, CreatedAt: now().UTC().Format(time.RFC3339Nano), Files: files, Source: &Source{ConfigPath: configPath, DatabasePath: databasePath, CLIBinaryPath: cliBinaryPath, DaemonBinaryPath: daemonBinaryPath}}
 	encoded, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fail(fmt.Errorf("encode backup manifest: %w", err))
@@ -91,7 +215,119 @@ func Create(ctx context.Context, input Input) (Result, error) {
 	if err := os.WriteFile(filepath.Join(bundle, "manifest.json"), append(encoded, '\n'), 0o600); err != nil {
 		return fail(fmt.Errorf("write backup manifest: %w", err))
 	}
+	// Durably publish every artifact and the parent directory before reporting
+	// success so a crash cannot leave a returned path with incomplete/torn files.
+	for _, name := range SortedFileNames(manifest) {
+		if err := syncFile(filepath.Join(bundle, name)); err != nil {
+			return fail(fmt.Errorf("sync backup file %s: %w", name, err))
+		}
+	}
+	if err := syncFile(filepath.Join(bundle, "manifest.json")); err != nil {
+		return fail(fmt.Errorf("sync backup manifest: %w", err))
+	}
+	if err := syncDirectory(bundle); err != nil {
+		return fail(fmt.Errorf("sync completed backup bundle: %w", err))
+	}
+	if err := syncDirectory(filepath.Dir(bundle)); err != nil {
+		return fail(fmt.Errorf("sync backup root: %w", err))
+	}
+	for _, parent := range backupRootParentSyncs {
+		if err := syncDirectory(parent); err != nil {
+			return fail(fmt.Errorf("sync backup root parent %s: %w", parent, err))
+		}
+	}
 	return Result{Directory: bundle, Manifest: manifest}, nil
+}
+
+func verifyBinaryPair(ctx context.Context, cliPath, daemonPath string) error {
+	cli, err := readBuildIdentity(ctx, cliPath, "version", "--json")
+	if err != nil {
+		return fmt.Errorf("verify backup CLI identity: %w", err)
+	}
+	daemon, err := readBuildIdentity(ctx, daemonPath, "--version-json")
+	if err != nil {
+		return fmt.Errorf("verify backup daemon identity: %w", err)
+	}
+	if !cli.SameBuild(daemon) {
+		return fmt.Errorf("backup CLI and daemon build identities differ")
+	}
+	return nil
+}
+
+func readBuildIdentity(ctx context.Context, binary string, args ...string) (version.Info, error) {
+	output, err := exec.CommandContext(ctx, binary, args...).Output()
+	if err != nil {
+		return version.Info{}, err
+	}
+	var identity version.Info
+	if err := json.Unmarshal(output, &identity); err != nil {
+		return version.Info{}, fmt.Errorf("decode build identity: %w", err)
+	}
+	if !identity.Complete() {
+		return version.Info{}, fmt.Errorf("build identity is incomplete")
+	}
+	return identity, nil
+}
+
+// ensureBackupRoot creates the backup root and returns every newly-created
+// ancestor that must be synced after the bundle is published. Syncing the
+// backup root persists the bundle entry; syncing its newly-created parents
+// persists the root entry itself and closes the power-loss window for a first
+// backup in a fresh directory tree.
+func ensureBackupRoot(root string) ([]string, error) {
+	missing := []string{}
+	probe := root
+	for {
+		info, err := os.Stat(probe)
+		if err == nil {
+			if !info.IsDir() {
+				return nil, fmt.Errorf("backup root %s is not a directory", root)
+			}
+			break
+		}
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("inspect backup root %s: %w", root, err)
+		}
+		missing = append(missing, probe)
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			break
+		}
+		probe = parent
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return nil, fmt.Errorf("create backup root: %w", err)
+	}
+	if len(missing) == 0 {
+		return nil, nil
+	}
+	parents := make([]string, 0, len(missing))
+	// missing is ordered from root toward the first existing ancestor. The
+	// closest new parent is synced first, then its parents, and finally the
+	// existing ancestor that receives the first new directory entry.
+	parents = append(parents, missing[1:]...)
+	parents = append(parents, probe)
+	return parents, nil
+}
+
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
+var syncDirectory = syncDirectoryImpl
+
+func syncDirectoryImpl(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func moveAndRecord(source, destination string, files map[string]File, name string) error {
@@ -128,17 +364,32 @@ func record(path string, files map[string]File, name string) error {
 	return nil
 }
 
-func describeFile(path, name string) (File, error) {
-	contents, err := os.ReadFile(path)
-	if err != nil {
-		return File{}, fmt.Errorf("read %s for checksum: %w", name, err)
+func writeAndRecord(contents []byte, destination string, files map[string]File, name string) error {
+	return writeAndRecordMode(contents, destination, files, name, 0o600)
+}
+
+func writeAndRecordMode(contents []byte, destination string, files map[string]File, name string, mode os.FileMode) error {
+	if err := os.WriteFile(destination, contents, mode); err != nil {
+		return fmt.Errorf("write %s: %w", name, err)
 	}
+	return record(destination, files, name)
+}
+
+func describeFile(path, name string) (File, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return File{}, fmt.Errorf("stat %s: %w", name, err)
 	}
-	sum := sha256.Sum256(contents)
-	return File{SHA256: hex.EncodeToString(sum[:]), Size: info.Size()}, nil
+	f, err := os.Open(path)
+	if err != nil {
+		return File{}, fmt.Errorf("open %s for checksum: %w", name, err)
+	}
+	defer f.Close()
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return File{}, fmt.Errorf("hash %s: %w", name, err)
+	}
+	return File{SHA256: hex.EncodeToString(hasher.Sum(nil)), Size: info.Size()}, nil
 }
 
 // Verify confirms that a bundle still has the exact small layout Create
@@ -201,7 +452,7 @@ func Verify(directory string) (Verification, error) {
 }
 
 func validateManifest(manifest Manifest) error {
-	if manifest.Version != ManifestVersion {
+	if manifest.Version != LegacyManifestVersion && manifest.Version != ManifestVersion {
 		return fmt.Errorf("unsupported backup manifest version %d", manifest.Version)
 	}
 	if _, err := time.Parse(time.RFC3339Nano, manifest.CreatedAt); err != nil {
@@ -228,7 +479,85 @@ func validateManifest(manifest Manifest) error {
 	if !manifest.Files["database.sqlite"].valid() || !manifest.Files["looper"].valid() || !manifest.Files["looperd"].valid() || configFiles != 1 {
 		return fmt.Errorf("backup manifest must name database.sqlite, looper, looperd, and one config file")
 	}
+	if manifest.Version == ManifestVersion {
+		if manifest.Source == nil || strings.TrimSpace(manifest.Source.ConfigPath) == "" || strings.TrimSpace(manifest.Source.DatabasePath) == "" || strings.TrimSpace(manifest.Source.CLIBinaryPath) == "" || strings.TrimSpace(manifest.Source.DaemonBinaryPath) == "" {
+			return fmt.Errorf("backup manifest v%d requires source restore metadata", ManifestVersion)
+		}
+		for _, item := range []struct{ name, path string }{{"config", manifest.Source.ConfigPath}, {"database", manifest.Source.DatabasePath}, {"CLI binary", manifest.Source.CLIBinaryPath}, {"daemon binary", manifest.Source.DaemonBinaryPath}} {
+			if !filepath.IsAbs(item.path) {
+				return fmt.Errorf("backup manifest v%d %s path must be absolute", ManifestVersion, item.name)
+			}
+		}
+	}
 	return nil
+}
+
+// RestoreSource returns the exact original destinations recorded in a v2
+// bundle. Older bundles deliberately return an error: guessing paths during a
+// destructive restore would make the manifest less safe than no restore.
+func RestoreSource(manifest Manifest) (Source, error) {
+	if manifest.Version != ManifestVersion || manifest.Source == nil {
+		return Source{}, fmt.Errorf("backup manifest v%d has no restore target metadata; create a new backup before using restore", manifest.Version)
+	}
+	return *manifest.Source, nil
+}
+
+func absolutePath(path, description string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s path: %w", description, err)
+	}
+	abs = filepath.Clean(abs)
+	// Only resolve a leaf symlink. Restore rejects symlink targets, so recording
+	// the link path would make the bundle unrestorable. Intermediate directory
+	// symlinks (e.g. macOS /var → /private/var) are left alone so source paths
+	// stay stable for operators.
+	info, err := os.Lstat(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return abs, nil
+		}
+		return "", fmt.Errorf("stat %s path: %w", description, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return abs, nil
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("resolve symlinked %s path: %w", description, err)
+	}
+	return filepath.Clean(resolved), nil
+}
+
+// absoluteFilesystemDatabasePath normalizes storage.dbPath (including file: URIs)
+// to an absolute filesystem path before it is recorded for restore.
+// Prefer the path frozen on the open coordinator when available; this fallback
+// rejects a leaf symlink and resolves remaining parent symlinks at Create time.
+func absoluteFilesystemDatabasePath(dbPath string) (string, error) {
+	path, isFile, err := storage.SQLiteFilesystemPath(dbPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve database path: %w", err)
+	}
+	if !isFile || strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("database path %q is not a filesystem SQLite database", dbPath)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve database path: %w", err)
+	}
+	abs = filepath.Clean(abs)
+	if info, err := os.Lstat(abs); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("database path %s is a leaf symlink; refuse restore metadata that can diverge from the open SQLite inode", abs)
+		}
+		if info.IsDir() {
+			return "", fmt.Errorf("database path %s is a directory", abs)
+		}
+		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+			return filepath.Clean(resolved), nil
+		}
+	}
+	return abs, nil
 }
 
 func (file File) valid() bool {

@@ -917,7 +917,7 @@ func TestServiceSyncConfiguredRefreshesTransferredRepoMetadata(t *testing.T) {
 	nowISO := now.UTC().Format(time.RFC3339Nano)
 	repoPath := "/tmp/looper"
 	baseBranch := "main"
-	metadata := `{"repo":"powerformer/looper","worktreeRoot":null,"source":"config"}`
+	metadata := `{"repo":"MumuTW/legacy-test","worktreeRoot":null,"source":"config"}`
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: repoPath, BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -956,7 +956,7 @@ func TestServiceSyncConfiguredPreservesRepoMetadataWhenDetectionReturnsEmpty(t *
 	nowISO := now.UTC().Format(time.RFC3339Nano)
 	repoPath := "/tmp/looper"
 	baseBranch := "main"
-	metadata := `{"repo":"powerformer/looper","worktreeRoot":null,"source":"config"}`
+	metadata := `{"repo":"MumuTW/legacy-test","worktreeRoot":null,"source":"config"}`
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: repoPath, BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -1034,7 +1034,7 @@ func TestServiceSyncConfiguredPreservesRepoMetadataWhenDetectionFails(t *testing
 	nowISO := now.UTC().Format(time.RFC3339Nano)
 	repoPath := "/tmp/looper"
 	baseBranch := "main"
-	metadata := `{"repo":"powerformer/looper","worktreeRoot":null,"source":"config"}`
+	metadata := `{"repo":"MumuTW/legacy-test","worktreeRoot":null,"source":"config"}`
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: repoPath, BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -1110,8 +1110,8 @@ func TestServiceSyncConfiguredArchivesConfigProjectsRemovedFromConfig(t *testing
 	repos := storage.NewRepositories(coordinator.DB())
 	now := time.Date(2026, time.July, 12, 10, 0, 0, 0, time.UTC)
 	createdAt := now.Add(-time.Hour).Format(time.RFC3339Nano)
-	configMetadata := `{"repo":"nexu-io/removed","source":"config"}`
-	apiMetadata := `{"repo":"nexu-io/api","source":"api"}`
+	configMetadata := `{"repo":"MumuTW/removed","source":"config"}`
+	apiMetadata := `{"repo":"MumuTW/api","source":"api"}`
 	baseBranch := "main"
 	for _, project := range []storage.ProjectRecord{
 		{ID: "removed", Name: "Removed", RepoPath: "/tmp/removed", BaseBranch: &baseBranch, MetadataJSON: &configMetadata, CreatedAt: createdAt, UpdatedAt: createdAt},
@@ -1121,7 +1121,7 @@ func TestServiceSyncConfiguredArchivesConfigProjectsRemovedFromConfig(t *testing
 			t.Fatalf("Projects.Upsert(%s) error = %v", project.ID, err)
 		}
 	}
-	targetID := "pr:nexu-io/removed:531"
+	targetID := "pr:MumuTW/removed:531"
 	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_removed", Seq: 1, ProjectID: "removed", Type: string(domain.LoopTypeReviewer), TargetType: string(domain.LoopTargetTypePullRequest), TargetID: &targetID, Status: string(domain.LoopStatusQueued), CreatedAt: createdAt, UpdatedAt: createdAt}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -1177,7 +1177,7 @@ func TestServiceSyncConfiguredRejectsAPIManagedIDCollision(t *testing.T) {
 	now := time.Date(2026, time.July, 12, 10, 0, 0, 0, time.UTC)
 	createdAt := now.Add(-time.Hour).Format(time.RFC3339Nano)
 	baseBranch := "main"
-	metadata := `{"repo":"nexu-io/api","source":"api"}`
+	metadata := `{"repo":"MumuTW/api","source":"api"}`
 	existing := storage.ProjectRecord{ID: "shared", Name: "API Project", RepoPath: "/tmp/api", BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: createdAt, UpdatedAt: createdAt}
 	if err := repos.Projects.Upsert(context.Background(), existing); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)

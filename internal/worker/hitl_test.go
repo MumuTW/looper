@@ -1172,6 +1172,32 @@ func TestMergeHITLCorrelationPreservesHumanAnswer(t *testing.T) {
 	}
 }
 
+func TestMergeHITLCorrelationDoesNotCarryAnswerOntoNewQuestion(t *testing.T) {
+	t.Parallel()
+	// A resumed agent consumed the answered ask and emitted a different
+	// question in the same turn while the old ask is still stored as answered.
+	// The old answer must not follow onto the new question, or the loop parks
+	// with a question that already appears answered by the previous decision.
+	delivered := loops.HITLAsk{
+		Question: "Ship the migration?", Status: "awaiting", Transport: "github",
+		PRNumber: 42, AskCommentID: 99,
+	}
+	answeredMeta, err := loops.WriteHITLAsk(nil, loops.HITLAsk{
+		Question: "Continue?", Status: "answered", Answer: "yes ship it", AnsweredAt: "2026-08-01T00:00:00.000Z",
+	})
+	if err != nil {
+		t.Fatalf("WriteHITLAsk() error = %v", err)
+	}
+	metaPtr := &answeredMeta
+	merged := mergeHITLCorrelation(delivered, metaPtr)
+	if merged.Answer != "" || merged.AnsweredAt != "" || merged.Status != "awaiting" {
+		t.Fatalf("merged = %#v, want new question without the old answer", merged)
+	}
+	if merged.PRNumber != 42 || merged.AskCommentID != 99 {
+		t.Fatalf("merged correlation = pr=%d comment=%d, want delivery values", merged.PRNumber, merged.AskCommentID)
+	}
+}
+
 func TestDetectHumanAskRecoversStagedPendingBeforeAgent(t *testing.T) {
 	// Crash recovery: ask.pending remains after Stage, no loop metadata ask yet.
 	// detectHumanAsk must re-enter suspension without requiring a new agent turn.

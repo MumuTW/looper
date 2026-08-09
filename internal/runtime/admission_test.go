@@ -117,6 +117,37 @@ func TestAdmissionDrainRefusesNewWorkWithoutStopping(t *testing.T) {
 	}
 }
 
+func TestRuntimeBeginDrainRollsBackJoinWhenTransitionRejected(t *testing.T) {
+	t.Parallel()
+	// shutting-down admission must not leave workProducerJoinStarted latched
+	// with a never-closed Done (Stop would block forever).
+	rt := &Runtime{admission: NewAdmission(), shutdownTimeout: time.Second}
+	if err := rt.admission.BeginShutdown("stop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.BeginDrain("upgrade"); err == nil {
+		t.Fatal("BeginDrain() error = nil, want illegal transition")
+	}
+	rt.mu.RLock()
+	started := rt.workProducerJoinStarted
+	done := rt.workProducerJoinDone
+	rt.mu.RUnlock()
+	if started || done != nil {
+		t.Fatalf("join latch after rejected drain: started=%v done=%v", started, done != nil)
+	}
+	// Stop must not hang waiting on a phantom join.
+	doneCh := make(chan struct{})
+	go func() {
+		rt.waitForDrainProducerJoin()
+		close(doneCh)
+	}()
+	select {
+	case <-doneCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waitForDrainProducerJoin hung after rejected BeginDrain")
+	}
+}
+
 // Contract (#592 review): TransitionThen holds a.mu across the state change and
 // then callback so cancelWorkProducers can run with no closed-before-cancel window.
 func TestAdmissionTransitionThenRunsCallbackUnderLock(t *testing.T) {

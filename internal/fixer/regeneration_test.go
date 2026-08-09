@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
@@ -39,6 +40,8 @@ func (f *regenerationFakeGateway) CreateIssueComment(ctx context.Context, input 
 	}
 	return f.fakeGitHubGateway.CreateIssueComment(ctx, input)
 }
+
+var _ RegenerationGateway = (*regenerationFakeGateway)(nil)
 
 func (f *regenerationFakeGateway) ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error) {
 	return f.issue, nil
@@ -226,5 +229,118 @@ func TestHandleTerminalExhaustionEscalatesHumanCommitWithoutClosing(t *testing.T
 	}
 	if len(gateway.addLabelCalls) != 1 || len(gateway.addLabelCalls[0].Labels) != 1 || gateway.addLabelCalls[0].Labels[0] != labels.NeedsHuman {
 		t.Fatalf("PR labels = %#v, want needs-human", gateway.addLabelCalls)
+	}
+}
+
+func TestHandleTerminalExhaustionSkipsFreshlyMergedPR(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "CLOSED", MergedAt: "2026-04-11T12:00:00Z", HeadRefName: "looper/fix-42", HeadSHA: "head-42"}}},
+		issue:             IssueDetail{Number: 7, State: "OPEN"},
+		commits:           []PullRequestCommit{{AuthorLogin: "looper", CommitterLogin: "looper"}},
+	}
+	routes := 0
+	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error { routes++; return nil })
+	loop, queue := setupRegenerationRecords(t, fixture)
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	action, err := runner.handleTerminalExhaustion(context.Background(), *project, loop, queue, fixerCheckpoint{}, &runpipe.LoopError{Message: "failed", Kind: runpipe.FailureRetryableTransient})
+	if err != nil {
+		t.Fatalf("handleTerminalExhaustion() error = %v", err)
+	}
+	if action != regenerationNone || routes != 0 || len(gateway.closeCalls) != 0 || len(gateway.fakeGitHubGateway.createIssueComments) != 0 {
+		t.Fatalf("merged action/routes/closes/comments = %q/%d/%d/%d, want no regeneration", action, routes, len(gateway.closeCalls), len(gateway.fakeGitHubGateway.createIssueComments))
+	}
+}
+
+func TestRegenerationHonorsGlobalHoldOnOriginatingIssue(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadRefName: "looper/fix-42", HeadSHA: "head-42"}}},
+		issue:             IssueDetail{Number: 7, State: "OPEN", Labels: []string{labels.HoldGlobal}},
+		commits:           []PullRequestCommit{{AuthorLogin: "looper", CommitterLogin: "looper"}},
+	}
+	routes := 0
+	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error { routes++; return nil })
+	loop, queue := setupRegenerationRecords(t, fixture)
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	action, err := runner.handleTerminalExhaustion(context.Background(), *project, loop, queue, fixerCheckpoint{}, &runpipe.LoopError{Message: "failed", Kind: runpipe.FailureRetryableTransient})
+	if err != nil {
+		t.Fatalf("handleTerminalExhaustion() error = %v", err)
+	}
+	if action != regenerationNone || routes != 0 || len(gateway.closeCalls) != 0 || len(gateway.fakeGitHubGateway.createIssueComments) != 0 {
+		t.Fatalf("held action/routes/closes/comments = %q/%d/%d/%d, want no regeneration", action, routes, len(gateway.closeCalls), len(gateway.fakeGitHubGateway.createIssueComments))
+	}
+}
+
+func TestRegenerationRequiresPlannerAuthorityAvailability(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadRefName: "looper/fix-42", HeadSHA: "head-42"}}},
+		issue:             IssueDetail{Number: 7, State: "OPEN"},
+		commits:           []PullRequestCommit{{AuthorLogin: "looper", CommitterLogin: "looper"}},
+	}
+	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error { return nil })
+	runner.plannerRegenerationAvailable = false
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if _, err := runner.RegenerateConflict(context.Background(), ConflictRegenerationInput{ProjectID: "project_1", Repo: "acme/looper", IssueRepo: "acme/looper", IssueNumber: 7, PRNumber: 42, ConflictRepairs: 2, CWD: project.RepoPath}); err == nil {
+		t.Fatal("RegenerateConflict() error = nil, want planner-unavailable guard")
+	}
+	if len(gateway.closeCalls) != 0 || len(gateway.fakeGitHubGateway.createIssueComments) != 0 {
+		t.Fatalf("planner-unavailable side effects: closes=%d comments=%d, want none", len(gateway.closeCalls), len(gateway.fakeGitHubGateway.createIssueComments))
+	}
+}
+
+func TestRegenerateConflictEscalatesBeforeCloseWhenPlannerUnavailable(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadRefName: "looper/fix-42", BaseRefName: "main", HeadSHA: "head-42"}}},
+		issue:             IssueDetail{Number: 7, State: "OPEN"},
+		commits:           []PullRequestCommit{{AuthorLogin: "looper", CommitterLogin: "looper"}},
+	}
+	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error {
+		t.Fatal("planner route should not run while unavailable")
+		return nil
+	})
+	runner.regenerationAvailability = func(string) string { return "Planner agent is not configured" }
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	result, err := runner.RegenerateConflict(context.Background(), ConflictRegenerationInput{
+		ProjectID: "project_1", Repo: "acme/looper", IssueRepo: "acme/looper",
+		IssueNumber: 7, PRNumber: 42, ConflictRepairs: 2, CWD: project.RepoPath,
+	})
+	if err != nil {
+		t.Fatalf("RegenerateConflict() error = %v", err)
+	}
+	if !result.Escalated || result.Completed {
+		t.Fatalf("RegenerateConflict() result = %#v, want escalation without completion", result)
+	}
+	if len(gateway.closeCalls) != 0 {
+		t.Fatalf("close calls = %#v, want none while Planner is unavailable", gateway.closeCalls)
+	}
+	if len(gateway.addLabelCalls) != 1 || len(gateway.addLabelCalls[0].Labels) != 1 || gateway.addLabelCalls[0].Labels[0] != labels.NeedsHuman {
+		t.Fatalf("PR labels = %#v, want needs-human escalation", gateway.addLabelCalls)
+	}
+	if len(gateway.fakeGitHubGateway.createIssueComments) != 1 || !strings.Contains(gateway.fakeGitHubGateway.createIssueComments[0].Body, "Planner agent is not configured") {
+		t.Fatalf("escalation comments = %#v, want availability reason", gateway.fakeGitHubGateway.createIssueComments)
+	}
+}
+
+func TestRegenerationDiscoveryLabelsUseProjectRoleOverrides(t *testing.T) {
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	planLabels := []string{"project-plan"}
+	workerLabels := []string{"project-worker"}
+	anyMode := config.LabelModeAny
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Roles: &config.PartialRoleConfigs{
+		Planner: &config.PartialPlannerRoleConfig{Triggers: &config.PartialIssueRoleTriggersConfig{Labels: &planLabels, LabelMode: &anyMode}},
+		Worker:  &config.PartialWorkerRoleConfig{Triggers: &config.PartialIssueRoleTriggersConfig{Labels: &workerLabels, LabelMode: &anyMode}},
+	}}}
+	runner := New(Options{CustomInstructions: &cfg})
+	if got := runner.regenerationDiscoveryLabels("project_1", config.CodingRolePlanner, labels.DefaultPlanTrigger); len(got) != 1 || got[0] != "project-plan" {
+		t.Fatalf("planner labels = %#v, want project-plan", got)
+	}
+	if got := runner.regenerationDiscoveryLabels("project_1", config.CodingRoleWorker, labels.DefaultWorkerReadyTrigger); len(got) != 1 || got[0] != "project-worker" {
+		t.Fatalf("worker labels = %#v, want project-worker", got)
 	}
 }

@@ -13,6 +13,7 @@ For the default supported install path:
 For source development:
 
 - Go `1.22`
+- Node.js `22+` and pnpm `10` for the production dashboard build
 - `git`
 - `gh` for GitHub projects
 - `osascript` if macOS notifications stay enabled
@@ -97,7 +98,7 @@ looperd service install
 
 Installing refuses rather than guessing:
 
-- **`daemon.environment` is refused.** The unit carries no environment, so anything the daemon needs belongs in the configuration file.
+- **`daemon.environment` is refused.** The unit carries no user-configurable environment; it supplies only a fixed service `PATH` so sandbox preflight matches the supervisor. Anything else the daemon needs belongs in the configuration file.
 - **`daemon.plistPath` is refused.** The unit always goes to the canonical per-user location, so activation, status, and uninstall address the same thing.
 - **Auto-detected tool paths are refused.** A supervisor starts the daemon with a minimal `PATH`, so a `git` or `gh` found through your shell would be searched for again and may resolve differently.
 - **An existing unit is refused.** Replacing one is `uninstall` then `install`, so no active service is silently left on an old definition.
@@ -152,16 +153,19 @@ looper upgrade preflight --target-looper /path/to/candidate/looper --target-loop
 
 Preflight only calls `GET /api/v1/version` and `GET /api/v1/status` on the running daemon and executes the candidate binaries' identity (and optional `--check-config`) commands. It does not start a second production daemon or mutate the production database. Incomplete build identities never count as a matching CLI/daemon pair.
 
-After a clean preflight, create an explicit rollback bundle (daemon-owned SQLite online backup + config + matching binaries + checksums):
+After a clean preflight, close work admission and wait for the Supervisor to report
+that all owned work has drained before taking the rollback snapshot. This ordering
+keeps the SQLite backup aligned with the final quiescent runtime state:
 
 ```bash
+looper upgrade drain --deadline 10m
 looper upgrade backup
 looper upgrade verify --bundle <directory>
 ```
 
 `upgrade verify` is offline and fail-closed on missing files, bad checksums, or manifest problems.
 
-Manual cutover after a clean preflight: replace the binaries from matching release artifacts. Download the newer `looper-<target>.tar.gz` and `looperd-<target>.tar.gz` release artifacts (or re-run the install script for the CLI), put them back on your `PATH`, and restart `looperd`. There is no self-upgrade, version check, rollback, or channel switching.
+Manual cutover after a clean preflight: replace the binaries from matching release artifacts. Download the newer `looper-<target>.tar.gz` and `looperd-<target>.tar.gz` release artifacts (or re-run the install script for the CLI), put them back on your `PATH`, and restart `looperd`. There is no one-command self-upgrade or channel switching; the rollback restore sequence below is the supported recovery path.
 
 ## Compatibility and version policy
 
@@ -195,10 +199,20 @@ cd looper
 Then build or run the Go binaries:
 
 ```bash
+cd web/dashboard
+pnpm install --frozen-lockfile
+pnpm test
+pnpm run build
+cd ../..
 go build -o looper ./cmd/looper
 go build -o looperd ./cmd/looperd
 go run ./cmd/looperd
 ```
+
+The dashboard assets are generated into `internal/dashboard/assets` and
+embedded into `looperd`; without the dashboard build, the daemon serves the
+development fallback page instead of the production SPA. `scripts/verify.sh`
+runs the same install, test, and build sequence before the Go checks.
 
 In another shell, run the CLI from source:
 
@@ -214,46 +228,92 @@ go run ./cmd/looper stop 12
 
 ### Atomic release switch
 
-Stage a matching CLI/daemon pair, then activate via an atomic release pointer:
+Stage a matching CLI/daemon pair, then activate via an atomic release pointer.
+`stage-release` computes the release id from the target build identity (it does
+not accept an operator-supplied id). `activate-release` and `verify-start`
+require the staged release id returned by stage.
 
 ```bash
-looper upgrade stage-release --root <dir> --release-id <id> --target-looper <path> --target-looperd <path>
-looper upgrade activate-release --root <dir> --release-id <id>
-looper upgrade verify-start --root <dir>
+looper upgrade stage-release --release-root <dir> --target-looper <path> --target-looperd <path>
+looper upgrade activate-release --release-root <dir> --release <id>
+looper upgrade verify-start --release-root <dir> --release <id> --bundle <ROLLBACK_BUNDLE>
 ```
 
-`verify-start` must succeed before declaring cutover success. `package.autoUpgradeEnabled` is not a supported managed upgrade path (legacy decode only).
+`verify-start` must succeed before declaring cutover success. It checks build
+identity, the release pointer, held admission (`draining`), storage health,
+zero `scheduler.activeRuns`/`scheduler.runningItems`, and quarantine debt. A
+held cutover must therefore leave both scheduler counts at zero; the queue is
+preserved for the unheld restart rather than claimed during verification.
+`package.autoUpgradeEnabled` is not a supported managed upgrade path (legacy
+decode only).
 
-### Building a dashboard-serving `looperd`
+Supported service layouts must launch `looperd` through the activated
+`release-root/current` pointer. `looperd service install` rewrites a binary
+path under `releases/<id>/` to `current/looperd` automatically when that
+pointer exists, so `activate-release` switches the next supervised start
+without rewriting unit files. Activation returns `serviceExecutable` with that
+path; restart the supervised unit after activate so the new image is loaded.
 
-The dashboard at `/dashboard/` is a React + Vite SPA whose built assets are
-`//go:embed`'d into `looperd` from `internal/dashboard/assets`. Those assets are
-generated by the frontend build and are gitignored, so a plain `go build` only
-embeds them when they already exist on disk.
+Also point `tools.looperPath` at `release-root/current/looper` as part of
+cutover (and restore the prior value on rollback). Agents publish reviews
+through that path; leaving it on a pre-cutover binary breaks the paired release.
 
-To produce a `looperd` that serves the usable dashboard, build the dashboard
-first, then build the daemon:
+
+### Rollback restore
+
+When post-start verification fails, **stop the candidate daemon first** (it still
+holds SQLite open). Then restore the matching pre-cutover config and SQLite
+snapshot from a v2 backup bundle (fail-closed if targets are still open):
 
 ```bash
-cd web/dashboard
-pnpm install --frozen-lockfile
-pnpm run build          # writes internal/dashboard/assets + the .production marker
-cd ../..
-go build -o looperd ./cmd/looperd
+# macOS: stop and forget the installed LaunchAgent
+launchctl bootout gui/$(id -u)/io.looper.looperd
+# Linux: stop the installed systemd user unit
+systemctl --user stop looperd.service
+looper upgrade restore-preflight --bundle <directory>
+looper upgrade restore --bundle <directory> --confirm
 ```
 
-`scripts/verify.sh` runs the same dashboard build before the Go gates, so a
-green local verify produces a dashboard-serving binary the same way CI does.
-Release binaries from `.github/workflows/release.yml` always build the dashboard
-before building `looperd`, so every published `looperd-<target>.tar.gz` serves
-the dashboard.
+If the bundle is unavailable but a durable restore journal remains, recover the
+database/config pair directly from the journal; this command does not inspect
+or require the bundle:
 
-**Development-mode exception.** A plain `go run ./cmd/looperd` or
-`go build ./cmd/looperd` without the dashboard build step embeds only the
-fallback placeholder, and `/dashboard/` renders a notice that production
-dashboard assets are not embedded. The API stays healthy. This is intentional:
-it keeps the Go-only dev loop (edit Go, run) free of a Node toolchain
-requirement. The `internal/e2e` smoke `TestSmokeLooperdServesEmbeddedDashboard`
-skips under this exception and runs only when the built assets are present, so
-CI — which builds the dashboard before `go test ./...` — guards the release
-embed path without forcing every local `go test` to install pnpm.
+```bash
+looper upgrade recover --journal /absolute/path/to/looper.sqlite.restore-journal
+```
+
+Both restore commands require `lsof` on `PATH` so Looper can prove that the
+config, SQLite database, and WAL/SHM sidecars are not open before replacement.
+
+Supported sequence:
+
+1. `preflight` (read-only compatibility; sandbox probe uses `daemon.workingDirectory`)
+2. **Ensure the live pair is staged under `release-root`** as the prior release:
+   - **First cutover:** `stage-release` the running CLI/daemon, then `activate-release` that id so `current` exists. Reinstall/update the service so the unit launches `release-root/current/looperd` (not a concrete old path). Set `tools.looperPath` to `release-root/current/looper` and restart once to confirm the service follows `current`. Keep that release id as `previous`.
+   - **Later cutovers:** the live pair is already that release id (last successful candidate). Re-run `stage-release` with the same binaries — staging is **idempotent** when the destination already matches (same build + binary hashes). Or skip re-staging and reuse `looper upgrade` / `CurrentReleaseID` as `previous`.
+3. `backup` (initial matching config + SQLite + binary evidence; keep the path)
+4. `stage-release` the **candidate** pair (new release id) — offline; fail here before one-way drain
+5. `drain` until `drained: true`
+6. **`backup` again while drained (mandatory)** — this is the rollback bundle for cutover. Work may still commit between step 3 and drain completion; only the post-drain bundle is guaranteed to include that work. Record this bundle directory as `ROLLBACK_BUNDLE`.
+7. `activate-release` the candidate (switches `current` only — does not restart)
+8. Point `tools.looperPath` at `release-root/current/looper` if not already
+9. **Restart the supervised daemon with a manager-level `LOOPER_UPGRADE_VERIFY_HOLD=1` environment** so it loads `current/looperd` but **keeps admission drained** (no claim/mutation) until verification finishes. A shell prefix such as `LOOPER_UPGRADE_VERIFY_HOLD=1 launchctl ...` does not update an already-installed service's environment. Use the manager commands below:
+   - macOS: `launchctl setenv LOOPER_UPGRADE_VERIFY_HOLD 1`, then `launchctl kickstart -k gui/$(id -u)/io.looper.looperd`
+   - Linux: `systemctl --user set-environment LOOPER_UPGRADE_VERIFY_HOLD=1`, then `systemctl --user restart looperd.service`
+   Without this hold, the replacement scheduler can complete work before `verify-start`; a later failed verify + restore of `$ROLLBACK_BUNDLE` would discard those writes.
+10. `verify-start --bundle $ROLLBACK_BUNDLE` (requires `admissionState: draining`, daemon/`tools.looperPath` governed by `current`, and the candidate's `storage.dbPath` matching the rollback bundle source)
+11. On success: **remove the manager-level hold and restart again** so admission opens and normal work resumes:
+    - macOS: `launchctl unsetenv LOOPER_UPGRADE_VERIFY_HOLD`, then `launchctl kickstart -k gui/$(id -u)/io.looper.looperd`
+    - Linux: `systemctl --user unset-environment LOOPER_UPGRADE_VERIFY_HOLD`, then `systemctl --user restart looperd.service`
+
+On failure after restart (while still held/drained):
+
+1. **Stop** the candidate daemon (required — restore fails closed while SQLite is open)
+2. `restore-preflight --bundle $ROLLBACK_BUNDLE` → `restore --bundle $ROLLBACK_BUNDLE --confirm` (use the **post-drain** bundle, not the pre-drain one)
+3. `activate-release` the **prior** release id
+4. Restore prior `tools.looperPath` if you changed it
+5. Remove the manager-level hold and restart the supervised daemon:
+   - macOS: `launchctl unsetenv LOOPER_UPGRADE_VERIFY_HOLD`, then `launchctl kickstart -k gui/$(id -u)/io.looper.looperd`
+   - Linux: `systemctl --user unset-environment LOOPER_UPGRADE_VERIFY_HOLD`, then `systemctl --user restart looperd.service`
+
+Backup-copied binaries are evidence, not an executable release; binary rollback is always via a previously staged release under the same `release-root`.
