@@ -1,6 +1,6 @@
 # ADR-0017: Auto-merge via GitHub-native auto-merge and Coordinator watch
 
-- Status: Accepted
+- Status: Superseded by the Gatekeeper trust ladder in issue #116
 - Date: 2026-05-18
 - Related: ADR-0002, PRD #352, slice #357, issue #358
 - Note: originally numbered 0005. Two ADRs were merged on 2026-05-18 from
@@ -8,6 +8,11 @@
   ambiguous. ADR-0015 cites 0005 meaning the webhook forwarder decision, so
   that one keeps the number and this one was renumbered. The decision, date,
   and content are unchanged.
+
+> Historical decision: Reviewer no longer enables GitHub-native auto-merge.
+> Merge Gatekeeper is the only Looper merge authority and, at `auto`, performs a
+> complete confirming evaluation before an immediate head-matched merge. The
+> Coordinator watch remains useful for human-created GitHub auto-merge state.
 
 ## Context
 

@@ -64,6 +64,27 @@ func gatekeeperDiffBudgetForProject(cfg config.Config, projectID string) config.
 	return budget
 }
 
+// gatekeeperRoleConfigForProject resolves the effective GatekeeperRoleConfig
+// for a project, applying project-level overrides on top of the global config.
+func gatekeeperRoleConfigForProject(cfg config.Config, projectID string) config.GatekeeperRoleConfig {
+	role := cfg.Roles.Gatekeeper
+	for _, project := range cfg.Projects {
+		if project.ID != projectID {
+			continue
+		}
+		if project.Roles != nil && project.Roles.Gatekeeper != nil {
+			if project.Roles.Gatekeeper.Trust != nil {
+				role.Trust = *project.Roles.Gatekeeper.Trust
+			}
+			if project.Roles.Gatekeeper.Strategy != nil {
+				role.Strategy = *project.Roles.Gatekeeper.Strategy
+			}
+		}
+		break
+	}
+	return role
+}
+
 // gatekeeperRequiredReviewChangedLinesForProject resolves the effective review
 // capacity threshold. The normalized global default is 200; a project override
 // may explicitly set zero to disable the threshold for that project.

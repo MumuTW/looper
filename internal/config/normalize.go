@@ -1310,6 +1310,13 @@ func mergeGatekeeperRoleConfig(config *GatekeeperRoleConfig, partial PartialGate
 	if partial.ProtectedPaths != nil {
 		config.ProtectedPaths = cloneStrings(*partial.ProtectedPaths)
 	}
+	if partial.Strategy != nil {
+		strategy := MergeStrategy(strings.TrimSpace(string(*partial.Strategy)))
+		if strategy == "" {
+			strategy = MergeStrategySquash
+		}
+		config.Strategy = strategy
+	}
 	if partial.RequiredReviewChangedLines != nil {
 		config.RequiredReviewChangedLines = *partial.RequiredReviewChangedLines
 	}
@@ -1612,31 +1619,18 @@ func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewer
 		mergeReviewerConfig(&config.Behavior, *partial.Behavior)
 	}
 	if partial.AutoMerge != nil {
-		mergeReviewerAutoMergeConfig(&config.AutoMerge, *partial.AutoMerge)
+		if partial.AutoMerge.Enabled != nil {
+			config.AutoMerge.Enabled = *partial.AutoMerge.Enabled
+		}
+		if partial.AutoMerge.Strategy != nil {
+			config.AutoMerge.Strategy = *partial.AutoMerge.Strategy
+		}
 	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
 	}
 	if partial.Agent != nil {
 		mergeRoleAgentConfig(&config.Agent, partial.Agent)
-	}
-}
-
-func mergeReviewerAutoMergeConfig(config *ReviewerAutoMergeConfig, partial PartialReviewerAutoMergeConfig) {
-	if partial.Enabled != nil {
-		config.Enabled = *partial.Enabled
-	}
-	if partial.Strategy != nil {
-		config.Strategy = *partial.Strategy
-	}
-	if partial.RequireBranchProtection != nil {
-		config.RequireBranchProtection = *partial.RequireBranchProtection
-	}
-	if partial.TransientRetries != nil {
-		config.TransientRetries = *partial.TransientRetries
-	}
-	if partial.Scope != nil {
-		config.Scope = *partial.Scope
 	}
 }
 
@@ -2248,8 +2242,14 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			trust := *configs.Gatekeeper.Trust
 			gatekeeper.Trust = &trust
 		}
-		if configs.Gatekeeper.DiffBudget != nil {
-			gatekeeper.DiffBudget = clonePartialGatekeeperDiffBudget(configs.Gatekeeper.DiffBudget)
+		gatekeeper.DiffBudget = clonePartialGatekeeperDiffBudget(configs.Gatekeeper.DiffBudget)
+		if configs.Gatekeeper.Strategy != nil {
+			strategy := *configs.Gatekeeper.Strategy
+			gatekeeper.Strategy = &strategy
+		}
+		if configs.Gatekeeper.RequiredReviewChangedLines != nil {
+			threshold := *configs.Gatekeeper.RequiredReviewChangedLines
+			gatekeeper.RequiredReviewChangedLines = &threshold
 		}
 		if configs.Gatekeeper.RequiredReviewChangedLines != nil {
 			threshold := *configs.Gatekeeper.RequiredReviewChangedLines

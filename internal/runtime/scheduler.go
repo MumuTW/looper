@@ -89,6 +89,10 @@ type coordinatorScheduler interface {
 	DiscoverIssues(context.Context, coordinatorrole.DiscoveryInput) (coordinatorrole.DiscoveryResult, error)
 }
 
+type coordinatorRetiredAutoMergeScheduler interface {
+	ReconcileRetiredAutoMerge(context.Context, coordinatorrole.RetiredAutoMergeInput) error
+}
+
 type reviewerScheduler interface {
 	DiscoverPullRequests(context.Context, reviewer.DiscoveryInput) (reviewer.DiscoveryResult, error)
 	DiscoverPullRequest(context.Context, reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error)
@@ -128,6 +132,9 @@ type schedulerAsyncRunner interface {
 
 type defaultSchedulerTickInput struct {
 	Repos *storage.Repositories
+	// CoordinatorState carries process-local maintenance readiness across tick
+	// snapshots and into the webhook targeted-evaluation adapter.
+	CoordinatorState *coordinatorrole.RuntimeState
 	// CapturedProjects is the project-table snapshot already validated by the
 	// catalog pass immediately before an independent claim pass. Keeping it on
 	// the claim input lets the quarantine scope reuse that read instead of
@@ -225,10 +232,14 @@ type catalogWebhookFixer struct {
 }
 
 type catalogWebhookGatekeeper struct {
-	snapshot func() gatekeeperScheduler
+	snapshot                func() gatekeeperScheduler
+	maintenanceCleanupReady func(projectID, repo string) bool
 }
 
 func (g catalogWebhookGatekeeper) EvaluatePullRequest(ctx context.Context, input gatekeeper.EvaluationInput) (gatekeeper.Report, error) {
+	if g.maintenanceCleanupReady != nil && !g.maintenanceCleanupReady(input.ProjectID, input.Repo) {
+		return gatekeeper.Report{}, fmt.Errorf("gatekeeper blocked until retired auto-merge cleanup succeeds")
+	}
 	if g.snapshot == nil {
 		return gatekeeper.Report{}, fmt.Errorf("gatekeeper is not configured")
 	}
@@ -814,10 +825,6 @@ func (a reviewerGitHubAdapter) SubmitReview(ctx context.Context, input githubinf
 		input.Comments = comments
 	}
 	return a.gateway.SubmitReview(ctx, input)
-}
-
-func (a reviewerGitHubAdapter) EnableAutoMerge(ctx context.Context, input githubinfra.EnableAutoMergeInput) error {
-	return a.gateway.EnableAutoMerge(ctx, input)
 }
 
 func (a reviewerGitHubAdapter) AddPullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
@@ -1950,6 +1957,8 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			}},
 			Gatekeeper: catalogWebhookGatekeeper{snapshot: func() gatekeeperScheduler {
 				return handlers.snapshot().gatekeeper
+			}, maintenanceCleanupReady: func(projectID, repo string) bool {
+				return coordinatorState == nil || coordinatorState.RetiredAutoMergeCleanupReady(projectID, repo)
 			}},
 			Logger: logger,
 			Now:    now,
@@ -2075,6 +2084,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			DiffBudgetForProject: func(projectID string) config.GatekeeperDiffBudget {
 				return gatekeeperDiffBudgetForProject(cfg, projectID)
 			},
+			MergeStrategyForProject: func(projectID string) config.MergeStrategy {
+				return gatekeeperRoleConfigForProject(cfg, projectID).Strategy
+			},
 			RequiredReviewChangedLinesForProject: func(projectID string) int {
 				return gatekeeperRequiredReviewChangedLinesForProject(cfg, projectID)
 			},
@@ -2098,7 +2110,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				if project.BaseBranch != nil && strings.TrimSpace(*project.BaseBranch) != "" {
 					configuredBase = strings.TrimSpace(*project.BaseBranch)
 				}
-				return strings.EqualFold(strings.TrimSpace(configuredBase), strings.TrimSpace(baseRefName))
+				return gatekeeperTargetBranchMatches(configuredBase, baseRefName)
 			},
 			ConfiguredTargetBranch: func(projectID string) string {
 				project, ok := runtimeProjectBinding(cfg, projectID)
@@ -2352,13 +2364,14 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	// Coordinator triage LLM uses the global agent only; missing global vendor
 	// must not disable coding roles that resolve via role/profile bindings.
 	coordinatorOpts := coordinatorrole.Options{
-		Repos:   repos,
-		GitHub:  githubGateway,
-		Config:  &cfg,
-		Logger:  logger,
-		Now:     now,
-		State:   coordinatorState,
-		Network: coordinatorrole.NewLoopernetGateway(networkclient.DefaultStatePath(runtimeHomeDirOrEmpty())),
+		Repos:                  repos,
+		GitHub:                 githubGateway,
+		Config:                 &cfg,
+		Logger:                 logger,
+		Now:                    now,
+		State:                  coordinatorState,
+		Network:                coordinatorrole.NewLoopernetGateway(networkclient.DefaultStatePath(runtimeHomeDirOrEmpty())),
+		CancelRetiredAutoMerge: true,
 	}
 	if cfg.Agent.Vendor != nil {
 		// Same ParamsOwnerVendor as coding-role executors: agent.params.command/args
@@ -2638,6 +2651,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		}
 		return defaultSchedulerTickInput{
 			Repos:                services.Repositories,
+			CoordinatorState:     coordinatorState,
 			GitHubGateway:        githubGateway,
 			GitGateway:           gitGateway,
 			Logger:               logger,
@@ -2727,12 +2741,21 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ConfigSource: configSource,
 			Reviewer:     webhookReviewer,
 			Fixer:        webhookFixer,
-			Gatekeeper:   gatekeeperRunner,
-			Logger:       logger,
-			Now:          now,
+			Gatekeeper: catalogWebhookGatekeeper{
+				snapshot: func() gatekeeperScheduler { return gatekeeperRunner },
+				maintenanceCleanupReady: func(projectID, repo string) bool {
+					return coordinatorState == nil || coordinatorState.RetiredAutoMergeCleanupReady(projectID, repo)
+				},
+			},
+			Logger: logger,
+			Now:    now,
 		})
 	}
 	return handlers
+}
+
+func gatekeeperTargetBranchMatches(configuredBase, observedBase string) bool {
+	return strings.TrimSpace(configuredBase) == strings.TrimSpace(observedBase)
 }
 
 // fixerRegenerationUnavailableReason is checked before Fixer closes an
@@ -2861,7 +2884,41 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		retErr = errors.Join(errs...)
 		return retErr
 	}
+	maintenanceFailures := make(map[string]bool)
+	if maintenance, ok := input.Coordinator.(coordinatorRetiredAutoMergeScheduler); ok {
+		for _, project := range projectsList {
+			maintenanceRepo := schedulerMaintenanceRepo(input, project)
+			if maintenanceRepo == "" {
+				continue
+			}
+			if input.CoordinatorState != nil && input.CoordinatorState.RetiredAutoMergeCleanupReady(project.ID, maintenanceRepo) {
+				continue
+			}
+			if err := admissionRefuseWork(input); err != nil {
+				return nil
+			}
+			maintenanceErr := runSchedulerLane(input, "coordinator migration cleanup", project.ID, maintenanceRepo, func() error {
+				return maintenance.ReconcileRetiredAutoMerge(ctx, coordinatorrole.RetiredAutoMergeInput{
+					ProjectID: project.ID,
+					Repo:      maintenanceRepo,
+					CWD:       schedulerMaintenanceCWD(input),
+				})
+			})
+			if maintenanceErr != nil {
+				if input.CoordinatorState != nil {
+					input.CoordinatorState.SetRetiredAutoMergeCleanupReady(project.ID, maintenanceRepo, false)
+				}
+				maintenanceFailures[project.ID] = true
+				appendErr(maintenanceErr)
+			} else if input.CoordinatorState != nil {
+				input.CoordinatorState.SetRetiredAutoMergeCleanupReady(project.ID, maintenanceRepo, true)
+			}
+		}
+	}
 	if !catalogCurrent {
+		if len(errs) > 0 {
+			return errors.Join(errs...)
+		}
 		return nil
 	}
 
@@ -2918,6 +2975,10 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			}
 			break
 		}
+		// Migration cleanup is maintenance authority, not policy-gated
+		// Coordinator discovery. Run it even when Coordinator is disabled or its
+		// normal retry path is deferred, so a retired native auto-merge request
+		// cannot outlive the Reviewer authority.
 		if project.Archived {
 			continue
 		}
@@ -2938,6 +2999,12 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		admissionClosed := false
 		for _, lane := range lanes {
 			if !lane.Present {
+				continue
+			}
+			if maintenanceFailures[project.ID] && lane.Name == config.RoleGatekeeper {
+				if input.Logger != nil {
+					input.Logger.Warn("scheduler blocked Gatekeeper after migration cleanup failure", map[string]any{"projectId": project.ID, "repo": repo})
+				}
 				continue
 			}
 			if !lane.Enabled(project.ID) {
@@ -3086,6 +3153,48 @@ func schedulerProjectRepo(input defaultSchedulerTickInput, project storage.Proje
 		repo = strings.TrimSpace(binding.Repo)
 	}
 	return repo, true
+}
+
+// schedulerMaintenanceRepo keeps migration cleanup routable after a project is
+// archived or removed from the current config catalog. The stored project
+// metadata is the historical repository binding; a live catalog binding is the
+// fallback for older records that predate that metadata.
+func schedulerMaintenanceRepo(input defaultSchedulerTickInput, project storage.ProjectRecord) string {
+	if input.Config != nil {
+		if binding, ok := runtimeProjectBinding(*input.Config, project.ID); ok {
+			if !project.Archived {
+				return strings.TrimSpace(binding.Repo)
+			}
+		}
+	}
+	if repo := repoFromProjectMetadata(project.MetadataJSON); repo != "" {
+		return repo
+	}
+	if input.Config != nil {
+		if binding, ok := runtimeProjectBinding(*input.Config, project.ID); ok {
+			return strings.TrimSpace(binding.Repo)
+		}
+	}
+	return ""
+}
+
+// schedulerMaintenanceCWD is deliberately independent of a project's
+// checkout. Retired cleanup is repo-qualified and may need to run after an
+// archived project's local checkout has been removed; the daemon working
+// directory (or the process directory) is the valid command launch boundary.
+func schedulerMaintenanceCWD(input defaultSchedulerTickInput) string {
+	if input.Config != nil {
+		cwd := strings.TrimSpace(input.Config.Daemon.WorkingDirectory)
+		if cwd != "" {
+			if info, err := os.Stat(cwd); err == nil && info.IsDir() {
+				return cwd
+			}
+		}
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		return cwd
+	}
+	return ""
 }
 
 func projectDiscoverySnapshotOptions(input defaultSchedulerTickInput, projectID string) githubinfra.DiscoverySnapshotOptions {
