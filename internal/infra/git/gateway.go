@@ -653,6 +653,10 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 		return fmt.Errorf("refusing to remove worktree %q branch %q: looper record has a different path %q — refusing to remove a path that may belong to a different checkout", input.WorktreePath, input.Branch, existing.WorktreePath)
 	}
 
+	if err := g.rescueDetachedWorktreeHead(ctx, input); err != nil {
+		return err
+	}
+
 	if err := g.runGitWithStartGate(ctx, input.RepoPath, nil, input.AdmitStart, "worktree", "remove", "--force", input.WorktreePath); err != nil {
 		if !missingWorktreeErrorPattern.MatchString(err.Error()) {
 			return err
@@ -668,6 +672,46 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 		return fmt.Errorf("update cleaned worktree record: %w", err)
 	}
 
+	return nil
+}
+
+func (g *Gateway) rescueDetachedWorktreeHead(ctx context.Context, input CleanupWorktreeInput) error {
+	if _, err := os.Stat(input.WorktreePath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("inspect worktree before cleanup: %w", err)
+	}
+
+	branch, err := g.runGitResultOnceWithStartGate(ctx, input.WorktreePath, nil, input.AdmitStart, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return fmt.Errorf("inspect worktree checkout mode before cleanup: %w", err)
+	}
+	if strings.TrimSpace(branch.Stdout) != "HEAD" {
+		return nil
+	}
+
+	head, err := g.runGitResultOnceWithStartGate(ctx, input.WorktreePath, nil, input.AdmitStart, "rev-parse", "HEAD")
+	if err != nil {
+		return fmt.Errorf("read detached worktree HEAD before cleanup: %w", err)
+	}
+	headSHA := strings.TrimSpace(head.Stdout)
+	if len(headSHA) < 8 {
+		return fmt.Errorf("read detached worktree HEAD before cleanup: invalid commit %q", headSHA)
+	}
+
+	containingRef, err := g.runGitResultOnceWithStartGate(ctx, input.RepoPath, nil, input.AdmitStart, "for-each-ref", "--contains", headSHA, "--count=1", "--format=%(refname)")
+	if err != nil {
+		return fmt.Errorf("check detached worktree HEAD reachability before cleanup: %w", err)
+	}
+	if strings.TrimSpace(containingRef.Stdout) != "" {
+		return nil
+	}
+
+	rescueRef := "refs/looper/rescue/" + sanitizeBranchName(filepath.Base(input.WorktreePath)) + "-" + headSHA[:8]
+	if err := g.runGitWithStartGate(ctx, input.RepoPath, nil, input.AdmitStart, "update-ref", rescueRef, headSHA); err != nil {
+		return fmt.Errorf("create rescue ref for detached worktree HEAD: %w", err)
+	}
 	return nil
 }
 
