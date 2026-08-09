@@ -28,9 +28,10 @@ import (
 const javaScriptISOStringLayout = "2006-01-02T15:04:05.000Z"
 
 const (
-	defaultGhCommandTimeout = 60 * time.Second
-	prListGhCommandTimeout  = 15 * time.Second
-	prDiffGhCommandTimeout  = 180 * time.Second
+	defaultGhCommandTimeout   = 60 * time.Second
+	prListGhCommandTimeout    = 15 * time.Second
+	prDiffGhCommandTimeout    = 180 * time.Second
+	protectedPathCaptureLimit = 16 * 1024 * 1024
 )
 
 var (
@@ -39,7 +40,7 @@ var (
 	prViewMetadataJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
 	prViewFixerJSONFields      = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "statusCheckRollup", "mergeStateStatus"}
 	prViewReviewerJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "statusCheckRollup", "mergeStateStatus"}
-	prViewGatekeeperJSONFields = []string{"number", "state", "closedAt", "mergedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "additions", "deletions", "mergeStateStatus", "changedFiles", "closingIssuesReferences"}
+	prViewGatekeeperJSONFields = []string{"number", "state", "closedAt", "mergedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "additions", "deletions", "mergeStateStatus", "changedFiles", "closingIssuesReferences", "files"}
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
@@ -179,12 +180,17 @@ type PullRequestDetail struct {
 	Reviews            []map[string]any
 	Checks             []map[string]any
 	DiffStats          *PullRequestDiffStats `json:"diffStats,omitempty"`
-	Mergeable          *bool
-	MergeableState     MergeabilityState
-	MergedAt           string
-	MergeCommitSHA     string
-	ClosingIssues      []IssueReference
-	AutoMerge          *PullRequestAutoMerge
+	ChangedFiles       []string
+	// ChangedFilesCount is the provider's total changed-file count for the pull
+	// request, independent of any paginated file-list ceiling. Gatekeeper uses
+	// it to detect when the REST file-list endpoint omitted files past its cap.
+	ChangedFilesCount int
+	Mergeable         *bool
+	MergeableState    MergeabilityState
+	MergedAt          string
+	MergeCommitSHA    string
+	ClosingIssues     []IssueReference
+	AutoMerge         *PullRequestAutoMerge
 }
 
 // PullRequestDiffStats is the provider-observed change size for a pull request.
@@ -503,6 +509,7 @@ type EnableAutoMergeInput struct {
 	PRNumber int64
 	Strategy config.ReviewerAutoMergeStrategy
 	HeadSHA  string
+	BaseSHA  string
 	CWD      string
 }
 
@@ -753,6 +760,10 @@ type ViewPullRequestInput struct {
 	Repo     string
 	PRNumber int64
 	CWD      string
+	// ProtectedPaths is the effective protected-path policy for the requesting
+	// project. The gatekeeper file-list read is only performed when it is
+	// non-empty, so projects without protected paths never pay for it.
+	ProtectedPaths []string
 }
 
 type ResolveReviewThreadInput struct {
@@ -1933,16 +1944,54 @@ func (g *Gateway) ViewPullRequestForGatekeeper(ctx context.Context, input ViewPu
 	// Gate decisions must bypass the per-tick discovery snapshot: this method
 	// is the fresh provider read that binds a report to the current head.
 	detail, err := g.viewPullRequestWithFields(ctx, input, prViewGatekeeperJSONFields, false, false)
-	if err == nil {
+	if err != nil {
+		// closingIssuesReferences is provenance enrichment, not merge authority.
+		// Older GitHub Enterprise APIs may reject the optional field; retry the
+		// authoritative gate read without it rather than blocking every evaluation.
+		if !isUnsupportedClosingIssuesReferencesError(err) {
+			return PullRequestDetail{}, err
+		}
+		detail, err = g.viewPullRequestWithFields(ctx, input, withoutJSONField(prViewGatekeeperJSONFields, "closingIssuesReferences"), false, false)
+		if err != nil {
+			return PullRequestDetail{}, err
+		}
+	}
+	// Enumerate changed files only when an effective protected-path policy
+	// exists. With no patterns to apply the paginated file-list request is pure
+	// overhead, and a transient failure of that endpoint would otherwise block
+	// an otherwise provider-state-only evaluation.
+	if len(input.ProtectedPaths) == 0 {
 		return detail, nil
 	}
-	// closingIssuesReferences is provenance enrichment, not merge authority.
-	// Older GitHub Enterprise APIs may reject the optional field; retry the
-	// authoritative gate read without it rather than blocking every evaluation.
-	if !isUnsupportedClosingIssuesReferencesError(err) {
+	// `gh pr view --json files` is backed by a first-page GraphQL connection.
+	// Gatekeeper must never treat that bounded projection as complete: a
+	// protected file after the first page would otherwise be silently missed.
+	paths, fetchedCount, err := g.listPullRequestFilePaths(ctx, input)
+	if err != nil {
 		return PullRequestDetail{}, err
 	}
-	return g.viewPullRequestWithFields(ctx, input, withoutJSONField(prViewGatekeeperJSONFields, "closingIssuesReferences"), false, false)
+	// The REST pulls/{n}/files endpoint returns at most 3,000 files even with
+	// --paginate. A protected file beyond that cap is omitted, so Gatekeeper
+	// could mark the report eligible and merge it. Compare the fetched entry
+	// count with the PR's total changedFiles count and fail closed when they
+	// differ rather than trusting an incomplete authority.
+	if fetchedCount != detail.ChangedFilesCount {
+		return PullRequestDetail{}, fmt.Errorf("pull request %d changed-file list incomplete: fetched %d of %d files", input.PRNumber, fetchedCount, detail.ChangedFilesCount)
+	}
+	// The file-list endpoint carries no head SHA, so a force-push between the
+	// metadata read and this request can enumerate files from a different head
+	// while every later comparison still uses the metadata head. Re-read the
+	// head and fail closed when it moved, binding the file evidence to the same
+	// head the rest of the detail was observed against.
+	observedHead, err := g.GetPullRequestHeadSHA(ctx, input)
+	if err != nil {
+		return PullRequestDetail{}, err
+	}
+	if strings.TrimSpace(observedHead) != strings.TrimSpace(detail.HeadSHA) {
+		return PullRequestDetail{}, fmt.Errorf("pull request %d head moved during changed-file enumeration: expected %s, got %s", input.PRNumber, detail.HeadSHA, observedHead)
+	}
+	detail.ChangedFiles = paths
+	return detail, nil
 }
 
 func isUnsupportedClosingIssuesReferencesError(err error) bool {
@@ -1956,6 +2005,29 @@ func isUnsupportedClosingIssuesReferencesError(err error) bool {
 		}
 	}
 	return false
+}
+
+func (g *Gateway) listPullRequestFilePaths(ctx context.Context, input ViewPullRequestInput) ([]string, int, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	// Project each page down to only the current and previous filenames before
+	// it reaches the bounded shell capture buffer. The full REST file objects
+	// include per-file patch text, so a moderately large diff would otherwise
+	// exceed the 256 KiB stdout cap and surface as a provider-state failure
+	// even when the filename list itself is small.
+	filter := `.[] | {filename, previous_filename}`
+	args := []string{"api", "--paginate", fmt.Sprintf("repos/%s/pulls/%d/files?per_page=100", repo, input.PRNumber), "--jq", filter, "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGhWithTimeoutAndCaptureLimit(ctx, input.CWD, "", defaultGhCommandTimeout, protectedPathCaptureLimit, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	rows, err := decodeJSONObjects(result.Stdout)
+	if err != nil {
+		return nil, 0, err
+	}
+	return extractPullRequestFilePaths(rows), len(rows), nil
 }
 
 func (g *Gateway) viewPullRequestWithFields(ctx context.Context, input ViewPullRequestInput, fields []string, includeReviewThreads bool, includeIssueComments bool) (PullRequestDetail, error) {
@@ -2019,6 +2091,8 @@ func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, 
 		Reviews:            toObjectSlice(row["reviews"]),
 		Checks:             toObjectSlice(row["statusCheckRollup"]),
 		DiffStats:          pullRequestDiffStatsFromRow(row),
+		ChangedFiles:       extractPullRequestFilePaths(row["files"]),
+		ChangedFilesCount:  int(asInt64(row["changedFiles"])),
 		Mergeable:          boolPtrFromValue(row["mergeable"]),
 		MergeableState:     ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),
 		MergedAt:           firstNonEmpty(asString(row["mergedAt"]), asString(row["merged_at"])),
@@ -2381,6 +2455,15 @@ func (g *Gateway) MergePullRequest(ctx context.Context, input EnableAutoMergeInp
 	if headSHA == "" {
 		return fmt.Errorf("merge head SHA is required")
 	}
+	if expectedBase := strings.TrimSpace(input.BaseSHA); expectedBase != "" {
+		actualBase, err := g.GetPullRequestBaseSHA(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+		if err != nil {
+			return fmt.Errorf("revalidate merge base SHA: %w", err)
+		}
+		if actualBase != expectedBase {
+			return fmt.Errorf("pull request base SHA moved: expected %s, got %s", expectedBase, actualBase)
+		}
+	}
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "merge", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--"+strategy, "--match-head-commit", headSHA)
 	return err
 }
@@ -2537,6 +2620,18 @@ func (g *Gateway) GetPullRequestHeadAndBaseSHA(ctx context.Context, input ViewPu
 		return "", "", err
 	}
 	return asString(row["headRefOid"]), asString(row["baseRefOid"]), nil
+}
+
+func (g *Gateway) GetPullRequestBaseSHA(ctx context.Context, input ViewPullRequestInput) (string, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "baseRefOid")
+	if err != nil {
+		return "", err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return "", err
+	}
+	return asString(row["baseRefOid"]), nil
 }
 
 func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewThreadInput) error {
@@ -4268,7 +4363,11 @@ func mergeIntoProcessEnv(overrides map[string]string) map[string]string {
 }
 
 func (g *Gateway) runGhWithTimeout(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
-	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Env: g.ghEnv, Stdin: stdin, Timeout: timeout})
+	return g.runGhWithTimeoutAndCaptureLimit(ctx, cwd, stdin, timeout, 0, args...)
+}
+
+func (g *Gateway) runGhWithTimeoutAndCaptureLimit(ctx context.Context, cwd, stdin string, timeout time.Duration, maxCapturedBytes int, args ...string) (shell.Result, error) {
+	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Env: g.ghEnv, Stdin: stdin, Timeout: timeout, MaxCapturedBytes: maxCapturedBytes})
 	if result.StdoutTruncated || result.StderrTruncated {
 		streams := make([]string, 0, 2)
 		if result.StdoutTruncated {
@@ -4921,6 +5020,43 @@ func extractLabelNamesFromConnection(value any) []string {
 		return []string{}
 	}
 	return extractLabelNames(row["nodes"])
+}
+
+func extractPullRequestFilePaths(value any) []string {
+	items, _ := value.([]any)
+	if len(items) == 0 {
+		if rows, ok := value.([]map[string]any); ok {
+			items = make([]any, 0, len(rows))
+			for _, row := range rows {
+				items = append(items, row)
+			}
+		}
+	}
+	paths := make([]string, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, rawItem := range items {
+		var pathsForItem []string
+		switch item := rawItem.(type) {
+		case map[string]any:
+			pathsForItem = append(pathsForItem, firstNonEmpty(asString(item["path"]), asString(item["filename"])))
+			pathsForItem = append(pathsForItem, firstNonEmpty(asString(item["previous_filename"]), asString(item["previousFilename"])))
+		case string:
+			pathsForItem = append(pathsForItem, item)
+		}
+		for _, path := range pathsForItem {
+			path = strings.TrimSpace(path)
+			if path == "" {
+				continue
+			}
+			path = strings.TrimPrefix(strings.ReplaceAll(path, "\\", "/"), "./")
+			if _, exists := seen[path]; exists {
+				continue
+			}
+			seen[path] = struct{}{}
+			paths = append(paths, path)
+		}
+	}
+	return paths
 }
 
 func normalizeGitHubLogin(login string) string {

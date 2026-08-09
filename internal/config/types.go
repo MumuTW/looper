@@ -884,6 +884,9 @@ type GatekeeperRoleConfig struct {
 	// triggers a review-capacity gate. The normalized default is 200; an explicit
 	// zero disables the threshold.
 	RequiredReviewChangedLines int `json:"requiredReviewChangedLines,omitempty"`
+	// ProtectedPaths are repository-relative globs that require human review
+	// before an auto-trust merge. Empty preserves the provider-state-only gate.
+	ProtectedPaths []string `json:"protectedPaths,omitempty"`
 }
 
 // GatekeeperDiffBudget is a boolean change-size gate. A zero bound is
@@ -1558,6 +1561,7 @@ type PartialGatekeeperRoleConfig struct {
 	Trust                      *GatekeeperTrustLevel        `json:"trust,omitempty"`
 	DiffBudget                 *PartialGatekeeperDiffBudget `json:"diffBudget,omitempty"`
 	RequiredReviewChangedLines *int                         `json:"requiredReviewChangedLines,omitempty"`
+	ProtectedPaths             *[]string                    `json:"protectedPaths,omitempty"`
 }
 
 type PartialGatekeeperDiffBudget struct {

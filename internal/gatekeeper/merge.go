@@ -19,6 +19,7 @@ type MergeOutcome struct {
 	// HeadSHA is the commit the decision was made about and, on success, the
 	// commit that was merged.
 	HeadSHA string `json:"headSha"`
+	BaseSHA string `json:"baseSha,omitempty"`
 	// MergeStrategy records the configured forge strategy so Auditor can reject
 	// a rebase tip as incomplete revert provenance.
 	MergeStrategy  string                      `json:"mergeStrategy,omitempty"`
