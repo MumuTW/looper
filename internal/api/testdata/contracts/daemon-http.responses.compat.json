@@ -171,10 +171,6 @@
             "enabled": true,
             "admit": true
           },
-          "resourceGuard": {
-            "enabled": true,
-            "admit": true
-          },
           "webhook": {
             "enabled": false,
             "endpointUrl": "http://127.0.0.1:17310/webhook/forward",
