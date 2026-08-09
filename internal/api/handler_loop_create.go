@@ -158,6 +158,9 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
 		return loopResponse{}, err
 	}
+	if err := h.validateCodingProjectRunnable(*project, domain.LoopType(loopType)); err != nil {
+		return loopResponse{}, err
+	}
 	if err := h.validateManualHoldBypassForLoopTarget(r.Context(), projectID, domain.LoopType(loopType), target, derefBool(body.Force)); err != nil {
 		return loopResponse{}, err
 	}
@@ -228,9 +231,9 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 
 		shouldQueue := ((domain.LoopType(loopType) == domain.LoopTypeReviewer || domain.LoopType(loopType) == domain.LoopTypeFixer || domain.LoopType(loopType) == domain.LoopTypeWorker) && candidateStatus == domain.LoopStatusQueued) || (domain.LoopType(loopType) == domain.LoopTypePlanner && (candidateStatus == domain.LoopStatusRunning || candidateStatus == domain.LoopStatusQueued))
 		if shouldQueue {
-			queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(record, target, nowISO, metadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+			queueRecord, ok, queueErr := loops.BuildQueuedLoopQueueRecord(record, target, nowISO, metadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
 			if queueErr != nil {
-				return storage.LoopRecord{}, queueErr
+				return storage.LoopRecord{}, mapLoopReactivationError(queueErr, record.ID)
 			}
 			if ok {
 				existingQueue, findErr := transactionRepos.Queue.FindActiveByDedupe(r.Context(), queueRecord.DedupeKey)
@@ -381,6 +384,9 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
 		return workerCreateResponse{}, err
 	}
+	if err := h.validateCodingProjectRunnable(project, domain.LoopTypeWorker); err != nil {
+		return workerCreateResponse{}, err
+	}
 	if requestedIssueTarget != nil {
 		if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), *requestedIssueTarget); err != nil {
 			return workerCreateResponse{}, err
@@ -514,6 +520,9 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 					// cannot insert a gate that we delete without recording for restore.
 					reuseGateWasActive = services.ActiveExecutions.ClearLoopStop(existingLoop.ID)
 				}
+				if h.workerReuseAfterClearStopGateHook != nil {
+					h.workerReuseAfterClearStopGateHook(existingLoop.ID)
+				}
 			}
 		}
 	}
@@ -644,6 +653,7 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		return record, nil
 	})
 	if err != nil {
+		err = mapIssueClaimAdmissionError(err)
 		if restoreErr := restoreReuseStopGate(); restoreErr != nil {
 			var typed apiError
 			if asAPIError(err, &typed) {
@@ -718,6 +728,16 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	// Hold preflight is best-effort at create time: when we cannot reliably talk to
 	// GitHub from this handler context (missing repo path, missing gh path, etc.) we
 	// skip validation rather than blocking manual creation for unrelated local setup.
+	if target.TargetType != domain.LoopTargetTypeProject && h.context.RefreshTargetLabels != nil {
+		liveLabels, err := h.context.RefreshTargetLabels(ctx, target, project.RepoPath)
+		if err != nil {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
+		}
+		if !domain.IsAutoLaneHeld(loopType, liveLabels) {
+			return nil
+		}
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}
+	}
 	if strings.TrimSpace(project.RepoPath) == "" {
 		return nil
 	}
@@ -848,6 +868,13 @@ func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *sto
 		loop.Status = string(domain.LoopStatusQueued)
 		loop.NextRunAt = &nowISO
 		loop.UpdatedAt = nowISO
+		// Reuse keeps the same source-issue claim as the paused loop, so the
+		// repository's change-detection guard would otherwise skip admission.
+		// Re-check the live claim set at the publication point to catch a
+		// competing fixer/reviewer that arrived after the loop was paused.
+		if err := repos.Loops.AssertIssueClaimAdmission(ctx, loop, force); err != nil {
+			return storage.LoopRecord{}, err
+		}
 		if err := repos.Loops.Upsert(ctx, loop); err != nil {
 			return storage.LoopRecord{}, err
 		}
@@ -898,9 +925,9 @@ func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *sto
 						return storage.LoopRecord{}, err
 					}
 				} else {
-					queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(loop, target, nowISO, loop.MetadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+					queueRecord, ok, queueErr := loops.BuildQueuedLoopQueueRecord(loop, target, nowISO, loop.MetadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
 					if queueErr != nil {
-						return storage.LoopRecord{}, queueErr
+						return storage.LoopRecord{}, mapLoopReactivationError(queueErr, loop.ID)
 					}
 					if ok {
 						if force {
@@ -1171,9 +1198,9 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 			return storage.LoopRecord{}, upsertErr
 		}
 
-		queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(record, target, nowISO, &metadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+		queueRecord, ok, queueErr := loops.BuildQueuedLoopQueueRecord(record, target, nowISO, &metadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
 		if queueErr != nil {
-			return storage.LoopRecord{}, queueErr
+			return storage.LoopRecord{}, mapLoopReactivationError(queueErr, record.ID)
 		}
 		if !ok {
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "failed to build planner queue item"}
