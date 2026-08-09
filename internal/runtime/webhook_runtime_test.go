@@ -1089,7 +1089,7 @@ func TestWebhookRuntimeReconcilePrunesForwardersForRemovedRepos(t *testing.T) {
 		stopCh: make(chan struct{}),
 		forwarderStopCh: map[string]chan struct{}{
 			"MumuTW/looper": make(chan struct{}),
-			"MumuTW/other": make(chan struct{}),
+			"MumuTW/other":  make(chan struct{}),
 		},
 		now: time.Now,
 	}

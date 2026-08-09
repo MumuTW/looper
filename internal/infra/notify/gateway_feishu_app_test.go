@@ -366,11 +366,11 @@ func TestBuildFeishuAskCardRendersDecisionBrief(t *testing.T) {
 	for _, want := range []string{
 		"GitHub Issue #132", // source label
 		"https://github.com/MumuTW/synclo-test/issues/132", // clickable link
-		"由 @lefarcen 提出",                                    // trigger attribution
-		"README 都是中文",                                       // recommendation
-		"⭐ 中文 · 推荐",                                         // recommended option marked prominently
-		"置信度 中",                                             // confidence
-		"写\\\"Welcome",                                      // a consequence (quote json-escaped)
+		"由 @lefarcen 提出",                                   // trigger attribution
+		"README 都是中文",                                      // recommendation
+		"⭐ 中文 · 推荐",                                        // recommended option marked prominently
+		"置信度 中",                                            // confidence
+		"写\\\"Welcome",                                     // a consequence (quote json-escaped)
 	} {
 		if !strings.Contains(raw, want) {
 			t.Fatalf("decision-brief card missing %q\ncard=%s", want, raw)

@@ -624,42 +624,42 @@ type DiscoveryPolicy struct {
 // Runner is the Fixer: a reactive Role that addresses review feedback on a
 // Pull Request. Stateful: it persists runs in the local SQLite database.
 type Runner struct {
-	db                          *sql.DB
-	repos                       *storage.Repositories
-	github                      GitHubGateway
-	git                         GitGateway
-	agentExecutor               AgentExecutor
-	logger                      bootstrap.Logger
-	now                         func() time.Time
-	agentTimeout                time.Duration
-	agentIdleTimeout            time.Duration
-	claimTTL                    time.Duration
-	validationCommands          []string
-	validationCommandsByProject map[string][]string
-	validationRunner            ValidationRunner
-	containmentTracker          processcontainment.LiveTracker
-	allowAutoCommit             bool
-	allowAutoPush               bool
-	allowRiskyFixes             bool
-	fixAllPullRequests          bool
-	discoveryPolicy             DiscoveryPolicy
-	disclosure                  config.DisclosureConfig
-	agentRuntime                string
-	agentProfileID              string
-	agentReasoningEffort        *config.ReasoningEffort
-	customInstructions          config.Config
-	projectRoleConfig           *config.Config
-	agentModel                  *string
-	sleep                       func(time.Duration)
-	retryBaseDelay              time.Duration
-	retryMaxAttempts            int64
-	consecutiveFailureThreshold int
-	maxFixerRounds              int
-	onAgentExecutionStarted     AgentExecutionStartedFunc
-	onQueueItemEnqueued         func()
-	onRegenerateIssue           RegenerateIssueFunc
-	regenerationAvailability    RegenerationAvailabilityFunc
-	deleteBranchOnRegeneration  func(projectID string) bool
+	db                           *sql.DB
+	repos                        *storage.Repositories
+	github                       GitHubGateway
+	git                          GitGateway
+	agentExecutor                AgentExecutor
+	logger                       bootstrap.Logger
+	now                          func() time.Time
+	agentTimeout                 time.Duration
+	agentIdleTimeout             time.Duration
+	claimTTL                     time.Duration
+	validationCommands           []string
+	validationCommandsByProject  map[string][]string
+	validationRunner             ValidationRunner
+	containmentTracker           processcontainment.LiveTracker
+	allowAutoCommit              bool
+	allowAutoPush                bool
+	allowRiskyFixes              bool
+	fixAllPullRequests           bool
+	discoveryPolicy              DiscoveryPolicy
+	disclosure                   config.DisclosureConfig
+	agentRuntime                 string
+	agentProfileID               string
+	agentReasoningEffort         *config.ReasoningEffort
+	customInstructions           config.Config
+	projectRoleConfig            *config.Config
+	agentModel                   *string
+	sleep                        func(time.Duration)
+	retryBaseDelay               time.Duration
+	retryMaxAttempts             int64
+	consecutiveFailureThreshold  int
+	maxFixerRounds               int
+	onAgentExecutionStarted      AgentExecutionStartedFunc
+	onQueueItemEnqueued          func()
+	onRegenerateIssue            RegenerateIssueFunc
+	regenerationAvailability     RegenerationAvailabilityFunc
+	deleteBranchOnRegeneration   func(projectID string) bool
 	plannerRegenerationAvailable bool
 }
 
@@ -1766,42 +1766,42 @@ func New(options Options) *Runner {
 		}
 	}
 	return &Runner{
-		db:                          options.DB,
-		repos:                       options.Repos,
-		github:                      options.GitHub,
-		git:                         options.Git,
-		agentExecutor:               options.AgentExecutor,
-		logger:                      options.Logger,
-		now:                         now,
-		agentTimeout:                agentTimeout,
-		agentIdleTimeout:            agentIdleTimeout,
-		claimTTL:                    claimTTL,
-		validationCommands:          append([]string(nil), options.ValidationCommands...),
-		validationCommandsByProject: cloneValidationCommandsByProject(options.ValidationCommandsByProject),
-		validationRunner:            options.ValidationRunner,
-		containmentTracker:          options.ContainmentTracker,
-		allowAutoCommit:             options.AllowAutoCommit,
-		allowAutoPush:               options.AllowAutoPush,
-		allowRiskyFixes:             options.AllowRiskyFixes,
-		fixAllPullRequests:          options.FixAllPullRequests,
-		discoveryPolicy:             policy,
-		disclosure:                  disclosureCfg,
-		agentRuntime:                strings.TrimSpace(options.AgentRuntime),
-		agentProfileID:              strings.TrimSpace(options.AgentProfileID),
-		agentReasoningEffort:        cloneReasoningEffortPtr(options.AgentReasoningEffort),
-		customInstructions:          customInstructionConfig(options.CustomInstructions),
-		projectRoleConfig:           options.CustomInstructions,
-		agentModel:                  cloneStringPtr(options.AgentModel),
-		sleep:                       sleep,
-		retryBaseDelay:              retryBaseDelay,
-		retryMaxAttempts:            retryMax,
-		consecutiveFailureThreshold: consecutiveFailureThreshold,
-		maxFixerRounds:              maxFixerRounds,
-		onAgentExecutionStarted:     options.OnAgentExecutionStarted,
-		onQueueItemEnqueued:         options.OnQueueItemEnqueued,
-		onRegenerateIssue:           options.OnRegenerateIssue,
-		regenerationAvailability:    options.RegenerationAvailability,
-		deleteBranchOnRegeneration:  options.DeleteBranchOnRegeneration,
+		db:                           options.DB,
+		repos:                        options.Repos,
+		github:                       options.GitHub,
+		git:                          options.Git,
+		agentExecutor:                options.AgentExecutor,
+		logger:                       options.Logger,
+		now:                          now,
+		agentTimeout:                 agentTimeout,
+		agentIdleTimeout:             agentIdleTimeout,
+		claimTTL:                     claimTTL,
+		validationCommands:           append([]string(nil), options.ValidationCommands...),
+		validationCommandsByProject:  cloneValidationCommandsByProject(options.ValidationCommandsByProject),
+		validationRunner:             options.ValidationRunner,
+		containmentTracker:           options.ContainmentTracker,
+		allowAutoCommit:              options.AllowAutoCommit,
+		allowAutoPush:                options.AllowAutoPush,
+		allowRiskyFixes:              options.AllowRiskyFixes,
+		fixAllPullRequests:           options.FixAllPullRequests,
+		discoveryPolicy:              policy,
+		disclosure:                   disclosureCfg,
+		agentRuntime:                 strings.TrimSpace(options.AgentRuntime),
+		agentProfileID:               strings.TrimSpace(options.AgentProfileID),
+		agentReasoningEffort:         cloneReasoningEffortPtr(options.AgentReasoningEffort),
+		customInstructions:           customInstructionConfig(options.CustomInstructions),
+		projectRoleConfig:            options.CustomInstructions,
+		agentModel:                   cloneStringPtr(options.AgentModel),
+		sleep:                        sleep,
+		retryBaseDelay:               retryBaseDelay,
+		retryMaxAttempts:             retryMax,
+		consecutiveFailureThreshold:  consecutiveFailureThreshold,
+		maxFixerRounds:               maxFixerRounds,
+		onAgentExecutionStarted:      options.OnAgentExecutionStarted,
+		onQueueItemEnqueued:          options.OnQueueItemEnqueued,
+		onRegenerateIssue:            options.OnRegenerateIssue,
+		regenerationAvailability:     options.RegenerationAvailability,
+		deleteBranchOnRegeneration:   options.DeleteBranchOnRegeneration,
 		plannerRegenerationAvailable: options.PlannerRegenerationAvailable == nil || *options.PlannerRegenerationAvailable,
 	}
 }
