@@ -23,6 +23,7 @@ import (
 	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/network/protocol"
 	"github.com/MumuTW/looper/internal/networkpolicy"
+	"github.com/MumuTW/looper/internal/reproducer"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -894,8 +895,8 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	if completed[0].Status != "success" || completed[0].PullRequestNumber != 101 || completed[0].PullRequestURL != "https://example/pr/101" {
 		t.Fatalf("completed[0] = %#v, want success with PR details", completed[0])
 	}
-	if !strings.Contains(agent.starts[0].Prompt, `__LOOPER_RESULT__={"summary":"<one-sentence summary>"}`) {
-		t.Fatalf("prompt = %q, want canonical completion instruction", agent.starts[0].Prompt)
+	if !strings.Contains(agent.starts[0].Prompt, `__LOOPER_RESULT__={"summary":"<one-sentence summary>","reproduction":null}`) {
+		t.Fatalf("prompt = %q, want Worker completion instruction with optional reproduction", agent.starts[0].Prompt)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
 	if err != nil {
@@ -1495,6 +1496,129 @@ func TestRunExecuteStepFailsResumedCompletedCheckpointWithoutParsedResult(t *tes
 	want := "Worker completed without a valid structured result (parse status: missing). See Looper logs for details."
 	if err.Error() != want {
 		t.Fatalf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+func TestRunExecuteStepPersistsPendingExecutionWhenWaitFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	project := fixture.project(t)
+	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	worktreePath := fixture.usableWorktree(t, "wait-error-retry")
+	run := storage.RunRecord{ID: "run_worker_wait_error", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	fixtureRoot, _ := writeWorkerReproductionFixture(t)
+	agent := &fakeAgentExecutor{wait: func(context.Context) error {
+		for _, relative := range []string{"internal/bug_test.go", reproducer.ManifestPath} {
+			source := filepath.Join(fixtureRoot, relative)
+			target := filepath.Join(worktreePath, relative)
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			contents, err := os.ReadFile(source)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(target, contents, 0o644); err != nil {
+				return err
+			}
+		}
+		return errors.New("agent wait interrupted")
+	}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+
+	checkpoint, err := runner.runExecuteStep(ctx, stepInput{
+		Project: project, Loop: *loop, Run: run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "wt_wait_error", Path: worktreePath, Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "agent wait interrupted") {
+		t.Fatalf("runExecuteStep() = %v, want Wait error", err)
+	}
+	if checkpoint.Execution == nil || checkpoint.Execution.Status != "running" || checkpoint.Execution.ExecutionID == "" {
+		t.Fatalf("checkpoint.Execution = %#v, want live execution boundary", checkpoint.Execution)
+	}
+
+	storedRun, err := fixture.repos.Runs.GetByID(ctx, run.ID)
+	if err != nil || storedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want stored run", storedRun, err)
+	}
+	storedCheckpoint, err := parseCheckpoint(storedRun.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint() error = %v", err)
+	}
+	if storedCheckpoint.Execution == nil || storedCheckpoint.Execution.Status != "running" || storedCheckpoint.Execution.ExecutionID != checkpoint.Execution.ExecutionID {
+		t.Fatalf("stored checkpoint.Execution = %#v, want retained live execution", storedCheckpoint.Execution)
+	}
+	if err := captureWorkerReproduction(&checkpoint, worktreePath); err != nil {
+		t.Fatalf("captureWorkerReproduction() = %v, want manifest deferred for retry", err)
+	}
+	if checkpoint.Work.Reproduction != nil || !checkpoint.ReproductionAbsent {
+		t.Fatalf("checkpoint after retry capture = %#v, want untrusted manifest deferred", checkpoint)
+	}
+}
+
+func TestRunExecuteStepDoesNotDowngradeTimeoutObservedDuringStart(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	project := fixture.project(t)
+	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	worktreePath := fixture.usableWorktree(t, "timeout-during-start")
+	run := storage.RunRecord{ID: "run_worker_timeout_during_start", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{
+		HeadSHA: "timeout-head", Branch: "looper/feature", ChangedFiles: []string{"changed.go"},
+		DiffFingerprint: "timeout-status", ContentFingerprint: "timeout-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "timeout-index",
+	}}
+	agent := &timeoutDuringStartAgentExecutor{
+		observation: agent.TimeoutObservation{TimeoutType: "idle", LastProgressAt: "2026-04-11T12:00:01.000Z"},
+		waitErr:     errors.New("daemon exited after timeout observation"),
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+
+	checkpoint, err := runner.runExecuteStep(ctx, stepInput{
+		Project: project, Loop: *loop, Run: run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "wt_timeout_start", Path: worktreePath, Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "daemon exited after timeout observation") {
+		t.Fatalf("runExecuteStep() error = %v, want Wait error after timeout observation", err)
+	}
+	if agent.observationErr != nil {
+		t.Fatalf("OnBeforeTimeout() error = %v", agent.observationErr)
+	}
+	if checkpoint.Execution == nil || checkpoint.Execution.Status != "timeout_observing" || checkpoint.Execution.ProgressBeforeTimeout == nil {
+		t.Fatalf("checkpoint.Execution = %#v, want timeout evidence retained", checkpoint.Execution)
+	}
+	storedRun, err := fixture.repos.Runs.GetByID(ctx, run.ID)
+	if err != nil || storedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want stored run", storedRun, err)
+	}
+	storedCheckpoint, err := parseCheckpoint(storedRun.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint() error = %v", err)
+	}
+	if storedCheckpoint.Execution == nil || storedCheckpoint.Execution.Status != "timeout_observing" || storedCheckpoint.Execution.ProgressBeforeTimeout == nil {
+		t.Fatalf("stored checkpoint.Execution = %#v, want timeout evidence not running", storedCheckpoint.Execution)
 	}
 }
 
@@ -3076,8 +3200,8 @@ func TestCreateRunContextReplaysExecuteWhenResumeCheckpointParseStatusIsInvalid(
 	if !resumed.Resumed || resumed.StartStep != stepExecute {
 		t.Fatalf("resumed = %#v, want resumed execute replay", resumed)
 	}
-	if resumed.Checkpoint.Execution != nil {
-		t.Fatalf("Execution = %#v, want cleared execution checkpoint", resumed.Checkpoint.Execution)
+	if resumed.Checkpoint.Execution == nil || resumed.Checkpoint.Execution.Status != "completed" || resumed.Checkpoint.Execution.ParseStatus != "" {
+		t.Fatalf("Execution = %#v, want invalid completed evidence retained for replay", resumed.Checkpoint.Execution)
 	}
 	if resumed.Checkpoint.Validation != nil {
 		t.Fatalf("Validation = %#v, want cleared validation checkpoint", resumed.Checkpoint.Validation)
@@ -3130,8 +3254,8 @@ func TestCreateRunContextReplaysExecuteWhenExecuteCheckpointIsInvalid(t *testing
 	if !resumed.Resumed || resumed.StartStep != stepExecute {
 		t.Fatalf("resumed = %#v, want execute replay for invalid execute checkpoint", resumed)
 	}
-	if resumed.Checkpoint.Execution != nil {
-		t.Fatalf("Execution = %#v, want cleared invalid execution checkpoint", resumed.Checkpoint.Execution)
+	if resumed.Checkpoint.Execution == nil || resumed.Checkpoint.Execution.Status != "completed" || resumed.Checkpoint.Execution.ParseStatus != "" {
+		t.Fatalf("Execution = %#v, want invalid completed evidence retained for replay", resumed.Checkpoint.Execution)
 	}
 }
 
@@ -6568,6 +6692,19 @@ func (f fakeAgentExecution) Wait(ctx context.Context) (AgentResult, error) {
 }
 
 func (f fakeAgentExecution) Kill(string) error { return nil }
+
+type timeoutDuringStartAgentExecutor struct {
+	observation    agent.TimeoutObservation
+	waitErr        error
+	observationErr error
+}
+
+func (f *timeoutDuringStartAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
+	if input.OnBeforeTimeout != nil {
+		f.observationErr = input.OnBeforeTimeout(context.Background(), f.observation)
+	}
+	return fakeAgentExecution{waitErr: f.waitErr}, nil
+}
 
 type timeoutObservingAgentExecutor struct {
 	starts           []AgentRunInput
