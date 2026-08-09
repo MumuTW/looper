@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -154,6 +155,39 @@ func TestHandlerLoopRetryCreatesReplacementQueueItem(t *testing.T) {
 	}
 	if replacement == nil || replacement.ID == "queue_retry_failed" || replacement.Attempts != 0 || replacement.LastErrorKind != nil {
 		t.Fatalf("replacement queue = %#v, want new queued item with reset attempts and cleared error", replacement)
+	}
+}
+
+func TestHandlerLoopRetryWithoutExistingQueueReturnsUUIDQueueID(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_uuid"
+	loopID := "loop_retry_uuid"
+	targetID := projectID
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 43, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/43/retry", strings.NewReader(`{"mode":"auto"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	queueID, ok := data["queueItemId"].(string)
+	canonicalUUID := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	if !ok || !canonicalUUID.MatchString(queueID) {
+		t.Fatalf("queueItemId = %#v, want UUID", data["queueItemId"])
+	}
+	queue, err := services.Repositories.Queue.GetByID(context.Background(), queueID)
+	if err != nil || queue == nil || queue.Status != "queued" {
+		t.Fatalf("Queue.GetByID() = %#v, %v; want queued UUID item", queue, err)
 	}
 }
 

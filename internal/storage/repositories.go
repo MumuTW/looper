@@ -1609,6 +1609,13 @@ func (r *LoopsRepository) AssertIssueClaimAdmission(ctx context.Context, candida
 		if !exists || existingClaim.issueNumber != claim.issueNumber || !strings.EqualFold(existingClaim.repo, claim.repo) {
 			continue
 		}
+		// A planner is the normal upstream of a worker for the same issue, so
+		// worker admission may coexist with an existing planner. The reverse is
+		// not true: starting a new planner after another lifecycle has claimed
+		// the issue must be rejected.
+		if loop.Type == string(domain.LoopTypePlanner) && candidate.Type != string(domain.LoopTypePlanner) {
+			continue
+		}
 		// A source worker and its PR descendants are one lifecycle, not
 		// competing claims. Different workers (or an issue worker with no PR
 		// source) are competing source-issue publications.
@@ -1621,7 +1628,7 @@ func (r *LoopsRepository) AssertIssueClaimAdmission(ctx context.Context, candida
 }
 
 func (r *LoopsRepository) issueClaimForLoop(ctx context.Context, loop LoopRecord) (issueClaim, bool, error) {
-	if loop.TargetType == string(domain.LoopTargetTypeIssue) && loop.Type == string(domain.LoopTypeWorker) {
+	if loop.TargetType == string(domain.LoopTargetTypeIssue) && (loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) {
 		repo, number, ok := parseIssueTargetID(loopString(loop.TargetID))
 		return issueClaim{repo: repo, issueNumber: number}, ok, nil
 	}
