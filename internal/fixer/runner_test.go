@@ -7300,9 +7300,10 @@ func (f *fakeGitGateway) CleanupWorktree(_ context.Context, input CleanupWorktre
 }
 
 type fakeAgentExecutor struct {
-	results []AgentResult
-	starts  []AgentRunInput
-	waitErr error
+	results       []AgentResult
+	starts        []AgentRunInput
+	waitErr       error
+	lastExecution *fakeAgentExecution
 }
 
 func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
@@ -7332,19 +7333,29 @@ func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (Agent
 			}
 		}
 	}
-	return fakeAgentExecution{result: result, waitErr: f.waitErr}, nil
+	execution := &fakeAgentExecution{result: result, waitErr: f.waitErr}
+	f.lastExecution = execution
+	return execution, nil
 }
 
 type fakeAgentExecution struct {
 	result  AgentResult
 	waitErr error
+	kills   []string
+	waits   int
 }
 
-func (f fakeAgentExecution) Wait(context.Context) (AgentResult, error) {
+func (f *fakeAgentExecution) Wait(context.Context) (AgentResult, error) {
+	f.waits++
 	if f.waitErr != nil {
 		return AgentResult{}, f.waitErr
 	}
 	return f.result, nil
+}
+
+func (f *fakeAgentExecution) Kill(reason string) error {
+	f.kills = append(f.kills, reason)
+	return nil
 }
 
 func passValidation(context.Context, ValidationInput) (ValidationResult, error) {

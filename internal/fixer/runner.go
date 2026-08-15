@@ -535,6 +535,7 @@ Looper's daemon already fetched the PR head and supplied the review items above.
 
 type AgentExecution interface {
 	Wait(context.Context) (AgentResult, error)
+	Kill(string) error
 }
 
 type AgentExecutor interface {
@@ -664,6 +665,10 @@ type Runner struct {
 	regenerationAvailability     RegenerationAvailabilityFunc
 	deleteBranchOnRegeneration   func(projectID string) bool
 	plannerRegenerationAvailable bool
+	// persistCheckpoint is the durable write behind every step transition.
+	// New wires it to the SQLite implementation; tests replace it to exercise
+	// the post-Start failure paths that must stop and drain a live agent.
+	persistCheckpoint func(ctx context.Context, runID string, step FixerStep, checkpoint fixerCheckpoint) error
 }
 
 type DiscoveryInput struct {
@@ -1935,7 +1940,7 @@ func New(options Options) *Runner {
 			policy.AuthorFilter = config.FixerAuthorFilterAny
 		}
 	}
-	return &Runner{
+	runner := &Runner{
 		db:                           options.DB,
 		repos:                        options.Repos,
 		github:                       options.GitHub,
@@ -1974,6 +1979,8 @@ func New(options Options) *Runner {
 		deleteBranchOnRegeneration:   options.DeleteBranchOnRegeneration,
 		plannerRegenerationAvailable: options.PlannerRegenerationAvailable == nil || *options.PlannerRegenerationAvailable,
 	}
+	runner.persistCheckpoint = runner.persistCheckpointDurable
+	return runner
 }
 
 func cloneValidationCommandsByProject(source map[string][]string) map[string][]string {
@@ -3966,6 +3973,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	}
 	if r.onAgentExecutionStarted != nil {
 		if err := r.onAgentExecutionStarted(ctx, AgentExecutionStartedInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Subtitle: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), Body: "Fix started", DedupeKey: "runtime.agent.started:fixer:" + input.Run.ID}); err != nil {
+			r.abandonStartedExecution(ctx, execution, "fixer agent-started notification failed: "+err.Error())
 			return checkpoint, err
 		}
 	}
@@ -3976,6 +3984,10 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	checkpoint.Repair = nil
 	checkpoint.PendingAgentExecutionID = executionID
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
+		// The agent is live in a worktree this run is about to abandon: stop and
+		// drain it so it cannot keep editing or pushing while retry handling
+		// begins on a checkpoint that never recorded the execution.
+		r.abandonStartedExecution(ctx, execution, "fixer repair checkpoint persist failed after agent start")
 		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	result, err := execution.Wait(ctx)
@@ -5714,7 +5726,23 @@ func (r *Runner) completeRun(ctx context.Context, run storage.RunRecord, status,
 	return runpipe.CompleteRun(ctx, r.repos, r.nowISO(), run, status, summary, errorMessage, checkpoint)
 }
 
-func (r *Runner) persistCheckpoint(ctx context.Context, runID string, step FixerStep, checkpoint fixerCheckpoint) error {
+// abandonStartedExecution stops and drains an agent whose run is failing
+// between Start and Wait. Returning without this would leave a live agent
+// editing or pushing from a worktree the run has already abandoned while
+// retry handling begins on a checkpoint that never recorded the execution.
+// Kill and Wait failures are logged, never propagated: the causal error owns
+// the return, and a kill that arrives late still cannot revive the run.
+func (r *Runner) abandonStartedExecution(ctx context.Context, execution AgentExecution, reason string) {
+	if execution == nil {
+		return
+	}
+	if err := execution.Kill(reason); err != nil {
+		r.logger.Warn("fixer failed to stop abandoned agent execution", map[string]any{"reason": reason, "error": err.Error()})
+	}
+	_, _ = execution.Wait(ctx)
+}
+
+func (r *Runner) persistCheckpointDurable(ctx context.Context, runID string, step FixerStep, checkpoint fixerCheckpoint) error {
 	if r.repos == nil || r.repos.Runs == nil || strings.TrimSpace(runID) == "" {
 		return nil
 	}

@@ -1648,6 +1648,10 @@ func (a fixerAgentExecutionAdapter) Wait(ctx context.Context) (fixer.AgentResult
 	return fixer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, CompletionPayload: result.CompletionPayload, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
 }
 
+func (a fixerAgentExecutionAdapter) Kill(reason string) error {
+	return a.execution.Kill(reason)
+}
+
 type workerGitHubAdapter struct {
 	gateway *githubinfra.Gateway
 	stamper disclosure.Stamper
