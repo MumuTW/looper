@@ -10,6 +10,19 @@ import (
 	"github.com/MumuTW/looper/internal/labels"
 )
 
+// gatekeeperStatusRevokePendingError marks a needs-human-review projection
+// whose label mutations succeeded while the commit-status revocation failed.
+// The route fact is established — the durable veto is on the pull request and
+// the queue trigger is gone — so the retry marker must retain it and the next
+// evaluation retries only the status write.
+type gatekeeperStatusRevokePendingError struct{ cause error }
+
+func (e *gatekeeperStatusRevokePendingError) Error() string {
+	return "revoke successful Gatekeeper status before queue veto: " + e.cause.Error()
+}
+
+func (e *gatekeeperStatusRevokePendingError) Unwrap() error { return e.cause }
+
 // protectedPathTouchedReason is owned by the independent protected-path gate
 // (#458), whose Go constant is not yet in this package. The routing layer
 // deliberately matches its stable wire value so #460 can merge independently of
@@ -394,7 +407,11 @@ func (r *Runner) applyRoutingLabelPlan(ctx context.Context, report Report, plan 
 			return fmt.Errorf("remove stale %s label: %w", labels.AutoMerge, err)
 		}
 		if revokeErr != nil {
-			return fmt.Errorf("revoke successful Gatekeeper status before queue veto: %w", revokeErr)
+			// The durable veto is on the pull request and the queue trigger is
+			// gone; only the commit-status write is outstanding. The typed error
+			// lets persist retain the established-route fact so the retry marker
+			// cannot read as "no route" and delete the veto it just installed.
+			return &gatekeeperStatusRevokePendingError{cause: revokeErr}
 		}
 	default:
 		// Mechanical blockers and observe demotions intentionally leave no
