@@ -2,6 +2,7 @@ package gatekeeper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -354,6 +355,15 @@ func (r *Runner) retireRoutingLabels(ctx context.Context, report Report, previou
 	}
 	cleanupErr := r.applyRoutingLabelPlan(ctx, report, plan)
 	if cleanupErr != nil {
+		var revokePending *gatekeeperStatusRevokePendingError
+		if errors.As(cleanupErr, &revokePending) {
+			// The cleanup installed the durable veto and only the commit-status
+			// write is outstanding. Preserve the typed state through the
+			// wrapper so persist retains the established-route fact and the
+			// next evaluation retries the projection instead of deleting the
+			// veto this cleanup just installed.
+			return &gatekeeperStatusRevokePendingError{cause: fmt.Errorf("%w (remove stale routing labels: %v)", err, revokePending.cause)}
+		}
 		return fmt.Errorf("%w (remove stale routing labels: %v)", err, cleanupErr)
 	}
 	return err
@@ -396,13 +406,23 @@ func (r *Runner) applyRoutingLabelPlan(ctx context.Context, report Report, plan 
 			// the veto label write fails (including another PR sharing this head).
 			removeErr := r.github.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Labels: []string{labels.AutoMerge}})
 			if removeErr != nil {
-				return fmt.Errorf("add %s label: %w (remove stale %s label: %v)", labels.NeedsHumanReview, err, labels.AutoMerge, removeErr)
+				combined := fmt.Errorf("add %s label: %w (remove stale %s label: %v)", labels.NeedsHumanReview, err, labels.AutoMerge, removeErr)
+				if revokeErr != nil {
+					// The projection is still pending: keep the typed state so
+					// persist retains the established route and the whole
+					// projection (veto, trigger removal, status) is retried.
+					return &gatekeeperStatusRevokePendingError{cause: combined}
+				}
+				return combined
+			}
+			if revokeErr != nil {
+				return &gatekeeperStatusRevokePendingError{cause: fmt.Errorf("add %s label: %w", labels.NeedsHumanReview, err)}
 			}
 			return fmt.Errorf("add %s label: %w", labels.NeedsHumanReview, err)
 		}
 		if err := r.github.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Labels: []string{labels.AutoMerge}}); err != nil {
 			if revokeErr != nil {
-				return fmt.Errorf("revoke successful Gatekeeper status before queue veto: %w (remove stale %s label: %v)", revokeErr, labels.AutoMerge, err)
+				return &gatekeeperStatusRevokePendingError{cause: fmt.Errorf("revoke successful Gatekeeper status before queue veto: %v (remove stale %s label: %w)", revokeErr, labels.AutoMerge, err)}
 			}
 			return fmt.Errorf("remove stale %s label: %w", labels.AutoMerge, err)
 		}
