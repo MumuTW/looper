@@ -36,6 +36,11 @@ type ReviewerConvergenceEvidence struct {
 	// observed for this evaluation, so the persisted decision is not
 	// authoritative for the current head and the gate fails closed.
 	HeadStale bool `json:"headStale,omitempty"`
+	// PendingStart is synthesized (not read from loop metadata) when the newest
+	// Reviewer loop has not yet written convergence metadata but may still do
+	// so — for example a loop queued for this PR that has not started running.
+	// The review is pending, so the gate blocks until a decision lands.
+	PendingStart bool `json:"pendingStart,omitempty"`
 }
 
 type reviewerConvergenceMetadata struct {
@@ -48,9 +53,14 @@ type reviewerConvergenceMetadata struct {
 }
 
 // latestReviewerConvergence reads only the newest Reviewer loop for this
-// project/repository/pull request. A newer loop without valid convergence
-// metadata deliberately hides older metadata rather than letting stale state
-// block a new review. Missing or malformed legacy metadata is not inferred.
+// project/repository/pull request. A newer loop that can no longer produce a
+// convergence decision (terminal without metadata) deliberately hides older
+// metadata rather than letting stale state block a new review. A newer loop
+// that has not written metadata yet but may still converge — queued, idle,
+// waiting, or mid-run — is pending, not absent: Gatekeeper blocks until the
+// Reviewer records its decision, so auto trust cannot merge a PR before its
+// pending Reviewer executes. Missing or malformed legacy metadata is not
+// inferred.
 //
 // observedHeadSHA binds the persisted convergence decision to the head
 // Gatekeeper is evaluating: the Reviewer's state is authoritative only for the
@@ -70,12 +80,29 @@ func latestReviewerConvergence(ctx context.Context, repos *storage.Repositories,
 		}
 		evidence, ok := reviewerConvergenceFromLoop(loop)
 		if !ok {
+			if reviewerLoopMayStillConverge(loop.Status) {
+				return ReviewerConvergenceEvidence{PendingStart: true}, true, nil
+			}
 			return ReviewerConvergenceEvidence{}, false, nil
 		}
 		evidence.HeadStale = evidence.ReviewedHeadSHA != observedHeadSHA
 		return evidence, true, nil
 	}
 	return ReviewerConvergenceEvidence{}, false, nil
+}
+
+// reviewerLoopMayStillConverge reports whether a Reviewer loop in this status
+// may still write convergence metadata. Only terminal statuses are excluded;
+// an unknown future status fails closed as pending rather than authorizing a
+// merge on an unreviewed PR.
+func reviewerLoopMayStillConverge(status string) bool {
+	switch domain.LoopStatus(strings.TrimSpace(status)) {
+	case domain.LoopStatusStopped, domain.LoopStatusTerminated, domain.LoopStatusCompleted,
+		domain.LoopStatusFailed, domain.LoopStatusInterrupted:
+		return false
+	default:
+		return true
+	}
 }
 
 func reviewerConvergenceFromLoop(loop storage.LoopRecord) (ReviewerConvergenceEvidence, bool) {
@@ -164,6 +191,9 @@ func validConvergenceState(state convergence.State) bool {
 }
 
 func reviewerConvergenceReasonSubject(evidence ReviewerConvergenceEvidence) string {
+	if evidence.PendingStart {
+		return "loop_pending_start"
+	}
 	parts := []string{"floor=" + string(evidence.Policy.SeverityFloor)}
 	if evidence.Status != "" {
 		parts = append(parts, "status="+evidence.Status)
@@ -178,6 +208,11 @@ func reviewerConvergenceReasonSubject(evidence ReviewerConvergenceEvidence) stri
 }
 
 func reviewerConvergenceBlocks(evidence ReviewerConvergenceEvidence) bool {
+	// The newest Reviewer loop has not written convergence metadata yet but may
+	// still do so: the review is pending, not complete.
+	if evidence.PendingStart {
+		return true
+	}
 	// Awaiting human is itself a durable decision boundary. Normal evaluator
 	// output always carries floor-qualified open items here, but retaining the
 	// status guard keeps a partially written escalation fail-closed.
@@ -202,7 +237,12 @@ func reviewerConvergenceBlocks(evidence ReviewerConvergenceEvidence) bool {
 // SQLite read instead of re-polling the forge every tick. It is a revision of
 // the durable state, not a content hash of the pull request.
 func convergenceRevision(evidence ReviewerConvergenceEvidence) string {
+	pending := ""
+	if evidence.PendingStart {
+		pending = "pending"
+	}
 	return strings.Join([]string{
+		pending,
 		evidence.UpdatedAt,
 		evidence.ReviewedHeadSHA,
 		string(evidence.Action),
@@ -213,9 +253,12 @@ func convergenceRevision(evidence ReviewerConvergenceEvidence) string {
 
 // latestConvergenceRevisions returns the current convergence revision per pull
 // request for one project in a single local query, so the unchanged path can
-// detect Reviewer progress without re-polling the forge. A pull request whose
-// newest reviewer loop has no valid convergence metadata is absent from the
-// map, matching latestReviewerConvergence's hide-stale-on-newer-loop rule.
+// detect Reviewer progress without re-polling the forge every tick. A pull
+// request whose newest reviewer loop can no longer produce a decision is
+// absent from the map, matching latestReviewerConvergence's hide-stale rule;
+// one whose newest loop is pending start maps to a pending revision so an
+// unchanged pending report is reused and the first persisted decision
+// invalidates it.
 func latestConvergenceRevisions(ctx context.Context, repos *storage.Repositories, projectID string) (map[string]string, error) {
 	if repos == nil || repos.Loops == nil {
 		return nil, nil
@@ -240,6 +283,9 @@ func latestConvergenceRevisions(ctx context.Context, repos *storage.Repositories
 		seen[entityID] = true
 		evidence, ok := reviewerConvergenceFromLoop(loop)
 		if !ok {
+			if reviewerLoopMayStillConverge(loop.Status) {
+				revisions[entityID] = convergenceRevision(ReviewerConvergenceEvidence{PendingStart: true})
+			}
 			continue
 		}
 		revisions[entityID] = convergenceRevision(evidence)

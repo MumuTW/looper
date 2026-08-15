@@ -20,8 +20,15 @@ func LoopTargetGuardKey(projectID, loopType, targetType, targetKey string) strin
 }
 
 // LoopTargetGuardKeyFromRecord derives LoopTargetGuardKey from a stored loop.
+// See loops.LoopTargetGuardKeyFromRecord.
 func LoopTargetGuardKeyFromRecord(loop storage.LoopRecord) string {
 	return loops.LoopTargetGuardKeyFromRecord(loop)
+}
+
+// PullRequestTargetKey builds the canonical pull-request target key shared by
+// runtime and API guard keys. See loops.PullRequestTargetKey.
+func PullRequestTargetKey(repo string, prNumber int64) string {
+	return loops.PullRequestTargetKey(repo, prNumber)
 }
 
 // LockLoopTarget acquires the process-wide same-target mutex. See

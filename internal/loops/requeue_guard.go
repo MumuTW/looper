@@ -115,6 +115,22 @@ func LoopTargetGuardKeyFromRecord(loop storage.LoopRecord) string {
 	return LoopTargetGuardKey(loop.ProjectID, loop.Type, loop.TargetType, TargetKeyFromLoopRecord(loop))
 }
 
+// NormalizeRepoIdentity folds a GitHub owner/repository identity to one
+// canonical spelling. GitHub resolves owner and repository names
+// case-insensitively and sibling lookups (ListByRepoAndPR) already compare
+// NOCASE, so raw-spelling target keys would let two loops on the same PR take
+// different target mutexes and race shared-worktree cleanup.
+func NormalizeRepoIdentity(repo string) string {
+	return strings.ToLower(strings.TrimSpace(repo))
+}
+
+// PullRequestTargetKey builds the canonical pull-request target key. Every
+// PR guard-key constructor — runtime and API — must build it here so
+// case-variant repository spellings share one mutex and one conflict identity.
+func PullRequestTargetKey(repo string, prNumber int64) string {
+	return fmt.Sprintf("pull_request:%s:%d", NormalizeRepoIdentity(repo), prNumber)
+}
+
 // PullRequestTargetGuardKey builds the shared PR worktree target mutex key from
 // project + repo + PR number (loop type omitted). Use when discovery creates or
 // requeues a reviewer/fixer for a PR before a loop record is available.
@@ -124,7 +140,7 @@ func PullRequestTargetGuardKey(projectID, repo string, prNumber int64) string {
 	if projectID == "" || repo == "" || prNumber <= 0 {
 		return ""
 	}
-	return LoopTargetGuardKey(projectID, string(domain.LoopTypeReviewer), string(domain.LoopTargetTypePullRequest), fmt.Sprintf("pull_request:%s:%d", repo, prNumber))
+	return LoopTargetGuardKey(projectID, string(domain.LoopTypeReviewer), string(domain.LoopTargetTypePullRequest), PullRequestTargetKey(repo, prNumber))
 }
 
 // TargetKeyFromLoopRecord returns the canonical target key for a stored loop
@@ -149,7 +165,7 @@ func TargetKeyFromLoopRecord(loop storage.LoopRecord) string {
 		if loop.Repo == nil || loop.PRNumber == nil {
 			return "pull_request:"
 		}
-		return fmt.Sprintf("pull_request:%s:%d", *loop.Repo, *loop.PRNumber)
+		return PullRequestTargetKey(*loop.Repo, *loop.PRNumber)
 	}
 }
 
