@@ -4777,6 +4777,41 @@ func TestAssertUniqueActiveLoopCompatAllowsWaitingReviewerRerun(t *testing.T) {
 	}
 }
 
+func TestLoopTargetKeysNormalizeRepoCasing(t *testing.T) {
+	t.Parallel()
+	repoLower := "acme/looper"
+	prNumber := int64(42)
+	storedLower := storage.LoopRecord{
+		ID:         "loop_running",
+		ProjectID:  "project_1",
+		Type:       string(domain.LoopTypeReviewer),
+		TargetType: string(domain.LoopTargetTypePullRequest),
+		Repo:       &repoLower,
+		PRNumber:   &prNumber,
+		Status:     string(domain.LoopStatusRunning),
+	}
+	mixedTarget := domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: "Acme/Looper", PRNumber: 42}
+
+	// API and runtime must agree on one canonical spelling for the same PR.
+	if loopTargetKeyCompat(mixedTarget) != loopTargetKeyFromRecordCompat(storedLower) {
+		t.Fatalf("case-variant spellings disagree: compat %q vs record %q", loopTargetKeyCompat(mixedTarget), loopTargetKeyFromRecordCompat(storedLower))
+	}
+	if got := looperdruntime.LoopTargetGuardKeyFromRecord(storedLower); got != "project_1|"+loops.PullRequestTargetKey("ACME/LOOPER", 42) {
+		t.Fatalf("runtime guard key = %q, want API-shared canonical key", got)
+	}
+
+	// Case-variant active loops now conflict instead of bypassing the check.
+	if err := assertUniqueActiveLoopCompat([]storage.LoopRecord{storedLower}, "loop_new", "project_1", domain.LoopTypeReviewer, mixedTarget, domain.LoopStatusQueued); err == nil {
+		t.Fatal("assertUniqueActiveLoopCompat() allowed a case-variant repo spelling for the same PR")
+	}
+	candidate := storedLower
+	candidate.ID = "loop_discard"
+	candidate.Repo = stringPtr("Acme/Looper")
+	if err := assertNoActiveSiblingPRWorktreeLoops([]storage.LoopRecord{storedLower}, candidate); err == nil {
+		t.Fatal("assertNoActiveSiblingPRWorktreeLoops() allowed discard preflight past a case-variant sibling on the same PR worktree")
+	}
+}
+
 func TestHandlerWorkerCreateUsesProjectScopedPullRequestSnapshot(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
