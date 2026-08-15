@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/MumuTW/looper/internal/domain"
 	"github.com/MumuTW/looper/internal/storage"
@@ -37,6 +38,51 @@ func TestPullRequestTargetGuardKeyMatchesLoopRecordKey(t *testing.T) {
 	reviewerKey := LoopTargetGuardKey("proj", string(domain.LoopTypeReviewer), string(domain.LoopTargetTypePullRequest), TargetKeyFromLoopRecord(loop))
 	if reviewerKey != fromPR {
 		t.Fatalf("reviewer key %q != fixer PR key %q", reviewerKey, fromPR)
+	}
+}
+
+func TestPullRequestTargetGuardKeyNormalizesRepoCasing(t *testing.T) {
+	t.Parallel()
+	lower := "acme/looper"
+	mixed := "Acme/Looper"
+	prNumber := int64(42)
+	record := func(repo string) storage.LoopRecord {
+		return storage.LoopRecord{
+			ProjectID:  "proj",
+			Type:       string(domain.LoopTypeFixer),
+			TargetType: string(domain.LoopTargetTypePullRequest),
+			Repo:       &repo,
+			PRNumber:   &prNumber,
+		}
+	}
+	lowerKey := LoopTargetGuardKeyFromRecord(record(lower))
+	mixedKey := LoopTargetGuardKeyFromRecord(record(mixed))
+	if lowerKey == "" || lowerKey != mixedKey {
+		t.Fatalf("case-variant repo spellings took different target mutexes: %q vs %q", lowerKey, mixedKey)
+	}
+	if explicit := PullRequestTargetGuardKey("proj", mixed, prNumber); explicit != lowerKey {
+		t.Fatalf("PullRequestTargetGuardKey(%q) = %q, want %q", mixed, explicit, lowerKey)
+	}
+
+	// The two spellings must serialize on one registry entry, not two.
+	unlock := LockLoopTarget(lowerKey)
+	acquired := make(chan struct{})
+	go func() {
+		unlockMixed := LockLoopTarget(mixedKey)
+		close(acquired)
+		unlockMixed()
+	}()
+	select {
+	case <-acquired:
+		unlock()
+		t.Fatal("case-variant target key acquired a second live mutex")
+	case <-time.After(50 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case <-acquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("case-variant target key did not acquire after release")
 	}
 }
 
