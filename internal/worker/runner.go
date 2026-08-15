@@ -3902,7 +3902,18 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	// predecessor's changes. Gate the refresh on the retained execution
 	// state of the checkpoint the new run will actually carry.
 	replaysAgentStep := workflow.Reaches(startStep, stepExecute) && !executeStepAlreadyCompleted(resumedCheckpoint)
-	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot, len(r.validationCommandsForProject(loop.ProjectID)) > 0, replaysAgentStep)
+	// The gate flag must reflect the commands the new run will actually
+	// enforce. runExecuteStep derives its validation commands from the base
+	// project policy plus the retained work checkpoint's reproduction command,
+	// so a project without base commands still denies tool network — and must
+	// still refresh an unsupported sticky snapshot — when the retained work
+	// carries a reproduction command.
+	var retainedWork workerInput
+	if resumedCheckpoint.Work != nil {
+		retainedWork = *resumedCheckpoint.Work
+	}
+	validationCommands := workerValidationCommands(r.validationCommandsForProject(loop.ProjectID), retainedWork)
+	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot, len(validationCommands) > 0, replaysAgentStep)
 	if err != nil {
 		return resumedRunContext{}, err
 	}
