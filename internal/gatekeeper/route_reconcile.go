@@ -311,6 +311,12 @@ func (r *Runner) retireRoutingLabelsForReport(ctx context.Context, report Report
 	// already inside the Mergify queue is dequeued rather than left satisfying
 	// the queue rule on stale authority. Label mutations need no pull-request
 	// head authority: removing a stale route can never authorize a merge.
+	//
+	// Deliberately no commit-status revocation here: the `Looper Gatekeeper`
+	// context is commit-wide, so retiring one PR of a shared-head pair would
+	// publish a failure its still-eligible sibling depends on for
+	// check-success (see TestTargetedEvaluationAggregatesAllReportsForSharedHead).
+	// The per-PR needs-human-review veto fully blocks the retired PR on its own.
 	return r.applyRoutingLabelPlan(ctx, report, routingLabelPlan{needsHumanReview: true})
 }
 

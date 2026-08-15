@@ -1424,6 +1424,16 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 		retry.Status = StatusBlocked
 		retry.SourceFingerprint = ""
 		retry.EvaluatedAt = r.now().UTC().Format(time.RFC3339Nano)
+		var revokePending *gatekeeperStatusRevokePendingError
+		if errors.As(routingErr, &revokePending) {
+			// The label projection succeeded and the durable veto is on the
+			// pull request; only the commit-status write is outstanding. Retain
+			// the established-route fact so the next evaluation re-runs the
+			// needs-human-review projection (retrying the revocation) instead
+			// of taking the removal-only branch and deleting the veto this
+			// attempt just installed.
+			retry.RouteEstablished = boolPointer(true)
+		}
 		if markerErr := r.appendGateReportAt(ctx, retry, entityType, entityID, r.now().Add(time.Millisecond)); markerErr != nil {
 			return report, fmt.Errorf("%w (persist routing retry marker: %v)", routingErr, markerErr)
 		}

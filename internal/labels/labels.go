@@ -49,7 +49,11 @@ func DefaultNamespace() Namespace { return Namespace{Prefix: Prefix} }
 
 // ValidatePrefix accepts a label namespace such as "looper:" or
 // "team.looper:". The colon is required so a namespace cannot accidentally
-// match an ordinary host label prefix.
+// match an ordinary host label prefix. A custom prefix nested under the
+// reserved default ("looper:team:") is rejected: every label it emits would
+// also satisfy the default namespace's IsOwned prefix check, so the default
+// instance could adopt the custom instance's PRs for auto-merge and
+// merge-watch — the opposite of the isolation this option provides.
 func ValidatePrefix(prefix string) error {
 	prefix = strings.TrimSpace(prefix)
 	if prefix == "" {
@@ -63,6 +67,9 @@ func ValidatePrefix(prefix string) error {
 			continue
 		}
 		return fmt.Errorf("label namespace contains unsupported character %q", r)
+	}
+	if normalized := strings.ToLower(prefix); normalized != Prefix && strings.HasPrefix(normalized, Prefix) {
+		return fmt.Errorf("label namespace %q is nested under the reserved default %q", prefix, Prefix)
 	}
 	return nil
 }

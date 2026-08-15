@@ -3,7 +3,9 @@ package gatekeeper
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -392,8 +394,11 @@ func TestRevokeProjectRoutesRetiresCrashPendingRoute(t *testing.T) {
 	if !foundAutoRemoval {
 		t.Fatalf("label removals = %#v, want crash-pending auto-merge route retired", fixture.github.labelRemoves)
 	}
+	// Out-of-page retirement is label-only: the commit status is commit-wide,
+	// so revoking it here would poison a still-eligible sibling sharing the
+	// head. The durable needs-human-review veto blocks this PR on its own.
 	if len(fixture.github.commitStatuses) != 0 {
-		t.Fatalf("commit statuses = %#v, want no verdict retirement for an unpublished pending report", fixture.github.commitStatuses)
+		t.Fatalf("commit statuses = %#v, want label-only out-of-page retirement", fixture.github.commitStatuses)
 	}
 	reports, err := latestGateReports(context.Background(), fixture.repos, "project_1")
 	if err != nil {
@@ -401,6 +406,174 @@ func TestRevokeProjectRoutesRetiresCrashPendingRoute(t *testing.T) {
 	}
 	if got := reports["acme/looper#42"]; !hasReason(got, ReasonRouteRevoked) {
 		t.Fatalf("report after revocation = %#v, want ReasonRouteRevoked", got)
+	}
+}
+
+// The label retirement is the merge-blocking authority; a commit-status API
+// outage must not keep a retired route alive. When the in-page plan asks for a
+// status revocation that fails, the veto label is still added and the trigger
+// removed, and the error is returned so the revocation is retried later.
+func TestRoutingLabelRetirementSurvivesStatusRevocationFailure(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.statusErr = errors.New("status api unavailable")
+	runner := trustRunner(fixture, config.GatekeeperTrustAuto)
+	established := true
+	report := Report{
+		Version: reportVersion, Mode: string(config.GatekeeperTrustAuto), Eligible: true,
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42,
+		ObservedHeadSHA: "head-1", RouteEstablished: &established,
+		Evidence: Evidence{PullRequestState: "OPEN", FinalObservedHeadSHA: "head-1"},
+	}
+	seedGateReport(t, fixture, report)
+
+	err := runner.applyRoutingLabelPlan(context.Background(), report, routingLabelPlan{needsHumanReview: true, revokeGateStatus: true})
+	if err == nil {
+		t.Fatal("applyRoutingLabelPlan() succeeded with the status API failing, want the revocation error returned for retry")
+	}
+	if len(fixture.github.labelAdds) == 0 || !slices.Equal(fixture.github.labelAdds[len(fixture.github.labelAdds)-1].Labels, []string{labels.NeedsHumanReview}) {
+		t.Fatalf("label adds = %#v, want the durable veto applied despite the status outage", fixture.github.labelAdds)
+	}
+	foundAutoRemoval := false
+	for _, removal := range fixture.github.labelRemoves {
+		if slices.Equal(removal.Labels, []string{labels.AutoMerge}) {
+			foundAutoRemoval = true
+		}
+	}
+	if !foundAutoRemoval {
+		t.Fatalf("label removals = %#v, want the queue trigger removed despite the status outage", fixture.github.labelRemoves)
+	}
+}
+
+// Two-pass invariant for a status revocation that outlives its first attempt:
+// pass one installs the durable veto while the status API is down, and the
+// retry marker must retain the established-route fact so pass two retries the
+// revocation instead of deleting the veto pass one just installed.
+func TestBlockedRouteRetriesStatusRevocationAcrossOutage(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	runner := trustRunner(fixture, config.GatekeeperTrustAuto)
+
+	// Establish the route while everything works.
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("initial discovery() error = %v", err)
+	}
+	reports, err := latestGateReports(context.Background(), fixture.repos, "project_1")
+	if err != nil {
+		t.Fatalf("latestGateReports() error = %v", err)
+	}
+	if r := reports["acme/looper#42"]; r.RouteEstablished == nil || !*r.RouteEstablished {
+		t.Fatalf("initial report = %#v, want an established route", r)
+	}
+	// Pass zero legitimately clears a stale veto while establishing the route;
+	// every assertion below watches only what happens after it.
+	removalsAfterEstablishment := len(fixture.github.labelRemoves)
+
+	// Pass one: the pull request gains a hold label while the status API is
+	// down. The veto must still be installed; only the status write is lost.
+	fixture.github.detail.Labels = []string{labels.HoldGlobal}
+	fixture.github.statusErr = errors.New("status api unavailable")
+	if _, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"}); err == nil {
+		t.Fatal("pass one hid the routing failure, want the status outage surfaced")
+	}
+	reports, err = latestGateReports(context.Background(), fixture.repos, "project_1")
+	if err != nil {
+		t.Fatalf("latestGateReports() after pass one error = %v", err)
+	}
+	if r := reports["acme/looper#42"]; r.RouteEstablished == nil || !*r.RouteEstablished {
+		t.Fatalf("retry marker = %#v, want the established-route fact retained across the status outage", r)
+	}
+	vetoInstalled := false
+	for _, add := range fixture.github.labelAdds {
+		if slices.Equal(add.Labels, []string{labels.NeedsHumanReview}) {
+			vetoInstalled = true
+		}
+	}
+	if !vetoInstalled {
+		t.Fatalf("label adds = %#v, want the durable veto installed despite the status outage", fixture.github.labelAdds)
+	}
+
+	// Pass two: the outage is over and the pull request is still blocked. The
+	// projection must retry the revocation and keep the veto, never take the
+	// removal-only branch that would strand an accepted queue entry.
+	fixture.github.statusErr = nil
+	second, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
+	if err != nil {
+		t.Fatalf("pass two error = %v", err)
+	}
+	if second.Eligible {
+		t.Fatalf("pass two report = %#v, want the hold label to keep blocking", second)
+	}
+	revoked := false
+	for _, status := range fixture.github.commitStatuses {
+		if status.State == "failure" && status.Context == RequiredStatusContext {
+			revoked = true
+		}
+	}
+	if !revoked {
+		t.Fatalf("commit statuses = %#v, want the revocation retried after the outage", fixture.github.commitStatuses)
+	}
+	for _, removal := range fixture.github.labelRemoves[removalsAfterEstablishment:] {
+		if slices.Equal(removal.Labels, []string{labels.NeedsHumanReview}) {
+			t.Fatalf("label removals = %#v, want the durable veto never deleted across the outage", fixture.github.labelRemoves)
+		}
+	}
+}
+
+// The revalidation retirement wraps its cleanup error beneath the original
+// revalidation cause; the pending-revocation state must survive that wrapper
+// or persist records RouteEstablished=false and the next blocked evaluation
+// deletes the veto the cleanup just installed.
+func TestRetireRoutingLabelsPreservesPendingRevocationThroughWrapper(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.statusErr = errors.New("status api unavailable")
+	runner := trustRunner(fixture, config.GatekeeperTrustAuto)
+	established := true
+	previous := Report{
+		Version: reportVersion, Mode: string(config.GatekeeperTrustAuto), Eligible: true,
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42,
+		ObservedHeadSHA: "head-1", RouteEstablished: &established,
+		Evidence: Evidence{PullRequestState: "OPEN", FinalObservedHeadSHA: "head-1"},
+	}
+	report := previous
+	report.Eligible = false
+
+	err := runner.retireRoutingLabels(context.Background(), report, &previous, errors.New("revalidation failed"))
+	if err == nil {
+		t.Fatal("retireRoutingLabels() succeeded, want the wrapped failure")
+	}
+	var pending *gatekeeperStatusRevokePendingError
+	if !errors.As(err, &pending) {
+		t.Fatalf("retireRoutingLabels() error = %v, want the pending-revocation state preserved through the wrapper", err)
+	}
+	if !strings.Contains(err.Error(), "revalidation failed") {
+		t.Fatalf("wrapped error = %v, want the revalidation cause retained", err)
+	}
+}
+
+// When the status revocation fails and a label mutation fails after it, the
+// returned error must still carry the pending-revocation state: the projection
+// is unfinished either way, and persist must retain the established route so
+// the whole projection is retried rather than deleted.
+func TestApplyRoutingLabelPlanRetainsPendingWhenLabelsAlsoFail(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.statusErr = errors.New("status api unavailable")
+	fixture.github.labelErr = errors.New("label api unavailable")
+	runner := trustRunner(fixture, config.GatekeeperTrustAuto)
+	established := true
+	report := Report{
+		Version: reportVersion, Mode: string(config.GatekeeperTrustAuto), Eligible: true,
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42,
+		ObservedHeadSHA: "head-1", RouteEstablished: &established,
+		Evidence: Evidence{PullRequestState: "OPEN", FinalObservedHeadSHA: "head-1"},
+	}
+
+	err := runner.applyRoutingLabelPlan(context.Background(), report, routingLabelPlan{needsHumanReview: true, revokeGateStatus: true})
+	if err == nil {
+		t.Fatal("applyRoutingLabelPlan() succeeded with both APIs failing")
+	}
+	var pending *gatekeeperStatusRevokePendingError
+	if !errors.As(err, &pending) {
+		t.Fatalf("applyRoutingLabelPlan() error = %v, want pending-revocation state retained alongside the label failure", err)
 	}
 }
 

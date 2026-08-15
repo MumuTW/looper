@@ -2,6 +2,7 @@ package gatekeeper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -9,6 +10,19 @@ import (
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
 )
+
+// gatekeeperStatusRevokePendingError marks a needs-human-review projection
+// whose label mutations succeeded while the commit-status revocation failed.
+// The route fact is established — the durable veto is on the pull request and
+// the queue trigger is gone — so the retry marker must retain it and the next
+// evaluation retries only the status write.
+type gatekeeperStatusRevokePendingError struct{ cause error }
+
+func (e *gatekeeperStatusRevokePendingError) Error() string {
+	return "revoke successful Gatekeeper status before queue veto: " + e.cause.Error()
+}
+
+func (e *gatekeeperStatusRevokePendingError) Unwrap() error { return e.cause }
 
 // protectedPathTouchedReason is owned by the independent protected-path gate
 // (#458), whose Go constant is not yet in this package. The routing layer
@@ -341,6 +355,15 @@ func (r *Runner) retireRoutingLabels(ctx context.Context, report Report, previou
 	}
 	cleanupErr := r.applyRoutingLabelPlan(ctx, report, plan)
 	if cleanupErr != nil {
+		var revokePending *gatekeeperStatusRevokePendingError
+		if errors.As(cleanupErr, &revokePending) {
+			// The cleanup installed the durable veto and only the commit-status
+			// write is outstanding. Preserve the typed state through the
+			// wrapper so persist retains the established-route fact and the
+			// next evaluation retries the projection instead of deleting the
+			// veto this cleanup just installed.
+			return &gatekeeperStatusRevokePendingError{cause: fmt.Errorf("%w (remove stale routing labels: %v)", err, revokePending.cause)}
+		}
 		return fmt.Errorf("%w (remove stale routing labels: %v)", err, cleanupErr)
 	}
 	return err
@@ -364,10 +387,15 @@ func (r *Runner) applyRoutingLabelPlan(ctx context.Context, report Report, plan 
 			return fmt.Errorf("remove stale %s label: %w", labels.NeedsHumanReview, err)
 		}
 	case plan.needsHumanReview:
+		// Attempt the status revocation first, but never let its failure block
+		// the label retirement below: during a status-API outage the route must
+		// still lose its queue trigger and gain the durable veto, or the
+		// supposedly retired pull request keeps both its route and the stale
+		// success until the API recovers. The revocation error is returned after
+		// the label mutations so the status is retried on the next pass.
+		var revokeErr error
 		if plan.revokeGateStatus {
-			if err := r.revokeGatekeeperStatus(ctx, report); err != nil {
-				return fmt.Errorf("revoke successful Gatekeeper status before queue veto: %w", err)
-			}
+			revokeErr = r.revokeGatekeeperStatus(ctx, report)
 		}
 		// Add the durable queue veto before removing the trigger. If the second
 		// mutation fails, the accepted queue entry remains blocked rather than
@@ -378,12 +406,32 @@ func (r *Runner) applyRoutingLabelPlan(ctx context.Context, report Report, plan 
 			// the veto label write fails (including another PR sharing this head).
 			removeErr := r.github.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Labels: []string{labels.AutoMerge}})
 			if removeErr != nil {
-				return fmt.Errorf("add %s label: %w (remove stale %s label: %v)", labels.NeedsHumanReview, err, labels.AutoMerge, removeErr)
+				combined := fmt.Errorf("add %s label: %w (remove stale %s label: %v)", labels.NeedsHumanReview, err, labels.AutoMerge, removeErr)
+				if revokeErr != nil {
+					// The projection is still pending: keep the typed state so
+					// persist retains the established route and the whole
+					// projection (veto, trigger removal, status) is retried.
+					return &gatekeeperStatusRevokePendingError{cause: combined}
+				}
+				return combined
+			}
+			if revokeErr != nil {
+				return &gatekeeperStatusRevokePendingError{cause: fmt.Errorf("add %s label: %w", labels.NeedsHumanReview, err)}
 			}
 			return fmt.Errorf("add %s label: %w", labels.NeedsHumanReview, err)
 		}
 		if err := r.github.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Labels: []string{labels.AutoMerge}}); err != nil {
+			if revokeErr != nil {
+				return &gatekeeperStatusRevokePendingError{cause: fmt.Errorf("revoke successful Gatekeeper status before queue veto: %v (remove stale %s label: %w)", revokeErr, labels.AutoMerge, err)}
+			}
 			return fmt.Errorf("remove stale %s label: %w", labels.AutoMerge, err)
+		}
+		if revokeErr != nil {
+			// The durable veto is on the pull request and the queue trigger is
+			// gone; only the commit-status write is outstanding. The typed error
+			// lets persist retain the established-route fact so the retry marker
+			// cannot read as "no route" and delete the veto it just installed.
+			return &gatekeeperStatusRevokePendingError{cause: revokeErr}
 		}
 	default:
 		// Mechanical blockers and observe demotions intentionally leave no
