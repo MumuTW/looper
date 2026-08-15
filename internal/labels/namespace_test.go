@@ -39,7 +39,7 @@ func TestDefinitionForPrefersLongestStandardSuffix(t *testing.T) {
 }
 
 func TestNamespaceRejectsUnsafePrefixes(t *testing.T) {
-	for _, prefix := range []string{"looper", "team looper:", "team/*:", ":"} {
+	for _, prefix := range []string{"looper", "team looper:", "team/*:", ":", "looper:team:", "looper:team:", "Looper:Team:"} {
 		if err := ValidatePrefix(prefix); err == nil {
 			t.Fatalf("ValidatePrefix(%q) succeeded", prefix)
 		}
@@ -49,5 +49,29 @@ func TestNamespaceRejectsUnsafePrefixes(t *testing.T) {
 	}
 	if err := ValidatePrefix("abcdefghijklmnopqrstuvwxyz123456:"); err == nil {
 		t.Fatal("ValidatePrefix() accepted a prefix that makes standard labels exceed GitHub's 50-character limit")
+	}
+}
+
+// A custom namespace nested under the default "looper:" prefix breaks
+// isolation: IsOwned is a prefix check, so "looper:team:" labels also satisfy
+// the default instance's IsOwned. ValidatePrefix must reject these so two
+// namespaced instances on the same repository stay isolated.
+func TestNamespaceRejectsNestedLooperPrefix(t *testing.T) {
+	for _, prefix := range []string{"looper:team:", "looper:team:", "Looper:Team:", "looper:a:"} {
+		if err := ValidatePrefix(prefix); err == nil {
+			t.Fatalf("ValidatePrefix(%q) succeeded; want rejection of namespace nested under looper:", prefix)
+		}
+	}
+	// The default prefix itself is valid.
+	if err := ValidatePrefix(Prefix); err != nil {
+		t.Fatalf("ValidatePrefix(%q) error = %v; want nil (default prefix is valid)", Prefix, err)
+	}
+	// NewNamespace falls back to default for a nested prefix.
+	if got := NewNamespace("looper:team:"); got.Prefix != Prefix {
+		t.Fatalf("NewNamespace(looper:team:) = %q, want fallback to %q", got.Prefix, Prefix)
+	}
+	// A distinct prefix is still accepted.
+	if err := ValidatePrefix("team.looper:"); err != nil {
+		t.Fatalf("ValidatePrefix(team.looper:) error = %v; want nil", err)
 	}
 }
