@@ -169,10 +169,8 @@ func validationToolEnvironment() (processsandbox.ToolEnvironment, []string) {
 
 func validationReadRoots(cwd string) []string {
 	roots := map[string]struct{}{filepath.Clean(cwd): {}}
-	for _, entry := range filepath.SplitList(os.Getenv("PATH")) {
-		if entry = strings.TrimSpace(entry); entry != "" {
-			roots[filepath.Clean(entry)] = struct{}{}
-		}
+	for _, root := range resolvedGitToolRoots() {
+		roots[root] = struct{}{}
 	}
 	if moduleCache := resolvedModuleCache(); moduleCache != "" {
 		roots[filepath.Clean(moduleCache)] = struct{}{}
@@ -202,11 +200,8 @@ func resolvedModuleCache() string {
 
 func buildPermissionProfileForAccess(cwd, tempRoot, profileName string, access workspaceAccess) string {
 	readRoots := map[string]struct{}{}
-	for _, entry := range filepath.SplitList(os.Getenv("PATH")) {
-		entry = strings.TrimSpace(entry)
-		if entry != "" {
-			readRoots[filepath.Clean(entry)] = struct{}{}
-		}
+	for _, root := range resolvedGitToolRoots() {
+		readRoots[root] = struct{}{}
 	}
 	moduleCache := strings.TrimSpace(os.Getenv("GOMODCACHE"))
 	if moduleCache == "" {
@@ -258,6 +253,101 @@ func resolvedGoRoot() string {
 	return filepath.Dir(filepath.Dir(resolved))
 }
 
+// toolProbeTimeout bounds synchronous tool probes: they run before the
+// sandboxed process starts, so agent and validation timeouts cannot interrupt
+// a hung wrapper. On expiry the probe's grant is skipped, never the whole run.
+var toolProbeTimeout = 5 * time.Second
+
+// probeEnvironment drops environment overrides that would make git or
+// xcode-select report operator-controlled paths (GIT_EXEC_PATH, DEVELOPER_DIR),
+// so grants follow the resolved installation, not inherited environment.
+func probeEnvironment() []string {
+	env := os.Environ()
+	filtered := make([]string, 0, len(env))
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "GIT_EXEC_PATH=") || strings.HasPrefix(entry, "DEVELOPER_DIR=") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
+func probeOutput(command string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), toolProbeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, command, args...)
+	cmd.Env = probeEnvironment()
+	output, err := cmd.Output()
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// resolvedGitToolRoots grants only the git installation sandboxed repository
+// inspection resolves to: the binary itself, its exec-path helper directory,
+// and, for darwin's stock stub, the developer-directory binary the stub execs.
+// Inherited daemon PATH directories (for example $HOME/bin) may hold operator
+// secrets and are never granted wholesale.
+func resolvedGitToolRoots() []string {
+	binary, err := exec.LookPath("git")
+	if err != nil {
+		return nil
+	}
+	resolved, err := filepath.EvalSymlinks(binary)
+	if err != nil {
+		return nil
+	}
+	roots := []string{resolved}
+	if output, execErr := probeOutput(resolved, "--exec-path"); execErr == nil {
+		if execPath := resolvedToolPath(output); execPath != "" {
+			if info, statErr := os.Stat(execPath); statErr == nil && info.IsDir() {
+				roots = append(roots, execPath)
+			}
+		}
+	}
+	if runtime.GOOS == "darwin" && resolved == "/usr/bin/git" {
+		if developerGit := developerDirGitBinary(); developerGit != "" {
+			roots = append(roots, developerGit)
+		}
+	}
+	sort.Strings(roots)
+	return roots
+}
+
+func developerDirGitBinary() string {
+	output, err := probeOutput("xcode-select", "-p")
+	if err != nil {
+		return ""
+	}
+	if output == "" {
+		return ""
+	}
+	candidate := filepath.Join(output, "usr", "bin", "git")
+	if info, statErr := os.Stat(candidate); statErr != nil || info.IsDir() {
+		return ""
+	}
+	return resolvedToolPath(candidate)
+}
+
+func resolvedToolPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
+		return resolved
+	}
+	return absolute
+}
+
 func linkedWorktreeReadRoots(cwd string) []string {
 	worktreeGitFile := filepath.Join(filepath.Clean(cwd), ".git")
 	data, err := os.ReadFile(worktreeGitFile)
@@ -301,11 +391,35 @@ func linkedWorktreeReadRoots(cwd string) []string {
 	return assessmentSafeGitReadRoots(gitDir, commonDir)
 }
 
-// assessmentSafeGitReadRoots returns the private worktree git dir plus the
-// object/ref metadata under the common git dir, deliberately omitting config,
-// hooks, and other credential-bearing paths at the common root.
+// assessmentSafeGitReadRoots returns only the per-worktree metadata that
+// read-only inspection needs, plus the object/ref metadata under the common
+// git dir, deliberately omitting config, hooks, and other credential-bearing
+// paths at either root. The private git dir itself is never granted wholesale:
+// extensions.worktreeConfig can place credential helpers and embedded remotes
+// in <gitDir>/config.worktree, and any other unlisted file there is unaudited.
 func assessmentSafeGitReadRoots(gitDir, commonDir string) []string {
-	roots := []string{gitDir}
+	roots := make([]string, 0, 8)
+	for _, name := range []string{
+		// Worktree identity and index state.
+		"HEAD", "commondir", "gitdir", "index",
+		// In-progress operation state: ref names, modes, and messages.
+		"ORIG_HEAD", "MERGE_HEAD", "MERGE_MODE", "MERGE_MSG",
+		"CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD",
+		"BISECT_LOG", "BISECT_EXPECTED_REV", "BISECT_ANCESTORS_OK",
+		// Per-worktree reflogs, per-worktree refs (for example refs/bisect),
+		// and sequencer state directories.
+		"logs", "refs", "rebase-merge", "rebase-apply", "sequencer",
+	} {
+		path := filepath.Join(gitDir, name)
+		if _, err := os.Stat(path); err == nil {
+			roots = append(roots, path)
+		}
+	}
+	// Split-index backing files referenced by the per-worktree index; hiding
+	// them makes git status exit fatally in split-index worktrees.
+	if shared, globErr := filepath.Glob(filepath.Join(gitDir, "sharedindex.*")); globErr == nil {
+		roots = append(roots, shared...)
+	}
 	for _, name := range []string{"objects", "refs", "info", "logs", "packed-refs", "HEAD", "shallow"} {
 		path := filepath.Join(commonDir, name)
 		if _, err := os.Stat(path); err == nil {
