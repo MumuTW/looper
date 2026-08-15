@@ -117,6 +117,53 @@ func TestRunRejectsBroadReadRoot(t *testing.T) {
 	}
 }
 
+func symlinkedHome(t *testing.T) (linked, real string) {
+	t.Helper()
+	root := t.TempDir()
+	real = filepath.Join(root, "real-home")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linked = filepath.Join(root, "linked-home")
+	if err := os.Symlink(real, linked); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", linked)
+	return linked, real
+}
+
+func TestUnsafeAllowReadRootRejectsMissingProtectedRootsBehindSymlinkedHome(t *testing.T) {
+	linked, real := symlinkedHome(t)
+	for _, root := range []string{
+		filepath.Join(linked, ".config"),
+		filepath.Join(real, ".config"),
+		filepath.Join(linked, ".ssh"),
+		filepath.Join(real, ".ssh"),
+	} {
+		if !unsafeAllowReadRoot(root) {
+			t.Fatalf("unsafeAllowReadRoot(%q) = false, want missing protected root behind symlinked home rejected", root)
+		}
+	}
+	if unsafeAllowReadRoot(filepath.Join(real, "unrelated")) {
+		t.Fatalf("unsafeAllowReadRoot(%q) = true, want unrelated directory accepted", filepath.Join(real, "unrelated"))
+	}
+}
+
+func TestRunRejectsBroadReadRootBehindSymlinkedHome(t *testing.T) {
+	linked, _ := symlinkedHome(t)
+	// The rejection must fire before any exec, so nonexistent command paths
+	// prove the guard no longer depends on the binary being startable.
+	_, err := Run(context.Background(), Options{
+		CWD:            t.TempDir(),
+		Command:        "/nonexistent/srt-probe",
+		Profile:        ReadOnlyProfile([]string{filepath.Join(linked, ".config")}, nil),
+		runtimeCommand: "/nonexistent/srt-probe",
+	})
+	if err == nil || !strings.Contains(err.Error(), "is too broad") {
+		t.Fatalf("Run() error = %v, want broad read-root rejection behind symlinked home", err)
+	}
+}
+
 func TestRunAssessmentReadOnlyContainsMaliciousProcessTree(t *testing.T) {
 	srt, err := exec.LookPath("srt")
 	if err != nil {

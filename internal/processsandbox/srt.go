@@ -572,20 +572,32 @@ func unsafeAllowReadRoot(path string) bool {
 	if err != nil {
 		return true
 	}
-	if resolved, resolveErr := filepath.EvalSymlinks(absolute); resolveErr == nil {
-		absolute = resolved
-	}
-	if isFilesystemRoot(absolute) {
-		return true
+	candidateForms := comparablePathForms(absolute)
+	for _, form := range candidateForms {
+		if isFilesystemRoot(form) {
+			return true
+		}
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return false
 	}
-	if resolved, resolveErr := filepath.EvalSymlinks(home); resolveErr == nil {
-		home = resolved
+	for _, homeForm := range comparablePathForms(home) {
+		for _, secretRoot := range protectedReadRoots(homeForm) {
+			for _, rootForm := range comparablePathForms(secretRoot) {
+				for _, form := range candidateForms {
+					if pathContains(form, rootForm) {
+						return true
+					}
+				}
+			}
+		}
 	}
-	protected := []string{
+	return false
+}
+
+func protectedReadRoots(home string) []string {
+	return []string{
 		home,
 		filepath.Join(home, ".ssh"),
 		filepath.Join(home, ".aws"),
@@ -603,12 +615,30 @@ func unsafeAllowReadRoot(path string) bool {
 		filepath.Join(home, ".gitconfig"),
 		filepath.Join(home, ".netrc"),
 	}
-	for _, secretRoot := range protected {
-		if pathContains(absolute, secretRoot) {
-			return true
-		}
+}
+
+// comparablePathForms returns the lexical spelling of path plus a spelling
+// with symlinks resolved as far as they exist. EvalSymlinks keeps missing
+// paths lexical, which never compares equal to a fully resolved spelling
+// when an ancestor is a symlink (for example macOS /tmp -> /private/tmp),
+// so both spellings must be compared.
+func comparablePathForms(path string) []string {
+	clean := filepath.Clean(path)
+	forms := []string{clean}
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+		return append(forms, resolved)
 	}
-	return false
+	dir, tail := filepath.Dir(clean), filepath.Base(clean)
+	for {
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			return append(forms, filepath.Join(resolved, tail))
+		}
+		if parent := filepath.Dir(dir); parent == dir {
+			return forms
+		}
+		tail = filepath.Join(filepath.Base(dir), tail)
+		dir = filepath.Dir(dir)
+	}
 }
 
 func isFilesystemRoot(path string) bool {
