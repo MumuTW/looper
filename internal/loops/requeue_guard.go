@@ -124,7 +124,7 @@ func PullRequestTargetGuardKey(projectID, repo string, prNumber int64) string {
 	if projectID == "" || repo == "" || prNumber <= 0 {
 		return ""
 	}
-	return LoopTargetGuardKey(projectID, string(domain.LoopTypeReviewer), string(domain.LoopTargetTypePullRequest), fmt.Sprintf("pull_request:%s:%d", repo, prNumber))
+	return LoopTargetGuardKey(projectID, string(domain.LoopTypeReviewer), string(domain.LoopTargetTypePullRequest), fmt.Sprintf("pull_request:%s:%d", NormalizeRepoForGuardKey(repo), prNumber))
 }
 
 // TargetKeyFromLoopRecord returns the canonical target key for a stored loop
@@ -149,8 +149,17 @@ func TargetKeyFromLoopRecord(loop storage.LoopRecord) string {
 		if loop.Repo == nil || loop.PRNumber == nil {
 			return "pull_request:"
 		}
-		return fmt.Sprintf("pull_request:%s:%d", *loop.Repo, *loop.PRNumber)
+		return fmt.Sprintf("pull_request:%s:%d", NormalizeRepoForGuardKey(*loop.Repo), *loop.PRNumber)
 	}
+}
+
+// NormalizeRepoForGuardKey lower-cases the repository identifier so that
+// sibling loops spelling the same GitHub repo with different casing
+// (acme/repo vs Acme/Repo) take the same target mutex key. This matches the
+// case-insensitive identity used by storage.ListByRepoAndPR (COLLATE NOCASE)
+// and storage forge lock keys (strings.ToLower).
+func NormalizeRepoForGuardKey(repo string) string {
+	return strings.ToLower(strings.TrimSpace(repo))
 }
 
 // LockLoopTarget acquires the process-wide same-target mutex. An empty key is a

@@ -139,3 +139,60 @@ func TestLockLoopRequeueAndTargetStillSerialize(t *testing.T) {
 	noop := LockLoopTarget("  ")
 	noop()
 }
+
+func TestPullRequestTargetGuardKeyNormalizesRepoCasing(t *testing.T) {
+	t.Parallel()
+	upperRepo := "Acme/Looper"
+	lowerRepo := "acme/looper"
+	prNumber := int64(42)
+
+	upperKey := PullRequestTargetGuardKey("proj", upperRepo, prNumber)
+	lowerKey := PullRequestTargetGuardKey("proj", lowerRepo, prNumber)
+	if upperKey == "" || upperKey != lowerKey {
+		t.Fatalf("PR guard keys for same repo different casing = %q / %q, want equal non-empty", upperKey, lowerKey)
+	}
+
+	upperTargetID := "pr:Acme/Looper:42"
+	lowerTargetID := "pr:acme/looper:42"
+	upperLoop := storage.LoopRecord{
+		ProjectID:  "proj",
+		Type:       string(domain.LoopTypeFixer),
+		TargetType: string(domain.LoopTargetTypePullRequest),
+		TargetID:   &upperTargetID,
+		Repo:       &upperRepo,
+		PRNumber:   &prNumber,
+	}
+	lowerLoop := storage.LoopRecord{
+		ProjectID:  "proj",
+		Type:       string(domain.LoopTypeFixer),
+		TargetType: string(domain.LoopTargetTypePullRequest),
+		TargetID:   &lowerTargetID,
+		Repo:       &lowerRepo,
+		PRNumber:   &prNumber,
+	}
+	fromUpperRecord := LoopTargetGuardKeyFromRecord(upperLoop)
+	fromLowerRecord := LoopTargetGuardKeyFromRecord(lowerLoop)
+	if fromUpperRecord == "" || fromUpperRecord != fromLowerRecord {
+		t.Fatalf("record-derived keys for same repo different casing = %q / %q, want equal non-empty", fromUpperRecord, fromLowerRecord)
+	}
+	if fromUpperRecord != upperKey {
+		t.Fatalf("record key %q != explicit PR key %q for upper-cased repo", fromUpperRecord, upperKey)
+	}
+
+	// The serialized lock must actually block: acquire the upper-cased key and
+	// confirm the lower-cased key cannot enter until release.
+	release := LockLoopTarget(upperKey)
+	locked := make(chan struct{})
+	go func() {
+		inner := LockLoopTarget(lowerKey)
+		close(locked)
+		inner()
+	}()
+	select {
+	case <-locked:
+		t.Fatal("lower-cased repo key acquired while upper-cased key still held")
+	default:
+	}
+	release()
+	<-locked
+}
