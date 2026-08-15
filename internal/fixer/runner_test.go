@@ -7339,14 +7339,17 @@ func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (Agent
 }
 
 type fakeAgentExecution struct {
-	result  AgentResult
-	waitErr error
-	kills   []string
-	waits   int
+	result       AgentResult
+	waitErr      error
+	killErr      error
+	kills        []string
+	waits        int
+	waitContexts []error
 }
 
-func (f *fakeAgentExecution) Wait(context.Context) (AgentResult, error) {
+func (f *fakeAgentExecution) Wait(ctx context.Context) (AgentResult, error) {
 	f.waits++
+	f.waitContexts = append(f.waitContexts, ctx.Err())
 	if f.waitErr != nil {
 		return AgentResult{}, f.waitErr
 	}
@@ -7355,7 +7358,7 @@ func (f *fakeAgentExecution) Wait(context.Context) (AgentResult, error) {
 
 func (f *fakeAgentExecution) Kill(reason string) error {
 	f.kills = append(f.kills, reason)
-	return nil
+	return f.killErr
 }
 
 func passValidation(context.Context, ValidationInput) (ValidationResult, error) {

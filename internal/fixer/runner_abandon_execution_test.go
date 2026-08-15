@@ -111,6 +111,47 @@ func TestRunRepairStepDrainsAgentWhenNotificationFailsAfterStart(t *testing.T) {
 	}
 }
 
+// The failing path is often reached with an already-canceled context; the
+// drain must not inherit it, or Wait returns through ctx.Done() before the
+// killed process has terminated and the shutdown race this helper closes
+// reopens.
+func TestRunRepairStepDrainsAgentOnLiveContextAfterCancel(t *testing.T) {
+	_, runner, agentExec, input := newAbandonFixture(t)
+	runner.persistCheckpoint = func(_ context.Context, _ string, _ FixerStep, checkpoint fixerCheckpoint) error {
+		if strings.TrimSpace(checkpoint.PendingAgentExecutionID) == "" {
+			return nil
+		}
+		return context.Canceled
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := runner.runRepairStep(canceled, input); err == nil {
+		t.Fatal("runRepairStep() succeeded with a canceled context")
+	}
+	execution := agentExec.lastExecution
+	if execution == nil || execution.waits == 0 {
+		t.Fatal("execution was never drained")
+	}
+	if err := execution.waitContexts[len(execution.waitContexts)-1]; err != nil {
+		t.Fatalf("drain Wait context err = %v, want a live context independent of the canceled run context", err)
+	}
+}
+
+// A Kill error must be logged without panicking on a runner constructed
+// without a logger, preserving the causal error the helper promises.
+func TestAbandonStartedExecutionSurvivesKillErrorWithoutLogger(t *testing.T) {
+	runner := New(Options{}) // no Logger
+	execution := &fakeAgentExecution{killErr: errors.New("kill refused"), result: AgentResult{Status: "killed"}}
+	runner.abandonStartedExecution(context.Background(), execution, "drain check")
+	if len(execution.kills) != 1 {
+		t.Fatalf("kills = %#v, want one attempt", execution.kills)
+	}
+	if execution.waits != 1 {
+		t.Fatalf("waits = %d, want the drain Wait after the failed kill", execution.waits)
+	}
+}
+
 func quoteJSONString(value string) string {
 	encoded, err := json.Marshal(value)
 	if err != nil {

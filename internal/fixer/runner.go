@@ -81,6 +81,11 @@ const (
 	// operation context being cancelled, but it must not wait indefinitely on a
 	// blocked SQLite call while the claim is held.
 	durableRecoveryTimeout = 5 * time.Second
+	// agentAbandonDrainTimeout bounds how long an abandoned agent execution may
+	// take to terminate after its kill request: long enough for the executor's
+	// graceful-shutdown window, short enough that a wedged process cannot stall
+	// the failing run's return.
+	agentAbandonDrainTimeout = 30 * time.Second
 )
 
 type FixItem struct {
@@ -5732,14 +5737,22 @@ func (r *Runner) completeRun(ctx context.Context, run storage.RunRecord, status,
 // retry handling begins on a checkpoint that never recorded the execution.
 // Kill and Wait failures are logged, never propagated: the causal error owns
 // the return, and a kill that arrives late still cannot revive the run.
+//
+// The drain runs on a fresh bounded context derived from Background: the
+// causal failure is often the cancellation or deadline of ctx itself, and a
+// Wait on that context would return immediately through ctx.Done() before the
+// killed process has actually terminated — reopening the shutdown race this
+// helper exists to close.
 func (r *Runner) abandonStartedExecution(ctx context.Context, execution AgentExecution, reason string) {
 	if execution == nil {
 		return
 	}
 	if err := execution.Kill(reason); err != nil {
-		r.logger.Warn("fixer failed to stop abandoned agent execution", map[string]any{"reason": reason, "error": err.Error()})
+		r.logWarn("fixer failed to stop abandoned agent execution", map[string]any{"reason": reason, "error": err.Error()})
 	}
-	_, _ = execution.Wait(ctx)
+	drainCtx, cancel := context.WithTimeout(context.Background(), agentAbandonDrainTimeout)
+	defer cancel()
+	_, _ = execution.Wait(drainCtx)
 }
 
 func (r *Runner) persistCheckpointDurable(ctx context.Context, runID string, step FixerStep, checkpoint fixerCheckpoint) error {
