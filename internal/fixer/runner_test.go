@@ -6006,6 +6006,65 @@ func TestRunRepairStepFailsResumedCompletedCheckpointWithoutParsedResult(t *test
 	}
 }
 
+// When persistCheckpoint fails after agentExecutor.Start succeeds, the live
+// agent must be killed and drained before returning. Without the durable
+// PendingAgentExecutionID marker a retry cannot know to drain this execution,
+// so the agent could keep editing or pushing from a worktree the Fixer has
+// already abandoned.
+func TestRunRepairStepKillsLiveAgentOnCheckpointPersistFailure(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	worktreeRoot := t.TempDir()
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, filepath.Dir(worktreeRoot))
+	git := &fakeGitGateway{}
+	execution := &fakeAgentExecution{result: AgentResult{Status: "completed", ParseStatus: "parsed", CompletionPayload: `{"outcome":"completed","summary":"resolved"}`}}
+	executor := &persistFailingAgentExecutor{execution: execution, db: fixture.coordinator.DB()}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: executor, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
+
+	_, err := runner.runRepairStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir(), MetadataJSON: &metadata},
+		Loop:    storage.LoopRecord{ID: "loop_persist_fail", Type: "fixer"},
+		Run:     storage.RunRecord{ID: "run_persist_fail"},
+		Repo:    "acme/looper", PRNumber: 42,
+		Checkpoint: fixerCheckpoint{
+			Detail:             &checkpointDetail{HeadRefName: "feature/fix-42", BaseRefName: "main", HeadSHA: "head-1"},
+			FixItems:           []FixItem{{ID: "fix-1", Type: "conflict", Summary: "merge conflict"}},
+			FixItemsHash:       "hash-1",
+			Worktree:           &checkpointWorktree{Path: worktreeRoot, Branch: "feature/fix-42", HeadSHA: "head-1", PreparedAt: fixture.nowISO()},
+			ReproductionAbsent: true,
+		},
+	})
+	if err == nil {
+		t.Fatal("runRepairStep() error = nil, want persist failure")
+	}
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureRetryableAfterResume {
+		t.Fatalf("error = %v, want FailureRetryableAfterResume", err)
+	}
+	if !execution.killed {
+		t.Fatal("live agent was not killed on checkpoint persist failure")
+	}
+	if execution.killCalls != 1 {
+		t.Fatalf("killCalls = %d, want exactly one Kill call", execution.killCalls)
+	}
+}
+
+// persistFailingAgentExecutor returns a tracked execution and closes the DB
+// connection after Start so persistCheckpoint fails on the Upsert that follows.
+type persistFailingAgentExecutor struct {
+	execution *fakeAgentExecution
+	db        *sql.DB
+	started   bool
+}
+
+func (f *persistFailingAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
+	f.started = true
+	if f.db != nil {
+		_ = f.db.Close()
+	}
+	return f.execution, nil
+}
+
 func TestCreateRunContextPreservesPostRepairCheckpointWhenParseStatusIsInvalid(t *testing.T) {
 	t.Parallel()
 
@@ -7332,19 +7391,27 @@ func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (Agent
 			}
 		}
 	}
-	return fakeAgentExecution{result: result, waitErr: f.waitErr}, nil
+	return &fakeAgentExecution{result: result, waitErr: f.waitErr}, nil
 }
 
 type fakeAgentExecution struct {
-	result  AgentResult
-	waitErr error
+	result    AgentResult
+	waitErr   error
+	killed    bool
+	killCalls int
 }
 
-func (f fakeAgentExecution) Wait(context.Context) (AgentResult, error) {
+func (f *fakeAgentExecution) Wait(context.Context) (AgentResult, error) {
 	if f.waitErr != nil {
 		return AgentResult{}, f.waitErr
 	}
 	return f.result, nil
+}
+
+func (f *fakeAgentExecution) Kill(string) error {
+	f.killed = true
+	f.killCalls++
+	return nil
 }
 
 func passValidation(context.Context, ValidationInput) (ValidationResult, error) {

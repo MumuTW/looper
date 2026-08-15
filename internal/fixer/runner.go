@@ -535,6 +535,7 @@ Looper's daemon already fetched the PR head and supplied the review items above.
 
 type AgentExecution interface {
 	Wait(context.Context) (AgentResult, error)
+	Kill(string) error
 }
 
 type AgentExecutor interface {
@@ -3976,6 +3977,18 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	checkpoint.Repair = nil
 	checkpoint.PendingAgentExecutionID = executionID
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
+		// The agent is live but the checkpoint recording its execution ID
+		// failed. Without that durable marker a retry cannot know to drain
+		// this execution, so the agent could keep editing or pushing from a
+		// worktree the Fixer has already abandoned. Kill and drain the
+		// started execution before returning so no live agent outlives the
+		// persist failure.
+		killErr := execution.Kill("checkpoint persist failed")
+		_, _ = execution.Wait(ctx)
+		r.logError("fixer repair checkpoint persist failed; stopped live agent", map[string]any{
+			"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID,
+			"executionId": executionID, "persistError": err.Error(), "killError": killErrorError(killErr),
+		})
 		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	result, err := execution.Wait(ctx)
@@ -9573,6 +9586,13 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func killErrorError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func appendUniqueStrings(dst []string, values ...string) []string {

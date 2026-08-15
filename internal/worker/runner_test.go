@@ -3039,6 +3039,75 @@ func TestCreateRunContextRefreshesUnsupportedSnapshotWhenValidationGateEnabled(t
 	}
 }
 
+// A project that opted out of validation commands (empty
+// ValidationCommandsByProject) but whose retained checkpoint carries
+// Work.Reproduction.TestCommand still appends that command in runExecuteStep
+// and starts the agent with RestrictToolNetwork=true. The snapshot
+// requireToolNetworkDenial flag must be derived from the effective
+// workerValidationCommands for the retained work, not just the project-level
+// commands, so a parked unsupported vendor is refreshed and can recover by
+// switching the role to a vendor that can serve the gate.
+func TestCreateRunContextRefreshesSnapshotWhenRetainedReproductionTestCommandEnablesGate(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	predecessorSnapshot := `{"vendor":"claude-code","model":"sonnet","profileId":"sticky"}`
+	runner := New(Options{
+		DB:             fixture.coordinator.DB(),
+		Repos:          fixture.repos,
+		Logger:         fixture.logger,
+		Now:            fixture.now,
+		AgentRuntime:   string(config.AgentVendorCodex),
+		AgentModel:     runpipe.StringPtr("gpt-5"),
+		AgentProfileID: "fast",
+		// No project-level validation commands — the project opted out.
+	})
+	checkpointJSON := runpipe.MustMarshalJSON(workerCheckpoint{
+		Work: &workerInput{
+			Title:        "Worker task",
+			Repo:         "acme/looper",
+			Reproduction: &reproducer.Manifest{TestCommand: "go test ./..."},
+		},
+		ClaimedLockKey: "worker:loop_worker_1",
+		Worktree:       &checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/test"},
+		Plan:           &checkpointPlan{Summary: "plan"},
+		Execution:      &checkpointExecution{Status: "completed", Summary: "upstream server_error"},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_repro_gate",
+		LoopID:            "loop_worker_1",
+		Status:            "failed",
+		CurrentStep:       runpipe.StringPtr(string(stepValidate)),
+		LastCompletedStep: runpipe.StringPtr(string(stepExecute)),
+		CheckpointJSON:    &checkpointJSON,
+		AgentSnapshotJSON: &predecessorSnapshot,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if resumed.Run.AgentSnapshotJSON == nil {
+		t.Fatal("AgentSnapshotJSON = nil, want refreshed snapshot (retained reproduction test command enables the gate)")
+	}
+	parsed, err := config.ParseAgentSnapshot(*resumed.Run.AgentSnapshotJSON)
+	if err != nil {
+		t.Fatalf("ParseAgentSnapshot() error = %v", err)
+	}
+	if parsed.Vendor != string(config.AgentVendorCodex) {
+		t.Fatalf("refreshed Vendor = %q, want codex (current role vendor, refreshed because retained reproduction test command enables the gate)", parsed.Vendor)
+	}
+}
+
 func TestCreateRunContextPreservesAuthorSnapshotWhenResumingAfterExecute(t *testing.T) {
 	t.Parallel()
 

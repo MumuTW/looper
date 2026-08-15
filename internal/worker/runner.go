@@ -3902,7 +3902,20 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	// predecessor's changes. Gate the refresh on the retained execution
 	// state of the checkpoint the new run will actually carry.
 	replaysAgentStep := workflow.Reaches(startStep, stepExecute) && !executeStepAlreadyCompleted(resumedCheckpoint)
-	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot, len(r.validationCommandsForProject(loop.ProjectID)) > 0, replaysAgentStep)
+	// Derive the network-denial flag from the effective workerValidationCommands
+	// for the retained work checkpoint, not just the project-level commands. A
+	// project that opted out of base validation commands but whose checkpoint
+	// carries Work.Reproduction.TestCommand still appends that command in
+	// runExecuteStep and starts the agent with RestrictToolNetwork=true; using
+	// only validationCommandsForProject here would leave the sticky snapshot
+	// as if no validation gate applies, so a parked unsupported vendor cannot
+	// recover by switching the role to a vendor that can serve the gate.
+	retainedWork := workerInput{}
+	if resumedCheckpoint.Work != nil {
+		retainedWork = *resumedCheckpoint.Work
+	}
+	requireToolNetworkDenial := len(workerValidationCommands(r.validationCommandsForProject(loop.ProjectID), retainedWork)) > 0
+	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot, requireToolNetworkDenial, replaysAgentStep)
 	if err != nil {
 		return resumedRunContext{}, err
 	}
