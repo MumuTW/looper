@@ -2,6 +2,7 @@ package validationcmd
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,8 +16,43 @@ import (
 
 const permissionProfile = "looper-validation"
 
+// writeFakeGitTool installs an executable git stub reporting execPath for
+// --exec-path so tool-root resolution is deterministic across machines.
+func writeFakeGitTool(t *testing.T) (binary, execPath string) {
+	t.Helper()
+	toolDir := t.TempDir()
+	execPath = filepath.Join(t.TempDir(), "git-core")
+	if err := os.MkdirAll(execPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rawBinary := filepath.Join(toolDir, "git")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' %q\n", execPath)
+	if err := os.WriteFile(rawBinary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resolvedBinary, err := filepath.EvalSymlinks(rawBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedExecPath, err := filepath.EvalSymlinks(execPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolvedBinary, resolvedExecPath
+}
+
+// setDaemonPathWithSecret prepends a secret-bearing directory to PATH, the
+// arrangement issue #556 requires to stay unreadable.
+func setDaemonPathWithSecret(t *testing.T, toolDir string) string {
+	t.Helper()
+	secretDir := t.TempDir()
+	t.Setenv("PATH", secretDir+string(os.PathListSeparator)+toolDir)
+	return secretDir
+}
+
 func TestBuildPermissionProfileDeniesNetworkAndLimitsWrites(t *testing.T) {
-	t.Setenv("PATH", "/usr/bin:/opt/tools/bin")
+	gitBinary, gitExecPath := writeFakeGitTool(t)
+	secretDir := setDaemonPathWithSecret(t, filepath.Dir(gitBinary))
 	t.Setenv("GOMODCACHE", "/cache/go-mod")
 
 	profile := buildPermissionProfileForAccess("/workspace/repo", "/private/tmp/validation", permissionProfile, workspaceWritable)
@@ -25,18 +61,25 @@ func TestBuildPermissionProfileDeniesNetworkAndLimitsWrites(t *testing.T) {
 		`network = { enabled = false }`,
 		`":workspace_roots" = { "." = "write" }`,
 		`"/private/tmp/validation" = "write"`,
-		`"/usr/bin" = "read"`,
-		`"/opt/tools/bin" = "read"`,
+		strconv.Quote(gitBinary) + ` = "read"`,
+		strconv.Quote(gitExecPath) + ` = "read"`,
 		`"/cache/go-mod" = "read"`,
 	} {
 		if !strings.Contains(profile, want) {
 			t.Fatalf("profile = %q, missing %q", profile, want)
 		}
 	}
+	if secret := strconv.Quote(secretDir); strings.Contains(profile, secret) {
+		t.Fatalf("profile grants inherited PATH directory %s: %s", secret, profile)
+	}
+	if binDir := strconv.Quote(filepath.Dir(gitBinary)) + ` = "read"`; strings.Contains(profile, binDir) {
+		t.Fatalf("profile grants the tool bin directory instead of the resolved binary: %s", profile)
+	}
 }
 
 func TestBuildAssessmentPermissionProfileReadsWorkspaceAndWritesOnlyTempRoot(t *testing.T) {
-	t.Setenv("PATH", "/usr/bin:/opt/tools/bin")
+	gitBinary, _ := writeFakeGitTool(t)
+	secretDir := setDaemonPathWithSecret(t, filepath.Dir(gitBinary))
 
 	profile := buildPermissionProfileForAccess("/workspace/repo", "/private/tmp/assessment", "looper-assessment", workspaceReadOnly)
 	for _, want := range []string{
@@ -44,7 +87,7 @@ func TestBuildAssessmentPermissionProfileReadsWorkspaceAndWritesOnlyTempRoot(t *
 		`network = { enabled = false }`,
 		`":workspace_roots" = { "." = "read" }`,
 		`"/private/tmp/assessment" = "write"`,
-		`"/usr/bin" = "read"`,
+		strconv.Quote(gitBinary) + ` = "read"`,
 	} {
 		if !strings.Contains(profile, want) {
 			t.Fatalf("profile = %q, missing %q", profile, want)
@@ -52,6 +95,9 @@ func TestBuildAssessmentPermissionProfileReadsWorkspaceAndWritesOnlyTempRoot(t *
 	}
 	if strings.Contains(profile, `":workspace_roots" = { "." = "write" }`) {
 		t.Fatalf("assessment profile grants worktree writes: %q", profile)
+	}
+	if secret := strconv.Quote(secretDir); strings.Contains(profile, secret) {
+		t.Fatalf("assessment profile grants inherited PATH directory %s: %s", secret, profile)
 	}
 }
 
@@ -230,6 +276,116 @@ func TestLinkedWorktreeReadRootsExcludesCommonConfig(t *testing.T) {
 	}
 	if strings.Contains(profile, "secret-token") {
 		t.Fatalf("assessment profile embeds credential material: %s", profile)
+	}
+}
+
+// setupLinkedWorktreeWithWorktreeConfig creates a real linked worktree whose
+// per-worktree config records a credential helper, the exact arrangement
+// issue #556 requires to stay hidden from untrusted assessment.
+func setupLinkedWorktreeWithWorktreeConfig(t *testing.T) (worktree, gitDir string) {
+	t.Helper()
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	worktree = filepath.Join(root, "linked")
+	runGit := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-c", "user.name=Looper Test", "-c", "user.email=looper@example.invalid"}, args...)...)
+		cmd.Dir = dir
+		if output, runErr := cmd.CombinedOutput(); runErr != nil {
+			t.Fatalf("git %v: %v\n%s", args, runErr, output)
+		}
+	}
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(repo, "init")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(repo, "add", "README.md")
+	runGit(repo, "commit", "-m", "initial")
+	runGit(repo, "config", "extensions.worktreeConfig", "true")
+	runGit(repo, "worktree", "add", "-b", "linked-test", worktree)
+	runGit(worktree, "config", "--worktree", "credential.helper", "/usr/local/bin/leak-helper")
+
+	data, err := os.ReadFile(filepath.Join(worktree, ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := strings.TrimSpace(string(data))
+	gitDir = strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(worktree, gitDir)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Clean(gitDir), "config.worktree")); err != nil {
+		t.Fatalf("setup did not create config.worktree: %v", err)
+	}
+	return worktree, gitDir
+}
+
+func TestLinkedWorktreeReadRootsOmitPrivateGitDirAndWorktreeConfig(t *testing.T) {
+	worktree, gitDir := setupLinkedWorktreeWithWorktreeConfig(t)
+	gitDir = resolvedToolPath(gitDir)
+	configWorktree := resolvedToolPath(filepath.Join(gitDir, "config.worktree"))
+
+	roots := linkedWorktreeReadRoots(worktree)
+	if len(roots) == 0 {
+		t.Fatal("linkedWorktreeReadRoots() returned no roots for a real linked worktree")
+	}
+	for _, root := range roots {
+		if samePath(root, gitDir) {
+			t.Fatalf("linkedWorktreeReadRoots() grants the whole private git dir %q: %q", gitDir, roots)
+		}
+		if samePath(root, configWorktree) {
+			t.Fatalf("linkedWorktreeReadRoots() grants config.worktree: %q", roots)
+		}
+	}
+	for _, required := range []string{"HEAD", "commondir", "gitdir", "index"} {
+		found := false
+		for _, root := range roots {
+			if samePath(root, filepath.Join(gitDir, required)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("linkedWorktreeReadRoots() missing %s root required for read-only inspection: %q", required, roots)
+		}
+	}
+
+	profile := buildPermissionProfileForAccess(worktree, filepath.Join(t.TempDir(), "assessment"), "looper-assessment", workspaceReadOnly)
+	for _, forbidden := range []string{
+		strconv.Quote(gitDir) + ` = "read"`,
+		strconv.Quote(configWorktree) + ` = "read"`,
+		"leak-helper",
+	} {
+		if strings.Contains(profile, forbidden) {
+			t.Fatalf("assessment profile grants forbidden path %q: %s", forbidden, profile)
+		}
+	}
+}
+
+func TestRunDeniesWorktreeConfigAndDaemonPathSecrets(t *testing.T) {
+	requireSandboxRuntime(t)
+	worktree, gitDir := setupLinkedWorktreeWithWorktreeConfig(t)
+	configWorktree := filepath.Join(filepath.Clean(gitDir), "config.worktree")
+
+	secretDir := t.TempDir()
+	secret := filepath.Join(secretDir, "credentials")
+	if err := os.WriteFile(secret, []byte("token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", secretDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	result, err := Run(context.Background(), Options{
+		CWD: worktree,
+		Command: fmt.Sprintf(
+			`git status --porcelain >/dev/null && test ! -r %s && test ! -r %s`,
+			strconv.Quote(configWorktree), strconv.Quote(secret)),
+		Timeout: 60 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v; stdout=%q stderr=%q", err, result.Stdout, result.Stderr)
 	}
 }
 
