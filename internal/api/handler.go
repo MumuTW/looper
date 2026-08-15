@@ -3818,7 +3818,9 @@ func loopTargetKeyCompat(target domain.LoopTarget) string {
 	case domain.LoopTargetTypeIssue:
 		return fmt.Sprintf("issue:%s:%d", target.Repo, target.IssueNumber)
 	default:
-		return fmt.Sprintf("pull_request:%s:%d", target.Repo, target.PRNumber)
+		// Canonical casing shared with runtime PR guard keys: the same PR
+		// spelled two ways is one worktree target (ListByRepoAndPR is NOCASE).
+		return looperdruntime.PullRequestTargetKey(target.Repo, target.PRNumber)
 	}
 }
 
@@ -3865,7 +3867,7 @@ func loopTargetKeyFromRecordCompat(loop storage.LoopRecord) string {
 		if loop.Repo == nil || loop.PRNumber == nil {
 			return "pull_request:"
 		}
-		return fmt.Sprintf("pull_request:%s:%d", *loop.Repo, *loop.PRNumber)
+		return looperdruntime.PullRequestTargetKey(*loop.Repo, *loop.PRNumber)
 	}
 }
 
