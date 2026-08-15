@@ -364,10 +364,15 @@ func (r *Runner) applyRoutingLabelPlan(ctx context.Context, report Report, plan 
 			return fmt.Errorf("remove stale %s label: %w", labels.NeedsHumanReview, err)
 		}
 	case plan.needsHumanReview:
+		// Attempt the status revocation first, but never let its failure block
+		// the label retirement below: during a status-API outage the route must
+		// still lose its queue trigger and gain the durable veto, or the
+		// supposedly retired pull request keeps both its route and the stale
+		// success until the API recovers. The revocation error is returned after
+		// the label mutations so the status is retried on the next pass.
+		var revokeErr error
 		if plan.revokeGateStatus {
-			if err := r.revokeGatekeeperStatus(ctx, report); err != nil {
-				return fmt.Errorf("revoke successful Gatekeeper status before queue veto: %w", err)
-			}
+			revokeErr = r.revokeGatekeeperStatus(ctx, report)
 		}
 		// Add the durable queue veto before removing the trigger. If the second
 		// mutation fails, the accepted queue entry remains blocked rather than
@@ -383,7 +388,13 @@ func (r *Runner) applyRoutingLabelPlan(ctx context.Context, report Report, plan 
 			return fmt.Errorf("add %s label: %w", labels.NeedsHumanReview, err)
 		}
 		if err := r.github.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Labels: []string{labels.AutoMerge}}); err != nil {
+			if revokeErr != nil {
+				return fmt.Errorf("revoke successful Gatekeeper status before queue veto: %w (remove stale %s label: %v)", revokeErr, labels.AutoMerge, err)
+			}
 			return fmt.Errorf("remove stale %s label: %w", labels.AutoMerge, err)
+		}
+		if revokeErr != nil {
+			return fmt.Errorf("revoke successful Gatekeeper status before queue veto: %w", revokeErr)
 		}
 	default:
 		// Mechanical blockers and observe demotions intentionally leave no

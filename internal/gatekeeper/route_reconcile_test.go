@@ -393,14 +393,11 @@ func TestRevokeProjectRoutesRetiresCrashPendingRoute(t *testing.T) {
 	if !foundAutoRemoval {
 		t.Fatalf("label removals = %#v, want crash-pending auto-merge route retired", fixture.github.labelRemoves)
 	}
-	// The crash boundary writes the success status before the label mutation,
-	// so recovery must withdraw the possibly published head-bound success. A
-	// failure status can only block the queue, never authorize one.
-	if len(fixture.github.commitStatuses) != 1 {
-		t.Fatalf("commit statuses = %#v, want the possibly published success revoked once", fixture.github.commitStatuses)
-	}
-	if status := fixture.github.commitStatuses[0]; status.State != "failure" || status.Context != RequiredStatusContext || status.SHA != "head-1" {
-		t.Fatalf("revoked status = %+v, want Gatekeeper failure on head-1", status)
+	// Out-of-page retirement is label-only: the commit status is commit-wide,
+	// so revoking it here would poison a still-eligible sibling sharing the
+	// head. The durable needs-human-review veto blocks this PR on its own.
+	if len(fixture.github.commitStatuses) != 0 {
+		t.Fatalf("commit statuses = %#v, want label-only out-of-page retirement", fixture.github.commitStatuses)
 	}
 	reports, err := latestGateReports(context.Background(), fixture.repos, "project_1")
 	if err != nil {
@@ -411,53 +408,11 @@ func TestRevokeProjectRoutesRetiresCrashPendingRoute(t *testing.T) {
 	}
 }
 
-func TestRetireRoutingLabelsForReportRevokesSuccessStatus(t *testing.T) {
-	fixture := newGatekeeperFixture(t)
-	runner := trustRunner(fixture, config.GatekeeperTrustAuto)
-	established := true
-	report := Report{
-		Version: reportVersion, Mode: string(config.GatekeeperTrustAuto), Eligible: true,
-		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42,
-		ObservedHeadSHA: "head-1", RouteEstablished: &established,
-		Evidence: Evidence{PullRequestState: "OPEN", FinalObservedHeadSHA: "head-1"},
-	}
-	seedGateReport(t, fixture, report)
-
-	if err := runner.retireRoutingLabelsForReport(context.Background(), report); err != nil {
-		t.Fatalf("retireRoutingLabelsForReport() error = %v", err)
-	}
-	if len(fixture.github.commitStatuses) != 1 {
-		t.Fatalf("commit statuses = %#v, want the stale success revoked", fixture.github.commitStatuses)
-	}
-	if status := fixture.github.commitStatuses[0]; status.State != "failure" || status.Context != RequiredStatusContext || status.SHA != "head-1" {
-		t.Fatalf("revoked status = %+v, want Gatekeeper failure on the unchanged head", status)
-	}
-	if len(fixture.github.labelAdds) == 0 || !slices.Equal(fixture.github.labelAdds[len(fixture.github.labelAdds)-1].Labels, []string{labels.NeedsHumanReview}) {
-		t.Fatalf("label adds = %#v, want durable needs-human-review veto", fixture.github.labelAdds)
-	}
-}
-
-func TestRetireRoutingLabelsForReportWithoutHeadSkipsStatus(t *testing.T) {
-	fixture := newGatekeeperFixture(t)
-	runner := trustRunner(fixture, config.GatekeeperTrustAuto)
-	established := true
-	report := Report{
-		Version: reportVersion, Mode: string(config.GatekeeperTrustAuto), Eligible: true,
-		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42,
-		RouteEstablished: &established,
-		Evidence:         Evidence{PullRequestState: "OPEN"},
-	}
-	seedGateReport(t, fixture, report)
-
-	if err := runner.retireRoutingLabelsForReport(context.Background(), report); err != nil {
-		t.Fatalf("retireRoutingLabelsForReport() error = %v, want label-only retirement for a headless legacy report", err)
-	}
-	if len(fixture.github.commitStatuses) != 0 {
-		t.Fatalf("commit statuses = %#v, want no status call without a head", fixture.github.commitStatuses)
-	}
-}
-
-func TestRetireRoutingLabelsForReportFailsClosedOnStatusError(t *testing.T) {
+// The label retirement is the merge-blocking authority; a commit-status API
+// outage must not keep a retired route alive. When the in-page plan asks for a
+// status revocation that fails, the veto label is still added and the trigger
+// removed, and the error is returned so the revocation is retried later.
+func TestRoutingLabelRetirementSurvivesStatusRevocationFailure(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	fixture.github.statusErr = errors.New("status api unavailable")
 	runner := trustRunner(fixture, config.GatekeeperTrustAuto)
@@ -470,8 +425,21 @@ func TestRetireRoutingLabelsForReportFailsClosedOnStatusError(t *testing.T) {
 	}
 	seedGateReport(t, fixture, report)
 
-	if err := runner.retireRoutingLabelsForReport(context.Background(), report); err == nil {
-		t.Fatal("retireRoutingLabelsForReport() succeeded with the status API failing, want fail-closed error so the route retries")
+	err := runner.applyRoutingLabelPlan(context.Background(), report, routingLabelPlan{needsHumanReview: true, revokeGateStatus: true})
+	if err == nil {
+		t.Fatal("applyRoutingLabelPlan() succeeded with the status API failing, want the revocation error returned for retry")
+	}
+	if len(fixture.github.labelAdds) == 0 || !slices.Equal(fixture.github.labelAdds[len(fixture.github.labelAdds)-1].Labels, []string{labels.NeedsHumanReview}) {
+		t.Fatalf("label adds = %#v, want the durable veto applied despite the status outage", fixture.github.labelAdds)
+	}
+	foundAutoRemoval := false
+	for _, removal := range fixture.github.labelRemoves {
+		if slices.Equal(removal.Labels, []string{labels.AutoMerge}) {
+			foundAutoRemoval = true
+		}
+	}
+	if !foundAutoRemoval {
+		t.Fatalf("label removals = %#v, want the queue trigger removed despite the status outage", fixture.github.labelRemoves)
 	}
 }
 
