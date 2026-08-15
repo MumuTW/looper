@@ -76,8 +76,11 @@ func TestEvaluatePullRequestUsesNewestReviewerLoopMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvaluatePullRequest() error = %v", err)
 	}
-	if !report.Eligible || report.Evidence.ReviewerConvergence != nil || hasReason(report, ReasonReviewerConvergence) {
-		t.Fatalf("report = %#v, want newer metadata to replace stale blocker", report)
+	// A newer Reviewer loop without convergence metadata is pending, not a
+	// signal to drop the gate. The PR must stay blocked until the new loop
+	// records its first convergence state.
+	if report.Eligible || !hasReason(report, ReasonReviewerConvergence) {
+		t.Fatalf("report = %#v, want blocked (newer loop without metadata is pending)", report)
 	}
 }
 
@@ -165,6 +168,46 @@ func TestEvaluatePullRequestConvergesForMatchingReviewedHead(t *testing.T) {
 	}
 	if !report.Eligible || hasReason(report, ReasonReviewerConvergence) {
 		t.Fatalf("report = %#v, want eligible for the reviewed head", report)
+	}
+}
+
+// A Reviewer loop that has been queued but has not started has no convergence
+// metadata at all (ensureLoopMetadataJSON / snapshotConvergencePolicy run from
+// run-start). Gatekeeper must treat this as pending and block, including a
+// confirming auto pass, so the PR cannot merge before the Reviewer executes.
+func TestEvaluatePullRequestBlocksQueuedReviewerWithoutConvergenceMetadata(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	seedReviewerLoopWithoutMetadata(t, fixture, 1)
+
+	report, err := fixture.autoRunner().EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !hasReason(report, ReasonReviewerConvergence) {
+		t.Fatalf("report = %#v, want convergence blocker for queued Reviewer without metadata", report)
+	}
+	if report.Evidence.ReviewerConvergence == nil {
+		t.Fatal("report has no reviewer convergence evidence for queued loop")
+	}
+	if report.Evidence.ReviewerConvergence.Action != "" {
+		t.Fatalf("convergence evidence = %#v, want empty action (no authoritative decision yet)", report.Evidence.ReviewerConvergence)
+	}
+}
+
+func seedReviewerLoopWithoutMetadata(t *testing.T, fixture *gatekeeperFixture, seq int64) {
+	t.Helper()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	targetID := "acme/looper#42"
+	nowISO := fixture.now.Format("2006-01-02T15:04:05.999999999Z07:00")
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: "reviewer-loop-queued", Seq: seq, ProjectID: "project_1", Type: string(domain.LoopTypeReviewer),
+		TargetType: string(domain.LoopTargetTypePullRequest), TargetID: &targetID, Repo: &repo, PRNumber: &prNumber,
+		Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 }
 

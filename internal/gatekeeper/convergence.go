@@ -49,8 +49,10 @@ type reviewerConvergenceMetadata struct {
 
 // latestReviewerConvergence reads only the newest Reviewer loop for this
 // project/repository/pull request. A newer loop without valid convergence
-// metadata deliberately hides older metadata rather than letting stale state
-// block a new review. Missing or malformed legacy metadata is not inferred.
+// metadata is treated as pending rather than hiding older metadata: a
+// Reviewer loop that has been queued but has not yet started has no
+// convergence object, and treating that as "no convergence gate" lets auto
+// mode merge before the pending Reviewer executes.
 //
 // observedHeadSHA binds the persisted convergence decision to the head
 // Gatekeeper is evaluating: the Reviewer's state is authoritative only for the
@@ -70,7 +72,13 @@ func latestReviewerConvergence(ctx context.Context, repos *storage.Repositories,
 		}
 		evidence, ok := reviewerConvergenceFromLoop(loop)
 		if !ok {
-			return ReviewerConvergenceEvidence{}, false, nil
+			// The newest Reviewer loop has no valid convergence metadata. This
+			// is the queued-but-not-started state: the loop exists but
+			// ensureLoopMetadataJSON / snapshotConvergencePolicy have not yet
+			// run. Treat it as pending so the gate fails closed instead of
+			// letting auto mode merge before the Reviewer executes.
+			evidence.HeadStale = observedHeadSHA != ""
+			return evidence, true, nil
 		}
 		evidence.HeadStale = evidence.ReviewedHeadSHA != observedHeadSHA
 		return evidence, true, nil
@@ -214,8 +222,10 @@ func convergenceRevision(evidence ReviewerConvergenceEvidence) string {
 // latestConvergenceRevisions returns the current convergence revision per pull
 // request for one project in a single local query, so the unchanged path can
 // detect Reviewer progress without re-polling the forge. A pull request whose
-// newest reviewer loop has no valid convergence metadata is absent from the
-// map, matching latestReviewerConvergence's hide-stale-on-newer-loop rule.
+// newest reviewer loop has no valid convergence metadata gets a pending
+// revision, matching latestReviewerConvergence's treat-queued-as-pending rule:
+// the unchanged path must re-evaluate rather than skip while the Reviewer is
+// queued but has not started.
 func latestConvergenceRevisions(ctx context.Context, repos *storage.Repositories, projectID string) (map[string]string, error) {
 	if repos == nil || repos.Loops == nil {
 		return nil, nil
@@ -227,8 +237,9 @@ func latestConvergenceRevisions(ctx context.Context, repos *storage.Repositories
 	revisions := make(map[string]string)
 	seen := make(map[string]bool)
 	// ListFiltered orders by updated_at DESC, seq DESC, so the first reviewer
-	// loop for an entity is its newest; a newer loop without valid convergence
-	// metadata hides older metadata rather than falling back to it.
+	// loop for an entity is its newest. A newer loop without valid convergence
+	// metadata is pending (queued but not started), not a signal to drop the
+	// gate; its pending revision forces re-evaluation on the unchanged path.
 	for _, loop := range loops {
 		if loop.Type != string(domain.LoopTypeReviewer) || loop.Repo == nil || loop.PRNumber == nil {
 			continue
@@ -240,9 +251,17 @@ func latestConvergenceRevisions(ctx context.Context, repos *storage.Repositories
 		seen[entityID] = true
 		evidence, ok := reviewerConvergenceFromLoop(loop)
 		if !ok {
+			revisions[entityID] = pendingConvergenceRevision
 			continue
 		}
 		revisions[entityID] = convergenceRevision(evidence)
 	}
 	return revisions, nil
 }
+
+// pendingConvergenceRevision is the revision for a Reviewer loop that exists
+// but has no convergence metadata yet. It is deliberately distinct from the
+// empty string that convergenceRevision produces for a report with no
+// convergence evidence, so the unchanged path re-evaluates a queued Reviewer
+// instead of skipping it.
+const pendingConvergenceRevision = "\x00pending"
