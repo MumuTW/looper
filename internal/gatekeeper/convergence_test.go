@@ -68,7 +68,11 @@ func TestEvaluatePullRequestBlocksAwaitingHumanConvergence(t *testing.T) {
 func TestEvaluatePullRequestUsesNewestReviewerLoopMetadata(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	seedReviewerConvergenceLoop(t, fixture, `{"convergence":{"policy":{"maxConsecutiveUnproductive":3,"maxFixerAttemptsPerItem":4,"maxTotalRounds":40,"severityFloor":"non_blocking"},"state":{"totalRounds":3,"items":{"blocking-1":{"id":"blocking-1","severity":"blocking","status":"open"}}},"action":"escalate","reason":"stalled","status":"awaiting_human"}}`, 1)
-	seedReviewerConvergenceLoop(t, fixture, `{}`, 2)
+	// The newer loop is terminal without metadata: it can no longer deliver a
+	// decision, so its absence hides the stale blocker rather than blocking
+	// forever. An active newer loop (queued/running) is pending instead — see
+	// TestEvaluatePullRequestBlocksOnQueuedReviewerLoop.
+	seedReviewerLoopWithStatus(t, fixture, `{}`, 2, "failed")
 
 	report, err := fixture.runner().EvaluatePullRequest(context.Background(), EvaluationInput{
 		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
@@ -169,6 +173,10 @@ func TestEvaluatePullRequestConvergesForMatchingReviewedHead(t *testing.T) {
 }
 
 func seedReviewerConvergenceLoop(t *testing.T, fixture *gatekeeperFixture, metadata string, seq int64) {
+	seedReviewerLoopWithStatus(t, fixture, metadata, seq, "running")
+}
+
+func seedReviewerLoopWithStatus(t *testing.T, fixture *gatekeeperFixture, metadata string, seq int64, status string) {
 	t.Helper()
 	repo := "acme/looper"
 	prNumber := int64(42)
@@ -177,8 +185,81 @@ func seedReviewerConvergenceLoop(t *testing.T, fixture *gatekeeperFixture, metad
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{
 		ID: "reviewer-loop", Seq: seq, ProjectID: "project_1", Type: string(domain.LoopTypeReviewer),
 		TargetType: string(domain.LoopTargetTypePullRequest), TargetID: &targetID, Repo: &repo, PRNumber: &prNumber,
-		Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+		Status: status, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+}
+
+// A Reviewer loop queued for this PR that has not started running has no
+// convergence metadata yet; the review is pending, so the gate — including a
+// confirming auto pass — must block instead of merging before the Reviewer
+// executes.
+func TestEvaluatePullRequestBlocksOnQueuedReviewerLoop(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	seedReviewerLoopWithStatus(t, fixture, `{}`, 1, "queued")
+
+	report, err := fixture.runner().EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1", Confirming: true,
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !hasReason(report, ReasonReviewerConvergence) {
+		t.Fatalf("report = %#v, want pending reviewer loop to block the confirming pass", report)
+	}
+	if report.Evidence.ReviewerConvergence == nil || !report.Evidence.ReviewerConvergence.PendingStart {
+		t.Fatalf("convergence evidence = %#v, want synthesized pending-start evidence", report.Evidence.ReviewerConvergence)
+	}
+	for _, reason := range report.Reasons {
+		if reason.Code == ReasonReviewerConvergence && reason.Subject != "loop_pending_start" {
+			t.Fatalf("convergence subject = %q, want loop_pending_start", reason.Subject)
+		}
+	}
+}
+
+// A terminal reviewer loop that never wrote convergence metadata hides older
+// metadata (hide-stale rule) and produces no block: it can no longer deliver a
+// decision, and a pending block would never resolve.
+func TestEvaluatePullRequestTerminalReviewerLoopWithoutMetadataDoesNotBlock(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	seedReviewerLoopWithStatus(t, fixture, `{}`, 1, "failed")
+
+	report, err := fixture.runner().EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if !report.Eligible || hasReason(report, ReasonReviewerConvergence) {
+		t.Fatalf("report = %#v, want terminal loop without metadata to hide stale state without blocking", report)
+	}
+}
+
+// The unchanged path must reuse a pending-start report while the reviewer
+// stays queued, then re-evaluate as soon as the loop writes its first decision.
+func TestConvergenceRevisionsTreatQueuedLoopAsPending(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	seedReviewerLoopWithStatus(t, fixture, `{}`, 1, "queued")
+
+	revisions, err := latestConvergenceRevisions(context.Background(), fixture.repos, "project_1")
+	if err != nil {
+		t.Fatalf("latestConvergenceRevisions() error = %v", err)
+	}
+	pending, ok := revisions["acme/looper#42"]
+	if !ok {
+		t.Fatal("queued reviewer loop absent from convergence revisions, want pending revision")
+	}
+	if pending != convergenceRevision(ReviewerConvergenceEvidence{PendingStart: true}) {
+		t.Fatalf("pending revision = %q, want synthesized pending revision", pending)
+	}
+
+	seedReviewerConvergenceLoop(t, fixture, `{"convergence":{"policy":{"maxConsecutiveUnproductive":3,"maxFixerAttemptsPerItem":4,"maxTotalRounds":40,"severityFloor":"blocking"},"state":{"totalRounds":1},"action":"complete","reason":"severity_floor_reached","status":"completed"},"loop":{"lastReviewedHeadSha":"head-1"}}`, 1)
+	revisions, err = latestConvergenceRevisions(context.Background(), fixture.repos, "project_1")
+	if err != nil {
+		t.Fatalf("latestConvergenceRevisions() after start error = %v", err)
+	}
+	if revisions["acme/looper#42"] == pending {
+		t.Fatal("first persisted convergence decision did not change the revision, want unchanged-path invalidation")
 	}
 }
