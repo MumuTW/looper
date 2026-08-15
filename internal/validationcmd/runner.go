@@ -169,10 +169,8 @@ func validationToolEnvironment() (processsandbox.ToolEnvironment, []string) {
 
 func validationReadRoots(cwd string) []string {
 	roots := map[string]struct{}{filepath.Clean(cwd): {}}
-	for _, entry := range filepath.SplitList(os.Getenv("PATH")) {
-		if entry = strings.TrimSpace(entry); entry != "" {
-			roots[filepath.Clean(entry)] = struct{}{}
-		}
+	for _, root := range resolvedToolReadRoots() {
+		roots[root] = struct{}{}
 	}
 	if moduleCache := resolvedModuleCache(); moduleCache != "" {
 		roots[filepath.Clean(moduleCache)] = struct{}{}
@@ -191,6 +189,27 @@ func validationReadRoots(cwd string) []string {
 	return result
 }
 
+// resolvedToolReadRoots returns the containing directories of required tool
+// binaries (git, gh) resolved via exec.LookPath, instead of allowlisting every
+// inherited PATH directory. A PATH entry such as $HOME/bin may contain
+// secret-bearing files unrelated to the resolved tool installations that
+// validation actually needs.
+func resolvedToolReadRoots() []string {
+	var roots []string
+	for _, name := range []string{"git", "gh"} {
+		binary, err := exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(binary)
+		if err != nil {
+			resolved = binary
+		}
+		roots = append(roots, filepath.Dir(resolved))
+	}
+	return roots
+}
+
 func resolvedModuleCache() string {
 	if moduleCache := strings.TrimSpace(os.Getenv("GOMODCACHE")); moduleCache != "" {
 		return moduleCache
@@ -202,11 +221,8 @@ func resolvedModuleCache() string {
 
 func buildPermissionProfileForAccess(cwd, tempRoot, profileName string, access workspaceAccess) string {
 	readRoots := map[string]struct{}{}
-	for _, entry := range filepath.SplitList(os.Getenv("PATH")) {
-		entry = strings.TrimSpace(entry)
-		if entry != "" {
-			readRoots[filepath.Clean(entry)] = struct{}{}
-		}
+	for _, root := range resolvedToolReadRoots() {
+		readRoots[root] = struct{}{}
 	}
 	moduleCache := strings.TrimSpace(os.Getenv("GOMODCACHE"))
 	if moduleCache == "" {
@@ -301,11 +317,22 @@ func linkedWorktreeReadRoots(cwd string) []string {
 	return assessmentSafeGitReadRoots(gitDir, commonDir)
 }
 
-// assessmentSafeGitReadRoots returns the private worktree git dir plus the
-// object/ref metadata under the common git dir, deliberately omitting config,
-// hooks, and other credential-bearing paths at the common root.
+// assessmentSafeGitReadRoots returns the specific private worktree git metadata
+// files plus the object/ref metadata under the common git dir, deliberately
+// omitting config, config.worktree, hooks, and other credential-bearing paths.
+// When extensions.worktreeConfig is enabled, the private git dir contains a
+// config.worktree file that can carry credential helpers and embedded remotes,
+// so the whole gitDir cannot be allowlisted.
 func assessmentSafeGitReadRoots(gitDir, commonDir string) []string {
-	roots := []string{gitDir}
+	var roots []string
+	// Enumerate the private worktree git dir files required for read-only
+	// inspection (status, log, diff). config.worktree and hooks are excluded.
+	for _, name := range []string{"HEAD", "commondir", "gitdir", "index", "logs", "ORIG_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "FETCH_HEAD", "AUTO_MERGE", "BISECT_LOG"} {
+		path := filepath.Join(gitDir, name)
+		if _, err := os.Stat(path); err == nil {
+			roots = append(roots, path)
+		}
+	}
 	for _, name := range []string{"objects", "refs", "info", "logs", "packed-refs", "HEAD", "shallow"} {
 		path := filepath.Join(commonDir, name)
 		if _, err := os.Stat(path); err == nil {

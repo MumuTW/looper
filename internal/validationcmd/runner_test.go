@@ -16,7 +16,6 @@ import (
 const permissionProfile = "looper-validation"
 
 func TestBuildPermissionProfileDeniesNetworkAndLimitsWrites(t *testing.T) {
-	t.Setenv("PATH", "/usr/bin:/opt/tools/bin")
 	t.Setenv("GOMODCACHE", "/cache/go-mod")
 
 	profile := buildPermissionProfileForAccess("/workspace/repo", "/private/tmp/validation", permissionProfile, workspaceWritable)
@@ -25,8 +24,6 @@ func TestBuildPermissionProfileDeniesNetworkAndLimitsWrites(t *testing.T) {
 		`network = { enabled = false }`,
 		`":workspace_roots" = { "." = "write" }`,
 		`"/private/tmp/validation" = "write"`,
-		`"/usr/bin" = "read"`,
-		`"/opt/tools/bin" = "read"`,
 		`"/cache/go-mod" = "read"`,
 	} {
 		if !strings.Contains(profile, want) {
@@ -36,15 +33,12 @@ func TestBuildPermissionProfileDeniesNetworkAndLimitsWrites(t *testing.T) {
 }
 
 func TestBuildAssessmentPermissionProfileReadsWorkspaceAndWritesOnlyTempRoot(t *testing.T) {
-	t.Setenv("PATH", "/usr/bin:/opt/tools/bin")
-
 	profile := buildPermissionProfileForAccess("/workspace/repo", "/private/tmp/assessment", "looper-assessment", workspaceReadOnly)
 	for _, want := range []string{
 		`permissions.looper-assessment=`,
 		`network = { enabled = false }`,
 		`":workspace_roots" = { "." = "read" }`,
 		`"/private/tmp/assessment" = "write"`,
-		`"/usr/bin" = "read"`,
 	} {
 		if !strings.Contains(profile, want) {
 			t.Fatalf("profile = %q, missing %q", profile, want)
@@ -230,6 +224,108 @@ func TestLinkedWorktreeReadRootsExcludesCommonConfig(t *testing.T) {
 	}
 	if strings.Contains(profile, "secret-token") {
 		t.Fatalf("assessment profile embeds credential material: %s", profile)
+	}
+}
+
+func TestResolvedToolReadRootsDoesNotAllowlistPathDirectories(t *testing.T) {
+	secretDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(secretDir, "secret.txt"), []byte("credential"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", secretDir)
+
+	for _, root := range resolvedToolReadRoots() {
+		resolved := root
+		if r, err := filepath.EvalSymlinks(root); err == nil {
+			resolved = r
+		}
+		if filepath.Clean(resolved) == filepath.Clean(secretDir) {
+			t.Fatalf("resolvedToolReadRoots() allowlisted PATH directory %q containing secrets: %v", secretDir, resolvedToolReadRoots())
+		}
+	}
+	profile := buildPermissionProfileForAccess("/workspace/repo", "/private/tmp/assessment", "looper-assessment", workspaceReadOnly)
+	if strings.Contains(profile, secretDir) {
+		t.Fatalf("assessment profile grants PATH directory %q: %s", secretDir, profile)
+	}
+}
+
+func TestAssessmentSafeGitReadRootsExcludesWorktreeConfig(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	worktree := filepath.Join(root, "linked")
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-c", "user.name=Looper Test", "-c", "user.email=looper@example.invalid"}, args...)...)
+		cmd.Dir = repo
+		if output, runErr := cmd.CombinedOutput(); runErr != nil {
+			t.Fatalf("git %v: %v\n%s", args, runErr, output)
+		}
+	}
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit("init")
+	runGit("config", "extensions.worktreeConfig", "true")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "README.md")
+	runGit("commit", "-m", "initial")
+	runGit("worktree", "add", "-b", "linked-test", worktree)
+
+	commonDir, err := filepath.EvalSymlinks(filepath.Join(repo, ".git"))
+	if err != nil {
+		commonDir = filepath.Clean(filepath.Join(repo, ".git"))
+	}
+	// Resolve the worktree's private git dir.
+	worktreeGitFile := filepath.Join(worktree, ".git")
+	data, err := os.ReadFile(worktreeGitFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitDir := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(data)), "gitdir:"))
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(worktree, gitDir)
+	}
+	gitDir = filepath.Clean(gitDir)
+
+	// Place a credential helper path in config.worktree.
+	worktreeConfig := filepath.Join(gitDir, "config.worktree")
+	if err := os.WriteFile(worktreeConfig, []byte("[credential]\n\thelper = /home/user/secret-helper\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	roots := linkedWorktreeReadRoots(worktree)
+	if len(roots) == 0 {
+		t.Fatal("linkedWorktreeReadRoots() returned no roots for a real linked worktree")
+	}
+	for _, rootPath := range roots {
+		resolved := rootPath
+		if r, err := filepath.EvalSymlinks(rootPath); err == nil {
+			resolved = r
+		}
+		if filepath.Clean(resolved) == filepath.Clean(gitDir) {
+			t.Fatalf("assessmentSafeGitReadRoots() allowlisted full gitDir %q (exposes config.worktree): %q", gitDir, roots)
+		}
+		if filepath.Clean(resolved) == filepath.Clean(worktreeConfig) {
+			t.Fatalf("assessmentSafeGitReadRoots() allowlisted config.worktree: %q", roots)
+		}
+		if filepath.Clean(resolved) == filepath.Clean(commonDir) {
+			t.Fatalf("assessmentSafeGitReadRoots() allowlisted full commonDir %q: %q", commonDir, roots)
+		}
+	}
+
+	// Verify the profile does not embed the credential helper or config.worktree path.
+	profile := buildPermissionProfileForAccess(worktree, filepath.Join(t.TempDir(), "assessment"), "looper-assessment", workspaceReadOnly)
+	quotedGitDir := strconv.Quote(gitDir)
+	if strings.Contains(profile, quotedGitDir+` = "read"`) {
+		t.Fatalf("assessment profile grants full gitDir %s: %s", quotedGitDir, profile)
+	}
+	if strings.Contains(profile, "secret-helper") {
+		t.Fatalf("assessment profile embeds credential material: %s", profile)
+	}
+	if strings.Contains(profile, "config.worktree") {
+		t.Fatalf("assessment profile references config.worktree: %s", profile)
 	}
 }
 
