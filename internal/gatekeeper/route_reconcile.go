@@ -311,7 +311,18 @@ func (r *Runner) retireRoutingLabelsForReport(ctx context.Context, report Report
 	// already inside the Mergify queue is dequeued rather than left satisfying
 	// the queue rule on stale authority. Label mutations need no pull-request
 	// head authority: removing a stale route can never authorize a merge.
-	return r.applyRoutingLabelPlan(ctx, report, routingLabelPlan{needsHumanReview: true})
+	plan := routingLabelPlan{needsHumanReview: true}
+	// These out-of-page retirements never re-enter the normal evaluation that
+	// would otherwise replace the success status, so an unchanged head would
+	// keep its stale `Looper Gatekeeper` success forever while the route is
+	// retired only by labels. The success status is written before the label
+	// mutation, so both a published and a crash-pending route may carry one;
+	// withdraw it with the route. A legacy report without a head cannot have
+	// published a head-bound status, so it retires labels only.
+	if strings.TrimSpace(report.Evidence.FinalObservedHeadSHA) != "" || strings.TrimSpace(report.ObservedHeadSHA) != "" {
+		plan.revokeGateStatus = true
+	}
+	return r.applyRoutingLabelPlan(ctx, report, plan)
 }
 
 func (r *Runner) clearRoutingLabelsForReport(ctx context.Context, report Report) error {
