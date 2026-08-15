@@ -17,7 +17,9 @@ import (
 const permissionProfile = "looper-validation"
 
 // writeFakeGitTool installs an executable git stub reporting execPath for
-// --exec-path so tool-root resolution is deterministic across machines.
+// --exec-path so tool-root resolution is deterministic across machines. Like
+// real git, an inherited GIT_EXEC_PATH wins, so tests can prove the probe
+// environment drops operator overrides.
 func writeFakeGitTool(t *testing.T) (binary, execPath string) {
 	t.Helper()
 	toolDir := t.TempDir()
@@ -26,7 +28,7 @@ func writeFakeGitTool(t *testing.T) (binary, execPath string) {
 		t.Fatal(err)
 	}
 	rawBinary := filepath.Join(toolDir, "git")
-	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' %q\n", execPath)
+	script := fmt.Sprintf("#!/bin/sh\nif [ -n \"$GIT_EXEC_PATH\" ]; then printf '%%s\\n' \"$GIT_EXEC_PATH\"; exit 0; fi\nprintf '%%s\\n' %q\n", execPath)
 	if err := os.WriteFile(rawBinary, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -39,6 +41,50 @@ func writeFakeGitTool(t *testing.T) (binary, execPath string) {
 		t.Fatal(err)
 	}
 	return resolvedBinary, resolvedExecPath
+}
+
+func TestResolvedGitToolRootsIgnoreInheritedExecPathOverride(t *testing.T) {
+	gitBinary, gitExecPath := writeFakeGitTool(t)
+	secretDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(secretDir, "git-core"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_EXEC_PATH", filepath.Join(secretDir, "git-core"))
+	setDaemonPathWithSecret(t, filepath.Dir(gitBinary))
+
+	profile := buildPermissionProfileForAccess("/workspace/repo", "/private/tmp/assessment", "looper-assessment", workspaceReadOnly)
+	if !strings.Contains(profile, strconv.Quote(gitExecPath)+` = "read"`) {
+		t.Fatalf("profile missing installation-default exec-path %q: %s", gitExecPath, profile)
+	}
+	if strings.Contains(profile, strconv.Quote(secretDir)) {
+		t.Fatalf("profile grants the inherited GIT_EXEC_PATH directory %q: %s", secretDir, profile)
+	}
+}
+
+func TestResolvedGitToolRootsBoundHangingProbe(t *testing.T) {
+	toolDir := t.TempDir()
+	rawBinary := filepath.Join(toolDir, "git")
+	if err := os.WriteFile(rawBinary, []byte("#!/bin/sh\nsleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(rawBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setDaemonPathWithSecret(t, toolDir)
+
+	previous := toolProbeTimeout
+	toolProbeTimeout = 250 * time.Millisecond
+	defer func() { toolProbeTimeout = previous }()
+
+	started := time.Now()
+	roots := resolvedGitToolRoots()
+	if len(roots) != 1 || roots[0] != resolved {
+		t.Fatalf("resolvedGitToolRoots() = %q, want only the resolved binary after the probe times out", roots)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("hanging --exec-path probe stalled root resolution for %s", elapsed)
+	}
 }
 
 // setDaemonPathWithSecret prepends a secret-bearing directory to PATH, the
@@ -307,6 +353,9 @@ func setupLinkedWorktreeWithWorktreeConfig(t *testing.T) (worktree, gitDir strin
 	runGit(repo, "config", "extensions.worktreeConfig", "true")
 	runGit(repo, "worktree", "add", "-b", "linked-test", worktree)
 	runGit(worktree, "config", "--worktree", "credential.helper", "/usr/local/bin/leak-helper")
+	// Split index keeps only the pointer in <gitDir>/index; the shared backing
+	// file must be granted or even git status exits fatally.
+	runGit(worktree, "update-index", "--split-index")
 
 	data, err := os.ReadFile(filepath.Join(worktree, ".git"))
 	if err != nil {
@@ -351,6 +400,16 @@ func TestLinkedWorktreeReadRootsOmitPrivateGitDirAndWorktreeConfig(t *testing.T)
 		if !found {
 			t.Fatalf("linkedWorktreeReadRoots() missing %s root required for read-only inspection: %q", required, roots)
 		}
+	}
+	sharedIndex := false
+	for _, root := range roots {
+		if strings.HasPrefix(filepath.Base(resolvedToolPath(root)), "sharedindex.") {
+			sharedIndex = true
+			break
+		}
+	}
+	if !sharedIndex {
+		t.Fatalf("linkedWorktreeReadRoots() missing the split-index backing file root: %q", roots)
 	}
 
 	profile := buildPermissionProfileForAccess(worktree, filepath.Join(t.TempDir(), "assessment"), "looper-assessment", workspaceReadOnly)

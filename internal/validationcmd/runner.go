@@ -253,6 +253,41 @@ func resolvedGoRoot() string {
 	return filepath.Dir(filepath.Dir(resolved))
 }
 
+// toolProbeTimeout bounds synchronous tool probes: they run before the
+// sandboxed process starts, so agent and validation timeouts cannot interrupt
+// a hung wrapper. On expiry the probe's grant is skipped, never the whole run.
+var toolProbeTimeout = 5 * time.Second
+
+// probeEnvironment drops environment overrides that would make git or
+// xcode-select report operator-controlled paths (GIT_EXEC_PATH, DEVELOPER_DIR),
+// so grants follow the resolved installation, not inherited environment.
+func probeEnvironment() []string {
+	env := os.Environ()
+	filtered := make([]string, 0, len(env))
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "GIT_EXEC_PATH=") || strings.HasPrefix(entry, "DEVELOPER_DIR=") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
+func probeOutput(command string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), toolProbeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, command, args...)
+	cmd.Env = probeEnvironment()
+	output, err := cmd.Output()
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
 // resolvedGitToolRoots grants only the git installation sandboxed repository
 // inspection resolves to: the binary itself, its exec-path helper directory,
 // and, for darwin's stock stub, the developer-directory binary the stub execs.
@@ -268,8 +303,8 @@ func resolvedGitToolRoots() []string {
 		return nil
 	}
 	roots := []string{resolved}
-	if output, execErr := exec.Command(resolved, "--exec-path").Output(); execErr == nil {
-		if execPath := resolvedToolPath(strings.TrimSpace(string(output))); execPath != "" {
+	if output, execErr := probeOutput(resolved, "--exec-path"); execErr == nil {
+		if execPath := resolvedToolPath(output); execPath != "" {
 			if info, statErr := os.Stat(execPath); statErr == nil && info.IsDir() {
 				roots = append(roots, execPath)
 			}
@@ -285,15 +320,14 @@ func resolvedGitToolRoots() []string {
 }
 
 func developerDirGitBinary() string {
-	output, err := exec.Command("xcode-select", "-p").Output()
+	output, err := probeOutput("xcode-select", "-p")
 	if err != nil {
 		return ""
 	}
-	developerDir := strings.TrimSpace(string(output))
-	if developerDir == "" {
+	if output == "" {
 		return ""
 	}
-	candidate := filepath.Join(developerDir, "usr", "bin", "git")
+	candidate := filepath.Join(output, "usr", "bin", "git")
 	if info, statErr := os.Stat(candidate); statErr != nil || info.IsDir() {
 		return ""
 	}
@@ -380,6 +414,11 @@ func assessmentSafeGitReadRoots(gitDir, commonDir string) []string {
 		if _, err := os.Stat(path); err == nil {
 			roots = append(roots, path)
 		}
+	}
+	// Split-index backing files referenced by the per-worktree index; hiding
+	// them makes git status exit fatally in split-index worktrees.
+	if shared, globErr := filepath.Glob(filepath.Join(gitDir, "sharedindex.*")); globErr == nil {
+		roots = append(roots, shared...)
 	}
 	for _, name := range []string{"objects", "refs", "info", "logs", "packed-refs", "HEAD", "shallow"} {
 		path := filepath.Join(commonDir, name)
