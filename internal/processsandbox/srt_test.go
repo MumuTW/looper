@@ -117,6 +117,112 @@ func TestRunRejectsBroadReadRoot(t *testing.T) {
 	}
 }
 
+func symlinkedHome(t *testing.T) (linked, real string) {
+	t.Helper()
+	root := t.TempDir()
+	real = filepath.Join(root, "real-home")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linked = filepath.Join(root, "linked-home")
+	if err := os.Symlink(real, linked); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", linked)
+	return linked, real
+}
+
+func TestUnsafeAllowReadRootRejectsMissingProtectedRootsBehindSymlinkedHome(t *testing.T) {
+	linked, real := symlinkedHome(t)
+	for _, root := range []string{
+		filepath.Join(linked, ".config"),
+		filepath.Join(real, ".config"),
+		filepath.Join(linked, ".ssh"),
+		filepath.Join(real, ".ssh"),
+	} {
+		if !unsafeAllowReadRoot(root) {
+			t.Fatalf("unsafeAllowReadRoot(%q) = false, want missing protected root behind symlinked home rejected", root)
+		}
+	}
+	if unsafeAllowReadRoot(filepath.Join(real, "unrelated")) {
+		t.Fatalf("unsafeAllowReadRoot(%q) = true, want unrelated directory accepted", filepath.Join(real, "unrelated"))
+	}
+}
+
+func TestRunRejectsBroadReadRootBehindSymlinkedHome(t *testing.T) {
+	linked, _ := symlinkedHome(t)
+	// The rejection must fire before any exec, so nonexistent command paths
+	// prove the guard no longer depends on the binary being startable.
+	_, err := Run(context.Background(), Options{
+		CWD:            t.TempDir(),
+		Command:        "/nonexistent/srt-probe",
+		Profile:        ReadOnlyProfile([]string{filepath.Join(linked, ".config")}, nil),
+		runtimeCommand: "/nonexistent/srt-probe",
+	})
+	if err == nil || !strings.Contains(err.Error(), "is too broad") {
+		t.Fatalf("Run() error = %v, want broad read-root rejection behind symlinked home", err)
+	}
+}
+
+func TestUnsafeAllowReadRootResolvesDanglingSymlinkTargets(t *testing.T) {
+	linked, real := symlinkedHome(t)
+	// A read root that is a dangling symlink naming a protected directory
+	// (before it exists) must be rejected: the sandbox can read through the
+	// link as soon as the target appears.
+	for _, target := range []string{filepath.Join(linked, ".ssh"), filepath.Join(real, ".aws")} {
+		dangling := filepath.Join(t.TempDir(), "credentials")
+		if err := os.Symlink(target, dangling); err != nil {
+			t.Skipf("symlink creation failed: %v", err)
+		}
+		if !unsafeAllowReadRoot(dangling) {
+			t.Fatalf("unsafeAllowReadRoot(%q) = false, want dangling symlink to protected root rejected", dangling)
+		}
+	}
+	// A relative target resolves against the link's directory.
+	relative := filepath.Join(filepath.Dir(linked), "credentials")
+	if err := os.Symlink(filepath.Join(filepath.Base(linked), ".ssh"), relative); err != nil {
+		t.Skipf("symlink creation failed: %v", err)
+	}
+	if !unsafeAllowReadRoot(relative) {
+		t.Fatalf("unsafeAllowReadRoot(%q) = false, want relative dangling symlink to protected root rejected", relative)
+	}
+}
+
+func TestUnsafeAllowReadRootRejectsFilesystemRootWithoutHome(t *testing.T) {
+	t.Setenv("HOME", "")
+	if !unsafeAllowReadRoot("/") {
+		t.Fatal(`unsafeAllowReadRoot("/") = false without HOME, want filesystem root rejected before the home lookup`)
+	}
+}
+
+func TestUnsafeAllowReadRootResolvesSymlinkedProtectedRoots(t *testing.T) {
+	_, real := symlinkedHome(t)
+	secrets := t.TempDir()
+	if err := os.Symlink(secrets, filepath.Join(real, ".ssh")); err != nil {
+		t.Skipf("symlink creation failed: %v", err)
+	}
+	if !unsafeAllowReadRoot(secrets) {
+		t.Fatalf("unsafeAllowReadRoot(%q) = false, want container of symlinked protected root rejected", secrets)
+	}
+}
+
+func TestUnsafeAllowReadRootResolvesDanglingSymlinkAncestors(t *testing.T) {
+	_, real := symlinkedHome(t)
+	// ~/.config is a dangling symlink into a vault directory that does not
+	// exist yet; the container of the future ~/.config/gh must be rejected.
+	vault := t.TempDir()
+	if err := os.Symlink(filepath.Join(vault, "config"), filepath.Join(real, ".config")); err != nil {
+		t.Skipf("symlink creation failed: %v", err)
+	}
+	if !unsafeAllowReadRoot(vault) {
+		t.Fatalf("unsafeAllowReadRoot(%q) = false, want container of a dangling ancestor's target rejected", vault)
+	}
+	unrelated := t.TempDir()
+	if unsafeAllowReadRoot(unrelated) {
+		t.Fatalf("unsafeAllowReadRoot(%q) = true, want unrelated directory accepted", unrelated)
+	}
+}
+
 func TestRunAssessmentReadOnlyContainsMaliciousProcessTree(t *testing.T) {
 	srt, err := exec.LookPath("srt")
 	if err != nil {

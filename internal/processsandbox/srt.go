@@ -572,20 +572,32 @@ func unsafeAllowReadRoot(path string) bool {
 	if err != nil {
 		return true
 	}
-	if resolved, resolveErr := filepath.EvalSymlinks(absolute); resolveErr == nil {
-		absolute = resolved
-	}
-	if isFilesystemRoot(absolute) {
-		return true
+	candidateForms := comparablePathForms(absolute)
+	for _, form := range candidateForms {
+		if isFilesystemRoot(form) {
+			return true
+		}
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return false
 	}
-	if resolved, resolveErr := filepath.EvalSymlinks(home); resolveErr == nil {
-		home = resolved
+	for _, homeForm := range comparablePathForms(home) {
+		for _, secretRoot := range protectedReadRoots(homeForm) {
+			for _, rootForm := range comparablePathForms(secretRoot) {
+				for _, form := range candidateForms {
+					if pathContains(form, rootForm) {
+						return true
+					}
+				}
+			}
+		}
 	}
-	protected := []string{
+	return false
+}
+
+func protectedReadRoots(home string) []string {
+	return []string{
 		home,
 		filepath.Join(home, ".ssh"),
 		filepath.Join(home, ".aws"),
@@ -603,12 +615,72 @@ func unsafeAllowReadRoot(path string) bool {
 		filepath.Join(home, ".gitconfig"),
 		filepath.Join(home, ".netrc"),
 	}
-	for _, secretRoot := range protected {
-		if pathContains(absolute, secretRoot) {
-			return true
+}
+
+// comparablePathForms returns every spelling of path that comparison must
+// consider: the lexical form, forms with symlinks resolved as far as they
+// exist, and forms reached by following dangling symlinks — a dangling link
+// still names the directory it will expose once its target exists. EvalSymlinks
+// keeps missing paths lexical, which never compares equal to a resolved
+// spelling when an ancestor is a symlink (for example macOS
+// /tmp -> /private/tmp), so all spellings must be compared.
+func comparablePathForms(path string) []string {
+	var forms []string
+	seen := make(map[string]struct{})
+	var visit func(candidate string)
+	visit = func(candidate string) {
+		candidate = filepath.Clean(candidate)
+		if _, ok := seen[candidate]; ok {
+			return
+		}
+		seen[candidate] = struct{}{}
+		forms = append(forms, candidate)
+		if resolved, err := filepath.EvalSymlinks(candidate); err == nil {
+			visit(resolved)
+			return
+		}
+		if target, err := os.Readlink(candidate); err == nil {
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(candidate), target)
+			}
+			visit(target)
+		}
+		if resolved, ok := throughAncestors(candidate); ok {
+			visit(resolved)
 		}
 	}
-	return false
+	visit(filepath.Clean(path))
+	return forms
+}
+
+// throughAncestors resolves the deepest existing ancestor of form and
+// reattaches the remainder, following dangling symlinks found in the
+// remainder (a dangling ancestor such as ~/.config -> /vault/config still
+// names where the protected children will live). It reports false when the
+// resolution does not produce a distinct spelling.
+func throughAncestors(form string) (string, bool) {
+	dir := filepath.Dir(form)
+	remainder := []string{filepath.Base(form)}
+	for {
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			out := resolved
+			for _, component := range remainder {
+				out = filepath.Join(out, component)
+				if target, err := os.Readlink(out); err == nil {
+					if !filepath.IsAbs(target) {
+						target = filepath.Join(filepath.Dir(out), target)
+					}
+					out = target
+				}
+			}
+			return out, out != form
+		}
+		if parent := filepath.Dir(dir); parent == dir {
+			return form, false
+		}
+		remainder = append([]string{filepath.Base(dir)}, remainder...)
+		dir = filepath.Dir(dir)
+	}
 }
 
 func isFilesystemRoot(path string) bool {
