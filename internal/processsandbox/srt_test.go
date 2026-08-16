@@ -117,6 +117,42 @@ func TestRunRejectsBroadReadRoot(t *testing.T) {
 	}
 }
 
+// A home directory behind a symlink must not defeat the guard: the candidate
+// read root stays lexical when it does not exist yet, while home resolves, so
+// a single-form prefix comparison misses protected roots (#563). Rejection
+// must fire on the spelling mismatch, before any exec.
+func TestUnsafeAllowReadRootRejectsProtectedRootsUnderSymlinkedHome(t *testing.T) {
+	realHome := t.TempDir()
+	linkParent := t.TempDir()
+	linkedHome := filepath.Join(linkParent, "home-link")
+	if err := os.Symlink(realHome, linkedHome); err != nil {
+		t.Skipf("symlink creation failed: %v", err)
+	}
+	t.Setenv("HOME", linkedHome)
+
+	for _, rel := range []string{".ssh", ".aws", ".config/gh", ".gitconfig", ".looper"} {
+		// Deliberately do not create the protected directory: the lexical
+		// candidate is what failed to match before the fix.
+		candidate := filepath.Join(linkedHome, rel)
+		if !unsafeAllowReadRoot(candidate) {
+			t.Fatalf("unsafeAllowReadRoot(%q) = false under symlinked home, want rejection", candidate)
+		}
+	}
+	// An ordinary workspace under the same symlinked home stays admissible.
+	if unsafeAllowReadRoot(filepath.Join(linkedHome, "workspace")) {
+		t.Fatal("unsafeAllowReadRoot() rejected an ordinary workspace under the symlinked home")
+	}
+	// resolveExistingPrefix must place a not-yet-created path in resolved
+	// space: deepest existing ancestor resolved, tail preserved.
+	resolvedRealHome, err := filepath.EvalSymlinks(realHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resolveExistingPrefix(filepath.Join(linkedHome, ".ssh", "keys")); filepath.Dir(got) != filepath.Join(resolvedRealHome, ".ssh") {
+		t.Fatalf("resolveExistingPrefix() = %q, want under %q", got, filepath.Join(resolvedRealHome, ".ssh"))
+	}
+}
+
 func TestRunAssessmentReadOnlyContainsMaliciousProcessTree(t *testing.T) {
 	srt, err := exec.LookPath("srt")
 	if err != nil {

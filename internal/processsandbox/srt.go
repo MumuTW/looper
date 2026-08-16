@@ -572,20 +572,37 @@ func unsafeAllowReadRoot(path string) bool {
 	if err != nil {
 		return true
 	}
-	if resolved, resolveErr := filepath.EvalSymlinks(absolute); resolveErr == nil {
-		absolute = resolved
-	}
-	if isFilesystemRoot(absolute) {
-		return true
-	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return false
 	}
-	if resolved, resolveErr := filepath.EvalSymlinks(home); resolveErr == nil {
-		home = resolved
+	// Compare both spellings on both sides. The candidate is kept lexical when
+	// it does not exist yet (EvalSymlinks fails), while home resolves whenever
+	// it exists — a symlinked home (macOS /tmp-rooted, nix-style, symlinked
+	// /home) then defeats a single-form prefix comparison and protected roots
+	// like ~/.ssh or ~/.aws are not rejected (#563). spellings resolves the
+	// deepest existing ancestor so a not-yet-created path still compares in
+	// resolved space; the lexical form is retained alongside it.
+	candidateForms := spellings(absolute)
+	for _, candidate := range candidateForms {
+		if isFilesystemRoot(candidate) {
+			return true
+		}
 	}
-	protected := []string{
+	for _, homeForm := range spellings(home) {
+		for _, secretRoot := range protectedHomeReadRoots(homeForm) {
+			for _, candidate := range candidateForms {
+				if pathContains(candidate, secretRoot) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func protectedHomeReadRoots(home string) []string {
+	return []string{
 		home,
 		filepath.Join(home, ".ssh"),
 		filepath.Join(home, ".aws"),
@@ -603,12 +620,40 @@ func unsafeAllowReadRoot(path string) bool {
 		filepath.Join(home, ".gitconfig"),
 		filepath.Join(home, ".netrc"),
 	}
-	for _, secretRoot := range protected {
-		if pathContains(absolute, secretRoot) {
-			return true
-		}
+}
+
+// spellings returns the lexical form plus the symlink-resolved form of an
+// absolute path. Resolution walks to the deepest existing ancestor, so a path
+// that does not exist yet still resolves the directory that will contain it;
+// when nothing along the path exists the original absolute form is returned.
+func spellings(absolute string) []string {
+	lexical := filepath.Clean(absolute)
+	resolved := lexical
+	if fully, err := filepath.EvalSymlinks(lexical); err == nil {
+		resolved = fully
+	} else {
+		resolved = resolveExistingPrefix(lexical)
 	}
-	return false
+	if resolved == lexical {
+		return []string{lexical}
+	}
+	return []string{lexical, resolved}
+}
+
+func resolveExistingPrefix(absolute string) string {
+	current := filepath.Clean(absolute)
+	tail := ""
+	for {
+		parent := filepath.Dir(current)
+		if parent == current {
+			return filepath.Clean(absolute)
+		}
+		if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+			return filepath.Join(resolved, filepath.Base(current), tail)
+		}
+		tail = filepath.Join(filepath.Base(current), tail)
+		current = parent
+	}
 }
 
 func isFilesystemRoot(path string) bool {
