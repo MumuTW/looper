@@ -572,6 +572,15 @@ func unsafeAllowReadRoot(path string) bool {
 	if err != nil {
 		return true
 	}
+	candidateForms := spellings(absolute)
+	// Reject filesystem roots before consulting HOME: with HOME unset the
+	// lookup below fails, and an explicit allowRead of "/" must still be
+	// rejected rather than pass validation and restore host-wide reads.
+	for _, candidate := range candidateForms {
+		if isFilesystemRoot(candidate) {
+			return true
+		}
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return false
@@ -582,18 +591,17 @@ func unsafeAllowReadRoot(path string) bool {
 	// /home) then defeats a single-form prefix comparison and protected roots
 	// like ~/.ssh or ~/.aws are not rejected (#563). spellings resolves the
 	// deepest existing ancestor so a not-yet-created path still compares in
-	// resolved space; the lexical form is retained alongside it.
-	candidateForms := spellings(absolute)
-	for _, candidate := range candidateForms {
-		if isFilesystemRoot(candidate) {
-			return true
-		}
-	}
+	// resolved space, and follows symlink components (including dangling ones)
+	// so a link to a protected location cannot hide behind resolution failure.
+	// Protected roots are spelled too: a ~/.ssh symlinked outside the home
+	// directory must guard its real target.
 	for _, homeForm := range spellings(home) {
 		for _, secretRoot := range protectedHomeReadRoots(homeForm) {
-			for _, candidate := range candidateForms {
-				if pathContains(candidate, secretRoot) {
-					return true
+			for _, secretForm := range spellings(secretRoot) {
+				for _, candidate := range candidateForms {
+					if pathContains(candidate, secretForm) {
+						return true
+					}
 				}
 			}
 		}
@@ -622,22 +630,52 @@ func protectedHomeReadRoots(home string) []string {
 	}
 }
 
-// spellings returns the lexical form plus the symlink-resolved form of an
-// absolute path. Resolution walks to the deepest existing ancestor, so a path
-// that does not exist yet still resolves the directory that will contain it;
-// when nothing along the path exists the original absolute form is returned.
+// spellings returns every spelling of an absolute path that can name the same
+// location: the lexical form, the fully symlink-resolved form (or, when the
+// path does not exist yet, the form with its deepest existing ancestor
+// resolved), and — when the path itself is a symlink, even a dangling one —
+// the spellings of its target. Depth bounds recursion through symlink chains
+// and breaks accidental cycles.
 func spellings(absolute string) []string {
+	return spellingsDepth(absolute, 8)
+}
+
+func spellingsDepth(absolute string, depth int) []string {
 	lexical := filepath.Clean(absolute)
+	forms := []string{lexical}
 	resolved := lexical
 	if fully, err := filepath.EvalSymlinks(lexical); err == nil {
 		resolved = fully
 	} else {
 		resolved = resolveExistingPrefix(lexical)
 	}
-	if resolved == lexical {
-		return []string{lexical}
+	if resolved != lexical && !containsPath(forms, resolved) {
+		forms = append(forms, resolved)
 	}
-	return []string{lexical, resolved}
+	if depth <= 0 {
+		return forms
+	}
+	if target, err := os.Readlink(lexical); err == nil {
+		targetPath := target
+		if !filepath.IsAbs(targetPath) {
+			targetPath = filepath.Join(filepath.Dir(lexical), targetPath)
+		}
+		for _, form := range spellingsDepth(targetPath, depth-1) {
+			if !containsPath(forms, form) {
+				forms = append(forms, form)
+			}
+		}
+	}
+	return forms
+}
+
+func containsPath(forms []string, candidate string) bool {
+	for _, form := range forms {
+		if form == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveExistingPrefix(absolute string) string {

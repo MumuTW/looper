@@ -153,6 +153,55 @@ func TestUnsafeAllowReadRootRejectsProtectedRootsUnderSymlinkedHome(t *testing.T
 	}
 }
 
+// A dangling symlink whose target is a not-yet-created protected path still
+// names that location: the link must be read and the target's spelling
+// compared, not just the link's parent directory.
+func TestUnsafeAllowReadRootFollowsDanglingSymlinkToProtectedPath(t *testing.T) {
+	realHome := t.TempDir()
+	linkParent := t.TempDir()
+	linkedHome := filepath.Join(linkParent, "home-link")
+	if err := os.Symlink(realHome, linkedHome); err != nil {
+		t.Skipf("symlink creation failed: %v", err)
+	}
+	t.Setenv("HOME", linkedHome)
+	credentials := filepath.Join(t.TempDir(), "credentials")
+	if err := os.Symlink(filepath.Join(linkedHome, ".ssh"), credentials); err != nil {
+		t.Skipf("symlink creation failed: %v", err)
+	}
+
+	if !unsafeAllowReadRoot(credentials) {
+		t.Fatalf("unsafeAllowReadRoot(%q) = false, want the dangling link to ~/.ssh rejected by target", credentials)
+	}
+}
+
+// Rejecting filesystem roots must not depend on HOME being set: with HOME
+// unset an explicit allowRead of "/" still fails validation.
+func TestUnsafeAllowReadRootRejectsFilesystemRootWithoutHome(t *testing.T) {
+	t.Setenv("HOME", "")
+	if !unsafeAllowReadRoot("/") {
+		t.Fatal("unsafeAllowReadRoot(\"/\") = false with HOME unset, want rejection before the home lookup")
+	}
+}
+
+// A protected directory symlinked outside the home directory must guard its
+// real target: a read root containing the target location is rejected.
+func TestUnsafeAllowReadRootResolvesProtectedRootsOutsideHome(t *testing.T) {
+	realHome := t.TempDir()
+	secrets := t.TempDir()
+	target := filepath.Join(secrets, "ssh")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(realHome, ".ssh")); err != nil {
+		t.Skipf("symlink creation failed: %v", err)
+	}
+	t.Setenv("HOME", realHome)
+
+	if !unsafeAllowReadRoot(secrets) {
+		t.Fatalf("unsafeAllowReadRoot(%q) = false, want the parent of the symlinked ~/.ssh target rejected", secrets)
+	}
+}
+
 func TestRunAssessmentReadOnlyContainsMaliciousProcessTree(t *testing.T) {
 	srt, err := exec.LookPath("srt")
 	if err != nil {
