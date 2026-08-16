@@ -664,8 +664,8 @@ func throughAncestors(form string) (string, bool) {
 	for {
 		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
 			out := resolved
-			for i := len(remainder) - 1; i >= 0; i-- {
-				out = filepath.Join(out, remainder[i])
+			for _, component := range remainder {
+				out = filepath.Join(out, component)
 				if target, err := os.Readlink(out); err == nil {
 					if !filepath.IsAbs(target) {
 						target = filepath.Join(filepath.Dir(out), target)
