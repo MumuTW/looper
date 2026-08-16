@@ -164,6 +164,48 @@ func TestRunRejectsBroadReadRootBehindSymlinkedHome(t *testing.T) {
 	}
 }
 
+func TestUnsafeAllowReadRootResolvesDanglingSymlinkTargets(t *testing.T) {
+	linked, real := symlinkedHome(t)
+	// A read root that is a dangling symlink naming a protected directory
+	// (before it exists) must be rejected: the sandbox can read through the
+	// link as soon as the target appears.
+	for _, target := range []string{filepath.Join(linked, ".ssh"), filepath.Join(real, ".aws")} {
+		dangling := filepath.Join(t.TempDir(), "credentials")
+		if err := os.Symlink(target, dangling); err != nil {
+			t.Skipf("symlink creation failed: %v", err)
+		}
+		if !unsafeAllowReadRoot(dangling) {
+			t.Fatalf("unsafeAllowReadRoot(%q) = false, want dangling symlink to protected root rejected", dangling)
+		}
+	}
+	// A relative target resolves against the link's directory.
+	relative := filepath.Join(filepath.Dir(linked), "credentials")
+	if err := os.Symlink(filepath.Join(filepath.Base(linked), ".ssh"), relative); err != nil {
+		t.Skipf("symlink creation failed: %v", err)
+	}
+	if !unsafeAllowReadRoot(relative) {
+		t.Fatalf("unsafeAllowReadRoot(%q) = false, want relative dangling symlink to protected root rejected", relative)
+	}
+}
+
+func TestUnsafeAllowReadRootRejectsFilesystemRootWithoutHome(t *testing.T) {
+	t.Setenv("HOME", "")
+	if !unsafeAllowReadRoot("/") {
+		t.Fatal(`unsafeAllowReadRoot("/") = false without HOME, want filesystem root rejected before the home lookup`)
+	}
+}
+
+func TestUnsafeAllowReadRootResolvesSymlinkedProtectedRoots(t *testing.T) {
+	_, real := symlinkedHome(t)
+	secrets := t.TempDir()
+	if err := os.Symlink(secrets, filepath.Join(real, ".ssh")); err != nil {
+		t.Skipf("symlink creation failed: %v", err)
+	}
+	if !unsafeAllowReadRoot(secrets) {
+		t.Fatalf("unsafeAllowReadRoot(%q) = false, want container of symlinked protected root rejected", secrets)
+	}
+}
+
 func TestRunAssessmentReadOnlyContainsMaliciousProcessTree(t *testing.T) {
 	srt, err := exec.LookPath("srt")
 	if err != nil {

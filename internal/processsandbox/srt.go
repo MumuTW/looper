@@ -617,24 +617,54 @@ func protectedReadRoots(home string) []string {
 	}
 }
 
-// comparablePathForms returns the lexical spelling of path plus a spelling
+// comparablePathForms returns the lexical spelling of path plus spellings
 // with symlinks resolved as far as they exist. EvalSymlinks keeps missing
 // paths lexical, which never compares equal to a fully resolved spelling
 // when an ancestor is a symlink (for example macOS /tmp -> /private/tmp),
-// so both spellings must be compared.
+// so both spellings must be compared. A dangling symlink still names the
+// directory it will expose once its target exists, so its target spelling
+// is included too.
 func comparablePathForms(path string) []string {
-	clean := filepath.Clean(path)
-	forms := []string{clean}
-	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
-		return append(forms, resolved)
+	var forms []string
+	seen := make(map[string]struct{})
+	queue := []string{filepath.Clean(path)}
+	for len(queue) > 0 {
+		form := queue[0]
+		queue = queue[1:]
+		if _, ok := seen[form]; ok {
+			continue
+		}
+		seen[form] = struct{}{}
+		forms = append(forms, form)
+		if resolved, err := filepath.EvalSymlinks(form); err == nil {
+			queue = append(queue, resolved)
+			continue
+		}
+		if resolved, ok := ancestorResolved(form); ok {
+			queue = append(queue, resolved)
+		}
+		if target, err := os.Readlink(form); err == nil {
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(form), target)
+			}
+			queue = append(queue, target)
+		}
 	}
-	dir, tail := filepath.Dir(clean), filepath.Base(clean)
+	return forms
+}
+
+// ancestorResolved resolves the symlinks of form's deepest existing
+// ancestor and reattaches the missing remainder. It reports false when the
+// resolution does not produce a distinct spelling.
+func ancestorResolved(form string) (string, bool) {
+	dir, tail := filepath.Dir(form), filepath.Base(form)
 	for {
 		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
-			return append(forms, filepath.Join(resolved, tail))
+			joined := filepath.Join(resolved, tail)
+			return joined, joined != form
 		}
 		if parent := filepath.Dir(dir); parent == dir {
-			return forms
+			return form, false
 		}
 		tail = filepath.Join(filepath.Base(dir), tail)
 		dir = filepath.Dir(dir)
