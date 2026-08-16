@@ -1,6 +1,9 @@
 package labels
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestNamespaceDerivesOwnedLabelsAndRejectsForeignDispatch(t *testing.T) {
 	ns := NewNamespace("Team.Looper:")
@@ -49,5 +52,31 @@ func TestNamespaceRejectsUnsafePrefixes(t *testing.T) {
 	}
 	if err := ValidatePrefix("abcdefghijklmnopqrstuvwxyz123456:"); err == nil {
 		t.Fatal("ValidatePrefix() accepted a prefix that makes standard labels exceed GitHub's 50-character limit")
+	}
+}
+
+// A custom namespace nested under the reserved default would make every label
+// it emit satisfy the default instance's IsOwned prefix check, so the default
+// instance could adopt the custom instance's PRs for auto-merge and
+// merge-watch. Only the default itself may use the looper: stem.
+func TestNamespaceRejectsPrefixesNestedUnderDefault(t *testing.T) {
+	for _, prefix := range []string{"looper:team:", "looper:t:", "LOOPER:Team:", "looper:" + strings.Repeat("a", 20) + ":"} {
+		if err := ValidatePrefix(prefix); err == nil {
+			t.Fatalf("ValidatePrefix(%q) succeeded, want nested-namespace rejection", prefix)
+		}
+	}
+	for _, prefix := range []string{"looper:", "LOOPER:", "team.looper:", "team:", "looperteam:"} {
+		if err := ValidatePrefix(prefix); err != nil {
+			t.Fatalf("ValidatePrefix(%q) error = %v, want accepted", prefix, err)
+		}
+	}
+	// The nested fallback keeps legacy callers deterministic: an invalid nested
+	// prefix never becomes a second namespace under the default.
+	if got := NewNamespace("looper:team:"); got.Prefix != Prefix {
+		t.Fatalf("nested namespace fallback = %q, want default %q", got.Prefix, Prefix)
+	}
+	// Discovery must not map a nested-spelled label back to any namespace.
+	if ns, ok := NamespaceForLabel("looper:team:auto-merge"); ok {
+		t.Fatalf("NamespaceForLabel(looper:team:auto-merge) = %q, want unrecognized", ns.Prefix)
 	}
 }

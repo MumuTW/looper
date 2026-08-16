@@ -2642,6 +2642,71 @@ func TestEnsureWorkerWorktreeUsableTreatsModeLessCheckpointAsBranch(t *testing.T
 	}
 }
 
+// A retained work checkpoint's reproduction command denies tool network even
+// when the project configures no base validation commands. The snapshot
+// refresh must derive the gate flag from those effective commands: with only
+// the base policy, a sticky snapshot from a vendor that cannot serve the gate
+// survives the operator's vendor switch and every retry refuses to spawn
+// (#558).
+func TestCreateRunContextRefreshesUnsupportedSnapshotForRetainedReproduction(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	predecessorSnapshot := `{"vendor":"claude-code","model":"sticky-model","profileId":"sticky-profile"}`
+	runner := New(Options{
+		DB:           fixture.coordinator.DB(),
+		Repos:        fixture.repos,
+		Logger:       fixture.logger,
+		Now:          fixture.now,
+		AgentRuntime: string(config.AgentVendorCodex),
+		AgentModel:   runpipe.StringPtr("gate-model"),
+	})
+	checkpointJSON := runpipe.MustMarshalJSON(workerCheckpoint{
+		Work: &workerInput{
+			Title:        "Worker task",
+			Reproduction: &reproducer.Manifest{Version: 1, TestPath: "internal/bug_test.go", TestName: "TestBug", TestCommand: "go test ./internal/... -run TestBug", TestSHA256: "hash"},
+		},
+		ClaimedLockKey: "worker:loop_worker_1",
+		Worktree:       &checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/test"},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_with_reproduction",
+		LoopID:            "loop_worker_1",
+		Status:            "failed",
+		CurrentStep:       runpipe.StringPtr(string(stepExecute)),
+		LastCompletedStep: runpipe.StringPtr(string(stepPrepareWork)),
+		CheckpointJSON:    &checkpointJSON,
+		AgentSnapshotJSON: &predecessorSnapshot,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if !resumed.Resumed {
+		t.Fatal("Resumed = false, want true")
+	}
+	if resumed.Run.AgentSnapshotJSON == nil {
+		t.Fatal("AgentSnapshotJSON = nil, want a refreshed snapshot")
+	}
+	snapshot, err := config.ParseAgentSnapshot(*resumed.Run.AgentSnapshotJSON)
+	if err != nil {
+		t.Fatalf("ParseAgentSnapshot() error = %v", err)
+	}
+	if snapshot.Vendor != string(config.AgentVendorCodex) {
+		t.Fatalf("refreshed snapshot vendor = %q, want codex: the reproduction command's network denial must retire the unsupported sticky snapshot", snapshot.Vendor)
+	}
+}
+
 func TestCreateRunContextCopiesPredecessorAgentSnapshotOnResume(t *testing.T) {
 	t.Parallel()
 
