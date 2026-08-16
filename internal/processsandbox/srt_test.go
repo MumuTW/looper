@@ -206,6 +206,23 @@ func TestUnsafeAllowReadRootResolvesSymlinkedProtectedRoots(t *testing.T) {
 	}
 }
 
+func TestUnsafeAllowReadRootResolvesDanglingSymlinkAncestors(t *testing.T) {
+	_, real := symlinkedHome(t)
+	// ~/.config is a dangling symlink into a vault directory that does not
+	// exist yet; the container of the future ~/.config/gh must be rejected.
+	vault := t.TempDir()
+	if err := os.Symlink(filepath.Join(vault, "config"), filepath.Join(real, ".config")); err != nil {
+		t.Skipf("symlink creation failed: %v", err)
+	}
+	if !unsafeAllowReadRoot(vault) {
+		t.Fatalf("unsafeAllowReadRoot(%q) = false, want container of a dangling ancestor's target rejected", vault)
+	}
+	unrelated := t.TempDir()
+	if unsafeAllowReadRoot(unrelated) {
+		t.Fatalf("unsafeAllowReadRoot(%q) = true, want unrelated directory accepted", unrelated)
+	}
+}
+
 func TestRunAssessmentReadOnlyContainsMaliciousProcessTree(t *testing.T) {
 	srt, err := exec.LookPath("srt")
 	if err != nil {

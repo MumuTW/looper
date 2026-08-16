@@ -617,56 +617,68 @@ func protectedReadRoots(home string) []string {
 	}
 }
 
-// comparablePathForms returns the lexical spelling of path plus spellings
-// with symlinks resolved as far as they exist. EvalSymlinks keeps missing
-// paths lexical, which never compares equal to a fully resolved spelling
-// when an ancestor is a symlink (for example macOS /tmp -> /private/tmp),
-// so both spellings must be compared. A dangling symlink still names the
-// directory it will expose once its target exists, so its target spelling
-// is included too.
+// comparablePathForms returns every spelling of path that comparison must
+// consider: the lexical form, forms with symlinks resolved as far as they
+// exist, and forms reached by following dangling symlinks — a dangling link
+// still names the directory it will expose once its target exists. EvalSymlinks
+// keeps missing paths lexical, which never compares equal to a resolved
+// spelling when an ancestor is a symlink (for example macOS
+// /tmp -> /private/tmp), so all spellings must be compared.
 func comparablePathForms(path string) []string {
 	var forms []string
 	seen := make(map[string]struct{})
-	queue := []string{filepath.Clean(path)}
-	for len(queue) > 0 {
-		form := queue[0]
-		queue = queue[1:]
-		if _, ok := seen[form]; ok {
-			continue
+	var visit func(candidate string)
+	visit = func(candidate string) {
+		candidate = filepath.Clean(candidate)
+		if _, ok := seen[candidate]; ok {
+			return
 		}
-		seen[form] = struct{}{}
-		forms = append(forms, form)
-		if resolved, err := filepath.EvalSymlinks(form); err == nil {
-			queue = append(queue, resolved)
-			continue
+		seen[candidate] = struct{}{}
+		forms = append(forms, candidate)
+		if resolved, err := filepath.EvalSymlinks(candidate); err == nil {
+			visit(resolved)
+			return
 		}
-		if resolved, ok := ancestorResolved(form); ok {
-			queue = append(queue, resolved)
-		}
-		if target, err := os.Readlink(form); err == nil {
+		if target, err := os.Readlink(candidate); err == nil {
 			if !filepath.IsAbs(target) {
-				target = filepath.Join(filepath.Dir(form), target)
+				target = filepath.Join(filepath.Dir(candidate), target)
 			}
-			queue = append(queue, target)
+			visit(target)
+		}
+		if resolved, ok := throughAncestors(candidate); ok {
+			visit(resolved)
 		}
 	}
+	visit(filepath.Clean(path))
 	return forms
 }
 
-// ancestorResolved resolves the symlinks of form's deepest existing
-// ancestor and reattaches the missing remainder. It reports false when the
+// throughAncestors resolves the deepest existing ancestor of form and
+// reattaches the remainder, following dangling symlinks found in the
+// remainder (a dangling ancestor such as ~/.config -> /vault/config still
+// names where the protected children will live). It reports false when the
 // resolution does not produce a distinct spelling.
-func ancestorResolved(form string) (string, bool) {
-	dir, tail := filepath.Dir(form), filepath.Base(form)
+func throughAncestors(form string) (string, bool) {
+	dir := filepath.Dir(form)
+	remainder := []string{filepath.Base(form)}
 	for {
 		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
-			joined := filepath.Join(resolved, tail)
-			return joined, joined != form
+			out := resolved
+			for i := len(remainder) - 1; i >= 0; i-- {
+				out = filepath.Join(out, remainder[i])
+				if target, err := os.Readlink(out); err == nil {
+					if !filepath.IsAbs(target) {
+						target = filepath.Join(filepath.Dir(out), target)
+					}
+					out = target
+				}
+			}
+			return out, out != form
 		}
 		if parent := filepath.Dir(dir); parent == dir {
 			return form, false
 		}
-		tail = filepath.Join(filepath.Base(dir), tail)
+		remainder = append([]string{filepath.Base(dir)}, remainder...)
 		dir = filepath.Dir(dir)
 	}
 }
