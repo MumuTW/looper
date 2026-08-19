@@ -457,3 +457,148 @@ func requireSandboxRuntime(t *testing.T) {
 		t.Skipf("trusted sandbox runtime is unavailable: %v", err)
 	}
 }
+
+// writeFakeLauncher installs an executable launcher in a dedicated directory
+// so command-root resolution is deterministic across machines.
+func writeFakeLauncher(t *testing.T, name, body string) string {
+	t.Helper()
+	toolDir := t.TempDir()
+	rawBinary := filepath.Join(toolDir, name)
+	if err := os.WriteFile(rawBinary, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(rawBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
+}
+
+func TestResolvedValidationCommandRootsGrantLauncherFileNotPathDirectory(t *testing.T) {
+	launcher := writeFakeLauncher(t, "pnpm", "#!/bin/sh\nprintf 'ok\\n'\n")
+	secretDir := setDaemonPathWithSecret(t, filepath.Dir(launcher))
+
+	roots := resolvedValidationCommandRoots("pnpm test --reporter dot")
+
+	if len(roots) != 2 {
+		t.Fatalf("roots = %q, want the launcher and its shebang interpreter", roots)
+	}
+	resolvedSh, err := filepath.EvalSymlinks("/bin/sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasLauncher := roots[0] == launcher || roots[1] == launcher
+	hasInterpreter := roots[0] == resolvedSh || roots[1] == resolvedSh
+	if !hasLauncher || !hasInterpreter {
+		t.Fatalf("roots = %q, want launcher %q and interpreter %q", roots, launcher, resolvedSh)
+	}
+	for _, root := range roots {
+		if root == secretDir || root == filepath.Dir(launcher) {
+			t.Fatalf("roots grant a PATH directory %q instead of resolved files: %q", root, roots)
+		}
+	}
+}
+
+func TestResolvedValidationCommandRootsOmitInterpreterForPlainBinary(t *testing.T) {
+	launcher := writeFakeLauncher(t, "looper-fixture", "\x7fELF-no-shebang\n")
+	setDaemonPathWithSecret(t, filepath.Dir(launcher))
+
+	roots := resolvedValidationCommandRoots("looper-fixture build")
+
+	if len(roots) != 1 || roots[0] != launcher {
+		t.Fatalf("roots = %q, want only the resolved launcher %q", roots, launcher)
+	}
+}
+
+func TestResolvedValidationCommandRootsAddNothingForRelativeOrMissingCommands(t *testing.T) {
+	for _, command := range []string{
+		"./scripts/check.sh",
+		"../tools/check",
+		"looper-definitely-not-installed --flag",
+		"",
+		"   ",
+		"CI=1",
+	} {
+		if roots := resolvedValidationCommandRoots(command); len(roots) != 0 {
+			t.Fatalf("resolvedValidationCommandRoots(%q) = %q, want no roots", command, roots)
+		}
+	}
+}
+
+func TestLeadingCommandName(t *testing.T) {
+	cases := map[string]string{
+		"pnpm test":             "pnpm",
+		"go vet ./...":          "go",
+		"  make   check":        "make",
+		"CI=1 pnpm test":        "pnpm",
+		"A_B=2 C3=d make check": "make",
+		`"pnpm" test`:           "pnpm",
+		"'git' status":          "git",
+		"/opt/tools/pnpm test":  "/opt/tools/pnpm",
+		"./scripts/check.sh":    "./scripts/check.sh",
+		"1BAD=x tool":           "1BAD=x",
+		"":                      "",
+		"   ":                   "",
+		`"unterminated quote`:   "",
+	}
+	for command, want := range cases {
+		if got := leadingCommandName(command); got != want {
+			t.Fatalf("leadingCommandName(%q) = %q, want %q", command, got, want)
+		}
+	}
+}
+
+func TestRunAllowsConfiguredPathLauncherValidationCommands(t *testing.T) {
+	requireSandboxRuntime(t)
+	toolDir := t.TempDir()
+	launcher := filepath.Join(toolDir, "looper-validation-fixture")
+	script := "#!/bin/sh\nprintf 'launcher-ok %s\\n' \"$LOOPER_FIXTURE_MODE\"\n"
+	if err := os.WriteFile(launcher, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", toolDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	for _, command := range []string{
+		"looper-validation-fixture",
+		"LOOPER_FIXTURE_MODE=assigned looper-validation-fixture",
+	} {
+		result, err := Run(context.Background(), Options{
+			CWD:     t.TempDir(),
+			Command: command,
+			Timeout: 60 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("Run(%q) error = %v; stdout=%q stderr=%q", command, err, result.Stdout, result.Stderr)
+		}
+		if !strings.Contains(result.Stdout, "launcher-ok") {
+			t.Fatalf("Run(%q) stdout = %q, want launcher output", command, result.Stdout)
+		}
+	}
+}
+
+func TestRunKeepsLauncherPathSiblingsUnreadable(t *testing.T) {
+	requireSandboxRuntime(t)
+	toolDir := t.TempDir()
+	secret := filepath.Join(toolDir, "launcher-secret")
+	if err := os.WriteFile(secret, []byte("credential"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	launcher := filepath.Join(toolDir, "looper-validation-fixture")
+	script := fmt.Sprintf("#!/bin/sh\ntest ! -r %s && printf 'no-leak\\n'\n", strconv.Quote(secret))
+	if err := os.WriteFile(launcher, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", toolDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	result, err := Run(context.Background(), Options{
+		CWD:     t.TempDir(),
+		Command: "looper-validation-fixture",
+		Timeout: 60 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v; stdout=%q stderr=%q", err, result.Stdout, result.Stderr)
+	}
+	if !strings.Contains(result.Stdout, "no-leak") {
+		t.Fatalf("stdout = %q, want the launcher's sibling to stay unreadable", result.Stdout)
+	}
+}

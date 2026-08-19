@@ -3,6 +3,7 @@ package validationcmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -134,6 +135,7 @@ func Run(ctx context.Context, options Options) (shell.Result, error) {
 		denyRead = append(denyRead, home)
 	}
 	allowRead := validationReadRoots(cwd)
+	allowRead = append(allowRead, resolvedValidationCommandRoots(command)...)
 	environment, platformReadRoots := validationToolEnvironment()
 	allowRead = append(allowRead, platformReadRoots...)
 	return processsandbox.Run(ctx, processsandbox.Options{
@@ -346,6 +348,168 @@ func resolvedToolPath(path string) string {
 		return resolved
 	}
 	return absolute
+}
+
+// resolvedValidationCommandRoots grants the launcher a configured validation
+// command resolves to through the same PATH the sandbox forwards: the
+// resolved executable file and, for script launchers, the resolved shebang
+// interpreter. Like resolvedGitToolRoots, grants follow resolved files, so
+// PATH directories holding unrelated operator files stay unreadable (#556).
+// Version-manager shims keep their own directory; only the shim file itself
+// is granted. Relative command paths resolve inside the worktree, which the
+// profile already grants, so they add nothing here.
+func resolvedValidationCommandRoots(command string) []string {
+	name := leadingCommandName(command)
+	if name == "" {
+		return nil
+	}
+	if strings.ContainsRune(name, '/') && !filepath.IsAbs(name) {
+		return nil
+	}
+	binary, err := exec.LookPath(name)
+	if err != nil {
+		return nil
+	}
+	resolved, err := filepath.EvalSymlinks(binary)
+	if err != nil {
+		return nil
+	}
+	if info, statErr := os.Stat(resolved); statErr != nil || info.IsDir() {
+		return nil
+	}
+	roots := []string{resolved}
+	if interpreter := shebangInterpreter(resolved); interpreter != "" {
+		roots = append(roots, interpreter)
+	}
+	sort.Strings(roots)
+	return roots
+}
+
+// leadingCommandName extracts the executable word the sandboxed /bin/sh would
+// exec first: leading environment assignments are skipped, and quotes are
+// honored so `"/opt/tools/pnpm" test` still names pnpm. It returns "" when no
+// command word remains or the input never closes a quote.
+func leadingCommandName(command string) string {
+	rest := strings.TrimSpace(command)
+	for rest != "" {
+		word, remainder, ok := scanShellWord(rest)
+		if !ok {
+			return ""
+		}
+		rest = strings.TrimSpace(remainder)
+		if word == "" {
+			continue
+		}
+		if isEnvironmentAssignment(word) {
+			continue
+		}
+		return word
+	}
+	return ""
+}
+
+// scanShellWord reads the first shell word, honoring single and double quotes
+// and backslash escapes outside single quotes. The remainder starts at the
+// terminating whitespace, so callers can keep scanning.
+func scanShellWord(command string) (string, string, bool) {
+	var word strings.Builder
+	inSingle := false
+	inDouble := false
+	escaped := false
+	for i := 0; i < len(command); i++ {
+		c := command[i]
+		if escaped {
+			word.WriteByte(c)
+			escaped = false
+			continue
+		}
+		switch {
+		case c == '\\' && !inSingle:
+			escaped = true
+		case c == '\'' && !inDouble:
+			inSingle = !inSingle
+		case c == '"' && !inSingle:
+			inDouble = !inDouble
+		case (c == ' ' || c == '\t' || c == '\n' || c == '\r') && !inSingle && !inDouble:
+			if word.Len() == 0 {
+				continue
+			}
+			return word.String(), command[i:], true
+		default:
+			word.WriteByte(c)
+		}
+	}
+	if inSingle || inDouble {
+		return "", "", false
+	}
+	return word.String(), "", true
+}
+
+func isEnvironmentAssignment(word string) bool {
+	equals := strings.IndexByte(word, '=')
+	if equals <= 0 {
+		return false
+	}
+	for i := 0; i < equals; i++ {
+		c := word[i]
+		valid := c == '_' ||
+			(c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(i > 0 && c >= '0' && c <= '9')
+		if !valid {
+			return false
+		}
+	}
+	return true
+}
+
+// shebangInterpreter resolves the interpreter a script launcher delegates to,
+// so node-based launchers (pnpm, yarn) keep their runtime readable. Only the
+// resolved interpreter file is granted, never its directory.
+func shebangInterpreter(script string) string {
+	info, err := os.Stat(script)
+	if err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	file, err := os.Open(script)
+	if err != nil {
+		return ""
+	}
+	header := make([]byte, 256)
+	read, _ := io.ReadFull(file, header)
+	_ = file.Close()
+	line := string(header[:read])
+	if newline := strings.IndexByte(line, '\n'); newline >= 0 {
+		line = line[:newline]
+	}
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "#!") {
+		return ""
+	}
+	fields := strings.Fields(strings.TrimPrefix(line, "#!"))
+	if len(fields) == 0 {
+		return ""
+	}
+	interpreter := fields[0]
+	if filepath.Base(interpreter) == "env" {
+		if len(fields) < 2 || strings.HasPrefix(fields[1], "-") {
+			return ""
+		}
+		interpreter = fields[1]
+	} else if !filepath.IsAbs(interpreter) {
+		return ""
+	}
+	resolved, err := exec.LookPath(interpreter)
+	if err != nil {
+		return ""
+	}
+	if evaluated, evalErr := filepath.EvalSymlinks(resolved); evalErr == nil {
+		resolved = evaluated
+	}
+	if info, statErr := os.Stat(resolved); statErr != nil || info.IsDir() {
+		return ""
+	}
+	return resolved
 }
 
 func linkedWorktreeReadRoots(cwd string) []string {
